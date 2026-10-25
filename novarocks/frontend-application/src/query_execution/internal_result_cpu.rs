@@ -51,6 +51,8 @@ use novarocks_workload_control::joint_admission::{
 };
 use std::sync::{Arc, Weak};
 
+mod execution_control;
+use execution_control::CpuWorkControl;
 mod metadata_geometry;
 mod scoped_statistics;
 pub use metadata_geometry::InternalCpuActionQuote;
@@ -1033,6 +1035,14 @@ impl InternalResultCpu {
             .provider_creator_source(scope)
     }
 
+    pub(crate) fn metadata_cpu_continuation_source(
+        &self,
+        io: &crate::query_execution::maintenance::io_admission::MetadataIoAdmission,
+        root: &WorkScope,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        io.metadata_cpu_continuation_source(self.factory.as_ref().ok_or(WorkError::NotReady)?, root)
+    }
+
     /// Same factory, bounded pool, original receipt/forwarder/cause algorithm.
     /// Input metadata is separate from the cumulative Internal result window.
     pub(crate) fn submit_provider_creator(
@@ -1071,6 +1081,27 @@ impl InternalResultCpu {
         runtime: &tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> ProviderReadCpuJob {
+        self.submit_creator_input_with_control(
+            input,
+            window,
+            backing,
+            source,
+            cancellation.into(),
+            runtime,
+            wake,
+        )
+    }
+
+    fn submit_creator_input_with_control(
+        &self,
+        input: ClosedCreatorInput,
+        window: ResultWindowAlias,
+        backing: Option<crate::task_execution::blocking_io::ConnectorBlockingIoBacking>,
+        source: Option<InternalCpuActionSource>,
+        control: CpuWorkControl,
+        runtime: &tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> ProviderReadCpuJob {
         let (completed, completion) = oneshot::channel();
         let retirement = Arc::new(InternalCpuRetirement::new(window, None));
         {
@@ -1084,7 +1115,7 @@ impl InternalResultCpu {
             self.executor.clone(),
             self.factory.clone(),
             source,
-            cancellation,
+            control,
             wake,
             Arc::clone(&retirement),
             completed,
@@ -1166,7 +1197,7 @@ impl InternalResultCpu {
             self.executor.clone(),
             self.factory.clone(),
             source,
-            cancellation,
+            cancellation.into(),
             wake,
             Arc::clone(&retirement),
             completed,
@@ -1393,14 +1424,14 @@ impl Drop for ProviderCreatorInputLoan<'_> {
 // unique input/Operation and cannot destroy them on forwarder cancellation.
 fn make_cpu_work(
     packet: Weak<InternalCpuRetirement<OperationOutput>>,
-    cancellation: QueryCancellationView,
+    control: CpuWorkControl,
 ) -> impl FnOnce() -> OperationResult + Send + 'static {
     move || {
         let packet = packet
             .upgrade()
             .ok_or_else(|| cpu_execution_failure("internal CPU job lost its original packet"))?;
-        if let Some(reason) = cancellation.reason() {
-            return Err(cpu_cancellation_failure(reason));
+        if let Some(failure) = control.failure() {
+            return Err(failure);
         }
         let operation = packet
             .state
@@ -1581,11 +1612,11 @@ impl Drop for CpuPublicationLease<'_> {
 fn publish_cpu_work(
     packet: &Arc<InternalCpuRetirement<OperationOutput>>,
     executor: &QueryBlockingExecutor,
-    cancellation: &QueryCancellationView,
+    control: &CpuWorkControl,
 ) -> Result<(), ExecutionFailureInput> {
     let mut lease = CpuActionLease::take(packet);
     let state = lease.state();
-    let work = make_cpu_work(Arc::downgrade(packet), cancellation.clone());
+    let work = make_cpu_work(Arc::downgrade(packet), control.clone());
     let prepared = match executor.prepare_preserving_in(
         state
             .physical
@@ -1714,16 +1745,30 @@ fn make_operation_forwarder(
     executor: QueryBlockingExecutor,
     factory: Option<InternalCpuFactoryBinding>,
     source: Option<InternalCpuActionSource>,
-    cancellation: QueryCancellationView,
+    control: CpuWorkControl,
     wake: Arc<dyn StatusIntakeWake>,
     packet: Arc<InternalCpuRetirement<OperationOutput>>,
     mut completed: oneshot::Sender<OperationResult>,
 ) -> impl std::future::Future<Output = ()> + Send {
     async move {
         let Some(source) = source else {
+            if control.requires_original_source() {
+                finish_unpublished(&packet);
+                let error =
+                    cpu_execution_failure("metadata obligation lost its original CPU source");
+                if let Err(original) = completed.send(Err(error)) {
+                    packet
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .outcome = Some(original);
+                }
+                packet.notify(0, wake.as_ref());
+                return;
+            }
             // Ordinary non-Root work consumes the exact same registered closed
             // factory but receives no joint claim or finite proof exemption.
-            make_closed_legacy_forwarder(executor, cancellation, wake, packet, completed).await;
+            make_closed_legacy_forwarder(executor, control, wake, packet, completed).await;
             return;
         };
         let setup = (|| {
@@ -1759,12 +1804,11 @@ fn make_operation_forwarder(
             .expect("Root source captured from the same bound CPU owner");
         let admission = tokio::select! {
             biased;
-            reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
+            failure = control.stopped() => Err(failure),
             _ = completed.closed() => Err(cpu_execution_failure("internal CPU consumer closed before publication")),
             result = acquire_cpu_offer(&packet, &executor, factory) => result,
         };
-        let admission =
-            admission.and_then(|()| publish_cpu_work(&packet, &executor, &cancellation));
+        let admission = admission.and_then(|()| publish_cpu_work(&packet, &executor, &control));
         if let Err(error) = admission {
             finish_unpublished(&packet);
             if let Err(original) = completed.send(Err(error)) {
@@ -1779,7 +1823,7 @@ fn make_operation_forwarder(
         }
         let early = tokio::select! {
             biased;
-            reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
+            failure = control.stopped() => Err(failure),
             _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
             result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)) => Ok(result),
         };
@@ -1818,18 +1862,18 @@ fn make_operation_forwarder(
 
 fn make_closed_legacy_forwarder(
     executor: QueryBlockingExecutor,
-    cancellation: QueryCancellationView,
+    control: CpuWorkControl,
     wake: Arc<dyn StatusIntakeWake>,
     packet: Arc<InternalCpuRetirement<OperationOutput>>,
     mut completed: oneshot::Sender<OperationResult>,
 ) -> impl std::future::Future<Output = ()> + Send {
     async move {
-        let work = executor
-            .execute_preserving(make_cpu_work(Arc::downgrade(&packet), cancellation.clone()));
+        let work =
+            executor.execute_preserving(make_cpu_work(Arc::downgrade(&packet), control.clone()));
         tokio::pin!(work);
         let early = tokio::select! {
             biased;
-            reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
+            failure = control.stopped() => Err(failure),
             _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
             result = &mut work => Ok(result),
         };
@@ -2019,6 +2063,14 @@ mod tests {
     }
     impl RootCpuBackpressure {
         fn new() -> Self {
+            let (fixture, payload) = Self::new_with_payload();
+            drop(payload);
+            fixture
+        }
+        fn new_with_payload() -> (
+            Self,
+            novarocks_workload_control::joint_admission::RetainedPayloadGrant,
+        ) {
             use crate::query_execution::internal_consumer::domain_cpu::root_action_tests::{
                 bind, paid_claim, root_control,
             };
@@ -2052,14 +2104,17 @@ mod tests {
                 ResultWindowAlias::from_internal_payload(&scope, &scope, payload.as_ref().unwrap())
                     .unwrap();
             // The alias keeps this same positive payload, without a new window.
-            drop(payload);
-            Self {
-                owner,
-                control,
-                root,
-                driver,
-                window,
-            }
+            let payload = payload.unwrap();
+            (
+                Self {
+                    owner,
+                    control,
+                    root,
+                    driver,
+                    window,
+                },
+                payload,
+            )
         }
         fn drive(&mut self) {
             use crate::query_execution::internal_consumer::domain_cpu::root_action_tests::drive;
@@ -2076,6 +2131,24 @@ mod tests {
             } = self;
             drop(window);
             root.owner.complete();
+            root.business.release();
+            drop(driver);
+            drop(control);
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        async fn close_after_terminal_cancel_settled(self) {
+            let Self {
+                mut owner,
+                control,
+                root,
+                driver,
+                window,
+            } = self;
+            drop(window);
+            root.owner.complete_after_terminal_cancel_settled();
             root.business.release();
             drop(driver);
             drop(control);
@@ -2159,6 +2232,23 @@ mod tests {
         OriginalCpuForwarder,
         oneshot::Receiver<OperationResult>,
     ) {
+        let source = fixture
+            .owner
+            .runtime()
+            .provider_creator_source(&fixture.root.owner.scope())
+            .unwrap();
+        original_metadata_forwarder_controlled(fixture, input, source, cancellation.view().into())
+    }
+    fn original_metadata_forwarder_controlled(
+        fixture: &RootCpuBackpressure,
+        input: novarocks_spi::connector::ProviderMetadataCpuInput,
+        source: InternalCpuActionSource,
+        control: CpuWorkControl,
+    ) -> (
+        Arc<InternalCpuRetirement<OperationOutput>>,
+        OriginalCpuForwarder,
+        oneshot::Receiver<OperationResult>,
+    ) {
         let cpu = fixture.owner.runtime();
         let packet = Arc::new(InternalCpuRetirement::new(fixture.window.clone(), None));
         {
@@ -2168,14 +2258,11 @@ mod tests {
             state.action = Some(CpuActionState::default());
         }
         let (completed, completion) = oneshot::channel();
-        let source = cpu
-            .provider_creator_source(&fixture.root.owner.scope())
-            .unwrap();
         let forwarder: OriginalCpuForwarder = Box::pin(make_operation_forwarder(
             cpu.executor.clone(),
             cpu.factory.clone(),
             Some(source),
-            cancellation.view(),
+            control,
             Arc::new(CondvarWake::default()),
             Arc::clone(&packet),
             completed,
@@ -2223,6 +2310,125 @@ mod tests {
         })
         .await
         .expect("original forwarder/worker actual-exit watchdog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn positive_metadata_obligation_uses_same_queue_after_root_cancel_and_keeps_finite_control()
+     {
+        use novarocks_spi::connector::{
+            ConnectorOperationControl, ConnectorRequestContext, ConnectorStopOwner,
+        };
+        use std::sync::atomic::Ordering;
+        for stop_obligation in [false, true] {
+            let (mut fixture, payload) = RootCpuBackpressure::new_with_payload();
+            let cpu = fixture.owner.runtime();
+            let factory = cpu.factory.as_ref().unwrap();
+            let mut held = Vec::new();
+            for _ in 0..cpu.configured_capacity().queue_capacity().get() {
+                held.push(
+                    cpu.executor
+                        .try_reserve_internal_result_closed_factory(factory)
+                        .unwrap(),
+                );
+            }
+            let business = QueryCancellationSource::new();
+            business.request(QueryCancellationReason::ExecutionCancellationRequested);
+            assert!(business.view().is_cancelled());
+            fixture
+                .root
+                .owner
+                .cancel(novarocks_workload_control::CancellationReason::ServerShutdown);
+            fixture.control.close_admission();
+            assert!(
+                cpu.provider_creator_source(&fixture.root.owner.scope())
+                    .is_err()
+            );
+            let source = factory
+                .provider_metadata_continuation_source(&payload, &fixture.root.owner.scope())
+                .unwrap();
+            let initial_stop = ConnectorStopOwner::new();
+            let obligation_stop = ConnectorStopOwner::new();
+            let initial = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(10),
+                initial_stop.view(),
+                1024,
+                4096,
+            )
+            .unwrap();
+            initial_stop.request_stop();
+            assert!(initial.check_active().is_err());
+            let obligation = initial.for_existing_obligation(
+                Instant::now() + Duration::from_secs(10),
+                obligation_stop.view(),
+            );
+            let (input, observation) = metadata_canary(None);
+            let (packet, mut forwarder, mut completion) = original_metadata_forwarder_controlled(
+                &fixture,
+                input,
+                source,
+                CpuWorkControl::existing_metadata_obligation(&obligation),
+            );
+            assert!(poll_original_forwarder(&mut forwarder).is_pending());
+            fixture.drive();
+            assert!(poll_original_forwarder(&mut forwarder).is_pending());
+            assert_original_metadata_input(&packet, &observation);
+            assert_eq!(observation.calls.load(Ordering::Acquire), 0);
+            assert!(matches!(
+                completion.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            if stop_obligation {
+                obligation_stop.request_stop();
+                assert!(poll_original_forwarder(&mut forwarder).is_ready());
+                let failure = completion
+                    .try_recv()
+                    .unwrap()
+                    .err()
+                    .expect("the obligation's own finite stop still refuses unstarted CPU");
+                assert_eq!(
+                    failure.fact(),
+                    obligation.check_active().unwrap_err().failure_fact()
+                );
+                assert_eq!(observation.calls.load(Ordering::Acquire), 0);
+                assert!(
+                    packet
+                        .state
+                        .lock()
+                        .unwrap()
+                        .action
+                        .as_ref()
+                        .unwrap()
+                        .receipt
+                        .is_none()
+                );
+            } else {
+                drop(held.pop());
+                finish_original_forwarder(&mut fixture, &mut forwarder).await;
+                let output = completion.try_recv().unwrap().unwrap();
+                assert!(matches!(
+                    output.value(),
+                    Ok(InternalDomainSlot::ProviderCreatorFinished)
+                ));
+                assert_eq!(observation.calls.load(Ordering::Acquire), 1);
+                assert!(
+                    poll_cpu_actual_exit(
+                        &packet,
+                        &mut std::task::Context::from_waker(std::task::Waker::noop())
+                    )
+                    .is_ready()
+                );
+                assert!(!packet.has_failure());
+                drop(output);
+            }
+            assert_original_metadata_input(&packet, &observation);
+            drop(forwarder);
+            drop(packet);
+            assert!(observation.original.upgrade().is_none());
+            assert_eq!(observation.drops.load(Ordering::Acquire), 1);
+            drop(held);
+            drop(payload);
+            fixture.close_after_terminal_cancel_settled().await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -73,7 +73,7 @@ impl InternalResultCpu {
                 provider,
                 write_begin,
             },
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -122,7 +122,56 @@ impl InternalResultCpu {
             incarnation: binding.incarnation(),
             source_type,
             mode: CreatorCpuMode::ProviderMetadata,
-            cancellation,
+            control: cancellation.into(),
+            runtime,
+            wake,
+            state: std::sync::Mutex::new(CreatorPortState {
+                job: None,
+                busy: false,
+            }),
+        }))
+    }
+
+    /// Only the journal's already-started obligation may use this independent
+    /// finite control. Ordinary planning never upgrades itself on cancellation.
+    pub(crate) fn planning_metadata_settlement_cpu_port(
+        &self,
+        scope: &WorkScope,
+        window: ResultWindowAlias,
+        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        io: Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
+        obligation: novarocks_spi::connector::ConnectorRequestContext,
+        runtime: tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>, WorkError> {
+        if !window.is_for_scope(scope) || !window.is_root_backed_internal() {
+            return Err(WorkError::Conflict);
+        }
+        // Capture from the real positive payload before constructing a port.
+        io.check_existing_metadata_obligation_context(scope, &obligation)?;
+        let _ = self.metadata_cpu_continuation_source(&io, scope)?;
+        let binding = planning.binding();
+        let (key, source_type) =
+            binding
+                .metadata()
+                .provider_metadata_cpu_author()
+                .ok_or(WorkError::InvalidConfig(
+                    "selected metadata CPU author is unsupported",
+                ))?;
+        if key.instance_id != binding.descriptor().instance_id
+            || key.incarnation != binding.incarnation()
+        {
+            return Err(WorkError::Conflict);
+        }
+        Ok(Arc::new(ScopedProviderCreatorCpu {
+            cpu: self.clone(),
+            scope: scope.clone(),
+            window,
+            descriptor: binding.descriptor().clone(),
+            incarnation: binding.incarnation(),
+            source_type,
+            mode: CreatorCpuMode::ProviderMetadataSettlement(io),
+            control: CpuWorkControl::existing_metadata_obligation(&obligation),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -157,7 +206,7 @@ impl InternalResultCpu {
             incarnation: lease.incarnation(),
             source_type,
             mode: CreatorCpuMode::ProviderMetadata,
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -197,7 +246,7 @@ impl InternalResultCpu {
             incarnation: lease.incarnation(),
             source_type,
             mode: CreatorCpuMode::ProviderMetadata,
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -231,7 +280,7 @@ impl InternalResultCpu {
             incarnation: lease.incarnation(),
             source_type,
             mode: CreatorCpuMode::RewriteProvider,
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -253,12 +302,12 @@ impl RewriteCpuPort for ScopedProviderCreatorCpu {
         let fe = std::any::TypeId::of::<
             crate::query_execution::maintenance::rewrite_preparation::RewriteCohortCpuOriginal,
         >();
-        let selected = match self.mode {
+        let selected = match &self.mode {
             CreatorCpuMode::RewriteProvider => actual == self.source_type,
             CreatorCpuMode::RewriteBound {
                 provider,
                 write_begin,
-            } => actual == provider || actual == fe || actual == write_begin,
+            } => actual == *provider || actual == fe || actual == *write_begin,
             _ => false,
         };
         if !selected
@@ -284,12 +333,12 @@ impl RewriteCpuPort for ScopedProviderCreatorCpu {
             ConnectorError::from_domain(statistics_failure_kind(e.failure_fact()), e)
         })?;
         // Every refusal above precedes the move from the actual input slot.
-        loan.job = Some(self.cpu.submit_creator_input(
+        loan.job = Some(self.cpu.submit_creator_input_with_control(
             ClosedCreatorInput::RewriteProvider(input.take().expect("checked Rewrite input")),
             window,
             None,
             Some(source),
-            self.cancellation.clone(),
+            self.control.clone(),
             &self.runtime,
             Arc::clone(&self.wake),
         ));

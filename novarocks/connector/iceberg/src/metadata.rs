@@ -894,6 +894,43 @@ impl ConnectorMetadata for IcebergMetadata {
         })
     }
 
+    fn capture_table_object_with_snapshot_cpu_in<'a>(
+        &'a self,
+        request: ConnectorTableObjectCaptureRequest,
+        cpu: &'a Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        owner: &'a mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        if owner.is_some() {
+            return Box::pin(async {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "metadata capture original owner receiver is occupied",
+                ))
+            });
+        }
+        if let Err(error) = self.require_current_table_object_selector(request.selector) {
+            return Box::pin(async move { Err(error) });
+        }
+        let source = crate::catalog_control::statistics::scoped_cpu::scoped_capture::MetadataCaptureOriginal::new(
+            self.clone(), request, Arc::clone(cpu),
+        );
+        *owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            Arc::clone(&source),
+        ));
+        Box::pin(async move { source.drive().await })
+    }
+
     fn capture_table_object_binding_for_statistics_async(
         &self,
         request: ConnectorTableObjectCaptureRequest,
@@ -1120,7 +1157,7 @@ impl IcebergMetadata {
             .invalidate_table(&request.table.namespace, &table_name);
         let loaded = self
             .runtime
-            .observe_table_classified_for_request_with_snapshots_async(
+            .observe_table_original_for_request_with_snapshots_async(
                 &request.table.namespace,
                 &table_name,
                 &request.context,
@@ -1130,8 +1167,7 @@ impl IcebergMetadata {
                     crate::catalog::SnapshotLoading::All
                 },
             )
-            .await
-            .map_err(classified_control_error)?;
+            .await?;
         Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
             self.descriptor.instance_id.clone(),
             IcebergPreparedTableFacts {
@@ -4164,6 +4200,323 @@ mod plan_splits_pruning_tests {
                     drop(owner);
                     assert!(weak.upgrade().is_none(), "the received value does not hide a runtime Source alias");
                 });
+    }
+    #[derive(Debug)]
+    struct OriginalCaptureCatalogFailure {
+        inner: Arc<dyn crate::catalog::NovaRocksCatalog>,
+        failure: ConnectorError,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::catalog::NovaRocksCatalog for OriginalCaptureCatalogFailure {
+        fn implementation_name(&self) -> &'static str {
+            "original-capture-failure"
+        }
+        fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
+            self.inner.listing_admission()
+        }
+        async fn list_namespaces(
+            &self,
+            bound: novarocks_spi::connector::ConnectorListingBound,
+        ) -> Result<Vec<String>, ConnectorError> {
+            self.inner.list_namespaces(bound).await
+        }
+        async fn namespace_exists(
+            &self,
+            name: crate::catalog::CatalogNamespaceName,
+        ) -> Result<bool, ConnectorError> {
+            self.inner.namespace_exists(name).await
+        }
+        async fn list_tables(
+            &self,
+            name: crate::catalog::CatalogNamespaceName,
+            bound: novarocks_spi::connector::ConnectorListingBound,
+        ) -> Result<Vec<String>, ConnectorError> {
+            self.inner.list_tables(name, bound).await
+        }
+        async fn table_exists(
+            &self,
+            name: crate::catalog::CatalogTableName,
+        ) -> Result<bool, ConnectorError> {
+            self.inner.table_exists(name).await
+        }
+        async fn load_table(
+            &self,
+            _: crate::catalog::CatalogTableName,
+        ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.failure.clone())
+        }
+        async fn view_exists(
+            &self,
+            name: crate::catalog::CatalogTableName,
+        ) -> Result<bool, ConnectorError> {
+            self.inner.view_exists(name).await
+        }
+        async fn list_views(
+            &self,
+            name: crate::catalog::CatalogNamespaceName,
+            bound: novarocks_spi::connector::ConnectorListingBound,
+        ) -> Result<Vec<String>, ConnectorError> {
+            self.inner.list_views(name, bound).await
+        }
+        async fn load_view(
+            &self,
+            name: crate::catalog::CatalogTableName,
+        ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+            self.inner.load_view(name).await
+        }
+        async fn anchor_written_metadata(
+            &self,
+            name: crate::catalog::CatalogTableName,
+            location: Arc<str>,
+        ) -> crate::catalog::error::CatalogOutcome<crate::catalog::CatalogTableName> {
+            self.inner.anchor_written_metadata(name, location).await
+        }
+        fn admit_operation(
+            &self,
+            operation: &crate::catalog::admission::CatalogOperation,
+            target: &crate::catalog::admission::CatalogAdmissionTarget,
+        ) -> Result<(), crate::catalog::error::CatalogUnsupported> {
+            self.inner.admit_operation(operation, target)
+        }
+    }
+
+    struct CaptureFooterPort {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        calls: std::sync::atomic::AtomicUsize,
+        footer: std::sync::Mutex<tokio::sync::oneshot::Receiver<()>>,
+        closed: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+    }
+    // Explicit component-only inline CPU author: the real private input runs,
+    // while a separate footer gate tests handoff ordering, not physical QB exit.
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for CaptureFooterPort {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            use std::sync::atomic::Ordering;
+            let source = input.as_ref().expect("same original capture input");
+            assert_eq!(source.descriptor(), &self.descriptor);
+            assert_eq!(source.incarnation(), self.incarnation);
+            assert_eq!(
+                source.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            input.take().unwrap().run_original_phase();
+            self.started.notify_one();
+            Ok(())
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            assert_eq!(self.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_closed(
+            &self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            use std::sync::atomic::Ordering;
+            if self.closed.load(Ordering::SeqCst) {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let result = std::future::Future::poll(
+                std::pin::Pin::new(&mut *self.footer.lock().unwrap()),
+                cx,
+            );
+            std::task::ready!(result).expect("the original footer gate is released");
+            self.closed.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+    fn original_capture_request(
+        provider: &IcebergMetadata,
+        namespace: &str,
+    ) -> ConnectorTableObjectCaptureRequest {
+        ConnectorTableObjectCaptureRequest {
+            table: ConnectorTableIdentity {
+                instance_id: provider.descriptor.instance_id.clone(),
+                namespace: namespace.into(),
+                table: "t".into(),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context(),
+        }
+    }
+    fn footer_port(
+        provider: &IcebergMetadata,
+    ) -> (tokio::sync::oneshot::Sender<()>, Arc<CaptureFooterPort>) {
+        let (release, footer) = tokio::sync::oneshot::channel();
+        (
+            release,
+            Arc::new(CaptureFooterPort {
+                descriptor: provider.descriptor.clone(),
+                incarnation: provider.incarnation,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                footer: std::sync::Mutex::new(footer),
+                closed: std::sync::atomic::AtomicBool::new(false),
+                started: tokio::sync::Notify::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn actual_catalog_original_failure_survives_prepare_current_and_stable_cpu_capture() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use std::error::Error;
+        use std::sync::atomic::Ordering;
+        let (executor, _warehouse, original) = provider();
+        // The actual NovaRocksCatalog callback produces this error. It is not
+        // injected into the metadata cache or disguised as CompileControl.
+        let failure = ConnectorError::from_domain_static(
+            ConnectorErrorKind::Unavailable,
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "catalog read original refusal",
+            ),
+            "catalog original read failed",
+        );
+        let cause = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let fact = failure.failure_fact();
+        let catalog = Arc::new(OriginalCaptureCatalogFailure {
+            inner: Arc::clone(original.runtime.novarocks_catalog()),
+            failure,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(IcebergMetadataContext::with_catalog_for_test(
+            original.runtime.control_state().clone(),
+            original.runtime.resources().clone(),
+            catalog.clone(),
+        ));
+        let metadata =
+            IcebergMetadata::new(original.descriptor.clone(), original.incarnation, runtime);
+        executor.block_on(async {
+            let request = original_capture_request(&metadata, "catalog_failure");
+            let preparation = metadata
+                .prepare_table(ConnectorTableRequest {
+                    table: request.table.clone(),
+                    resolution: request.resolution,
+                    context: request.context.clone(),
+                })
+                .await
+                .err()
+                .expect("actual catalog failure");
+            let current = metadata
+                .capture_table_object_binding_async(request.clone())
+                .await
+                .err()
+                .expect("actual Current loader failure");
+            let (_release, port) = footer_port(&metadata);
+            let port: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort> = port;
+            let mut owner = None;
+            let capture = metadata
+                .capture_table_object_with_snapshot_cpu_in(request, &port, &mut owner)
+                .await
+                .err()
+                .expect("actual stable capture loader failure");
+            assert!(
+                owner.is_some(),
+                "the original Source stays in caller custody on refusal"
+            );
+            for error in [&preparation, &current, &capture] {
+                assert_eq!(error.failure_fact(), fact);
+                assert_eq!(
+                    error.source().unwrap().downcast_ref::<SharedFailureCause>(),
+                    Some(&cause)
+                );
+                let original = cause
+                    .downcast_ref::<ConnectorError>()
+                    .expect("actual catalog error type");
+                assert_eq!(original.kind(), ConnectorErrorKind::Unavailable);
+            }
+            assert_eq!(
+                catalog.reads.load(Ordering::SeqCst),
+                3,
+                "each request reached the real catalog loader; no negative-cache shortcut"
+            );
+        });
+    }
+
+    #[test]
+    fn stable_metadata_capture_keeps_original_owner_and_waits_for_cpu_footer() {
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            for request in [
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new("capture_original"),
+                    properties: HashMap::new(), no_op_if_exists: false,
+                },
+                CatalogPublicationRequest::CreateTable {
+                    namespace: crate::catalog::CatalogNamespaceName::new("capture_original"),
+                    creation: crate::iceberg::TableCreation::builder().name("t".into()).schema(
+                        Schema::builder().with_fields(vec![Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)))]).build().unwrap()
+                    ).format_version(FormatVersion::V2).build(),
+                    no_op_if_exists: false,
+                },
+            ] {
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(&metadata.runtime, metadata.incarnation, request).await;
+                assert!(matches!(outcome, CatalogOutcome::KnownCommitted { .. }), "{outcome:?}");
+            }
+            let (release, concrete) = footer_port(&metadata);
+            let port: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort> = concrete.clone();
+            // The synchronous _in author installs its actual Source even if
+            // the returned original F has never been polled.
+            let mut unpolled_owner = None;
+            let unpolled = metadata.capture_table_object_with_snapshot_cpu_in(original_capture_request(&metadata, "capture_original"), &port, &mut unpolled_owner);
+            drop(unpolled);
+            assert!(unpolled_owner.is_some());
+            assert_eq!(concrete.calls.load(Ordering::SeqCst), 0);
+            drop(unpolled_owner);
+            let mut owner = None;
+            let mut original = metadata.capture_table_object_with_snapshot_cpu_in(original_capture_request(&metadata, "capture_original"), &port, &mut owner);
+            // Real filesystem preparation may itself yield. Wait for the actual
+            // CPU submission, without assuming one loader poll completes I/O.
+            let started = concrete.started.notified();
+            tokio::pin!(started);
+            started.as_mut().enable();
+            tokio::select! {
+                result = original.as_mut() => panic!("binding handed off before footer: {}", result.is_ok()),
+                _ = &mut started => {},
+            }
+            // Retain the SAME original Future while a temporary borrower exits.
+            let mut borrower = Box::pin(std::future::poll_fn(|cx| original.as_mut().poll(cx)));
+            assert!(futures::poll!(&mut borrower).is_pending());
+            assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
+            assert!(!concrete.closed.load(Ordering::SeqCst));
+            drop(borrower);
+            release.send(()).unwrap();
+            let (binding, snapshot) = original.await.unwrap();
+            assert_eq!(binding.metadata.identity.table.as_ref(), "t");
+            assert_eq!(snapshot, None);
+            assert!(concrete.closed.load(Ordering::SeqCst));
+            assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
+            let weak = Arc::downgrade(owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::scoped_capture::MetadataCaptureOriginal>(metadata.descriptor.instance_id.as_str()).unwrap());
+            let rejected = metadata.capture_table_object_with_snapshot_cpu_in(original_capture_request(&metadata, "capture_original"), &port, &mut owner).await.err().expect("occupied original receiver");
+            assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(weak.upgrade().is_some());
+            drop(owner);
+            assert!(weak.upgrade().is_none(), "binding result does not hide the original runtime header");
+        });
     }
 }
 

@@ -30,6 +30,8 @@ use std::sync::{Mutex, Weak};
 
 type PublicationResult = Result<async_publication::PreparedStatisticsPublication, ConnectorError>;
 type EvidenceResult = crate::iceberg::Result<(ExternalMutationEvidence, StatisticsReceipt)>;
+#[path = "scoped_capture.rs"]
+pub(crate) mod scoped_capture;
 #[path = "scoped_change_window.rs"]
 pub(crate) mod scoped_change_window;
 #[path = "scoped_read.rs"]

@@ -19,10 +19,10 @@
 //! Layouts do not pay for backing, certify a task, or bound opaque pointees.
 
 use super::{
-    ExecutionFailureInput, InternalCpuActionSource, InternalCpuRetired, InternalCpuRetirement,
-    InternalDomainFailure, InternalDomainSlot, InternalResultCpuJob, InternalResultOperation,
-    InternalResultValue, OperationResult, QueryBlockingExecutor, QueryBlockingFailure,
-    QueryCancellationView, StatusIntakeWake, make_cpu_work, make_operation_forwarder, oneshot,
+    CpuWorkControl, ExecutionFailureInput, InternalCpuActionSource, InternalCpuRetired,
+    InternalCpuRetirement, InternalDomainFailure, InternalDomainSlot, InternalResultCpuJob,
+    InternalResultOperation, InternalResultValue, OperationResult, QueryBlockingExecutor,
+    QueryBlockingFailure, StatusIntakeWake, make_cpu_work, make_operation_forwarder, oneshot,
 };
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 use std::{
@@ -151,7 +151,7 @@ fn forwarder_layout<F: std::future::Future<Output = ()>>(
         QueryBlockingExecutor,
         Option<super::InternalCpuFactoryBinding>,
         Option<InternalCpuActionSource>,
-        QueryCancellationView,
+        CpuWorkControl,
         Arc<dyn StatusIntakeWake>,
         Arc<InternalCpuRetirement<Output>>,
         Completion,
@@ -164,7 +164,7 @@ fn forwarder_layout<F: std::future::Future<Output = ()>>(
 // This neither constructs a dummy packet/input nor assumes a capture ABI.
 pub(super) fn operation_call_layout() -> Layout {
     fn of<F: FnOnce() -> OperationResult + Send + 'static>(
-        _: fn(Weak<InternalCpuRetirement<Output>>, QueryCancellationView) -> F,
+        _: fn(Weak<InternalCpuRetirement<Output>>, CpuWorkControl) -> F,
     ) -> Layout {
         QueryBlockingExecutor::preserving_call_layout::<OperationResult, F>()
     }

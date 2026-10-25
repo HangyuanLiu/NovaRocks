@@ -1584,3 +1584,209 @@ fn computation_and_payload_pins_retire_independently_at_their_actual_last_alias(
     drive(&mut driver);
     assert_eq!(held(&control, JointResource::PayloadBytes), 0);
 }
+
+#[test]
+fn positive_payload_metadata_cpu_continuation_keeps_original_root_facts_after_cancel_and_close() {
+    // This WC component uses a neutral physical value. The real QA queue and
+    // worker/footer regression is owned by InternalResultCpu's component.
+    for cancel_at in 0..3 {
+        let pool: Arc<dyn Send + Sync> = Arc::new(());
+        let descriptor = InternalResultClosedFactoryDescriptor::for_composition(
+            Arc::downgrade(&pool),
+            std::any::TypeId::of::<fn()>(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        );
+        let (control, handle, mut driver, factory) = fixture_with_optional_closed_factory(
+            1,
+            JointLane::Foreground,
+            1,
+            0,
+            2,
+            Some(descriptor),
+        );
+        let factory = factory.unwrap();
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let facts = [
+            fact("metadata-obligation-catalog"),
+            fact("metadata-obligation-store"),
+        ];
+        bind(&scope, &facts, &mut driver);
+        let mut raw = Some(claim(
+            &handle,
+            &work.owner,
+            &facts,
+            JointLane::Custody,
+            amounts(JointResource::PayloadBytes, 8),
+            &mut driver,
+        ));
+        let mut payload = None;
+        RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+            .unwrap()
+            .notify();
+        let payload = payload.unwrap();
+        if cancel_at == 0 {
+            work.owner.cancel(crate::CancellationReason::ServerShutdown);
+            control.close_admission();
+        }
+        let source = factory
+            .provider_metadata_continuation_source(&payload, &scope)
+            .unwrap();
+        let mut action = source
+            .begin(
+                std::num::NonZeroU64::new(17).unwrap(),
+                std::num::NonZeroU64::new(23).unwrap(),
+            )
+            .unwrap();
+        if cancel_at == 1 {
+            work.owner.cancel(crate::CancellationReason::ServerShutdown);
+            control.close_admission();
+        }
+        {
+            let state = control.inner.state.lock().unwrap();
+            let request = state
+                .joint
+                .as_ref()
+                .unwrap()
+                .requests
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(request.changes[0].claim.facts.lane, JointLane::Settlement);
+            assert_eq!(request.changes[0].claim.facts.dependencies.len(), 2);
+            assert_eq!(
+                request.changes[0]
+                    .claim
+                    .amounts
+                    .get(JointResource::Computations),
+                0
+            );
+        }
+        drive(&mut driver);
+        let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("same original metadata obligation offer"),
+        };
+        if cancel_at == 2 {
+            work.owner.cancel(crate::CancellationReason::ServerShutdown);
+            control.close_admission();
+        }
+        assert!(
+            factory.provider_creator_source(&scope).is_err(),
+            "ordinary creator never upgrades itself"
+        );
+        let mut physical = Some(());
+        let mut target = None;
+        offer
+            .accept_in(&mut physical, &mut target)
+            .unwrap()
+            .notify();
+        assert!(physical.is_none());
+        assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+        assert_eq!(held(&control, JointResource::Computations), 0);
+        drop(offer);
+        drop(action);
+        assert_eq!(
+            held(&control, JointResource::InternalCpuJobs),
+            1,
+            "the actual local holder retains its claim"
+        );
+        drop(target);
+        assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+        drop(payload);
+        work.owner.complete_after_terminal_cancel_settled();
+        work.business.release();
+        drive(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+}
+
+#[test]
+fn metadata_cpu_continuation_rejects_foreign_root_released_payload_and_closed_driver() {
+    let pool: Arc<dyn Send + Sync> = Arc::new(());
+    let descriptor = InternalResultClosedFactoryDescriptor::for_composition(
+        Arc::downgrade(&pool),
+        std::any::TypeId::of::<fn()>(),
+        std::num::NonZeroU64::new(23).unwrap(),
+    );
+    let (control, handle, mut driver, factory) =
+        fixture_with_optional_closed_factory(1, JointLane::Foreground, 1, 0, 2, Some(descriptor));
+    let factory = factory.unwrap();
+    let work = root(&control);
+    let other = root(&control);
+    let scope = work.owner.scope();
+    let facts = [fact("metadata-positive-root")];
+    bind(&scope, &facts, &mut driver);
+    let mut raw = Some(claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 8),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    let payload = payload.unwrap();
+    assert!(matches!(
+        factory.provider_metadata_continuation_source(&payload, &other.owner.scope()),
+        Err(WorkError::Conflict)
+    ));
+    let (foreign, _, foreign_driver) = fixture();
+    let foreign_work = root(&foreign);
+    assert!(matches!(
+        factory.provider_metadata_continuation_source(&payload, &foreign_work.owner.scope()),
+        Err(WorkError::ForeignAuthority)
+    ));
+    foreign_work.owner.complete();
+    foreign_work.business.release();
+    drop(foreign_driver);
+    drop(foreign);
+    let stale = factory
+        .provider_metadata_continuation_source(&payload, &scope)
+        .unwrap();
+    drop(payload);
+    assert!(matches!(
+        stale.begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap()
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Released
+        })
+    ));
+    // A live positive payload never overrides the real driver's closure.
+    let mut raw = Some(claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 8),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    let payload = payload.unwrap();
+    let source = factory
+        .provider_metadata_continuation_source(&payload, &scope)
+        .unwrap();
+    drop(driver);
+    assert!(matches!(
+        source.begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap()
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Closed
+        })
+    ));
+    drop(payload);
+    work.owner.complete();
+    work.business.release();
+    other.owner.complete();
+    other.business.release();
+}

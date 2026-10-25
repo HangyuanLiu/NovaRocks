@@ -1590,6 +1590,31 @@ pub trait ConnectorMetadata: Send + Sync {
         })
     }
 
+    /// Install the original capture Source in the caller's stable receiver
+    /// before the returned Future may poll a catalog or CPU author. The caller
+    /// retains this receiver AND that same Future through actual exit; neither
+    /// the opaque owner nor this method grants a CPU factory or Root authority.
+    fn capture_table_object_with_snapshot_cpu_in<'a>(
+        &'a self,
+        _request: ConnectorTableObjectCaptureRequest,
+        _cpu: &'a Arc<dyn super::ProviderMetadataCpuPort>,
+        _owner: &'a mut Option<super::ConnectorProcessLocalPayload>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no original capture receiver author",
+            ))
+        })
+    }
+
     fn instance_id(&self) -> &ConnectorInstanceId;
 
     /// Await the original provider's real I/O before borrowing any synchronous

@@ -219,13 +219,16 @@ struct CreatorPortState {
     job: Option<ProviderReadCpuJob>,
     busy: bool,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum CreatorCpuMode {
     InternalProvider,
     ForegroundBinding,
     ForegroundRead,
     RewriteProvider,
     ProviderMetadata,
+    ProviderMetadataSettlement(
+        Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
+    ),
     RewriteBound {
         provider: std::any::TypeId,
         write_begin: std::any::TypeId,
@@ -239,7 +242,7 @@ pub(super) struct ScopedProviderCreatorCpu {
     incarnation: novarocks_spi::connector::ProviderBindingEpoch,
     source_type: std::any::TypeId,
     mode: CreatorCpuMode,
-    cancellation: QueryCancellationView,
+    control: CpuWorkControl,
     runtime: tokio::runtime::Handle,
     wake: Arc<dyn StatusIntakeWake>,
     state: std::sync::Mutex<CreatorPortState>,
@@ -395,7 +398,7 @@ impl InternalResultCpu {
             incarnation: lease.incarnation(),
             source_type,
             mode,
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -454,7 +457,7 @@ impl InternalResultCpu {
             incarnation: lease.incarnation(),
             source_type,
             mode: CreatorCpuMode::ForegroundRead,
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -565,6 +568,7 @@ impl StatisticsCpuPort for ScopedProviderCreatorCpu {
             CreatorCpuMode::RewriteProvider
                 | CreatorCpuMode::RewriteBound { .. }
                 | CreatorCpuMode::ProviderMetadata
+                | CreatorCpuMode::ProviderMetadataSettlement(_)
         ) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -609,12 +613,12 @@ impl StatisticsCpuPort for ScopedProviderCreatorCpu {
         let window = self.window.try_clone().map_err(|e| {
             ConnectorError::from_domain(statistics_failure_kind(e.failure_fact()), e)
         })?;
-        loan.job = Some(self.cpu.submit_creator_input(
+        loan.job = Some(self.cpu.submit_creator_input_with_control(
             ClosedCreatorInput::StatisticsProvider(input.take().expect("checked input")),
             window,
             None,
             Some(source),
-            self.cancellation.clone(),
+            self.control.clone(),
             &self.runtime,
             Arc::clone(&self.wake),
         ));
@@ -672,7 +676,7 @@ impl InternalResultCpu {
             incarnation,
             source_type,
             mode: CreatorCpuMode::InternalProvider,
-            cancellation,
+            control: cancellation.into(),
             runtime,
             wake,
             state: std::sync::Mutex::new(CreatorPortState {
@@ -724,6 +728,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuPort for ScopedProviderCreator
             self.mode,
             CreatorCpuMode::ForegroundRead
                 | CreatorCpuMode::ProviderMetadata
+                | CreatorCpuMode::ProviderMetadataSettlement(_)
                 | CreatorCpuMode::RewriteBound { .. }
         ) || original.original_source_type_id() != self.source_type
             || original.descriptor() != &self.descriptor
@@ -741,18 +746,22 @@ impl novarocks_spi::connector::ProviderMetadataCpuPort for ScopedProviderCreator
                 "metadata source retains its serial CPU job",
             ));
         }
-        let source = self.cpu.provider_creator_source(&self.scope).map_err(|e| {
-            ConnectorError::from_domain(statistics_failure_kind(e.failure_fact()), e)
-        })?;
+        let source = match &self.mode {
+            CreatorCpuMode::ProviderMetadataSettlement(io) => {
+                self.cpu.metadata_cpu_continuation_source(io, &self.scope)
+            }
+            _ => self.cpu.provider_creator_source(&self.scope),
+        }
+        .map_err(|e| ConnectorError::from_domain(statistics_failure_kind(e.failure_fact()), e))?;
         let window = self.window.try_clone().map_err(|e| {
             ConnectorError::from_domain(statistics_failure_kind(e.failure_fact()), e)
         })?;
-        loan.job = Some(self.cpu.submit_creator_input(
+        loan.job = Some(self.cpu.submit_creator_input_with_control(
             ClosedCreatorInput::ProviderMetadata(input.take().unwrap()),
             window,
             None,
             Some(source),
-            self.cancellation.clone(),
+            self.control.clone(),
             &self.runtime,
             self.wake.clone(),
         ));

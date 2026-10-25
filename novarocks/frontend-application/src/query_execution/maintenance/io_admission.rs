@@ -1279,6 +1279,71 @@ impl MetadataIoAdmission {
             &body.root, &body.root, body.payload.as_ref().ok_or(WorkError::NotReady)?)
     }
 
+    /// Capture only from the same already-positive Root after its original
+    /// Provider journal recorded an existing publication obligation.
+    pub(crate) fn metadata_cpu_continuation_source(
+        &self,
+        factory: &novarocks_workload_control::joint_admission::InternalCpuFactoryBinding,
+        root: &WorkScope,
+    ) -> Result<novarocks_workload_control::joint_admission::InternalCpuActionSource, WorkError>
+    {
+        let original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_ref().ok_or(WorkError::NotReady)?;
+        if body.unstarted_withdrawing || body.unstarted_withdrawn {
+            return Err(WorkError::Released);
+        }
+        if !body.first_ready || !body.settlement {
+            return Err(WorkError::NotReady);
+        }
+        let payload = body.payload.as_ref().ok_or(WorkError::NotReady)?;
+        factory.provider_metadata_continuation_source(payload, root)
+    }
+
+    pub(crate) fn check_existing_metadata_obligation_context(
+        self: &Arc<Self>,
+        root: &WorkScope,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), WorkError> {
+        let original: Arc<dyn ConnectorIoAdmissionPort> = self.clone();
+        if !context
+            .io_admission()
+            .is_some_and(|selected| std::sync::Weak::ptr_eq(selected, &Arc::downgrade(&original)))
+        {
+            return Err(WorkError::Conflict);
+        }
+        self.check_existing_metadata_obligation(root)
+    }
+
+    pub(crate) fn settlement_result_scope(
+        self: &Arc<Self>,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        obligation: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorOriginalResultScope,
+        novarocks_spi::connector::OriginalResultCheckError,
+    > {
+        super::rewrite_capture::borrow_positive_settlement_capture(self, binding, obligation)
+    }
+
+    pub(crate) fn check_existing_metadata_obligation(
+        &self,
+        root: &WorkScope,
+    ) -> Result<(), WorkError> {
+        let original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_ref().ok_or(WorkError::NotReady)?;
+        if body.unstarted_withdrawing || body.unstarted_withdrawn {
+            return Err(WorkError::Released);
+        }
+        if !body.first_ready || !body.settlement {
+            return Err(WorkError::NotReady);
+        }
+        body.payload
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .async_continuation_source(root, JointLane::Settlement)
+            .map(drop)
+    }
+
     /// The caller has retired the failed computation's original producer,
     /// output and aliases. Keep every actually admitted Provider peak, and
     /// subtract at most that computation's formation increment. No domain or
@@ -1915,6 +1980,98 @@ mod original_governor_tests {
         root.business.release();
         root.owner.complete();
         control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn metadata_settlement_capture_requires_the_same_positive_source_and_preserves_its_control() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_spi::connector::{
+            ConnectorOperationControl, ConnectorRequestContext, ConnectorStopOwner,
+        };
+        let (control, mut driver, root) = original_governor();
+        let source = MetadataIoAdmission::for_original_source(
+            &root.owner,
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source
+                .poll_progress(&root.owner, &mut Context::from_waker(Waker::noop()))
+                .unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        let binding = source.root_capacity().unwrap();
+        let business_stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            business_stop.view(),
+            1024,
+            4096,
+        )
+        .unwrap()
+        .with_io_admission(source.clone());
+        assert!(matches!(
+            source.check_existing_metadata_obligation(binding.scope()),
+            Err(WorkError::NotReady)
+        ));
+        assert!(
+            source.settlement_result_scope(&binding, &context).is_err(),
+            "positive bytes alone do not assert a publication obligation"
+        );
+        source.publication_obligation_started();
+        let foreign_context =
+            ConnectorRequestContext::try_new(context.deadline(), business_stop.view(), 1024, 4096)
+                .unwrap();
+        assert!(matches!(
+            source.check_existing_metadata_obligation_context(binding.scope(), &foreign_context),
+            Err(WorkError::Conflict)
+        ));
+        let ordinary =
+            super::super::rewrite_capture::borrow_positive_capture(&source, &context).unwrap();
+        let obligation_stop = ConnectorStopOwner::new();
+        let obligation =
+            context.for_existing_obligation(context.deadline(), obligation_stop.view());
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::ServerShutdown);
+        control.close_admission();
+        assert!(ordinary.check_active().is_err());
+        assert!(
+            source.root_capacity().is_err(),
+            "no new result alias is minted after business cancellation"
+        );
+        let settlement = source
+            .settlement_result_scope(&binding, &obligation)
+            .unwrap();
+        assert!(settlement.check_active().is_ok());
+        assert!(
+            source
+                .check_existing_metadata_obligation(binding.scope())
+                .is_ok()
+        );
+        obligation_stop.request_stop();
+        assert!(obligation.check_active().is_err());
+        let refused = settlement.check_active().unwrap_err();
+        assert_eq!(
+            refused.class(),
+            novarocks_spi::connector::OriginalResultCheckClass::Control
+        );
+        assert_eq!(
+            refused.failure_fact(),
+            obligation.check_active().unwrap_err().failure_fact()
+        );
+        drop(settlement);
+        drop(ordinary);
+        drop(binding);
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
         drive_original(&mut driver);
         assert!(control.shutdown().is_ok());
     }

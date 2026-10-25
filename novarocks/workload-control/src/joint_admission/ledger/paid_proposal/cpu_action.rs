@@ -142,6 +142,7 @@ impl InternalCpuFactoryBinding {
             epoch: 0,
             structure_revision: view.structure_revision,
             factory: Some(registered.stamp()),
+            root_payload: None,
             control: Some(CpuControlFence {
                 slot,
                 generation,
@@ -152,6 +153,60 @@ impl InternalCpuFactoryBinding {
         Ok(InternalCpuActionSource {
             inner: Arc::downgrade(&scope.inner),
             owner: scope.id,
+            fence,
+        })
+    }
+
+    /// Only the original positive Root payload may continue an existing
+    /// Provider metadata obligation through this same closed factory. This
+    /// captures responsibility; the original physical queue still admits it.
+    pub fn provider_metadata_continuation_source(
+        &self,
+        payload: &RetainedPayloadGrant,
+        root: &WorkScope,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        if !Weak::ptr_eq(&self.inner, &Arc::downgrade(&root.inner)) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let key = {
+            let state = root.inner.state.lock().unwrap();
+            let view = super::super::typed_custody::payload_growth_view(payload, root, &state)?;
+            let ClaimSource::Payload { epoch } = view.source else {
+                return Err(WorkError::Conflict);
+            };
+            [view.id, epoch]
+        };
+        let (view, _) = control_claim_view_for_scope(root, false)?;
+        let ClaimSource::NodeControl {
+            slot, generation, ..
+        } = view.source
+        else {
+            return Err(WorkError::Conflict);
+        };
+        let state = root.inner.state.lock().unwrap();
+        let registered = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if !registered.matches(&self.descriptor) || !registered.is_live() {
+            return Err(WorkError::Released);
+        }
+        let fence = CpuActionFence {
+            claim: view.id,
+            epoch: 0,
+            structure_revision: view.structure_revision,
+            factory: Some(registered.stamp()),
+            control: Some(CpuControlFence {
+                slot,
+                generation,
+                release_revision: view.release_revision,
+            }),
+            root_payload: Some(key),
+        };
+        action_source_facts(&state, root.id, fence)?;
+        Ok(InternalCpuActionSource {
+            inner: Arc::downgrade(&root.inner),
+            owner: root.id,
             fence,
         })
     }
@@ -215,6 +270,7 @@ pub(in crate::joint_admission::ledger) struct CpuActionFence {
     structure_revision: u64,
     factory: Option<CpuFactoryStamp>,
     control: Option<CpuControlFence>,
+    root_payload: Option<[u64; 2]>,
 }
 #[derive(Clone, Copy)]
 struct CpuControlFence {
@@ -280,6 +336,12 @@ fn action_source_facts(
     }
     let row = ledger.claims.get(&fence.claim).ok_or(WorkError::Released)?;
     if let Some(control) = fence.control {
+        if let Some(key) = fence.root_payload {
+            if node.parent.is_some() || node.root != owner || fence.factory.is_none() {
+                return Err(WorkError::Conflict);
+            }
+            super::super::typed_custody::validate_native_payload_fence(state, owner, key)?;
+        }
         let slot = state
             .cancellations
             .slots
@@ -304,9 +366,11 @@ fn action_source_facts(
         {
             return Err(WorkError::Conflict);
         }
-        node.check(&state.cancellations)?;
-        if state.closed {
-            return Err(WorkError::Closed);
+        if fence.root_payload.is_none() {
+            node.check(&state.cancellations)?;
+            if state.closed {
+                return Err(WorkError::Closed);
+            }
         }
         return Ok(&row.active_facts);
     }
@@ -398,7 +462,9 @@ pub(in crate::joint_admission::ledger) fn validate_cpu_action(
         || amounts.get(JointResource::PhysicalQueueBytes) == 0
         || change.claim.facts.key.class != original.key.class
         || change.claim.facts.key.lane
-            != if fence.control.is_some() {
+            != if fence.root_payload.is_some() {
+                JointLane::Settlement as usize
+            } else if fence.control.is_some() {
                 JointLane::Foreground as usize
             } else {
                 original.key.lane
@@ -449,6 +515,7 @@ pub(in crate::joint_admission::ledger) fn capture(
         structure_revision: row.structure_revision,
         factory: None,
         control: None,
+        root_payload: None,
     };
     action_source_facts(&state, scope.id, fence)?;
     Ok(InternalCpuActionSource {
@@ -510,7 +577,9 @@ impl InternalCpuActionSource {
         // Arm the same private source before its one body is constructed.
         // No generic builder can choose this per-resource causal shape.
         proposal.cpu_action = Some(self.fence);
-        let lane = if self.fence.control.is_some() {
+        let lane = if self.fence.root_payload.is_some() {
+            JointLane::Settlement
+        } else if self.fence.control.is_some() {
             JointLane::Foreground
         } else {
             facts.lane
