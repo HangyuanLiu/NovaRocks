@@ -75,6 +75,7 @@ struct IcebergRewritePlanPayloadV1 {
 }
 
 /// Complete distributed-rewrite capability for one provider generation.
+#[derive(Clone)]
 pub struct IcebergDistributedRewriteControl {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
@@ -130,17 +131,6 @@ impl IcebergDistributedRewriteControl {
             .load_table_for_request(&target.namespace, &target.table, &request.context)
             .map_err(unavailable)?
             .into_table();
-        let metadata = table.metadata();
-        if matches!(
-            request.operation(),
-            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
-        ) {
-            crate::commit::validation::deny_unwritable_data_files(
-                metadata.current_schema(),
-                &format!("{}.{}", target.namespace, target.table),
-            )?;
-        }
-        let base_snapshot_id = metadata.current_snapshot_id();
         let table_for_files = table.clone();
         let read_control = request.context.clone();
         let files_result = self
@@ -156,11 +146,45 @@ impl IcebergDistributedRewriteControl {
             });
         validate_context(&request.context)?;
         let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
+        let live_delete_paths = if matches!(
+            request.operation(),
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        ) {
+            live_delete_file_paths(&self.runtime, &table, &request.context)?
+        } else {
+            BTreeSet::new()
+        };
+        self.build_loaded_plan(request, &table, files, &live_delete_paths, creation)
+    }
+
+    /// Pure group/schema/artifact author, called only by the bound closed CPU source on the async route.
+    fn build_loaded_plan(
+        &self,
+        request: &ConnectorDistributedRewritePlanningRequest,
+        table: &crate::iceberg::table::Table,
+        files: Vec<DataFileWithStats>,
+        live_delete_paths: &BTreeSet<EntryIdentity>,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        validate_context(&request.context)?;
+        let target = self.provider.table_payload(request.operation().table())?;
+        let metadata = table.metadata();
+        if matches!(
+            request.operation(),
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        ) {
+            crate::commit::validation::deny_unwritable_data_files(
+                metadata.current_schema(),
+                &format!("{}.{}", target.namespace, target.table),
+            )?;
+        }
+        let base_snapshot_id = metadata.current_snapshot_id();
         let groups = match request.operation() {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
-                let live_delete_paths =
-                    live_delete_file_paths(&self.runtime, &table, &request.context)?;
-                plan_data_file_groups(files, &live_delete_paths)?
+                plan_data_file_groups(files, live_delete_paths)?
             }
             ConnectorDistributedRewriteOperation::RewritePositionDeletes {
                 rewrite_all,
@@ -282,7 +306,24 @@ impl IcebergDistributedRewriteControl {
     }
 }
 
+pub(crate) mod async_plan;
 impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
+    fn planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        self.runtime.metadata_action_initial_dependencies()
+    }
+
+    fn scoped_cpu_source_type_id(&self) -> Option<std::any::TypeId> {
+        Some(std::any::TypeId::of::<async_plan::RewritePlanOriginal>())
+    }
+    fn prepare_plan_source_in(
+        &self,
+        request: &mut Option<novarocks_spi::connector::ConnectorRewriteSourceRequest>,
+        receiving: &mut Option<Box<dyn novarocks_spi::connector::ConnectorRewritePlanSource>>,
+    ) -> Result<(), ConnectorError> {
+        async_plan::prepare_source_in(self, request, receiving)
+    }
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }

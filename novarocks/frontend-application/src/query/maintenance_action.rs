@@ -33,6 +33,30 @@ pub(super) fn prepare(
     context: &RequestContext,
     command_context: &CommandContext,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
+    if let Some(action) = executor
+        .prepare_optimize_action(
+            command,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            context.execution(),
+            command_context.connector_context(),
+        )
+        .map_err(maintenance_command_error)?
+    {
+        return Ok(action);
+    }
+    if let Some(action) = executor
+        .prepare_direct_rewrite_action(
+            command,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            context.execution(),
+            command_context.connector_context(),
+        )
+        .map_err(maintenance_command_error)?
+    {
+        return Ok(action);
+    }
     let capacity = context.execution().result_capacity().ok_or_else(|| {
         CommandError::new(
             CommandErrorKind::Rejected,

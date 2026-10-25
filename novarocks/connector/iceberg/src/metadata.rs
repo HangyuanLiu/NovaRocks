@@ -860,6 +860,40 @@ impl ConnectorMetadata for IcebergMetadata {
         })
     }
 
+    fn capture_table_object_with_snapshot_cpu(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.require_current_table_object_selector(request.selector)?;
+            let preparation = self
+                .prepare_table(ConnectorTableRequest {
+                    table: request.table,
+                    resolution: request.resolution,
+                    context: request.context,
+                })
+                .await?;
+            let facts = preparation
+                .into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+            self.validate_metadata_binding_generation(&facts)?;
+            let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::metadata_binding(self.clone(), facts, None);
+            let mut input = Some(novarocks_spi::connector::ProviderMetadataCpuInput(
+                source.clone(),
+            ));
+            cpu.submit_metadata_in(&mut input)?;
+            std::future::poll_fn(|cx| cpu.poll_finished(cx)).await?;
+            source.take_binding_with_snapshot_result()
+        })
+    }
+
     fn capture_table_object_binding_for_statistics_async(
         &self,
         request: ConnectorTableObjectCaptureRequest,
@@ -990,6 +1024,12 @@ pub(crate) struct IcebergPreparedTableFacts {
     generation_owner: Arc<GenerationOwner>,
 }
 
+impl IcebergPreparedTableFacts {
+    pub(crate) fn rewrite_physical_table(&self) -> &crate::iceberg::table::Table {
+        &self.loaded.table
+    }
+}
+
 impl IcebergMetadata {
     async fn statistics_table_object_binding_original(
         &self,
@@ -1022,14 +1062,7 @@ impl IcebergMetadata {
         // an opaque Any. The worker only borrows this stable typed source.
         let facts =
             preparation.into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
-        if facts.incarnation != self.incarnation
-            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Statistics table preparation belongs to another exact generation",
-            ));
-        }
+        self.validate_metadata_binding_generation(&facts)?;
         let source =
             crate::catalog_control::statistics::scoped_cpu::StatisticsCpuOriginal::metadata_binding(
                 self.clone(),
@@ -1039,11 +1072,10 @@ impl IcebergMetadata {
         crate::catalog_control::statistics::scoped_cpu::run_binding(&cpu, &source).await?;
         source.take_binding_result()
     }
-    pub(crate) fn create_statistics_binding_borrowed(
+    fn validate_metadata_binding_generation(
         &self,
         facts: &IcebergPreparedTableFacts,
-        expected: &Option<ConnectorTableObjectId>,
-    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+    ) -> Result<(), ConnectorError> {
         if facts.incarnation != self.incarnation
             || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
         {
@@ -1052,6 +1084,14 @@ impl IcebergMetadata {
                 "Statistics table preparation belongs to another exact generation",
             ));
         }
+        Ok(())
+    }
+    pub(crate) fn create_binding_with_snapshot_borrowed(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+        expected: &Option<ConnectorTableObjectId>,
+    ) -> Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError> {
+        self.validate_metadata_binding_generation(facts)?;
         let metadata = with_pure_schema_creation(&facts.request.context, |creation| {
             self.create_table_from_observation(facts.clone(), creation)
                 .map_err(metadata_creation_error)
@@ -1063,7 +1103,9 @@ impl IcebergMetadata {
                 "Iceberg table no longer matches its durable object binding",
             ));
         }
-        Ok(binding)
+        // Same immutable loaded observation, read on this SAME original CPU
+        // phase. No handle-token interpretation or second Catalog observation.
+        Ok((binding, facts.loaded.table.metadata().current_snapshot_id()))
     }
     async fn prepare_table_original(
         &self,
@@ -1131,6 +1173,25 @@ impl IcebergMetadata {
             self.create_table_from_observation(facts.clone(), creation)
                 .map_err(metadata_creation_error)
         })
+    }
+    pub(crate) fn create_rewrite_table_borrowed(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Rewrite preparation has a foreign exact generation",
+            )
+            .into());
+        }
+        self.create_table_from_observation(facts.clone(), creation)
     }
     pub(crate) fn statistics_read_physical(
         facts: &IcebergPreparedTableFacts,
@@ -2866,6 +2927,52 @@ mod plan_splits_pruning_tests {
         });
     }
 
+    // Executes the real closed Provider CPU input after removing its original
+    // catalog files. This fixture tests phase/input semantics, not thread-pool
+    // capacity or the physical worker's exit protocol.
+    struct CaptureAfterOriginalIo {
+        path: std::path::PathBuf,
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for CaptureAfterOriginalIo {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            use std::sync::atomic::Ordering;
+            let original = input.as_ref().expect("original metadata input");
+            assert_eq!(original.descriptor(), &self.descriptor);
+            assert_eq!(original.incarnation(), self.incarnation);
+            assert_eq!(
+                original.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            std::fs::remove_dir_all(&self.path).unwrap();
+            input.take().unwrap().run_original_phase();
+            Ok(())
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_closed(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+
     #[test]
     fn completed_async_observation_creates_the_original_schema_without_further_io() {
         use crate::catalog::CatalogNamespaceName;
@@ -2925,12 +3032,42 @@ mod plan_splits_pruning_tests {
                 context: context(),
             };
             let prepared = metadata.prepare_table(request.clone()).await.unwrap();
-            let foreign = metadata.prepare_table(request).await.unwrap();
+            let foreign = metadata.prepare_table(request.clone()).await.unwrap();
+            let cpu = Arc::new(CaptureAfterOriginalIo {
+                path: warehouse.path().to_path_buf(),
+                descriptor: metadata.descriptor.clone(),
+                incarnation: metadata.incarnation,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let (binding, snapshot) = metadata
+                .capture_table_object_with_snapshot_cpu(
+                    ConnectorTableObjectCaptureRequest {
+                        table: request.table.clone(),
+                        resolution: request.resolution,
+                        selector: ConnectorTableObjectSelector::Current,
+                        context: request.context,
+                    },
+                    cpu.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cpu.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(binding.metadata.identity, request.table);
+            assert_eq!(snapshot, None, "the real new table has no snapshot");
+            assert_eq!(
+                metadata
+                    .table_payload(&binding.metadata.table)
+                    .unwrap()
+                    .table_info
+                    .unwrap()
+                    .current_snapshot_id,
+                snapshot
+            );
             (prepared, foreign)
         });
-        // Real local catalog/file I/O has finished. A schema creator must now
-        // use that observation even when the original storage disappears.
-        std::fs::remove_dir_all(warehouse.path()).unwrap();
+        // The actual tuple capture removed storage before its original CPU
+        // phase. These earlier observations also remain usable without I/O.
+        assert!(!warehouse.path().exists());
         let mut request = |_: std::alloc::Layout| Ok(());
         let mut work = |_: usize| Ok(());
         let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(

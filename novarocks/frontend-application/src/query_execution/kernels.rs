@@ -446,6 +446,7 @@ impl ViewExecutionKernel {
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
+    rewrite_runtime: Option<MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
@@ -457,6 +458,20 @@ pub struct MaintenanceExecutionKernel {
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
+}
+
+/// The exact existing host leaves used by one maintenance Action. This owns
+/// neither a new Root nor a runtime, and exposes no caller-selected CPU work.
+#[derive(Clone)]
+pub(crate) struct MaintenanceRewriteRuntime {
+    pub(crate) client: novarocks_query_application::api::QueryExecutionClient,
+    pub(crate) launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    pub(crate) completion: crate::query_execution::completion_facts::CompletionFactOwners,
+    pub(crate) execution: (
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        crate::native::data_runtime::FrontendDataRuntime,
+    ),
 }
 
 impl MaintenanceExecutionKernel {
@@ -478,6 +493,7 @@ impl MaintenanceExecutionKernel {
         static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
+            rewrite_runtime: None,
             constant_policy,
             functions,
             static_plan_carrier,
@@ -490,6 +506,18 @@ impl MaintenanceExecutionKernel {
             query_execution,
             service,
         }
+    }
+
+    pub(crate) fn with_rewrite_runtime(mut self, original: MaintenanceRewriteRuntime) -> Self {
+        self.rewrite_runtime = Some(original);
+        self
+    }
+    pub(crate) fn rewrite_runtime(
+        &self,
+    ) -> Result<&MaintenanceRewriteRuntime, novarocks_workload_control::WorkError> {
+        self.rewrite_runtime
+            .as_ref()
+            .ok_or(novarocks_workload_control::WorkError::NotReady)
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {

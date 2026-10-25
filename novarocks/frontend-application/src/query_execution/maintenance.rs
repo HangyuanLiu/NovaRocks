@@ -26,8 +26,11 @@ use std::sync::Arc;
 mod action_state;
 pub mod command;
 pub(crate) mod io_admission;
+mod rewrite_capture;
 pub(crate) mod rewrite_computation;
+pub(crate) mod rewrite_job;
 pub(crate) mod rewrite_preparation;
+pub(crate) mod rewrite_submission;
 pub use action_state::MaintenanceActionState;
 pub(crate) mod iceberg;
 #[cfg(test)]
@@ -359,6 +362,12 @@ pub enum MaintenanceStatementResult {
 pub trait TableMaintenanceEngine: Send + Sync {
     /// Bind the one already-admitted root before any distributed rewrite
     /// construction. This capability never enters durable job descriptions.
+    fn for_original_background_root(
+        &self,
+        _owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<RequestScopedMaintenanceEngine, String> {
+        Err("original governed Rewrite engine is unsupported".into())
+    }
     fn for_admitted_execution(
         &self,
         capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -627,9 +636,21 @@ pub trait TableMaintenanceService: Send + Sync {
         ))
     }
 
+    fn original_optimize_host(&self) -> Result<OriginalOptimizeHost, String> {
+        Err("original Optimize job host is unavailable".into())
+    }
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String>;
 
     fn request_shutdown_for_process_exit(&self);
+}
+
+#[doc(hidden)]
+pub struct OriginalOptimizeHost {
+    pub(crate) product: Arc<novarocks_table_maintenance::product::TableMaintenanceProduct>,
+    pub(crate) roots: novarocks_workload_control::RootAdmissionHandle,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) controls:
+        Option<Arc<crate::table_maintenance::test_controls::MaintenanceTestControls>>,
 }
 
 /// One foreground SQL maintenance command bound to the exact request admitted
@@ -644,6 +665,57 @@ pub(crate) struct RequestScopedMaintenanceEngine {
 }
 
 impl RequestScopedMaintenanceEngine {
+    pub(crate) fn original_result_capacity(
+        &self,
+    ) -> Option<&novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>
+    {
+        self.execution.result_capacity()
+    }
+
+    pub(crate) async fn reject_direct_rewrite_on_mv(
+        &self,
+        target: &MaintenanceTarget,
+        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    ) -> Result<(), String> {
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+            self.kernel.mv_storage_observation().as_ref(),
+            exact_lease,
+            self.kernel.mv_readiness().as_ref(),
+            &crate::catalog_application::resolver::TargetBackend {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
+            self.connector_context.clone(),
+        ).await
+    }
+
+    pub(crate) async fn reject_direct_rewrite_on_mv_governed(
+        &self,
+        target: &MaintenanceTarget,
+        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> Result<(), String> {
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+            self.kernel.mv_storage_observation().as_ref(),
+            exact_lease,
+            self.kernel.mv_readiness().as_ref(),
+            &crate::catalog_application::resolver::TargetBackend {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
+            self.connector_context.clone(),
+            cpu,
+        ).await
+    }
+
     pub fn new(
         kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
         execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
@@ -868,6 +940,12 @@ impl BackgroundMaintenanceAttempt {
 /// for each call. There is deliberately no Core default, process-global lookup
 /// or application-facade fallback.
 pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
+    fn begin_original_root_maintenance_attempt(
+        &self,
+        _owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<BackgroundMaintenanceAttempt, String> {
+        Err("original governed maintenance context is unsupported".into())
+    }
     fn begin_automatic_maintenance_attempt(
         &self,
         capacity: Option<
@@ -927,6 +1005,51 @@ impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
 
 #[async_trait::async_trait]
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
+    fn for_original_background_root(
+        &self,
+        owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<RequestScopedMaintenanceEngine, String> {
+        let root = owner.scope();
+        root.check().map_err(|e| e.to_string())?;
+        let cancellation = root.cancellation().map_err(|e| e.to_string())?;
+        let deadline = cancellation
+            .deadline()
+            .map(std::time::Instant::from)
+            .map_or(self.execution.deadline(), |root_deadline| {
+                Some(
+                    self.execution
+                        .deadline()
+                        .map_or(root_deadline, |old| old.min(root_deadline)),
+                )
+            });
+        let execution = novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
+            self.execution.role(),
+            self.execution.topology().clone(),
+            deadline,
+            novarocks_query_application::cancellation::QueryCancellationView::governed(
+                cancellation,
+                None,
+            ),
+            self.execution.optimizer_settings().clone(),
+            self.execution.sql_semantics().clone(),
+        ).with_result_capacity(
+            novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(owner)
+                .map_err(|error| error.to_string())?
+        ).map_err(|error| error.to_string())?;
+        let connector = crate::connector::connector_request_context_for_execution_on_runtime(
+            None,
+            &execution,
+            self.kernel
+                .rewrite_runtime()
+                .map_err(|e| e.to_string())?
+                .execution
+                .0
+                .runtime(),
+        )?
+        .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::JobAttempt);
+        Ok(Self::new(self.kernel.clone(), execution, connector))
+    }
+
     #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
         &self,
@@ -1036,20 +1159,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             &instance_id,
         )
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
-            self.kernel.mv_storage_observation().as_ref(),
-            &exact_lease,
-            self.kernel.mv_readiness().as_ref(),
-            &crate::catalog_application::resolver::TargetBackend {
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                    .expect("static Iceberg provider ID"),
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            },
-            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
-            self.connector_context.clone(),
-        ).await
+        self.reject_direct_rewrite_on_mv(target, &exact_lease).await
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
@@ -1301,6 +1411,38 @@ impl RequestScopedMaintenanceEngine {
 
 #[async_trait::async_trait]
 impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
+    fn for_original_background_root(
+        &self,
+        owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<RequestScopedMaintenanceEngine, String> {
+        let root = owner.scope();
+        root.check().map_err(|e| e.to_string())?;
+        let attempt = self
+            .attempt_factory
+            .begin_original_root_maintenance_attempt(owner)?;
+        let capacity = attempt
+            .execution
+            .result_capacity()
+            .ok_or("original maintenance Root retention is absent")?;
+        let window = capacity
+            .try_window_alias()
+            .map_err(|error| error.to_string())?;
+        if !capacity.is_root_backed_internal()
+            || !window.is_for_scope(&root)
+            || window
+                .internal_manifest_binding()
+                .map_err(|error| error.to_string())?
+                .is_some()
+        {
+            return Err("unmounted maintenance context has foreign or computation capacity".into());
+        }
+        Ok(RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            attempt.execution,
+            attempt.connector_context,
+        ))
+    }
+
     fn for_admitted_execution(
         &self,
         capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,

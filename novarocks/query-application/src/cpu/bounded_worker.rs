@@ -194,7 +194,7 @@ pub enum QueuePublishRefusal {
     FactoryMismatch,
 }
 
-/// One fixed observer header for a new joint job, not another completion queue.
+/// One fixed observer header for a received job, not another completion queue.
 /// The platform Mutex's external backing and Waker pointees are not quoted here.
 pub(crate) struct BoundedWorkerActualExit {
     phase: AtomicU8,
@@ -275,8 +275,8 @@ impl BoundedWorkerActualExit {
     }
 }
 
-/// Prepared only after the caller's original grant. Receipt custody is returned
-/// before publication; constructing this value does not enqueue or execute F.
+/// Prepared under the caller's original reservation/source. Receipt custody
+/// precedes publication; constructing this value does not enqueue or execute F.
 pub(crate) struct BoundedWorkerPrepared<R> {
     source: Weak<dyn Send + Sync>,
     job: BoundedWorkerJob<R>,
@@ -329,12 +329,23 @@ impl<R> Drop for JointQueuedJob<R> {
         }
     }
 }
+/// An ordinary queue reservation does not carry a workload grant. The stable
+/// original receiver outside this row remains responsible for source custody.
+struct OrdinaryQueuedJob<R> {
+    prepared: BoundedWorkerPrepared<R>,
+    reservation: BoundedWorkerReservation,
+}
 enum QueuedJob<R> {
     Legacy(LegacyQueuedJob<R>),
+    Ordinary(OrdinaryQueuedJob<R>),
     Joint(JointQueuedJob<R>),
 }
 enum PendingRecord<'a, R> {
     Legacy(&'a mut Option<LegacyQueuedJob<R>>),
+    Ordinary {
+        prepared: &'a mut Option<BoundedWorkerPrepared<R>>,
+        reservation: &'a mut Option<super::QueryBlockingReservation>,
+    },
     Joint {
         prepared: &'a mut Option<BoundedWorkerPrepared<R>>,
         physical: &'a mut Option<JointLocalGrant<super::QueryBlockingReservation>>,
@@ -344,12 +355,21 @@ impl<R> PendingRecord<'_, R> {
     fn call_type(&self) -> TypeId {
         match self {
             Self::Legacy(row) => row.as_ref().unwrap().job.call_type,
-            Self::Joint { prepared, .. } => prepared.as_ref().unwrap().job.call_type,
+            Self::Joint { prepared, .. } | Self::Ordinary { prepared, .. } => {
+                prepared.as_ref().unwrap().job.call_type
+            }
         }
     }
     fn take(&mut self) -> QueuedJob<R> {
         match self {
             Self::Legacy(row) => QueuedJob::Legacy(row.take().unwrap()),
+            Self::Ordinary {
+                prepared,
+                reservation,
+            } => QueuedJob::Ordinary(OrdinaryQueuedJob {
+                prepared: prepared.take().unwrap(),
+                reservation: reservation.take().unwrap().inner,
+            }),
             Self::Joint { prepared, physical } => QueuedJob::Joint(JointQueuedJob {
                 prepared: ManuallyDrop::new(prepared.take().unwrap()),
                 physical: ManuallyDrop::new(physical.take().unwrap()),
@@ -798,6 +818,32 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         }
         self.publish_record(&mut PendingRecord::Joint { prepared, physical })
     }
+    pub(crate) fn publish_ordinary_in(
+        &self,
+        prepared: &mut Option<BoundedWorkerPrepared<R>>,
+        reservation: &mut Option<super::QueryBlockingReservation>,
+        call: TypeId,
+    ) -> Result<BoundedWorkerPublication<R>, QueuePublishRefusal> {
+        let job = prepared.as_ref().ok_or(QueuePublishRefusal::Empty)?;
+        let reserved = reservation.as_ref().ok_or(QueuePublishRefusal::Empty)?;
+        let source = self.source();
+        if !Weak::ptr_eq(&job.source, &source) || !Weak::ptr_eq(&reserved.inner.source, &source) {
+            return Err(QueuePublishRefusal::ForeignPool);
+        }
+        if reserved.inner.queue_slot.is_none() {
+            return Err(QueuePublishRefusal::Empty);
+        }
+        if job.job.call_type != call {
+            return Err(QueuePublishRefusal::FactoryMismatch);
+        }
+        if job.completion.is_closed() {
+            return Err(QueuePublishRefusal::ReceiptClosed);
+        }
+        self.publish_record(&mut PendingRecord::Ordinary {
+            prepared,
+            reservation,
+        })
+    }
     /// The only FIFO publication author. Taking these closed enum fields runs
     /// no callback, allocation or destructor under QueueState.
     fn publish_record(
@@ -807,6 +853,11 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
             return Err(QueuePublishRefusal::Closed);
+        }
+        // Ordinary publication cannot borrow a finite factory's stamp, even
+        // when its erased call happens to have the same Rust type.
+        if matches!(pending, PendingRecord::Ordinary { .. }) && state.closed_factory.is_some() {
+            return Err(QueuePublishRefusal::FactoryMismatch);
         }
         if state
             .closed_factory
@@ -901,6 +952,22 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
                 drop(queue_slot);
                 (job, completion, None, None)
             }
+            QueuedJob::Ordinary(OrdinaryQueuedJob {
+                prepared,
+                mut reservation,
+            }) => {
+                let BoundedWorkerPrepared {
+                    job,
+                    completion,
+                    exit,
+                    ..
+                } = prepared;
+                // Same queue-only lifetime as the ordinary executor. The
+                // independent exit header still covers the actual call and
+                // result/destructor path on this original worker.
+                drop(reservation.queue_slot.take());
+                (job, completion, None, Some(exit))
+            }
             QueuedJob::Joint(row) => {
                 let mut row = ManuallyDrop::new(row);
                 // SAFETY: suppress the row destructor and move each initialized
@@ -925,9 +992,9 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
             }
         };
         let mut physical = physical;
-        let cleanup = if cancelling && physical.is_some() {
-            // The original worker disposes an unexecuted joint call. The same
-            // guard stays outside this catch and cannot ordinary-unwind away.
+        let cleanup = if cancelling && exit.is_some() {
+            // The original worker disposes an unexecuted received call. Any
+            // joint guard stays outside this catch and cannot unwind away.
             match catch_unwind(AssertUnwindSafe(|| drop(job))) {
                 Ok(()) => catch_unwind(AssertUnwindSafe(|| {
                     if let Err(original) = completion.send(Err(BoundedWorkerError::ExecutorClosed))
@@ -961,7 +1028,7 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
             }))
         };
         if let Err(original) = cleanup {
-            if physical.is_some() {
+            if exit.is_some() {
                 retire_failed_worker(
                     &shared,
                     physical.take(),
@@ -1076,6 +1143,7 @@ fn close_queue<R>(shared: &Shared<R>) {
                 // Same original FIFO/storage: workers perform the cancelled
                 // joint call's real destruction under its physical guard.
                 QueuedJob::Joint(row) => state.jobs.push_back(QueuedJob::Joint(row)),
+                QueuedJob::Ordinary(row) => state.jobs.push_back(QueuedJob::Ordinary(row)),
             }
         }
         legacy

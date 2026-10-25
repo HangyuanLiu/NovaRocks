@@ -2258,7 +2258,7 @@ impl IcebergAdmissionStatisticsMetadata {
             match (self, prospective) {
                 (Self::Shared(original), None) => Ok(Self::Shared(Arc::clone(original))),
                 _ => Err(invalid(
-                    "Iceberg COW admission lost its original immutable metadata owner",
+                    "Iceberg admission lost its original immutable metadata owner",
                 )),
             }
         } else {
@@ -2289,6 +2289,8 @@ impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
 pub(crate) mod cow_begin;
 #[path = "control/cow_begin_own.rs"]
 mod cow_begin_own;
+#[path = "control/rewrite_begin.rs"]
+mod rewrite_begin;
 
 impl IcebergWriteSessionControl {
     fn frozen_references_of(
@@ -2316,6 +2318,23 @@ impl IcebergWriteSessionControl {
         ),
         ConnectorError,
     > {
+        self.admit_async_with_rewrite_io(request, None).await
+    }
+
+    async fn admit_async_with_rewrite_io(
+        &self,
+        request: &ConnectorWriteBeginRequest,
+        rewrite_io: Option<&Arc<rewrite_begin::RewriteBeginIo>>,
+    ) -> Result<
+        (
+            IcebergCommitHandle,
+            Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
+            IcebergAdmissionStatisticsMetadata,
+        ),
+        ConnectorError,
+    > {
+        let rewrite_scope = rewrite_io.map(|io| io.formation_scope()).transpose()?;
+        let formation_error = crate::distributed_rewrite::async_plan::formation_failure;
         if matches!(
             &request.flavor,
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
@@ -2394,7 +2413,9 @@ impl IcebergWriteSessionControl {
             }
             None => {
                 // Begin must observe the catalog after planning, even when FE shares one request cache.
-                let physical = if matches!(
+                let physical = if let Some(io) = rewrite_io {
+                    io.observe(namespace, table_name, &request.context).await
+                } else if matches!(
                     &request.flavor,
                     ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
                 ) {
@@ -2442,6 +2463,7 @@ impl IcebergWriteSessionControl {
                     matches!(
                         &request.flavor,
                         ConnectorWriteSessionFlavor::CopyOnWrite { .. }
+                            | ConnectorWriteSessionFlavor::DistributedRewrite { .. }
                     ),
                 );
                 (Some(table), metadata, cow_read_access)
@@ -2621,19 +2643,37 @@ impl IcebergWriteSessionControl {
             base.validate()?;
         }
         let base_sequence_number = source_snapshot_sequence(&metadata, base_snapshot_id)?;
-        let facts = IcebergWriteTableFacts::try_new(
-            metadata.uuid().to_string(),
-            namespace.to_string(),
-            table_name.to_string(),
-            metadata.location().to_string(),
-            iceberg_data_location(&metadata),
-            target_ref.to_string(),
-            base_snapshot_id,
-            base_sequence_number,
-            metadata.current_schema_id(),
-            metadata.default_partition_spec_id(),
-            format_version_number(&metadata),
-        )?;
+        let facts = if let Some(scope) = rewrite_scope.as_ref() {
+            let loaded = cow_begin_own::loaded_facts(cow_begin_own::LoadedFactsInput {
+                metadata: &metadata,
+                namespace,
+                table: table_name,
+                target_ref,
+                base_snapshot_id,
+                base_sequence_number,
+                schema_id: metadata.current_schema_id(),
+                spec_id: metadata.default_partition_spec_id(),
+                format_version: format_version_number(&metadata),
+                scope,
+            })
+            .map_err(cow_begin::own_error)
+            .map_err(formation_error)?;
+            loaded.into_facts()
+        } else {
+            IcebergWriteTableFacts::try_new(
+                metadata.uuid().to_string(),
+                namespace.to_string(),
+                table_name.to_string(),
+                metadata.location().to_string(),
+                iceberg_data_location(&metadata),
+                target_ref.to_string(),
+                base_snapshot_id,
+                base_sequence_number,
+                metadata.current_schema_id(),
+                metadata.default_partition_spec_id(),
+                format_version_number(&metadata),
+            )?
+        };
         // A managed publication may replace the target's default partitioning
         // inside the same external commit that publishes its rows. Preparing it
         // here, before any branch is planned, is what lets the writers write
@@ -2696,6 +2736,7 @@ impl IcebergWriteSessionControl {
             matches!(
                 &request.flavor,
                 ConnectorWriteSessionFlavor::CopyOnWrite { .. }
+                    | ConnectorWriteSessionFlavor::DistributedRewrite { .. }
             ),
         )?;
         let authored_input = if matches!(
@@ -2725,7 +2766,14 @@ impl IcebergWriteSessionControl {
             &authored_input,
             &request.context,
         )?;
-        let signed = sign_input_shape(&facts, &authored_input)?;
+        let signed = if let Some(scope) = rewrite_scope.as_ref() {
+            let signed = cow_begin_own::signed_input(&facts, &authored_input, scope)
+                .map_err(cow_begin::own_error)
+                .map_err(formation_error)?;
+            signed.into_shape()
+        } else {
+            sign_input_shape(&facts, &authored_input)?
+        };
         let material = IcebergSessionMaterial {
             data_output: IcebergWriterOutput::try_new(
                 crate::delete_file::IcebergFileFormat::Parquet,
@@ -2736,10 +2784,20 @@ impl IcebergWriteSessionControl {
                 .map_err(invalid)?
                 .map(|size| size as u64),
             )?,
-            data_recipe: data_branch_recipe(
-                writer_metadata,
-                matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
-            )?,
+            data_recipe: if let Some(scope) = rewrite_scope.as_ref() {
+                cow_begin_own::data_recipe(
+                    writer_metadata,
+                    matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
+                    scope,
+                )
+                .map_err(cow_begin::own_error)
+                .map_err(formation_error)?
+            } else {
+                data_branch_recipe(
+                    writer_metadata,
+                    matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
+                )?
+            },
             // A delete branch's frozen old-delete references are the one piece
             // of material that costs an external read, so it is taken only when
             // the request's own shape says a delete branch exists.
@@ -2799,7 +2857,9 @@ impl IcebergWriteSessionControl {
                     invalid("Iceberg distributed rewrite requires a loaded target table")
                 })?;
                 let groups = self
-                    .rewrite_branches_from_frozen_async(table, &metadata, content, *shape)
+                    .rewrite_branches_from_frozen_with_io(
+                        table, &metadata, content, *shape, rewrite_io,
+                    )
                     .await?;
                 plan_distributed_rewrite_branches(&material, *shape, &groups)?
             }
@@ -2951,6 +3011,18 @@ impl IcebergWriteSessionControl {
         content: &crate::distributed_rewrite::FrozenRewritePlanContent,
         shape: ConnectorDistributedRewriteShape,
     ) -> Result<Vec<IcebergFrozenRewriteBranch>, ConnectorError> {
+        self.rewrite_branches_from_frozen_with_io(table, metadata, content, shape, None)
+            .await
+    }
+
+    async fn rewrite_branches_from_frozen_with_io(
+        &self,
+        table: &crate::iceberg::table::Table,
+        metadata: &TableMetadata,
+        content: &crate::distributed_rewrite::FrozenRewritePlanContent,
+        shape: ConnectorDistributedRewriteShape,
+        rewrite_io: Option<&Arc<rewrite_begin::RewriteBeginIo>>,
+    ) -> Result<Vec<IcebergFrozenRewriteBranch>, ConnectorError> {
         match shape {
             ConnectorDistributedRewriteShape::DataFiles { .. } => Ok(content
                 .groups
@@ -2966,11 +3038,31 @@ impl IcebergWriteSessionControl {
                     .base_snapshot_id
                     .ok_or_else(|| internal("Iceberg rewrite has no starting snapshot"))?;
                 let owned = table.clone();
-                let files = (async move {
-                    crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
-                })
-                .await
-                .map_err(unavailable)?;
+                let files = if let Some(io) = rewrite_io {
+                    let snapshot = io.snapshot(owned, snapshot_id).await?;
+                    let scope = io.formation_scope()?;
+                    let capture =
+                        crate::read_snapshot::cow_capture::CaptureScope::new(scope.original())
+                            .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
+                    let checked =
+                        crate::manifest::finish_checked_cow_data_files_from_original_files(
+                            metadata,
+                            snapshot_id,
+                            snapshot.files,
+                            scope.original(),
+                            &capture,
+                        )
+                        .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
+                    checked
+                        .files
+                        .into_iter()
+                        .map(|file| file.stats)
+                        .collect::<Vec<_>>()
+                } else {
+                    crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id)
+                        .await
+                        .map_err(unavailable)?
+                };
                 let by_path = files
                     .into_iter()
                     .map(|file| (file.path.clone(), file))
@@ -3588,6 +3680,27 @@ pub fn write_control_io_geometry()
 impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
     for IcebergWriteSessionControl
 {
+    fn rewrite_begin_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        self.runtime.metadata_action_initial_dependencies()
+    }
+
+    fn rewrite_begin_cpu_author(&self) -> Option<(ConnectorProviderBindingKey, std::any::TypeId)> {
+        Some((
+            self.key.clone(),
+            std::any::TypeId::of::<rewrite_begin::RewriteBeginOriginal>(),
+        ))
+    }
+    fn prepare_rewrite_begin_source_in(
+        self: Arc<Self>,
+        request: &mut Option<ConnectorWriteBeginRequest>,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+        receiving: &mut Option<Arc<dyn novarocks_spi::connector::ConnectorRewriteWriteBeginSource>>,
+    ) -> Result<(), ConnectorError> {
+        rewrite_begin::prepare_in(self, request, original, receiving)
+    }
+
     fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
@@ -5427,8 +5540,19 @@ impl IcebergWriteSessionControl {
         &self,
         request: ConnectorWriteBeginRequest,
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
+        self.begin_write_original_with_rewrite_io(request, None)
+            .await
+    }
+
+    async fn begin_write_original_with_rewrite_io(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        rewrite_io: Option<&Arc<rewrite_begin::RewriteBeginIo>>,
+    ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
         validate_context(&request.context)?;
-        let (handle, targets, statistics_metadata) = self.admit_async(&request).await?;
+        let (handle, targets, statistics_metadata) = self
+            .admit_async_with_rewrite_io(&request, rewrite_io)
+            .await?;
         let copy_on_write = match &request.flavor {
             ConnectorWriteSessionFlavor::CopyOnWrite {
                 selection,

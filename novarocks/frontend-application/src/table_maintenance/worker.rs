@@ -35,7 +35,7 @@ use novarocks_table_maintenance::product::{
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 use novarocks_table_maintenance::worker::{
     OptimizeJobAdmission, OptimizeJobAdmissionPort, OptimizeJobExecution, OptimizeJobExecutionPort,
-    OptimizeJobScope,
+    OptimizeJobOriginals, OptimizeJobScope,
 };
 use novarocks_table_maintenance::{
     AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
@@ -77,130 +77,159 @@ impl<'a> FrontendMaintenanceEffectPort<'a> {
     }
 }
 
-#[async_trait::async_trait]
 impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
-    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        self.engine.reject_user_action_on_mv(target).await
+    fn reject_user_action_on_mv<'a>(
+        &'a self,
+        target: &'a MaintenanceTarget,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.engine.reject_user_action_on_mv(target).await })
     }
 
-    async fn execute_metadata(
-        &self,
+    fn execute_metadata<'a>(
+        &'a self,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
-        let state = self
-            .state
-            .ok_or("rewrite effect cannot dispatch metadata")?;
-        self.engine.execute_action(state, request).await
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<MaintenanceActionOutcome, String>,
+    > {
+        Box::pin(async move {
+            let state = self
+                .state
+                .ok_or("rewrite effect cannot dispatch metadata")?;
+            self.engine.execute_action(state, request).await
+        })
     }
 
-    async fn execute_metadata_with_id(
-        &self,
+    fn execute_metadata_with_id<'a>(
+        &'a self,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
-    ) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
-        let state = self.state.ok_or_else(|| {
-            OptimizeTerminalError::pre_dispatch_failed("rewrite effect cannot dispatch metadata")
-        })?;
-        self.engine
-            .execute_automatic_metadata_action(state, request, effect_id)
-            .await
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<AutomaticMaintenanceOutcome, OptimizeTerminalError>,
+    > {
+        Box::pin(async move {
+            let state = self.state.ok_or_else(|| {
+                OptimizeTerminalError::pre_dispatch_failed(
+                    "rewrite effect cannot dispatch metadata",
+                )
+            })?;
+            self.engine
+                .execute_automatic_metadata_action(state, request, effect_id)
+                .await
+        })
     }
 
     fn begin_rewrite<'a>(
         &'a self,
-        target: &MaintenanceTarget,
+        target: &'a MaintenanceTarget,
         intent: RewriteIntent,
-    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
-        let intent = match intent {
-            RewriteIntent::DataFiles { rewrite_all } => {
-                DistributedRewriteIntent::DataFiles { rewrite_all }
-            }
-            RewriteIntent::PositionDeletes {
-                rewrite_all,
-                min_input_files,
-            } => DistributedRewriteIntent::PositionDeletes {
-                rewrite_all,
-                min_input_files,
-            },
-        };
-        let session = self.engine.plan_distributed_rewrite(
-            target,
-            ConnectorWriteOperationId::new(),
-            intent,
-        )?;
-        Ok(Box::new(FrontendDistributedRewriteSession {
-            engine: self.engine,
-            session,
-            committed_receipt: None,
-        }))
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+    > {
+        Box::pin(async move {
+            let intent = match intent {
+                RewriteIntent::DataFiles { rewrite_all } => {
+                    DistributedRewriteIntent::DataFiles { rewrite_all }
+                }
+                RewriteIntent::PositionDeletes {
+                    rewrite_all,
+                    min_input_files,
+                } => DistributedRewriteIntent::PositionDeletes {
+                    rewrite_all,
+                    min_input_files,
+                },
+            };
+            let session = self.engine.plan_distributed_rewrite(
+                target,
+                ConnectorWriteOperationId::new(),
+                intent,
+            )?;
+            Ok(Box::new(LegacyFrontendDistributedRewriteSession {
+                engine: self.engine,
+                session,
+                committed_receipt: None,
+            }) as Box<dyn DistributedRewriteSession + 'a>)
+        })
     }
 
     fn begin_rewrite_with_id<'a>(
         &'a self,
-        target: &MaintenanceTarget,
+        target: &'a MaintenanceTarget,
         intent: RewriteIntent,
         effect_id: MaintenanceEffectId,
-    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, OptimizeTerminalError> {
-        let intent = match intent {
-            RewriteIntent::DataFiles { rewrite_all } => {
-                DistributedRewriteIntent::DataFiles { rewrite_all }
-            }
-            RewriteIntent::PositionDeletes {
-                rewrite_all,
-                min_input_files,
-            } => DistributedRewriteIntent::PositionDeletes {
-                rewrite_all,
-                min_input_files,
-            },
-        };
-        let session = self
-            .engine
-            .plan_distributed_rewrite(
-                target,
-                ConnectorWriteOperationId::from_bytes(effect_id.to_bytes()),
-                intent,
-            )
-            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        Ok(Box::new(FrontendDistributedRewriteSession {
-            engine: self.engine,
-            session,
-            committed_receipt: None,
-        }))
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<Box<dyn DistributedRewriteSession + 'a>, OptimizeTerminalError>,
+    > {
+        Box::pin(async move {
+            let intent = match intent {
+                RewriteIntent::DataFiles { rewrite_all } => {
+                    DistributedRewriteIntent::DataFiles { rewrite_all }
+                }
+                RewriteIntent::PositionDeletes {
+                    rewrite_all,
+                    min_input_files,
+                } => DistributedRewriteIntent::PositionDeletes {
+                    rewrite_all,
+                    min_input_files,
+                },
+            };
+            let session = self
+                .engine
+                .plan_distributed_rewrite(
+                    target,
+                    ConnectorWriteOperationId::from_bytes(effect_id.to_bytes()),
+                    intent,
+                )
+                .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
+            Ok(Box::new(LegacyFrontendDistributedRewriteSession {
+                engine: self.engine,
+                session,
+                committed_receipt: None,
+            }) as Box<dyn DistributedRewriteSession + 'a>)
+        })
     }
 
     fn begin_cleanup<'a>(
         &'a self,
-        target: &MaintenanceTarget,
+        target: &'a MaintenanceTarget,
         older_than_ms: i64,
-    ) -> Result<Box<dyn CleanupSession + 'a>, String> {
-        let session = self.engine.plan_cleanup_maintenance(
-            target,
-            ConnectorCleanupOperationId::new(),
-            older_than_ms,
-        )?;
-        let raw_candidates = cleanup_candidates_first_page(self.engine, &session)?;
-        let candidates = raw_candidates
-            .iter()
-            .map(cleanup_candidate_fact)
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Box::new(FrontendCleanupSession {
-            engine: self.engine,
-            target: target.clone(),
-            older_than_ms,
-            session,
-            raw_candidates,
-            candidates,
-        }))
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<Box<dyn CleanupSession + 'a>, String>,
+    > {
+        Box::pin(async move {
+            let session = self.engine.plan_cleanup_maintenance(
+                target,
+                ConnectorCleanupOperationId::new(),
+                older_than_ms,
+            )?;
+            let raw_candidates = cleanup_candidates_first_page(self.engine, &session)?;
+            let candidates = raw_candidates
+                .iter()
+                .map(cleanup_candidate_fact)
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Box::new(FrontendCleanupSession {
+                engine: self.engine,
+                target: target.clone(),
+                older_than_ms,
+                session,
+                raw_candidates,
+                candidates,
+            }) as Box<dyn CleanupSession + 'a>)
+        })
     }
 }
 
-struct FrontendDistributedRewriteSession<'a> {
+struct LegacyFrontendDistributedRewriteSession<'a> {
     engine: &'a dyn TableMaintenanceEngine,
     session: crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
     committed_receipt: Option<novarocks_spi::connector::ConnectorWriteReceipt>,
 }
 
-fn rewrite_compile_terminal(
+pub(crate) fn rewrite_compile_terminal(
     error: novarocks_sql::compiler::SqlCompileError,
 ) -> OptimizeTerminalError {
     match error {
@@ -232,7 +261,7 @@ fn rewrite_compile_terminal(
     }
 }
 
-impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
+impl DistributedRewriteSession for LegacyFrontendDistributedRewriteSession<'_> {
     fn plan_facts(&self) -> RewritePlanFacts {
         RewritePlanFacts {
             noop: self.session.is_noop(),
@@ -241,77 +270,157 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
         }
     }
 
-    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), OptimizeTerminalError> {
-        let cohort =
-            self.session.plan().cohorts().get(ordinal).ok_or_else(|| {
+    fn execute_cohort<'a>(
+        &'a mut self,
+        ordinal: usize,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<(), OptimizeTerminalError>,
+    > {
+        Box::pin(async move {
+            let cohort = self.session.plan().cohorts().get(ordinal).ok_or_else(|| {
                 format!("rewrite cohort ordinal {ordinal} is not in the frozen plan")
             })?;
-        let prepared = self
-            .engine
-            .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())
-            .map_err(rewrite_compile_terminal)?;
-        let completion = prepared.finish()?;
-        self.engine
-            .accumulate_distributed_rewrite_group(&self.session, completion)
-            .map_err(OptimizeTerminalError::pre_dispatch_failed)
-    }
-
-    fn commit(&mut self) -> Result<RewriteCommit, String> {
-        match self.engine.commit_distributed_rewrite(&self.session)? {
-            ExternalMutationOutcome::KnownCommitted {
-                receipt,
-                finalization,
-                cleanup,
-                ..
-            } => {
-                if let ExternalMutationFinalization::Failed(error) = &cleanup {
-                    tracing::warn!(%error, "committed rewrite retains incomplete cleanup");
-                }
-                self.committed_receipt = Some(receipt);
-                Ok(RewriteCommit::KnownCommitted {
-                    finalization_failed: match finalization {
-                        ExternalMutationFinalization::Failed(error) => Some(error.to_string()),
-                        _ => None,
-                    },
-                })
-            }
-            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
-                Ok(RewriteCommit::KnownUncommitted {
-                    failure: crate::connector::mutation::known_uncommitted_message(
-                        failure, &cleanup,
-                    ),
-                })
-            }
-            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
-                Ok(RewriteCommit::CommitUnknown {
-                    failure: failure.to_string(),
-                })
-            }
-        }
-    }
-
-    fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
-        let receipt = self.committed_receipt.as_ref().ok_or_else(|| {
-            "distributed rewrite has no committed receipt to finalize".to_string()
-        })?;
-        let receipt = self
-            .engine
-            .finalize_distributed_rewrite(&self.session, receipt)?;
-        let summary = receipt.summary();
-        Ok(RewriteReceiptFacts {
-            target_snapshot_id: summary.target_version,
-            input_data_files: summary.input_data_files,
-            input_delete_files: summary.input_delete_files,
-            output_data_files: summary.output_data_files,
-            output_delete_files: summary.output_delete_files,
-            output_rows: summary.output_rows,
+            let prepared = self
+                .engine
+                .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())
+                .map_err(rewrite_compile_terminal)?;
+            let completion = prepared.finish()?;
+            self.engine
+                .accumulate_distributed_rewrite_group(&self.session, completion)
+                .map_err(OptimizeTerminalError::pre_dispatch_failed)
         })
     }
 
-    fn abort(&mut self, _reason: String) -> Result<(), String> {
-        self.engine
-            .abort_distributed_rewrite(&self.session)
-            .and_then(crate::query_execution::write_session::require_uncommitted_release)
+    fn commit<'a>(
+        &'a mut self,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<RewriteCommit, novarocks_table_maintenance::product::RewriteFailure>,
+    > {
+        Box::pin(async move {
+            match self.engine.commit_distributed_rewrite(&self.session)? {
+                ExternalMutationOutcome::KnownCommitted {
+                    effect,
+                    receipt,
+                    finalization,
+                    cleanup,
+                    ..
+                } => {
+                    if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                        tracing::warn!(%error, "committed rewrite retains incomplete cleanup");
+                    }
+                    self.committed_receipt = Some(receipt);
+                    Ok(RewriteCommit::KnownCommitted {
+                        effect: match effect {
+                            novarocks_spi::connector::ExternalMutationEffect::Applied => {
+                                novarocks_coordination_contract::ExecutionEffect::External
+                            }
+                            novarocks_spi::connector::ExternalMutationEffect::NoOp => {
+                                novarocks_coordination_contract::ExecutionEffect::None
+                            }
+                        },
+                        finalization_failed: match finalization {
+                            ExternalMutationFinalization::Failed(error) => Some(
+                                novarocks_table_maintenance::product::RewriteFailure::from_cause(
+                                    novarocks_failure_contract::SharedFailureCause::new(error),
+                                ),
+                            ),
+                            _ => None,
+                        },
+                    })
+                }
+                ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+                    Ok(RewriteCommit::KnownUncommitted {
+                        failure: {
+                            let message = crate::connector::mutation::known_uncommitted_message(
+                                failure.clone(),
+                                &cleanup,
+                            );
+                            novarocks_table_maintenance::product::RewriteFailure::from_cause(
+                                novarocks_failure_contract::SharedFailureCause::new(failure),
+                            )
+                            .with_message(message)
+                        },
+                    })
+                }
+                ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+                    Ok(RewriteCommit::CommitUnknown {
+                        failure: novarocks_table_maintenance::product::RewriteFailure::from_cause(
+                            novarocks_failure_contract::SharedFailureCause::new(failure),
+                        ),
+                    })
+                }
+            }
+        })
+    }
+
+    fn finalize_committed<'a>(
+        &'a mut self,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<RewriteReceiptFacts, novarocks_table_maintenance::product::RewriteFailure>,
+    > {
+        Box::pin(async move {
+            let receipt = self.committed_receipt.as_ref().ok_or_else(|| {
+                "distributed rewrite has no committed receipt to finalize".to_string()
+            })?;
+            let receipt = self
+                .engine
+                .finalize_distributed_rewrite(&self.session, receipt)?;
+            let summary = receipt.summary();
+            Ok(RewriteReceiptFacts {
+                target_snapshot_id: summary.target_version,
+                input_data_files: summary.input_data_files,
+                input_delete_files: summary.input_delete_files,
+                output_data_files: summary.output_data_files,
+                output_delete_files: summary.output_delete_files,
+                output_rows: summary.output_rows,
+            })
+        })
+    }
+
+    fn abort<'a>(
+        &'a mut self,
+        _reason: String,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<
+            novarocks_table_maintenance::product::RewriteAbort,
+            novarocks_table_maintenance::product::RewriteFailure,
+        >,
+    > {
+        Box::pin(async move {
+            use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationEffect};
+            use novarocks_table_maintenance::product::RewriteAbort;
+            Ok(
+                match self.engine.abort_distributed_rewrite(&self.session)? {
+                    ConnectorWriteAbortOutcome::KnownUncommitted { .. } => {
+                        RewriteAbort::KnownUncommitted
+                    }
+                    ConnectorWriteAbortOutcome::KnownCommitted { needed, .. } => {
+                        RewriteAbort::KnownCommitted {
+                            effect: match needed.effect() {
+                                ExternalMutationEffect::Applied => {
+                                    novarocks_coordination_contract::ExecutionEffect::External
+                                }
+                                ExternalMutationEffect::NoOp => {
+                                    novarocks_coordination_contract::ExecutionEffect::None
+                                }
+                            },
+                        }
+                    }
+                    ConnectorWriteAbortOutcome::CommitUnknown { failure, .. } => {
+                        RewriteAbort::CommitUnknown {
+                            failure:
+                                novarocks_table_maintenance::product::RewriteFailure::from_cause(
+                                    novarocks_failure_contract::SharedFailureCause::new(failure),
+                                ),
+                        }
+                    }
+                },
+            )
+        })
     }
 }
 
@@ -334,55 +443,75 @@ impl CleanupSession for FrontendCleanupSession<'_> {
         &self.candidates
     }
 
-    fn select_owned_refs(&mut self, candidate_indexes: &[usize]) -> Result<(), String> {
-        let identities = candidate_indexes
-            .iter()
-            .map(|index| {
-                self.raw_candidates
-                    .get(*index)
-                    .and_then(ConnectorCleanupCandidate::owned_ref_identity)
-                    .ok_or_else(|| "owned-ref candidate has no valid exact identity".to_string())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let selection = ConnectorCleanupOwnedRefSelection::try_new(identities)
-            .map_err(|error| format!("build mature owned-ref cleanup selection failed: {error}"))?;
-        self.session = self.engine.plan_selected_owned_ref_cleanup_maintenance(
-            &self.target,
-            ConnectorCleanupOperationId::new(),
-            self.older_than_ms,
-            selection,
-        )?;
-        Ok(())
+    fn select_owned_refs<'a>(
+        &'a mut self,
+        candidate_indexes: &'a [usize],
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let identities = candidate_indexes
+                .iter()
+                .map(|index| {
+                    self.raw_candidates
+                        .get(*index)
+                        .and_then(ConnectorCleanupCandidate::owned_ref_identity)
+                        .ok_or_else(|| {
+                            "owned-ref candidate has no valid exact identity".to_string()
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let selection =
+                ConnectorCleanupOwnedRefSelection::try_new(identities).map_err(|error| {
+                    format!("build mature owned-ref cleanup selection failed: {error}")
+                })?;
+            self.session = self.engine.plan_selected_owned_ref_cleanup_maintenance(
+                &self.target,
+                ConnectorCleanupOperationId::new(),
+                self.older_than_ms,
+                selection,
+            )?;
+            Ok(())
+        })
     }
 
-    fn execute(&mut self) -> Result<CleanupTerminal, String> {
-        // The report is the candidate set, which the manifest fixes before
-        // any batch runs. Collect it first, under the local result bound, so
-        // a report too large to show is refused before anything is deleted.
-        let locations = cleanup_candidate_locations(self.engine, &self.session)?;
-        let batches = self.session.plan_ref().summary().batch_count();
-        for ordinal in 0..batches {
-            let prepared = self.engine.prepare_cleanup_batch(&self.session, ordinal)?;
-            match self.engine.execute_cleanup_batch(&self.session, prepared)? {
-                crate::connector::cleanup_maintenance::CleanupBatchExecution::Receipt(receipt) => {
-                    if receipt.summary().unknown() != 0 {
+    fn execute<'a>(
+        &'a mut self,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<CleanupTerminal, String>>
+    {
+        Box::pin(async move {
+            // The report is the candidate set, which the manifest fixes before
+            // any batch runs. Collect it first, under the local result bound, so
+            // a report too large to show is refused before anything is deleted.
+            let locations = cleanup_candidate_locations(self.engine, &self.session)?;
+            let batches = self.session.plan_ref().summary().batch_count();
+            for ordinal in 0..batches {
+                let prepared = self.engine.prepare_cleanup_batch(&self.session, ordinal)?;
+                match self.engine.execute_cleanup_batch(&self.session, prepared)? {
+                    crate::connector::cleanup_maintenance::CleanupBatchExecution::Receipt(
+                        receipt,
+                    ) => {
+                        if receipt.summary().unknown() != 0 {
+                            return Ok(CleanupTerminal::CommitUnknown {
+                                failure: "provider reported an unknown cleanup batch outcome"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    crate::connector::cleanup_maintenance::CleanupBatchExecution::Uncertain(
+                        error,
+                    ) => {
                         return Ok(CleanupTerminal::CommitUnknown {
-                            failure: "provider reported an unknown cleanup batch outcome"
-                                .to_string(),
+                            failure: error.to_string(),
                         });
                     }
                 }
-                crate::connector::cleanup_maintenance::CleanupBatchExecution::Uncertain(error) => {
-                    return Ok(CleanupTerminal::CommitUnknown {
-                        failure: error.to_string(),
-                    });
+            }
+            match self.engine.finalize_cleanup_terminal(&self.session) {
+                Ok(()) => Ok(CleanupTerminal::KnownCommitted { locations }),
+                Err(error) => {
+                    Ok(CleanupTerminal::KnownCommittedFinalizationFailed { failure: error })
                 }
             }
-        }
-        match self.engine.finalize_cleanup_terminal(&self.session) {
-            Ok(()) => Ok(CleanupTerminal::KnownCommitted { locations }),
-            Err(error) => Ok(CleanupTerminal::KnownCommittedFinalizationFailed { failure: error }),
-        }
+        })
     }
 }
 
@@ -527,21 +656,35 @@ impl OptimizeTargetCapturePort for FrontendOptimizeTargetCapturePort<'_> {
 
 pub(crate) struct FrontendOptimizeJobAdmissionPort {
     root_admission: RootAdmissionHandle,
+    engine: Weak<dyn TableMaintenanceEngine>,
 }
 
 impl FrontendOptimizeJobAdmissionPort {
-    pub(crate) fn new(root_admission: RootAdmissionHandle) -> Self {
-        Self { root_admission }
+    pub(crate) fn new(
+        root_admission: RootAdmissionHandle,
+        engine: Weak<dyn TableMaintenanceEngine>,
+    ) -> Self {
+        Self {
+            root_admission,
+            engine,
+        }
     }
 }
 
-#[async_trait::async_trait]
 impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
-    async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
-        let root = match self
-            .root_admission
-            .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
-        {
+    fn begin(&self) -> novarocks_table_maintenance::worker::OptimizeJobAdmissionFuture<'_> {
+        Box::pin(admit_original_optimize(
+            self.root_admission.clone(),
+            self.engine.clone(),
+        ))
+    }
+}
+async fn admit_original_optimize(
+    root_admission: RootAdmissionHandle,
+    engine: Weak<dyn TableMaintenanceEngine>,
+) -> Result<OptimizeJobAdmission, String> {
+    let root =
+        match root_admission.begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance)) {
             Ok(root) => root,
             Err(WorkError::NotReady)
             | Err(WorkError::Capacity(_))
@@ -549,114 +692,49 @@ impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
             Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
             Err(error) => return Err(format!("admit governed optimize root failed: {error}")),
         };
-        let (permit, window) = match root
-            .owner
-            .scope()
-            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)
-        {
-            Ok(admission) => match admission.await {
-                Ok(permit) => permit,
-                Err(WorkError::Cancelled(_))
-                | Err(WorkError::Capacity(_))
-                | Err(WorkError::CapacityWaitTimeout) => {
-                    return Ok(OptimizeJobAdmission::RetryLater);
-                }
-                Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
-                Err(error) => {
-                    return Err(format!("admit warehouse optimize query failed: {error}"));
-                }
-            },
-            Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
-            Err(error) => {
-                return Err(format!(
-                    "register warehouse optimize admission failed: {error}"
-                ));
-            }
-        };
-        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).map_err(|error| format!("bind admitted optimize capacity: {error}"))?;
-        Ok(OptimizeJobAdmission::Acquired(Box::new(
-            FrontendOptimizeJobScope::new(root.owner, permit, capacity),
-        )))
+    let permit = root
+        .owner
+        .scope()
+        .admit_query()
+        .map_err(|error| error.to_string())?
+        .await
+        .map_err(|error| error.to_string())?;
+    if engine.upgrade().is_none() {
+        return Err("Optimize original execution owner has exited".into());
     }
+    let mut owner = Some(root.owner);
+    let scope = owner.as_ref().unwrap().scope();
+    let mut permit = Some(permit);
+    let originals = OptimizeJobOriginals::take_in(&mut owner, &mut permit)?;
+    Ok(OptimizeJobAdmission::Acquired(Box::new(
+        FrontendOptimizeJobScope {
+            work: Some(originals),
+            scope,
+        },
+    )))
 }
 
 struct FrontendOptimizeJobScope {
-    work: Mutex<Option<AdmittedOptimizeJob>>,
+    work: Option<OptimizeJobOriginals>,
+    scope: novarocks_workload_control::WorkScope,
 }
-
-struct AdmittedOptimizeJob {
-    owner: WorkOwner,
-    query_concurrency: QueryConcurrencyPermit,
-    result_capacity:
-        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-}
-
-impl FrontendOptimizeJobScope {
-    fn new(
-        owner: WorkOwner,
-        query_concurrency: QueryConcurrencyPermit,
-        result_capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Self {
-        Self {
-            work: Mutex::new(Some(AdmittedOptimizeJob {
-                owner,
-                query_concurrency,
-                result_capacity,
-            })),
-        }
-    }
-}
-
 impl OptimizeJobScope for FrontendOptimizeJobScope {
-    fn result_capacity(
-        &self,
-    ) -> Result<
-        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        String,
-    > {
-        let work = self
-            .work
-            .lock()
-            .map_err(|error| format!("lock optimize result capacity: {error}"))?;
-        let work = work
-            .as_ref()
-            .ok_or("optimize result capacity was released")?;
-        Ok(work.result_capacity.clone())
-    }
-
-    fn is_cancelled(&self) -> Result<bool, String> {
-        let work = self
-            .work
-            .lock()
-            .map_err(|error| format!("lock governed optimize root scope: {error}"))?;
-        let work = work
-            .as_ref()
-            .ok_or_else(|| "governed optimize root scope was released".to_string())?;
-        let cancellation =
-            work.owner.scope().cancellation().map_err(|error| {
-                format!("observe governed optimize cancellation failed: {error}")
-            })?;
-        Ok(cancellation.reason().is_some())
-    }
-}
-
-impl Drop for FrontendOptimizeJobScope {
-    fn drop(&mut self) {
-        let Some(AdmittedOptimizeJob {
-            owner,
-            query_concurrency,
-            result_capacity,
-        }) = self
-            .work
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
+    fn take_originals(&mut self) -> Result<OptimizeJobOriginals, String> {
+        self.work
             .take()
-        else {
-            return;
-        };
-        drop(query_concurrency);
-        owner.complete();
-        drop(result_capacity);
+            .ok_or_else(|| "Optimize original admission was already moved".into())
+    }
+    fn original_owner(&self) -> Result<&novarocks_workload_control::WorkOwner, String> {
+        self.work
+            .as_ref()
+            .and_then(|o| o.owner.as_ref())
+            .ok_or_else(|| "Optimize original Root is empty".into())
+    }
+    fn is_cancelled(&self) -> Result<bool, String> {
+        self.scope
+            .cancellation()
+            .map(|view| view.reason().is_some())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -691,13 +769,14 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
 
     fn acquire(
         &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        owner: &novarocks_workload_control::WorkOwner,
     ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
         let Some((engine, product)) = self.engine.upgrade().zip(self.product.upgrade()) else {
             return Ok(None);
         };
-        let engine = engine.for_admitted_execution(capacity)?;
+        let engine = engine.for_original_background_root(owner)?;
         Ok(Some(Box::new(FrontendOptimizeJobExecution {
+            mounted: None,
             engine,
             product,
             #[cfg(novarocks_dev_controls)]
@@ -706,16 +785,16 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
                 .as_ref()
                 .map(|owner| MaintenanceExecutionControls {
                     owner: owner.clone(),
-                    capacity: capacity.clone(),
                     observation: Mutex::new(None),
                 }),
         })))
     }
 }
 
-struct FrontendOptimizeJobExecution {
-    engine: Arc<dyn TableMaintenanceEngine>,
-    product: Arc<TableMaintenanceProduct>,
+pub(crate) struct FrontendOptimizeJobExecution {
+    pub(crate) mounted: Option<crate::query_execution::maintenance::rewrite_job::RewriteDomainView>,
+    pub(crate) engine: crate::query_execution::maintenance::RequestScopedMaintenanceEngine,
+    pub(crate) product: Arc<TableMaintenanceProduct>,
     #[cfg(novarocks_dev_controls)]
     test: Option<MaintenanceExecutionControls>,
 }
@@ -723,7 +802,6 @@ struct FrontendOptimizeJobExecution {
 #[cfg(novarocks_dev_controls)]
 struct MaintenanceExecutionControls {
     owner: Arc<super::test_controls::MaintenanceTestControls>,
-    capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     observation: Mutex<Option<super::test_controls::AuthorizedJob>>,
 }
 #[cfg(novarocks_dev_controls)]
@@ -747,65 +825,59 @@ impl FrontendOptimizeJobExecution {
 }
 
 impl OptimizeJobExecution for FrontendOptimizeJobExecution {
-    fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
-        #[cfg(novarocks_dev_controls)]
-        if let Some(test) = &self.test {
-            let observation = test.owner.before_rebind(job, &test.capacity)?;
-            *test
-                .observation
-                .lock()
-                .map_err(|_| "maintenance rebind observation lock failed")? = observation;
-        }
-        let expected_object_id = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
-            &job.object_id,
-        ))
-        .map_err(|error| {
-            format!(
-                "restore optimize job {} target object ID failed: {error}",
-                job.job_id
-            )
-        })?;
-        self.engine
-            .rebind_target_object(&job.target, &expected_object_id)
+    fn run_original_job<'a>(
+        self: Box<Self>,
+        jobs: Arc<novarocks_table_maintenance::OptimizeProcessRuntime>,
+        originals: OptimizeJobOriginals,
+        job: OptimizeJob,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<novarocks_table_maintenance::OptimizeJobOutcome, OptimizeTerminalError>,
+    > {
+        Box::pin(original_job_run_original_job(self, jobs, originals, job))
     }
 
-    fn execute(
-        &self,
-        job: &OptimizeJob,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
-        let engine = self
-            .engine
-            .for_admitted_execution(capacity)
-            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        #[cfg(novarocks_dev_controls)]
-        self.record_test_dispatch(job, capacity)
-            .map_err(OptimizeTerminalError::failed)?;
-        self.product.execute_rewrite_terminal(
-            &FrontendMaintenanceEffectPort::for_rewrite(engine.as_ref()),
-            &job.target,
-            RewriteIntent::DataFiles { rewrite_all: true },
-        )
+    fn original_effect<'a>(
+        &'a self,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Option<novarocks_coordination_contract::ExecutionEffect>,
+    > {
+        Box::pin(original_job_original_effect(self))
+    }
+    fn rebind_target<'a>(
+        &'a self,
+        job: &'a OptimizeJob,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<MaintenanceTargetRebind, String>,
+    > {
+        Box::pin(original_job_rebind_target(self, job))
     }
 
-    fn execute_automatic(
-        &self,
-        job: &OptimizeJob,
+    fn execute<'a>(
+        &'a self,
+        job: &'a OptimizeJob,
+        capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<MaintenanceActionOutcome, OptimizeTerminalError>,
+    > {
+        Box::pin(original_job_execute(self, job, capacity))
+    }
+
+    fn execute_automatic<'a>(
+        &'a self,
+        job: &'a OptimizeJob,
         effect_id: MaintenanceEffectId,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
-        let engine = self
-            .engine
-            .for_admitted_execution(capacity)
-            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        #[cfg(novarocks_dev_controls)]
-        self.record_test_dispatch(job, capacity)
-            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        self.product.execute_automatic_rewrite_terminal(
-            &FrontendMaintenanceEffectPort::for_rewrite(engine.as_ref()),
-            &job.target,
-            effect_id,
-        )
+        capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<AutomaticMaintenanceOutcome, OptimizeTerminalError>,
+    > {
+        Box::pin(original_job_execute_automatic(
+            self, job, effect_id, capacity,
+        ))
     }
 }
 
@@ -847,4 +919,90 @@ mod rewrite_compile_projection_tests {
             );
         }
     }
+}
+
+async fn original_job_run_original_job<'a>(
+    this: Box<FrontendOptimizeJobExecution>,
+    jobs: Arc<novarocks_table_maintenance::OptimizeProcessRuntime>,
+    originals: OptimizeJobOriginals,
+    job: OptimizeJob,
+) -> Result<novarocks_table_maintenance::OptimizeJobOutcome, OptimizeTerminalError> {
+    crate::query_execution::maintenance::rewrite_job::mount_original(this, jobs, originals, job)
+        .await
+}
+async fn original_job_original_effect<'a>(
+    this: &'a FrontendOptimizeJobExecution,
+) -> Option<novarocks_coordination_contract::ExecutionEffect> {
+    crate::query_execution::maintenance::rewrite_job::actual_original_effect(this.mounted.as_ref()?)
+        .await
+}
+async fn original_job_rebind_target<'a>(
+    this: &'a FrontendOptimizeJobExecution,
+    job: &'a OptimizeJob,
+) -> Result<MaintenanceTargetRebind, String> {
+    #[cfg(novarocks_dev_controls)]
+    if let Some(test) = &this.test {
+        let capacity = this
+            .engine
+            .original_result_capacity()
+            .cloned()
+            .ok_or("Optimize MIO capacity is absent")?;
+        let observation = test.owner.before_rebind(job, &capacity)?;
+        *test
+            .observation
+            .lock()
+            .map_err(|_| "maintenance rebind observation lock failed")? = observation;
+    }
+    let original = this
+        .mounted
+        .as_ref()
+        .ok_or("Optimize original background Source is not mounted")?;
+    crate::query_execution::maintenance::rewrite_job::rebind_original(original, job).await
+}
+async fn original_job_execute<'a>(
+    this: &'a FrontendOptimizeJobExecution,
+    job: &'a OptimizeJob,
+    capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
+    let original = this.mounted.as_ref().ok_or_else(|| {
+        OptimizeTerminalError::pre_dispatch_failed(
+            "Optimize original background Source is not mounted",
+        )
+    })?;
+    #[cfg(novarocks_dev_controls)]
+    this.record_test_dispatch(job, capacity)
+        .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
+    this.product
+        .execute_rewrite_terminal(
+            &crate::query_execution::maintenance::rewrite_job::GovernedRewriteEffectPort::new(
+                original.clone(),
+            ),
+            &job.target,
+            RewriteIntent::DataFiles { rewrite_all: true },
+        )
+        .await
+}
+async fn original_job_execute_automatic<'a>(
+    this: &'a FrontendOptimizeJobExecution,
+    job: &'a OptimizeJob,
+    effect_id: MaintenanceEffectId,
+    capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
+    let original = this.mounted.as_ref().ok_or_else(|| {
+        OptimizeTerminalError::pre_dispatch_failed(
+            "Optimize original background Source is not mounted",
+        )
+    })?;
+    #[cfg(novarocks_dev_controls)]
+    this.record_test_dispatch(job, capacity)
+        .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
+    this.product
+        .execute_automatic_rewrite_terminal(
+            &crate::query_execution::maintenance::rewrite_job::GovernedRewriteEffectPort::new(
+                original.clone(),
+            ),
+            &job.target,
+            effect_id,
+        )
+        .await
 }

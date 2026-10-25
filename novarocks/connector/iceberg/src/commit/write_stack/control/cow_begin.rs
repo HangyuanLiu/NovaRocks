@@ -49,7 +49,7 @@ pub(crate) fn projection_error(e: projection::Error<OriginalResultCheckError>) -
         .into(),
     }
 }
-fn own_error(e: own::Failure<OriginalResultCheckError>) -> Cause {
+pub(super) fn own_error(e: own::Failure<OriginalResultCheckError>) -> Cause {
     match e {
         own::Failure::Original(e) => e.into(),
         own::Failure::Provider(e) => e.into(),

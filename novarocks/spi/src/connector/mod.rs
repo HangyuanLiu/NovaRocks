@@ -80,7 +80,9 @@ pub use catalog::{
 pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
-    CandidatePage, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
+    CandidatePage, ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation,
+    ConnectorCleanupAsyncOutput, ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart,
+    ConnectorCleanupAsyncStep, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
@@ -162,8 +164,9 @@ pub use distributed_rewrite::{
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary,
     ConnectorDistributedRewriteResolver, ConnectorDistributedRewriteShape,
-    ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead,
-    MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
+    ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead, ConnectorRewritePlanSource,
+    ConnectorRewritePrepared, ConnectorRewriteSelection, ConnectorRewriteSourceRequest,
+    ConnectorRewriteWriteBeginSource, MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
     REWRITE_POSITION_DELETES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
 };

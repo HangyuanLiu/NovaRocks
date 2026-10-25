@@ -239,25 +239,26 @@ impl StatementPublication {
         }
         Poll::Ready(())
     }
-    /// None means no committed fact; only the actual NoOp variant means no effect.
+    /// Exact original canonical business frontier, independent of actual GC.
+    pub(crate) fn committed_needed(&self) -> Option<&ConnectorWriteNeededReady> {
+        self.needed
+            .as_deref()
+            .or_else(|| match (&self.outcome, &self.abort_outcome) {
+                (
+                    Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
+                        needed, ..
+                    })),
+                    _,
+                ) => Some(needed.as_ref()),
+                (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }))) => {
+                    Some(needed.as_ref())
+                }
+                _ => None,
+            })
+    }
+    /// None means no committed fact; only actual NoOp proves no external effect.
     pub(crate) fn committed_effect(&self) -> Option<CommittedWriteEffect<'_>> {
-        let needed =
-            self.needed
-                .as_deref()
-                .or_else(|| match (&self.outcome, &self.abort_outcome) {
-                    (
-                        Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
-                            needed,
-                            ..
-                        })),
-                        _,
-                    ) => Some(needed.as_ref()),
-                    (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }))) => {
-                        Some(needed.as_ref())
-                    }
-                    _ => None,
-                })?;
-        Some(match needed.effect() {
+        self.committed_needed().map(|needed| match needed.effect() {
             novarocks_spi::connector::ExternalMutationEffect::Applied => {
                 CommittedWriteEffect::Applied(needed.receipt())
             }

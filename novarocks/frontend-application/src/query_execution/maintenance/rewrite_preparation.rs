@@ -34,6 +34,22 @@ use std::sync::Mutex;
 type Access = FinalPlanRuntimeAccess<FrozenProviderRead>;
 type CompileResult<T> = Result<T, novarocks_sql::compiler::SqlCompileError>;
 enum OriginalInput {
+    BeginRequest {
+        plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
+        lease: ConnectorDistributedRewriteLease,
+        table: novarocks_spi::connector::ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+        capture: novarocks_spi::connector::ConnectorOriginalResultScope,
+    },
+    Seal {
+        plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
+        lease: ConnectorDistributedRewriteLease,
+        write: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
+    },
+    Finalize {
+        session: crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+        receipt: novarocks_spi::connector::ConnectorWriteReceipt,
+    },
     Recipe {
         session: crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
         cohort_id: ConnectorWriteCohortId,
@@ -50,6 +66,12 @@ enum OriginalInput {
     },
 }
 enum OriginalOutput {
+    BeginRequest {
+        request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+        properties: novarocks_spi::connector::CatalogProperties,
+    },
+    Sealed(crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession),
+    Finalized(novarocks_spi::connector::ConnectorDistributedRewriteReceipt),
     Recipe(RewriteCohortRecipe),
     Frozen(RewriteCohortPlanParts),
 }
@@ -83,6 +105,139 @@ impl Drop for CpuLoan<'_> {
         *slot = self.body.take();
     }
 }
+impl RewriteCohortCpuOriginal {
+    pub(crate) fn begin_request_original(
+        plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
+        lease: ConnectorDistributedRewriteLease,
+        table: novarocks_spi::connector::ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+        capture: novarocks_spi::connector::ConnectorOriginalResultScope,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: lease.descriptor().clone(),
+            incarnation: lease.incarnation(),
+            body: Mutex::new(Some(CpuBody {
+                input: OriginalInput::BeginRequest {
+                    plan,
+                    lease,
+                    table,
+                    context,
+                    capture,
+                },
+                started: false,
+                result: None,
+            })),
+        })
+    }
+    pub(crate) fn take_begin_request_in(
+        &self,
+        receiving: &mut Option<(
+            novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+            novarocks_spi::connector::CatalogProperties,
+        )>,
+    ) -> CompileResult<()> {
+        if receiving.is_some() {
+            return Err("Rewrite begin receiver is occupied".into());
+        }
+        let mut loan = CpuLoan::take(self);
+        let body = loan.body.as_mut().unwrap();
+        if !matches!(body.result, Some(Ok(OriginalOutput::BeginRequest { .. }))) {
+            return match body.result.as_ref() {
+                Some(Err(error)) => Err(error.clone()),
+                _ => Err("Rewrite begin has no actual CPU result".into()),
+            };
+        }
+        let Some(Ok(OriginalOutput::BeginRequest {
+            request,
+            properties,
+        })) = body.result.take()
+        else {
+            unreachable!()
+        };
+        *receiving = Some((request, properties));
+        Ok(())
+    }
+    pub(crate) fn seal_original(
+        plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
+        lease: ConnectorDistributedRewriteLease,
+        write: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: lease.descriptor().clone(),
+            incarnation: lease.incarnation(),
+            body: Mutex::new(Some(CpuBody {
+                input: OriginalInput::Seal { plan, lease, write },
+                started: false,
+                result: None,
+            })),
+        })
+    }
+    pub(crate) fn finalize_original(
+        session: crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+        receipt: novarocks_spi::connector::ConnectorWriteReceipt,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: session.lease().descriptor().clone(),
+            incarnation: session.lease().incarnation(),
+            body: Mutex::new(Some(CpuBody {
+                input: OriginalInput::Finalize { session, receipt },
+                started: false,
+                result: None,
+            })),
+        })
+    }
+    pub(crate) fn take_sealed_in(
+        &self,
+        receiving: &mut Option<
+            crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+        >,
+    ) -> CompileResult<()> {
+        if receiving.is_some() {
+            return Err("Rewrite sealed session receiver is occupied".into());
+        }
+        let mut loan = CpuLoan::take(self);
+        let body = loan.body.as_mut().unwrap();
+        if !matches!(body.result, Some(Ok(OriginalOutput::Sealed(_)))) {
+            return match body.result.as_ref() {
+                Some(Err(e)) => Err(e.clone()),
+                _ => Err("Rewrite seal has no actual closed CPU result".into()),
+            };
+        }
+        let Some(Ok(OriginalOutput::Sealed(session))) = body.result.take() else {
+            unreachable!()
+        };
+        *receiving = Some(session);
+        Ok(())
+    }
+    pub(crate) fn take_receipt_in(
+        &self,
+        receiving: &mut Option<novarocks_spi::connector::ConnectorDistributedRewriteReceipt>,
+    ) -> CompileResult<()> {
+        if receiving.is_some() {
+            return Err("Rewrite receipt receiver is occupied".into());
+        }
+        let mut loan = CpuLoan::take(self);
+        let body = loan.body.as_mut().unwrap();
+        if !matches!(body.result, Some(Ok(OriginalOutput::Finalized(_)))) {
+            return match body.result.as_ref() {
+                Some(Err(e)) => Err(e.clone()),
+                _ => Err("Rewrite finalize has no actual closed CPU result".into()),
+            };
+        }
+        let Some(Ok(OriginalOutput::Finalized(receipt))) = body.result.take() else {
+            unreachable!()
+        };
+        *receiving = Some(receipt);
+        Ok(())
+    }
+}
+fn original_provider_error(
+    error: novarocks_spi::connector::ConnectorError,
+) -> novarocks_sql::compiler::SqlCompileError {
+    novarocks_sql::compiler::SqlCompileError::CompilationSource(
+        novarocks_failure_contract::SharedFailureCause::new(error),
+    )
+}
 impl RewritePlanCpuSource for RewriteCohortCpuOriginal {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
@@ -96,6 +251,20 @@ impl RewritePlanCpuSource for RewriteCohortCpuOriginal {
         assert!(!body.started, "one original Rewrite CPU invocation");
         body.started = true;
         body.result = Some(match &body.input {
+            OriginalInput::BeginRequest {plan,lease,table,context,capture} => (|| {
+                use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession as Session;
+                capture.check_active().map_err(|e| novarocks_sql::compiler::SqlCompileError::from(
+                    novarocks_type_contract::CompileControlError::from_domain(e)))?;
+                let properties=lease.planning_lease().binding().catalog_properties().map_err(original_provider_error)?.clone();
+                let context=crate::query_execution::write_session::context_for_write_begin(context.clone(),&properties).map_err(original_provider_error)?;
+                let request=Session::original_begin_request_from_identity(plan,table,context).map_err(novarocks_sql::compiler::SqlCompileError::from)?;
+                Ok(OriginalOutput::BeginRequest{request,properties})
+            })(),
+            OriginalInput::Seal { plan, lease, write } =>
+                crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession::from_original_session(plan.clone(),lease.clone(),write.clone())
+                    .map(OriginalOutput::Sealed).map_err(original_provider_error),
+            OriginalInput::Finalize { session, receipt } => session.finalize_committed(receipt)
+                .map(OriginalOutput::Finalized).map_err(original_provider_error),
             OriginalInput::Recipe {
                 session,
                 cohort_id,
@@ -143,42 +312,6 @@ pub(crate) struct RewritePreparationCustody {
     closed: bool,
 }
 impl RewritePreparationCustody {
-    pub(crate) fn layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Self>()
-    }
-    /// Fixed heap metadata only; the inline custody is already included in
-    /// its actual Action layout. This quote does not grant running CPU, graph
-    /// formation bytes, read access, or capacity for a result/tail vector.
-    pub(crate) fn fixed_heap_bytes()
-    -> Result<std::num::NonZeroU64, novarocks_workload_control::WorkError> {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        use novarocks_workload_control::WorkError;
-        let sink = ReadAccessSink::<FrozenProviderRead>::known_source_layouts()
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
-        let source = arc_layout(std::alloc::Layout::new::<RewriteCohortCpuOriginal>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .size();
-        let recipe = arc_layout(std::alloc::Layout::new::<RewriteCohortRecipe>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .size();
-        let mutex = if cfg!(all(target_os = "macos", target_pointer_width = "64")) {
-            64
-        } else {
-            0
-        };
-        let port = usize::try_from(crate::query_execution::internal_result_cpu::InternalResultCpu::rewrite_port_metadata_bytes_for_composition()?.get())
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
-        let bytes = source
-            .checked_add(recipe)
-            .and_then(|n| n.checked_add(mutex))
-            .and_then(|n| n.checked_add(sink[0].size()))
-            .and_then(|n| n.checked_add(sink[1].size()))
-            .and_then(|n| n.checked_add(port))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        std::num::NonZeroU64::new(u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?)
-            .ok_or(WorkError::ArithmeticOverflow)
-    }
-
     // Called only after the same worker/forwarder and Provider have joined.
     // Every capability returns to the original owner before source retirement.
     fn receive_unpaired_after_exit(&mut self) {
@@ -204,6 +337,16 @@ impl RewritePreparationCustody {
             return Err("Rewrite preparation has no closed transferable result");
         }
         *target = self.output.take();
+        Ok(())
+    }
+    /// A transferred plan has no remaining unique access or running creator.
+    /// Release its stage/window aliases before admitting a successor cohort.
+    /// Failure and partial formation still use close() on the original Source.
+    pub(crate) fn retire_transferred(&mut self) -> Result<(), &'static str> {
+        if !self.closed || self.output.is_some() || self.returned.is_some() || self.sink.is_some() {
+            return Err("Rewrite preparation has not transferred its closed original result");
+        }
+        *self = Self::default();
         Ok(())
     }
     /// This close is driven by the same original Source even after the Product
@@ -280,7 +423,7 @@ pub(crate) async fn prepare_original_cohort_in(
     custody.recipe = Some(recipe.clone());
     // The first physical worker and forwarder have exited. Retire this empty
     // original before allocating its successor; only one CPU source Arc is
-    // live at a time and the fixed heap quote states that actual geometry.
+    // live at a time; their original access remains in this stable custody.
     drop(custody.original.take());
     drop(original);
     // A real governed source executes the actual read factory, not BindingOnly.

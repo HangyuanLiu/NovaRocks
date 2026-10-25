@@ -71,35 +71,45 @@ fn optimize_terminal_record_error(
         other => other,
     };
     TerminalError {
+        effect: job.effect,
         state,
         message,
         compile_control: job.compile_control,
         execution_failure: job.execution_failure,
+        failure_cause: job.failure_cause,
     }
 }
 
-fn optimize_statement_terminal_result(
+pub(crate) fn optimize_statement_terminal_result(
     handle: novarocks_table_maintenance::runtime::JobHandle,
     job: novarocks_table_maintenance::OptimizeJob,
     cancelled: bool,
     cancellation_error: Option<String>,
 ) -> Result<(), TerminalError> {
-    let has_selected_cause = job.execution_failure.is_some()
+    // The actual product chose this business result. Applied and NoOp successes
+    // both survive a later observer stop or a failed cancellation request.
+    if job.state == MaintenanceJobState::Finished {
+        return Ok(());
+    }
+    let has_selected_cause = job.failure_cause.is_some()
+        || job.execution_failure.is_some()
         || matches!(
             &job.compile_control,
             Some(novarocks_type_contract::CompileControlError::Source(_))
         );
-    if job.state != MaintenanceJobState::Finished && has_selected_cause {
+    if has_selected_cause {
         return Err(optimize_terminal_record_error(handle, job, "optimize"));
     }
-    // The original select still requests cancellation and waits for actual
-    // exit first. Only an already selected owner cause precedes its fallback.
+    // The observer waits for the original business conclusion. Actual Source
+    // exit remains a separate fact; a stop never manufactures convergence.
     let caller_error = cancellation_error.or_else(|| {
-        cancelled
-            .then(|| "OPTIMIZE statement cancelled; optimize job has actually exited".to_string())
+        cancelled.then(|| {
+            "OPTIMIZE statement cancelled; optimize job business result is available".to_string()
+        })
     });
     if let Some(message) = caller_error {
         let mut error = TerminalError::from(message);
+        error.effect = job.effect;
         // These are the actual publication owner's verdicts, never inferred
         // from Finished (which may be an effect-free plan) or from a refusal.
         if matches!(
@@ -111,11 +121,7 @@ fn optimize_statement_terminal_result(
         }
         return Err(error);
     }
-    if job.state == MaintenanceJobState::Finished {
-        Ok(())
-    } else {
-        Err(optimize_terminal_record_error(handle, job, "optimize"))
-    }
+    Err(optimize_terminal_record_error(handle, job, "optimize"))
 }
 
 pub mod admission;
@@ -270,11 +276,22 @@ impl FrontendTableMaintenanceService {
 
 #[async_trait::async_trait]
 impl TableMaintenanceService for FrontendTableMaintenanceService {
+    fn original_optimize_host(
+        &self,
+    ) -> Result<crate::query_execution::maintenance::OriginalOptimizeHost, String> {
+        Ok(crate::query_execution::maintenance::OriginalOptimizeHost {
+            product: self.product.clone(),
+            roots: self.root_admission.clone(),
+            #[cfg(novarocks_dev_controls)]
+            controls: self.controls.clone(),
+        })
+    }
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
         self.product.start(
             &self.runtime,
             Arc::new(FrontendOptimizeJobAdmissionPort::new(
                 self.root_admission.clone(),
+                Arc::downgrade(&engine),
             )),
             Arc::new(FrontendOptimizeJobExecutionPort::new(
                 Arc::downgrade(&engine),
@@ -500,6 +517,7 @@ mod optimize_terminal_record_projection_tests {
     use novarocks_table_maintenance::runtime::JobHandle;
     fn record(state: MaintenanceJobState) -> novarocks_table_maintenance::OptimizeJob {
         novarocks_table_maintenance::runtime::JobRecord {
+            effect: Some(novarocks_coordination_contract::ExecutionEffect::None),
             job_id: 71,
             target: MaintenanceTarget {
                 catalog: "ice".into(),
@@ -514,6 +532,7 @@ mod optimize_terminal_record_projection_tests {
             error_message: Some("original owner failure".into()),
             compile_control: None,
             execution_failure: None,
+            failure_cause: None,
             created_at_ms: 1,
             started_at_ms: Some(2),
             finished_at_ms: Some(3),
@@ -553,7 +572,7 @@ mod optimize_terminal_record_projection_tests {
         assert_eq!(error.state, MaintenanceJobState::CommitUnknown);
         assert_eq!(
             error.message,
-            "OPTIMIZE statement cancelled; optimize job has actually exited"
+            "OPTIMIZE statement cancelled; optimize job business result is available"
         );
         assert!(
             optimize_statement_terminal_result(
@@ -564,15 +583,22 @@ mod optimize_terminal_record_projection_tests {
             )
             .is_ok()
         );
-        let error = optimize_statement_terminal_result(
-            JobHandle::new(71),
-            record(MaintenanceJobState::Finished),
-            true,
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(error.state, MaintenanceJobState::PreDispatchFailed);
-        assert_eq!(error.execution_failure, None);
+        for effect in [
+            Some(novarocks_coordination_contract::ExecutionEffect::External),
+            Some(novarocks_coordination_contract::ExecutionEffect::None),
+        ] {
+            let mut job = record(MaintenanceJobState::Finished);
+            job.effect = effect;
+            assert!(
+                optimize_statement_terminal_result(
+                    JobHandle::new(71),
+                    job,
+                    true,
+                    Some("late cancellation request failed".into()),
+                )
+                .is_ok()
+            );
+        }
     }
     #[test]
     fn ordinary_optimize_original_source_precedes_late_cancel_request_error() {

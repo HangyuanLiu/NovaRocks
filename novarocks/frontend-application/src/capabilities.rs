@@ -393,6 +393,7 @@ pub fn iceberg_ref_command_executor(
 /// Leaf ports for foreground table-maintenance commands.
 #[derive(Clone)]
 pub struct MaintenanceCommandPorts {
+    rewrite_runtime: Option<domain::MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
@@ -427,6 +428,7 @@ impl MaintenanceCommandPorts {
         static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
+            rewrite_runtime: None,
             constant_policy,
             functions,
             static_plan_carrier,
@@ -442,8 +444,16 @@ impl MaintenanceCommandPorts {
         }
     }
 
+    pub(crate) fn with_rewrite_runtime(
+        mut self,
+        runtime: domain::MaintenanceRewriteRuntime,
+    ) -> Self {
+        self.rewrite_runtime = Some(runtime);
+        self
+    }
+
     fn kernel(&self) -> domain::MaintenanceExecutionKernel {
-        domain::MaintenanceExecutionKernel::new(
+        let kernel = domain::MaintenanceExecutionKernel::new(
             Arc::clone(&self.functions),
             Arc::clone(&self.catalog_service),
             self.catalog_application.clone(),
@@ -455,29 +465,18 @@ impl MaintenanceCommandPorts {
             Arc::clone(&self.service),
             self.constant_policy,
             self.static_plan_carrier,
-        )
+        );
+        match self.rewrite_runtime.as_ref() {
+            Some(runtime) => kernel.with_rewrite_runtime(runtime.clone()),
+            None => kernel,
+        }
     }
 }
 
 pub fn maintenance_command_executor(
     ports: MaintenanceCommandPorts,
 ) -> maintenance_command::MaintenanceCommandExecutor {
-    maintenance_command::MaintenanceCommandExecutor::new(
-        domain::MaintenanceExecutionKernel::new(
-            ports.functions,
-            ports.catalog_service,
-            ports.catalog_application,
-            ports.connector_control,
-            ports.typed_connector_control,
-            ports.mv_storage_observation,
-            ports.mv_readiness,
-            ports.query_execution,
-            ports.service,
-            ports.constant_policy,
-            ports.static_plan_carrier,
-        ),
-        ports.runtime,
-    )
+    maintenance_command::MaintenanceCommandExecutor::new(ports.kernel(), ports.runtime)
 }
 
 /// Build the read-only maintenance command capability.  It deliberately has
@@ -892,16 +891,56 @@ pub fn background_maintenance_attempt(
             &capacity.window_alias(),
         )?;
     }
+    original_maintenance_context(
+        role,
+        topology,
+        max_attempt_duration,
+        runtime,
+        capacity,
+        capacity.map(|c| c.root_scope()),
+    )
+}
+
+/// Bind only original Root control/deadline. MIO and the computation source
+/// must install their own positive capacity before any physical work.
+pub fn original_background_maintenance_attempt(
+    role: novarocks_types::ClusterRole,
+    topology: BackendTopologyService,
+    max_attempt_duration: std::time::Duration,
+    runtime: &tokio::runtime::Handle,
+    owner: &novarocks_workload_control::WorkOwner,
+) -> Result<BackgroundMaintenanceAttempt, String> {
+    let root = owner.scope();
+    root.check().map_err(|e| e.to_string())?;
+    let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(owner)
+        .map_err(|error| error.to_string())?;
+    original_maintenance_context(
+        role,
+        topology,
+        max_attempt_duration,
+        runtime,
+        Some(&capacity),
+        Some(&root),
+    )
+}
+
+fn original_maintenance_context(
+    role: novarocks_types::ClusterRole,
+    topology: BackendTopologyService,
+    max_attempt_duration: std::time::Duration,
+    runtime: &tokio::runtime::Handle,
+    capacity: Option<
+        &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    >,
+    original_root: Option<&novarocks_workload_control::WorkScope>,
+) -> Result<BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
     let deadline = std::time::Instant::now()
         .checked_add(max_attempt_duration)
         .ok_or_else(|| "automatic maintenance deadline overflow".to_string())?;
-    let (cancellation, deadline) = match capacity {
-        Some(capacity) => {
-            let view = capacity
-                .scope()
-                .cancellation()
-                .map_err(|error| error.to_string())?;
+    let (cancellation, deadline) = match original_root {
+        Some(root) => {
+            let view = root.cancellation().map_err(|error| error.to_string())?;
             let deadline = view
                 .deadline()
                 .map(std::time::Instant::from)

@@ -102,23 +102,86 @@ impl RewriteCohortComputation {
         >,
     ) -> Result<Self, QueryServiceError> {
         let expected_session = Arc::clone(&cohort.write_session);
-        let mut computation = StatementComputation::new(
-            root.clone(),
+        let mut source = Self::empty(
+            root,
             initial,
             launcher,
+            expected_session,
             #[cfg(novarocks_dev_controls)]
             observation,
         );
-        computation.install_assembly(cohort)?;
-        Ok(Self {
+        source.install_prepared(cohort)?;
+        Ok(source)
+    }
+    /// The real Stage is admitted before cohort planning. This is the SAME
+    /// common computation source; it does not mint a preparation-only P.
+    pub(crate) fn empty(
+        root: WorkScope,
+        initial: InitialComputationReservation,
+        launcher: Arc<dyn LogicalExecutionLauncher>,
+        expected_session: Arc<ConnectorWriteSession>,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Self {
+        Self {
+            computation: StatementComputation::new(
+                root.clone(),
+                initial,
+                launcher,
+                #[cfg(novarocks_dev_controls)]
+                observation,
+            ),
             root,
             expected_session,
-            computation,
             ready: None,
             native_tail: None,
             handed_off: false,
             failure: None,
-        })
+        }
+    }
+    pub(crate) fn poll_admit(
+        &mut self,
+        io: &MetadataIoAdmission,
+        owner: &novarocks_workload_control::WorkOwner,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), QueryServiceError>> {
+        self.computation.poll_admit(io, owner, cx)
+    }
+    pub(crate) fn preparation_execution(
+        &self,
+        original: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    ) -> Result<novarocks_query_application::admitted_query_context::QueryExecutionContext, WorkError>
+    {
+        self.computation.computation_context(original)
+    }
+    pub(crate) fn preparation_context(
+        &self,
+        original: novarocks_spi::connector::ConnectorRequestContext,
+        #[cfg(novarocks_dev_controls)] nomination: Option<
+            &Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+        >,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorRequestContext,
+        crate::query_execution::contract::DistributedQueryError,
+    > {
+        self.computation.preparation_connector_context(
+            original,
+            #[cfg(novarocks_dev_controls)]
+            nomination,
+        )
+    }
+    pub(crate) fn install_prepared(
+        &mut self,
+        prepared: PreparedDistributedRewriteCohort,
+    ) -> Result<(), QueryServiceError> {
+        if !Arc::ptr_eq(&self.expected_session, &prepared.write_session) {
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                "Rewrite prepared cohort belongs to another original session",
+            ));
+        }
+        self.computation.install_assembly(prepared)
     }
     /// Success requires the real Ready token and original local CPU exit.
     /// Unrelated Native cleanup stays in the SAME retained observer.

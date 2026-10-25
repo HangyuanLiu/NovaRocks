@@ -123,6 +123,12 @@ impl ResultWindowAlias {
         Ok(ResultPayloadBytes { original, bytes })
     }
 
+    /// Observe the original configured data budget. This neither reserves
+    /// backing nor grants a computation, Source, manifest, or dispatch right.
+    pub fn payload_capacity_bytes(&self) -> u64 {
+        self.retained_bytes().limit()
+    }
+
     pub fn retained_payload_bytes(&self) -> u64 {
         self.retained_bytes().held.load(Ordering::Acquire)
     }

@@ -39,7 +39,7 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorOperationControl, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
     ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationDisposition,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -175,6 +175,30 @@ struct JournalState<R> {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JournalEntryRef(Uuid);
+
+/// Exact original failure dimension, independent of the recorded commit fact.
+/// Cloning preserves the original typed cause; no Checked graph is projected.
+#[derive(Clone)]
+pub(crate) enum CatalogPublicationFailure {
+    Dispatch(ConnectorMutationFailure),
+    RequiredFinalization(ConnectorMutationFailure),
+}
+impl CatalogPublicationFailure {
+    pub(crate) fn connector_error(&self) -> ConnectorError {
+        let (failure, detail) = match self {
+            Self::Dispatch(failure) => (failure, "original catalog publication failed"),
+            Self::RequiredFinalization(failure) => {
+                (failure, "original catalog required finalization failed")
+            }
+        };
+        if let Some(original) = failure.connector_source() {
+            return original.clone();
+        }
+        // This is the publication boundary's descriptive kind. The original
+        // producer's typed failure remains authoritative for classification.
+        ConnectorError::from_domain_static(ConnectorErrorKind::Unavailable, failure.clone(), detail)
+    }
+}
 
 pub(crate) enum RetainedPublicationProjection<R> {
     Committed {
@@ -421,6 +445,29 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         receipt: R,
         request: &FrozenRequest,
     ) -> Result<()> {
+        self.record_receipts(evidence, PublicationReceipts::same(receipt), request)
+    }
+    /// The exact dispatch effect, never a receipt/snapshot guess, selects one
+    /// of the two receipts frozen before publication.
+    pub(crate) fn record_for_effects(
+        &self,
+        evidence: ExternalMutationEvidence,
+        applied: R,
+        no_op: R,
+        request: &FrozenRequest,
+    ) -> Result<()> {
+        self.record_receipts(
+            evidence,
+            PublicationReceipts::for_effects(applied, no_op),
+            request,
+        )
+    }
+    fn record_receipts(
+        &self,
+        evidence: ExternalMutationEvidence,
+        receipts: PublicationReceipts<R>,
+        request: &FrozenRequest,
+    ) -> Result<()> {
         if request.artifacts().attempt().operation() != self.operation {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -439,7 +486,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .collect();
         self.prepare(Checked {
             evidence,
-            receipts: PublicationReceipts::same(receipt),
+            receipts,
             retained,
             descriptor: PublicationDescriptor::frozen(request)?,
             attempt: Some(request.artifacts().attempt()),
@@ -563,6 +610,71 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                     .then(|| AppliedDropWitness(scope.clone()))
             }
             _ => None,
+        }
+    }
+    /// Copy-only observation of the original dispatch evidence. This borrows
+    /// neither a receipt nor a cloned Checked graph and grants no retirement,
+    /// finalization or I/O authority. None means no dispatch conclusion exists.
+    pub(crate) fn catalog_dispatch_fact(&self) -> Option<(LakePublicationDisposition, bool)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state
+            .current
+            .get(&self.frontier)
+            .and_then(|id| state.entries.get(id))?;
+        match &entry.phase {
+            EntryPhase::Concluded(DispatchEvidence::Applied { proof }) => Some((
+                LakePublicationDisposition::KnownCommitted,
+                proof.effect == ExternalMutationEffect::Applied,
+            )),
+            EntryPhase::Concluded(
+                DispatchEvidence::NotDispatched { .. } | DispatchEvidence::Rejected { .. },
+            ) => Some((LakePublicationDisposition::KnownUncommitted, false)),
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. }) => {
+                match &entry.positive_proof {
+                    Some(proof) => Some((
+                        LakePublicationDisposition::KnownCommitted,
+                        proof.effect == ExternalMutationEffect::Applied,
+                    )),
+                    None => Some((LakePublicationDisposition::CommitUnknown, false)),
+                }
+            }
+            EntryPhase::Prepared | EntryPhase::Claimed | EntryPhase::Dispatching => None,
+        }
+    }
+    /// Copy only the exact original failure needed by a stable receiver before
+    /// a later receipt/CPU action can refuse. Commit, Unknown, finalization and
+    /// independent object cleanup remain separate dimensions.
+    pub(crate) fn catalog_publication_failure(&self) -> Option<CatalogPublicationFailure> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state
+            .current
+            .get(&self.frontier)
+            .and_then(|id| state.entries.get(id))?;
+        match &entry.phase {
+            EntryPhase::Concluded(
+                DispatchEvidence::NotDispatched { failure }
+                | DispatchEvidence::Rejected { failure, .. },
+            ) => Some(CatalogPublicationFailure::Dispatch(failure.clone())),
+            EntryPhase::Concluded(DispatchEvidence::Unknown { failure, .. })
+                if entry.positive_proof.is_none() =>
+            {
+                Some(CatalogPublicationFailure::Dispatch(failure.clone()))
+            }
+            EntryPhase::Concluded(
+                DispatchEvidence::Applied { .. } | DispatchEvidence::Unknown { .. },
+            ) => match &entry.finalization {
+                ExternalMutationFinalization::Complete => None,
+                ExternalMutationFinalization::Failed(failure) => Some(
+                    CatalogPublicationFailure::RequiredFinalization(failure.clone()),
+                ),
+            },
+            EntryPhase::Prepared | EntryPhase::Claimed | EntryPhase::Dispatching => None,
         }
     }
     pub(crate) fn current_entry(&self) -> Option<JournalEntryRef> {

@@ -39,6 +39,14 @@ impl fmt::Display for InvalidOriginal {
     }
 }
 impl std::error::Error for InvalidOriginal {}
+impl novarocks_failure_contract::FailureProjection for InvalidOriginal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+        )
+    }
+}
+
 impl ConnectorOriginalResultScopeCheck for OriginalCowResultScope {
     fn original_deadline(&self) -> Instant {
         self.control.deadline()
@@ -121,6 +129,14 @@ mod tests {
         }
     }
     impl Error for Canary {}
+    impl novarocks_failure_contract::FailureProjection for Box<Canary> {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                &novarocks_spi::connector::ConnectorErrorKind::Interrupted,
+            )
+        }
+    }
+
     impl Drop for Canary {
         fn drop(&mut self) {
             self.held_during_cause_exit.store(

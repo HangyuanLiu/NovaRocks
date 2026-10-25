@@ -126,7 +126,14 @@ pub fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
     match statement {
         ParsedStatement::Dml(_)
         | ParsedStatement::ExplainQuery(_)
-        | ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_)) => {
+        | ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_))
+        | ParsedStatement::Maintenance(ast::MaintenanceStatement::Optimize(_)) => WorkClass::Query,
+        ParsedStatement::Maintenance(ast::MaintenanceStatement::Call(call))
+            if matches!(call.procedure.parts.as_slice(), [_, namespace, procedure]
+                if namespace.value.eq_ignore_ascii_case("system")
+                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
+                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files"))) =>
+        {
             WorkClass::Query
         }
         ParsedStatement::Session(_) | ParsedStatement::Query(_) => {
@@ -409,10 +416,10 @@ mod tests {
             typed_statement_work_class(&management),
             WorkClass::Management
         );
-        // OPTIMIZE retains its existing management admission policy.
+        // OPTIMIZE carries this exact SQL permit into its original JobRoot.
         let optimize = parse_single_statement("ALTER TABLE lake.db.events OPTIMIZE")
             .expect("parse job-submitting statement");
-        assert_eq!(typed_statement_work_class(&optimize), WorkClass::Management);
+        assert_eq!(typed_statement_work_class(&optimize), WorkClass::Query);
     }
 
     #[test]
@@ -592,6 +599,29 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    #[test]
+    fn direct_rewrite_calls_keep_the_original_sql_query_permit_class() {
+        for sql in [
+            "CALL ice.system.rewrite_data_files(table => 'db.orders')",
+            "CALL ice.system.rewrite_position_delete_files(table => 'db.orders')",
+            "CALL ice.SYSTEM.ReWrItE_DaTa_FiLeS(table => 'db.orders')",
+        ] {
+            let statement = parse_single_statement(sql).expect("original typed CALL parser");
+            assert_eq!(typed_statement_work_class(&statement), WorkClass::Query);
+        }
+        for sql in [
+            "CALL ice.system.remove_orphan_files(table => 'db.orders', older_than => TIMESTAMP '2020-01-01 00:00:00')",
+            "CALL ice.other.rewrite_data_files(table => 'db.orders')",
+            "CALL ice.system.rewrite_manifests(table => 'db.orders')",
+            "SHOW OPTIMIZE",
+        ] {
+            let statement = parse_single_statement(sql).expect("original typed management parser");
+            assert_eq!(
+                typed_statement_work_class(&statement),
+                WorkClass::Management
+            );
         }
     }
 }

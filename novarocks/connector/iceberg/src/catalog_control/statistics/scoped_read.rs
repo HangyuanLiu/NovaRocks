@@ -424,6 +424,14 @@ mod failure_geometry_tests {
         }
     }
     impl Error for OriginalRefusal {}
+    impl novarocks_failure_contract::FailureProjection for OriginalRefusal {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                &ConnectorErrorKind::ResourceExhausted,
+            )
+        }
+    }
+
     impl Drop for OriginalRefusal {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);

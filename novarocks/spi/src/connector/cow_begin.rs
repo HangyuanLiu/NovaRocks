@@ -57,6 +57,15 @@ impl Error for ConnectorCowBeginCause {
     }
 }
 
+impl novarocks_failure_contract::FailureProjection for ConnectorCowBeginCause {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Provider(error) => error.failure_fact(),
+            Self::OriginalResult(error) => error.failure_fact(),
+        }
+    }
+}
+
 pub struct ConnectorCowBeginFailure {
     cause: ConnectorCowBeginCause,
     // Original cause destroys before its last neutral holder.

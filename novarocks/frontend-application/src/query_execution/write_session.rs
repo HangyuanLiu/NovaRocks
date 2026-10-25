@@ -324,6 +324,53 @@ impl ConnectorWriteSession {
         receiving.completed_result()
     }
 
+    /// Borrow the selected stable original Rewrite source; no synchronous begin fallback.
+    pub(crate) async fn begin_rewrite_scoped_in(
+        lease: ConnectorWriteStackLease,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
+        request: ConnectorWriteBeginRequest,
+        receiving: &WriteBeginReceiving,
+        original_source: &mut Option<
+            Arc<dyn novarocks_spi::connector::ConnectorRewriteWriteBeginSource>,
+        >,
+        cpu: &dyn novarocks_spi::connector::RewriteCpuPort,
+        metadata_cpu: &Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    ) -> Result<Arc<Self>, ConnectorError> {
+        if original_source.is_some()
+            || !matches!(
+                &request.flavor,
+                ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+            )
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "governed Rewrite begin requires an empty original source and exact flavor",
+            ));
+        }
+        receiving.claim()?;
+        receiving.install_input(lease, catalog_properties, false);
+        let mut request = Some(request);
+        receiving.control().prepare_rewrite_begin_source_in(
+            &mut request,
+            original,
+            original_source,
+        )?;
+        let source = original_source
+            .as_ref()
+            .expect("installed original Rewrite begin source");
+        let mut driver = source.prepare(cpu, metadata_cpu);
+        let status = std::future::poll_fn(|cx| driver.as_mut().poll(cx)).await;
+        drop(driver);
+        status?;
+        let mut plan = None;
+        source.take_plan_in(&mut plan)?;
+        receiving.publish_plan(plan.expect("same original Rewrite begin result"));
+        receiving.adopt_session();
+        receiving.finish_drop();
+        receiving.completed_result()
+    }
+
     pub(crate) fn io_profile(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
@@ -1355,7 +1402,7 @@ fn ensure_finish_context_active(context: &ConnectorRequestContext) -> Result<(),
 /// Bind only an already-admitted attempt sink to the retained write generation.
 /// The owned context preserves its deadline, stop and request/storage capabilities.
 /// COW callers must cover this properties clone before entering this helper.
-fn context_for_write_begin(
+pub(super) fn context_for_write_begin(
     context: ConnectorRequestContext,
     catalog_properties: &novarocks_spi::connector::CatalogProperties,
 ) -> Result<ConnectorRequestContext, ConnectorError> {

@@ -43,6 +43,85 @@ impl MaintenanceCommandExecutor {
         Self { kernel, runtime }
     }
 
+    pub(crate) fn prepare_optimize_action(
+        &self,
+        command: &novarocks_sql::semantic::MaintenanceSqlCommand,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        connector: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
+        novarocks_table_maintenance::runtime::TerminalError,
+    > {
+        let lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
+            command,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+        )?;
+        let crate::table_maintenance::ParsedMaintenanceStatement::SubmitOptimize { name_parts } =
+            lowered
+        else {
+            return Ok(None);
+        };
+        super::rewrite_submission::prepare(
+            &self.kernel,
+            &name_parts,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+            execution,
+            connector,
+        )
+        .map(Some)
+    }
+    pub(crate) fn prepare_direct_rewrite_action(
+        &self,
+        command: &novarocks_sql::semantic::MaintenanceSqlCommand,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        connector: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
+        novarocks_table_maintenance::runtime::TerminalError,
+    > {
+        let lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
+            command,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+        )?;
+        let crate::table_maintenance::ParsedMaintenanceStatement::Execute { name_parts, action } =
+            lowered
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            &action,
+            crate::table_maintenance::ParsedMaintenanceAction::RewriteDataFiles { .. }
+                | crate::table_maintenance::ParsedMaintenanceAction::RewritePositionDeleteFiles { .. }
+        ) {
+            return Ok(None);
+        }
+        super::rewrite_job::direct::prepare(
+            &self.kernel,
+            &name_parts,
+            action,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+            execution,
+            connector,
+        )
+        .map(Some)
+    }
+
     /// Construct the actual original producer, without polling provider I/O.
     /// The caller installs this WHOLE value in its registered Statement Source.
     pub fn prepare_command(
@@ -168,14 +247,15 @@ impl MaintenanceCommandExecutor {
         )?;
         if matches!(
             &lowered,
-            crate::table_maintenance::ParsedMaintenanceStatement::Execute {
-                action: crate::table_maintenance::ParsedMaintenanceAction::RewriteManifests { .. }
-                    | crate::table_maintenance::ParsedMaintenanceAction::ExpireSnapshots { .. },
-                ..
-            }
+            crate::table_maintenance::ParsedMaintenanceStatement::SubmitOptimize { .. }
+                | crate::table_maintenance::ParsedMaintenanceStatement::Execute {
+                    action: crate::table_maintenance::ParsedMaintenanceAction::RewriteManifests { .. }
+                        | crate::table_maintenance::ParsedMaintenanceAction::ExpireSnapshots { .. },
+                    ..
+                }
         ) {
             return Err(
-                "metadata command requires its original async statement source"
+                "governed maintenance command requires its original async statement source"
                     .to_string()
                     .into(),
             );
@@ -215,11 +295,15 @@ pub(crate) fn is_async_metadata_command(
     )?;
     Ok(matches!(
         lowered,
-        crate::table_maintenance::ParsedMaintenanceStatement::Execute {
-            action: crate::table_maintenance::ParsedMaintenanceAction::RewriteManifests { .. }
-                | crate::table_maintenance::ParsedMaintenanceAction::ExpireSnapshots { .. },
-            ..
-        }
+        crate::table_maintenance::ParsedMaintenanceStatement::SubmitOptimize { .. }
+            | crate::table_maintenance::ParsedMaintenanceStatement::Execute {
+                action: crate::table_maintenance::ParsedMaintenanceAction::RewriteManifests { .. }
+                    | crate::table_maintenance::ParsedMaintenanceAction::ExpireSnapshots { .. }
+                    | crate::table_maintenance::ParsedMaintenanceAction::RewriteDataFiles { .. }
+                    | crate::table_maintenance::ParsedMaintenanceAction::RewritePositionDeleteFiles { .. }
+                    | crate::table_maintenance::ParsedMaintenanceAction::RemoveOrphanFiles { .. },
+                ..
+            }
     ))
 }
 

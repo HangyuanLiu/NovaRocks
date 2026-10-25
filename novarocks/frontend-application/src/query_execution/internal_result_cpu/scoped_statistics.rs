@@ -225,6 +225,11 @@ pub(super) enum CreatorCpuMode {
     ForegroundBinding,
     ForegroundRead,
     RewriteProvider,
+    ProviderMetadata,
+    RewriteBound {
+        provider: std::any::TypeId,
+        write_begin: std::any::TypeId,
+    },
 }
 pub(super) struct ScopedProviderCreatorCpu {
     cpu: InternalResultCpu,
@@ -555,7 +560,12 @@ impl StatisticsCpuPort for ScopedProviderCreatorCpu {
                 "Statistics CPU input is empty",
             )
         })?;
-        if matches!(self.mode, CreatorCpuMode::RewriteProvider) {
+        if matches!(
+            self.mode,
+            CreatorCpuMode::RewriteProvider
+                | CreatorCpuMode::RewriteBound { .. }
+                | CreatorCpuMode::ProviderMetadata
+        ) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Statistics input cannot use a Rewrite-only CPU source",
@@ -710,8 +720,12 @@ impl novarocks_spi::connector::ProviderMetadataCpuPort for ScopedProviderCreator
                 "metadata CPU input is empty",
             )
         })?;
-        if !matches!(self.mode, CreatorCpuMode::ForegroundRead)
-            || original.original_source_type_id() != self.source_type
+        if !matches!(
+            self.mode,
+            CreatorCpuMode::ForegroundRead
+                | CreatorCpuMode::ProviderMetadata
+                | CreatorCpuMode::RewriteBound { .. }
+        ) || original.original_source_type_id() != self.source_type
             || original.descriptor() != &self.descriptor
             || original.incarnation() != self.incarnation
         {

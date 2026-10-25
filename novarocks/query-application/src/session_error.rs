@@ -66,6 +66,7 @@ enum QueryServiceErrorBody {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryServiceError {
+    failure_cause: Option<novarocks_failure_contract::SharedFailureCause>,
     body: QueryServiceErrorBody,
     publication_terminal: Option<LakePublicationTerminal>,
     maintenance_publication_disposition: Option<LakePublicationDisposition>,
@@ -94,6 +95,7 @@ impl QueryServiceError {
             maintenance_publication_disposition: None,
             compile_control: None,
             compile_provenance: None,
+            failure_cause: None,
         }
     }
 
@@ -106,6 +108,7 @@ impl QueryServiceError {
             maintenance_publication_disposition: None,
             compile_control: None,
             compile_provenance: None,
+            failure_cause: None,
         }
     }
 
@@ -124,7 +127,24 @@ impl QueryServiceError {
             maintenance_publication_disposition: None,
             compile_control: None,
             compile_provenance: None,
+            failure_cause: None,
         }
+    }
+
+    /// Preserve the originating domain and use its frozen fact and safe detail.
+    pub fn from_failure_cause(cause: novarocks_failure_contract::SharedFailureCause) -> Self {
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        use novarocks_failure_contract::FailureProjection;
+        let mut failure = Self::from_execution_failure(ExecutionFailureInput::new(
+            cause.failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating(cause.detail()),
+            ExecutionFailureSite::Coordinator,
+        ));
+        failure.failure_cause = Some(cause);
+        failure
+    }
+    pub fn failure_cause(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.failure_cause.as_ref()
     }
 
     pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
@@ -147,6 +167,7 @@ impl QueryServiceError {
             maintenance_publication_disposition: None,
             compile_control: None,
             compile_provenance: None,
+            failure_cause: None,
         }
     }
 
@@ -358,9 +379,14 @@ impl fmt::Display for QueryServiceError {
 
 impl std::error::Error for QueryServiceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.compile_control
+        self.failure_cause
             .as_ref()
             .map(|cause| cause as &dyn std::error::Error)
+            .or_else(|| {
+                self.compile_control
+                    .as_ref()
+                    .map(|cause| cause as &dyn std::error::Error)
+            })
     }
 }
 

@@ -35,14 +35,22 @@ mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
+    Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
     Read(scoped_read::ReadBody),
     MetadataBinding {
         provider: IcebergMetadata,
         facts: crate::metadata::IcebergPreparedTableFacts,
         expected: Option<novarocks_spi::connector::ConnectorTableObjectId>,
-        result:
-            Option<Result<novarocks_spi::connector::ConnectorTableObjectBinding, ConnectorError>>,
+        result: Option<
+            Result<
+                (
+                    novarocks_spi::connector::ConnectorTableObjectBinding,
+                    Option<i64>,
+                ),
+                ConnectorError,
+            >,
+        >,
     },
     Schema {
         provider: IcebergMetadata,
@@ -106,6 +114,26 @@ impl Drop for BodyLoan<'_> {
     }
 }
 impl IcebergMetadataCpuOriginal {
+    pub(crate) fn cleanup_source(
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+        work: crate::catalog_control::cleanup_maintenance::async_original::CpuWork,
+    ) -> Arc<Self> {
+        Self::new(descriptor, incarnation, CpuBody::Cleanup(Box::new(work)))
+    }
+    pub(crate) fn take_cleanup_output(
+        &self,
+    ) -> Result<
+        crate::catalog_control::cleanup_maintenance::async_original::CpuOutput,
+        ConnectorError,
+    > {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::Cleanup(work) = &mut loan.body.as_mut().unwrap().body else {
+            return Err(invalid("cleanup CPU source differs"));
+        };
+        work.take_output()
+    }
+
     fn new(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
         incarnation: novarocks_spi::connector::ProviderBindingEpoch,
@@ -139,6 +167,18 @@ impl IcebergMetadataCpuOriginal {
     pub(crate) fn take_binding_result(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorTableObjectBinding, ConnectorError> {
+        self.take_binding_with_snapshot_result()
+            .map(|(binding, _)| binding)
+    }
+    pub(crate) fn take_binding_with_snapshot_result(
+        &self,
+    ) -> Result<
+        (
+            novarocks_spi::connector::ConnectorTableObjectBinding,
+            Option<i64>,
+        ),
+        ConnectorError,
+    > {
         let mut original = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let CpuBody::MetadataBinding { result, .. } = &mut original.as_mut().unwrap().body else {
             panic!("same Statistics metadata binding result");
@@ -225,6 +265,7 @@ impl IcebergMetadataCpuOriginal {
         assert!(!original.started, "one original Statistics CPU execution");
         original.started = true;
         match &mut original.body {
+            CpuBody::Cleanup(work) => work.run(),
             CpuBody::Read(body) => body.run(),
             CpuBody::ReadSnapshot(body) => body.run(),
             CpuBody::MetadataBinding {
@@ -233,7 +274,7 @@ impl IcebergMetadataCpuOriginal {
                 expected,
                 result,
             } => {
-                *result = Some(provider.create_statistics_binding_borrowed(facts, expected));
+                *result = Some(provider.create_binding_with_snapshot_borrowed(facts, expected));
             }
             CpuBody::Schema {
                 provider,
@@ -463,6 +504,16 @@ async fn run(
     cpu.submit_in(&mut input)?;
     std::future::poll_fn(|cx| cpu.poll_finished(cx)).await
 }
+pub(crate) async fn run_provider_metadata(
+    cpu: &Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    source: &Arc<IcebergMetadataCpuOriginal>,
+) -> Result<(), ConnectorError> {
+    let mut input = Some(novarocks_spi::connector::ProviderMetadataCpuInput(
+        source.clone(),
+    ));
+    cpu.submit_metadata_in(&mut input)?;
+    std::future::poll_fn(|cx| cpu.poll_finished(cx)).await
+}
 pub(crate) async fn run_binding(
     cpu: &Arc<dyn StatisticsCpuPort>,
     source: &Arc<IcebergMetadataCpuOriginal>,
@@ -538,7 +589,9 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
             assert!(
                 matches!(
                     &body.as_ref().expect("same metadata source").body,
-                    CpuBody::MetadataBinding { .. } | CpuBody::ReadSnapshot(_)
+                    CpuBody::MetadataBinding { .. }
+                        | CpuBody::ReadSnapshot(_)
+                        | CpuBody::Cleanup(_)
                 ) || matches!(&body.as_ref().unwrap().body,CpuBody::Read(read) if read.phase<=1
                 ),
                 "metadata source cannot dispatch a Statistics product phase"

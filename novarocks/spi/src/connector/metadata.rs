@@ -1566,6 +1566,30 @@ pub trait ConnectorMetadata: Send + Sync {
         None
     }
 
+    /// Capture the binding and current snapshot from ONE original metadata
+    /// observation and selected CPU phase. Snapshot is an actual Provider fact,
+    /// never a second catalog lookup or an interpretation of the opaque token.
+    /// The caller keeps the original CPU owner through actual exit.
+    fn capture_table_object_with_snapshot_cpu(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+        _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no governed original snapshot binding author",
+            ))
+        })
+    }
+
     fn instance_id(&self) -> &ConnectorInstanceId;
 
     /// Await the original provider's real I/O before borrowing any synchronous
@@ -1823,6 +1847,52 @@ pub trait ConnectorMetadata: Send + Sync {
                 super::ConnectorErrorKind::Unsupported,
                 "connector metadata does not support asynchronous physical table object rebinding",
             ))
+        })
+    }
+
+    /// Reobserve the current physical object using the caller's original CPU source.
+    /// Missing/replaced facts remain distinct from an ordinary provider error.
+    fn rebind_table_object_with_cpu(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+        cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let expected = request.expected_object_id;
+            let (binding, _) = self
+                .capture_table_object_with_snapshot_cpu(
+                    ConnectorTableObjectCaptureRequest {
+                        table: request.table,
+                        resolution: request.resolution,
+                        selector: request.selector,
+                        context: request.context,
+                    },
+                    cpu,
+                )
+                .await
+                .map_err(|error| {
+                    if error.kind() == super::ConnectorErrorKind::NotFound {
+                        ConnectorError::table_object_binding(
+                            super::ConnectorTableObjectBindingFailure::Missing,
+                            "table no longer resolves for its original physical object binding",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if binding.object_id != expected {
+                return Err(ConnectorError::table_object_binding(
+                    super::ConnectorTableObjectBindingFailure::Replaced,
+                    "table no longer matches its original physical object binding",
+                ));
+            }
+            Ok(binding)
         })
     }
 

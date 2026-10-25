@@ -29,6 +29,7 @@
 mod attempt;
 mod contract;
 mod error;
+mod execution;
 mod limits;
 mod provider;
 mod range;
@@ -42,6 +43,11 @@ pub use contract::{
     StateStore, StoreIdentity, StoreRevision, Value, VersionToken, WriteTransaction,
 };
 pub use error::{StateStoreError, StateStoreErrorKind};
+pub use execution::{
+    StateStoreBlockingExit, StateStoreBlockingOrigin, StateStoreBlockingOriginal,
+    StateStoreBlockingPhase, StateStoreBlockingRequest, StateStoreBlockingSlot,
+    StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreExecutionPort,
+};
 pub use limits::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
     MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,

@@ -674,8 +674,107 @@ impl<F> std::fmt::Debug for QueryBlockingPrepareRefusal<F> {
     }
 }
 
+/// A named, concrete blocking source. Its business input/result must already
+/// reside in the caller's stable original custody; this borrowed call is never
+/// the unique owner. Implement on the provider's private purpose type, not a
+/// caller-supplied closure. This trait grants no workload or provider authority.
+pub trait QueryBlockingOriginal: Send + Sync + 'static {
+    fn run_original(&self);
+}
+
+/// Purpose-typed view of the existing ordinary pool. It has no new worker,
+/// queue, source registry, finite stamp, or workload grant. The composition
+/// author retains responsibility for the concrete original's authority.
+pub struct QueryBlockingOriginalExecutor<O> {
+    executor: QueryBlockingExecutor,
+    _original: std::marker::PhantomData<fn() -> O>,
+}
+impl<O> Clone for QueryBlockingOriginalExecutor<O> {
+    fn clone(&self) -> Self {
+        Self {
+            executor: self.executor.clone(),
+            _original: std::marker::PhantomData,
+        }
+    }
+}
+fn original_call<O: QueryBlockingOriginal>(original: Arc<O>) -> impl FnOnce() -> CpuResult + Send {
+    move || {
+        original.run_original();
+        Box::new(()) as CpuResult
+    }
+}
+fn original_call_type<O: QueryBlockingOriginal>() -> std::any::TypeId {
+    // Name the same opaque call type without constructing an input or
+    // invoking provider code.
+    fn returned_type<A, F: 'static>(_: fn(A) -> F) -> std::any::TypeId {
+        std::any::TypeId::of::<F>()
+    }
+    returned_type(original_call::<O>)
+}
+impl<O: QueryBlockingOriginal> QueryBlockingOriginalExecutor<O> {
+    /// Same cancellable Semaphore wait; callers select their original deadline
+    /// and cancellation around this F while keeping Original outside it.
+    pub async fn reserve(&self) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        self.executor.reserve().await
+    }
+    pub fn try_reserve(&self) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        self.executor.try_reserve()
+    }
+    /// Installs the independent result/exit receiver before queue publication.
+    /// Refusal leaves the original, reservation and receiving slot untouched.
+    pub fn prepare_in(
+        &self,
+        reservation: &QueryBlockingReservation,
+        original: &Arc<O>,
+        receipt: &mut Option<QueryBlockingReceipt<()>>,
+    ) -> Result<QueryBlockingPreparedJob, QueryBlockingPublishRefusal> {
+        if self.executor.handle.closed_factory_descriptor().is_some() {
+            return Err(QueryBlockingPublishRefusal::FactoryMismatch);
+        }
+        if receipt.is_some() {
+            return Err(QueryBlockingPublishRefusal::Empty);
+        }
+        if !self.executor.handle.same_pool(&reservation.inner) {
+            return Err(QueryBlockingPublishRefusal::ForeignPool);
+        }
+        let (prepared, original_receipt, exit) = self
+            .executor
+            .handle
+            .prepare(BoundedWorkerJob::new(original_call(Arc::clone(original))));
+        *receipt = Some(QueryBlockingReceipt {
+            receipt: Some(original_receipt),
+            exit,
+            _result: std::marker::PhantomData,
+        });
+        Ok(QueryBlockingPreparedJob {
+            inner: Some(prepared),
+        })
+    }
+    /// Silent same-FIFO publication. Every refusal preserves both original
+    /// slots. Notify only after the caller records acceptance outside its lock.
+    /// On a normal unpublished refusal, destroy prepared before reservation;
+    /// only normal return proves NeverPublishedReturned. Its unused exit
+    /// header remains Pending: no worker ran and no actual exit is invented.
+    pub fn publish_in(
+        &self,
+        reservation: &mut Option<QueryBlockingReservation>,
+        prepared: &mut Option<QueryBlockingPreparedJob>,
+    ) -> Result<QueryBlockingPublication, QueryBlockingPublishRefusal> {
+        let original = prepared
+            .as_mut()
+            .ok_or(QueryBlockingPublishRefusal::Empty)?;
+        let inner = self.executor.handle.publish_ordinary_in(
+            &mut original.inner,
+            reservation,
+            original_call_type::<O>(),
+        )?;
+        prepared.take();
+        Ok(QueryBlockingPublication { inner })
+    }
+}
+
 /// The actual move-only boxed call and its one existing completion sender.
-/// The caller must pay captures/backing before preparation, after its grant.
+/// The caller retains the original source and actual input before preparation.
 #[must_use = "Publish or dispose the same unexecuted input under its original custody"]
 pub struct QueryBlockingPreparedJob {
     inner: Option<bounded_worker::BoundedWorkerPrepared<CpuResult>>,
@@ -1016,6 +1115,21 @@ impl QueryBlockingExecutor {
             return Err(QueryBlockingReserveRefusal::FactoryMismatch);
         }
         Ok(QueryBlockingReservation { inner })
+    }
+
+    /// Selects a named original on this ordinary executor. This is a typed
+    /// call/pool check only; the role/Action must first install its stable
+    /// strong receiver and validate the selected provider/purpose separately.
+    pub fn original_executor<O: QueryBlockingOriginal>(
+        &self,
+    ) -> Result<QueryBlockingOriginalExecutor<O>, QueryBlockingReserveRefusal> {
+        if self.handle.closed_factory_descriptor().is_some() {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
+        Ok(QueryBlockingOriginalExecutor {
+            executor: self.clone(),
+            _original: std::marker::PhantomData,
+        })
     }
 
     /// The original caller supplies an empty stable receipt slot before any
@@ -1790,6 +1904,322 @@ mod joint_queue_tests {
         drop(waiting);
         drop(held);
         shutdown(&mut owner).await;
+    }
+
+    struct OrdinaryOriginal {
+        input: String,
+        address: usize,
+        runs: AtomicUsize,
+        output: Mutex<Option<usize>>,
+    }
+    impl OrdinaryOriginal {
+        fn new() -> Arc<Self> {
+            let input = String::from("same private opening input");
+            let address = input.as_ptr() as usize;
+            Arc::new(Self {
+                input,
+                address,
+                runs: AtomicUsize::new(0),
+                output: Mutex::new(None),
+            })
+        }
+    }
+    impl QueryBlockingOriginal for OrdinaryOriginal {
+        fn run_original(&self) {
+            assert_eq!(self.input.as_ptr() as usize, self.address);
+            assert_eq!(self.runs.fetch_add(1, Ordering::SeqCst), 0);
+            *self.output.lock().unwrap() = Some(self.input.len());
+        }
+    }
+    struct OtherOrdinaryOriginal;
+    impl QueryBlockingOriginal for OtherOrdinaryOriginal {
+        fn run_original(&self) {
+            panic!("foreign purpose must not execute");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_full_wait_cancels_without_moving_input_then_same_queue_runs_once() {
+        let (mut owner, executor) = worker();
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        let original = OrdinaryOriginal::new(); // stable original receiver, outside each waiting F
+        let pointer = Arc::as_ptr(&original);
+        let mut held: Vec<_> = (0..3).map(|_| executor.try_reserve().unwrap()).collect();
+        let mut waiting = Box::pin(port.reserve());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(waiting); // withdraw only this queue waiter, not the original input
+        assert_eq!(Arc::as_ptr(&original), pointer);
+        assert_eq!(original.runs.load(Ordering::SeqCst), 0);
+        drop(held.pop());
+        let mut reservation = Some(port.reserve().await.unwrap());
+        assert!(matches!(
+            executor.try_reserve(),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        let mut receipt = None;
+        let mut prepared = Some(
+            port.prepare_in(reservation.as_ref().unwrap(), &original, &mut receipt)
+                .unwrap(),
+        );
+        assert!(receipt.is_some());
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        assert!(original.output.lock().unwrap().is_none());
+        port.publish_in(&mut reservation, &mut prepared)
+            .unwrap()
+            .notify();
+        assert!(reservation.is_none() && prepared.is_none());
+        let mut receipt = receipt.unwrap();
+        result(&mut receipt).await.unwrap();
+        exited(&receipt).await.unwrap();
+        assert_eq!(original.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(*original.output.lock().unwrap(), Some(original.input.len()));
+        assert_eq!(Arc::as_ptr(&original), pointer);
+        drop(held);
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_wait_uses_callers_absolute_deadline_without_publication() {
+        let (mut owner, executor) = worker();
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        let original = OrdinaryOriginal::new();
+        let held: Vec<_> = (0..3).map(|_| port.try_reserve().unwrap()).collect();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(
+            tokio::time::timeout_at(deadline.into(), port.reserve())
+                .await
+                .is_err()
+        );
+        assert_eq!(original.runs.load(Ordering::SeqCst), 0);
+        assert!(original.output.lock().unwrap().is_none());
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        drop(held);
+        // The elapsed caller's wait did not retain a queue position.
+        drop(port.try_reserve().unwrap());
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_stable_result_precedes_actual_exit_and_shutdown_keeps_same_worker() {
+        let (mut owner, executor) = worker();
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        let original = OrdinaryOriginal::new();
+        let mut reservation = Some(port.try_reserve().unwrap());
+        let mut receipt = None;
+        let mut prepared = Some(
+            port.prepare_in(reservation.as_ref().unwrap(), &original, &mut receipt)
+                .unwrap(),
+        );
+        let mut receipt = receipt.unwrap();
+        let (entered, did_enter) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let wake = Waker::from(Arc::new(PausedWake {
+            entered,
+            release: Mutex::new(released),
+            once: AtomicBool::new(false),
+        }));
+        assert!(
+            receipt
+                .poll_result(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        port.publish_in(&mut reservation, &mut prepared)
+            .unwrap()
+            .notify();
+        receive(&did_enter).await;
+        assert_eq!(*original.output.lock().unwrap(), Some(original.input.len()));
+        result(&mut receipt).await.unwrap();
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(executor.handle.snapshot().running, 1);
+        // Pop has returned the original queue position, independently of exit.
+        let held: Vec<_> = (0..3).map(|_| executor.try_reserve().unwrap()).collect();
+        assert!(
+            owner
+                .shutdown_until(Instant::now() + Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(original.runs.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        exited(&receipt).await.unwrap();
+        drop(held);
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_foreign_pool_purpose_and_unpublished_close_preserve_receivers() {
+        let (mut owner, executor) = worker();
+        let (mut foreign_owner, foreign) = worker();
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        let wrong = executor
+            .original_executor::<OtherOrdinaryOriginal>()
+            .unwrap();
+        let foreign = foreign.original_executor::<OrdinaryOriginal>().unwrap();
+        let original = OrdinaryOriginal::new();
+        let mut reservation = Some(port.try_reserve().unwrap());
+        let mut receipt = None;
+        assert_eq!(
+            foreign
+                .prepare_in(reservation.as_ref().unwrap(), &original, &mut receipt)
+                .err(),
+            Some(QueryBlockingPublishRefusal::ForeignPool)
+        );
+        assert!(receipt.is_none());
+        let mut prepared = Some(
+            port.prepare_in(reservation.as_ref().unwrap(), &original, &mut receipt)
+                .unwrap(),
+        );
+        assert_eq!(
+            foreign.publish_in(&mut reservation, &mut prepared).err(),
+            Some(QueryBlockingPublishRefusal::ForeignPool)
+        );
+        assert_eq!(
+            wrong.publish_in(&mut reservation, &mut prepared).err(),
+            Some(QueryBlockingPublishRefusal::FactoryMismatch)
+        );
+        assert!(reservation.is_some() && prepared.is_some() && receipt.is_some());
+        owner.request_shutdown_for_process_exit();
+        assert_eq!(
+            port.publish_in(&mut reservation, &mut prepared).err(),
+            Some(QueryBlockingPublishRefusal::Closed)
+        );
+        assert!(reservation.is_some() && prepared.is_some());
+        drop(prepared.take()); // normal never-published return, not worker actual exit
+        drop(reservation.take());
+        assert_eq!(original.runs.load(Ordering::SeqCst), 0);
+        assert!(
+            receipt
+                .as_ref()
+                .unwrap()
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        shutdown(&mut owner).await;
+        shutdown(&mut foreign_owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_accepted_before_close_is_destroyed_on_same_worker_without_running() {
+        let (mut owner, executor) = worker();
+        let parked = park_all_legacy_workers(&executor).await;
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        let original = OrdinaryOriginal::new();
+        let mut reservation = Some(port.try_reserve().unwrap());
+        let mut receipt = None;
+        let mut prepared = Some(
+            port.prepare_in(reservation.as_ref().unwrap(), &original, &mut receipt)
+                .unwrap(),
+        );
+        port.publish_in(&mut reservation, &mut prepared)
+            .unwrap()
+            .notify();
+        assert_eq!(executor.handle.snapshot().queued, 1);
+        owner.request_shutdown_for_process_exit();
+        let mut receipt = receipt.unwrap();
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        for release in parked {
+            release.send(()).unwrap();
+        }
+        assert!(matches!(
+            result(&mut receipt).await,
+            Err(QueryBlockingFailure::ExecutorClosed)
+        ));
+        exited(&receipt).await.unwrap();
+        assert_eq!(original.runs.load(Ordering::SeqCst), 0);
+        assert!(original.output.lock().unwrap().is_none());
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_view_cannot_borrow_later_finite_factory_registration() {
+        let (mut owner, executor) = worker();
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        owner
+            .bind_internal_result_closed_factory_for_composition(fixture_closed_work)
+            .unwrap();
+        assert!(matches!(
+            port.try_reserve(),
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
+        assert!(matches!(
+            port.reserve().await,
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
+        assert!(matches!(
+            executor.original_executor::<OrdinaryOriginal>(),
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_original_notification_panic_preserves_raw_cause_and_unproven_exit() {
+        let (mut owner, executor) = worker();
+        let parked = park_all_legacy_workers(&executor).await;
+        let port = executor.original_executor::<OrdinaryOriginal>().unwrap();
+        let original = OrdinaryOriginal::new();
+        let mut reservation = Some(port.try_reserve().unwrap());
+        let mut receipt = None;
+        let mut prepared = Some(
+            port.prepare_in(reservation.as_ref().unwrap(), &original, &mut receipt)
+                .unwrap(),
+        );
+        let mut receipt = receipt.unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let wake = Waker::from(Arc::new(PanicOnceWake {
+            armed: AtomicBool::new(true),
+            dropped: Arc::clone(&dropped),
+        }));
+        assert!(
+            receipt
+                .poll_result(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        port.publish_in(&mut reservation, &mut prepared)
+            .unwrap()
+            .notify();
+        for release in parked {
+            release.send(()).unwrap();
+        }
+        assert_eq!(
+            exited(&receipt).await,
+            Err(QueryBlockingActualExitFailure::FailedUnproven)
+        );
+        result(&mut receipt).await.unwrap(); // stable business result does not erase notification failure
+        let cause = receipt.actual_exit_failure().unwrap();
+        assert!(cause.original_payload_is::<PanicTag>());
+        assert!(
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        let failure = owner.take_worker_failure().unwrap();
+        assert!(failure.cause().unwrap().shares_original_with(&cause));
+        assert_eq!(original.runs.load(Ordering::SeqCst), 1);
+        drop(failure);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(receipt);
+        drop(cause);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     fn joint_fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {

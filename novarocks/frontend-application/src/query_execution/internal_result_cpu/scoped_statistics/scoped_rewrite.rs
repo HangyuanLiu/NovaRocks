@@ -20,7 +20,110 @@ use super::*;
 use novarocks_spi::connector::{ConnectorDistributedRewriteLease, RewriteCpuInput, RewriteCpuPort};
 
 impl InternalResultCpu {
-    pub(crate) fn rewrite_cohort_cpu_port(
+    /// Two typed facades, one original serial slot. Metadata accepts only the
+    /// selected first-party binding input; Rewrite accepts only its selected
+    /// Provider source or the closed first-party FE cohort/seal input.
+    pub(crate) fn rewrite_cpu_ports(
+        &self,
+        scope: &WorkScope,
+        window: ResultWindowAlias,
+        lease: &ConnectorDistributedRewriteLease,
+        write: &novarocks_catalog_application::ConnectorWriteStackLease,
+        cancellation: QueryCancellationView,
+        runtime: tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<
+        (
+            Arc<dyn RewriteCpuPort>,
+            Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        ),
+        WorkError,
+    > {
+        if !window.is_for_scope(scope) || window.class() != ResultWindowClass::Internal {
+            return Err(WorkError::Conflict);
+        }
+        scope.check()?;
+        let _ = self.provider_creator_source(scope)?;
+        let provider = lease
+            .scoped_cpu_source_type_id()
+            .map_err(|_| WorkError::InvalidConfig("selected Rewrite CPU source is unsupported"))?;
+        let source_type = lease.metadata_cpu_source_type_id().map_err(|_| {
+            WorkError::InvalidConfig("selected metadata binding CPU author is unsupported")
+        })?;
+        let (write_key, write_begin) =
+            write
+                .session()
+                .rewrite_begin_cpu_author()
+                .ok_or(WorkError::InvalidConfig(
+                    "selected WriteControl has no governed Rewrite begin author",
+                ))?;
+        if write_key.instance_id != lease.descriptor().instance_id
+            || write_key.incarnation != lease.incarnation()
+        {
+            return Err(WorkError::Conflict);
+        }
+        let source = Arc::new(ScopedProviderCreatorCpu {
+            cpu: self.clone(),
+            scope: scope.clone(),
+            window,
+            descriptor: lease.descriptor().clone(),
+            incarnation: lease.incarnation(),
+            source_type,
+            mode: CreatorCpuMode::RewriteBound {
+                provider,
+                write_begin,
+            },
+            cancellation,
+            runtime,
+            wake,
+            state: std::sync::Mutex::new(CreatorPortState {
+                job: None,
+                busy: false,
+            }),
+        });
+        Ok((source.clone(), source))
+    }
+
+    pub(crate) fn provider_metadata_cpu_port(
+        &self,
+        scope: &WorkScope,
+        window: ResultWindowAlias,
+        lease: &ConnectorDistributedRewriteLease,
+        cancellation: QueryCancellationView,
+        runtime: tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>, WorkError> {
+        if !window.is_for_scope(scope)
+            || !matches!(
+                window.class(),
+                ResultWindowClass::Local | ResultWindowClass::Client
+            )
+        {
+            return Err(WorkError::Conflict);
+        }
+        scope.check()?;
+        let _ = self.provider_creator_source(scope)?;
+        let source_type = lease.metadata_cpu_source_type_id().map_err(|_| {
+            WorkError::InvalidConfig("selected metadata binding CPU author is unsupported")
+        })?;
+        Ok(Arc::new(ScopedProviderCreatorCpu {
+            cpu: self.clone(),
+            scope: scope.clone(),
+            window,
+            descriptor: lease.descriptor().clone(),
+            incarnation: lease.incarnation(),
+            source_type,
+            mode: CreatorCpuMode::ProviderMetadata,
+            cancellation,
+            runtime,
+            wake,
+            state: std::sync::Mutex::new(CreatorPortState {
+                job: None,
+                busy: false,
+            }),
+        }))
+    }
+    pub(crate) fn rewrite_cpu_port(
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
@@ -33,10 +136,10 @@ impl InternalResultCpu {
             return Err(WorkError::Conflict);
         }
         scope.check()?;
-        self.provider_creator_source(scope)?;
-        let source_type = std::any::TypeId::of::<
-            crate::query_execution::maintenance::rewrite_preparation::RewriteCohortCpuOriginal,
-        >();
+        let _ = self.provider_creator_source(scope)?;
+        let source_type = lease
+            .scoped_cpu_source_type_id()
+            .map_err(|_| WorkError::InvalidConfig("original Rewrite CPU factory is unsupported"))?;
         Ok(Arc::new(ScopedProviderCreatorCpu {
             cpu: self.clone(),
             scope: scope.clone(),
@@ -54,11 +157,6 @@ impl InternalResultCpu {
             }),
         }))
     }
-    pub(crate) fn rewrite_port_metadata_bytes_for_composition() -> Result<NonZeroU64, WorkError> {
-        // Same concrete header and original serial slot as Statistics. No
-        // second job, forwarder, physical factory, or alias authority exists.
-        Self::statistics_port_metadata_bytes_for_composition()
-    }
 }
 impl RewriteCpuPort for ScopedProviderCreatorCpu {
     fn submit_in(&self, input: &mut Option<RewriteCpuInput>) -> Result<(), ConnectorError> {
@@ -68,8 +166,19 @@ impl RewriteCpuPort for ScopedProviderCreatorCpu {
                 "Rewrite CPU input is empty",
             )
         })?;
-        if !matches!(self.mode, CreatorCpuMode::RewriteProvider)
-            || original.original_source_type_id() != self.source_type
+        let actual = original.original_source_type_id();
+        let fe = std::any::TypeId::of::<
+            crate::query_execution::maintenance::rewrite_preparation::RewriteCohortCpuOriginal,
+        >();
+        let selected = match self.mode {
+            CreatorCpuMode::RewriteProvider => actual == self.source_type,
+            CreatorCpuMode::RewriteBound {
+                provider,
+                write_begin,
+            } => actual == provider || actual == fe || actual == write_begin,
+            _ => false,
+        };
+        if !selected
             || original.descriptor() != &self.descriptor
             || original.incarnation() != self.incarnation
         {
@@ -116,9 +225,5 @@ impl RewriteCpuPort for ScopedProviderCreatorCpu {
             .job
             .as_ref()
             .and_then(ProviderReadCpuJob::health_failure)
-    }
-    fn metadata_bytes(&self) -> Result<NonZeroU64, ConnectorError> {
-        InternalResultCpu::rewrite_port_metadata_bytes_for_composition()
-            .map_err(|e| ConnectorError::from_domain(ConnectorErrorKind::ResourceExhausted, e))
     }
 }

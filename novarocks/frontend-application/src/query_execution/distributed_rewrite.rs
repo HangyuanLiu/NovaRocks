@@ -225,7 +225,7 @@ pub struct ConnectorDistributedRewriteSession {
 }
 
 struct ConnectorDistributedRewriteSessionInner {
-    plan: ConnectorDistributedRewritePlan,
+    plan: Arc<ConnectorDistributedRewritePlan>,
     lease: ConnectorDistributedRewriteLease,
     write_session: Option<Arc<ConnectorWriteSession>>,
 }
@@ -254,7 +254,7 @@ impl ConnectorDistributedRewriteSession {
         }
         Ok(Self {
             inner: Arc::new(ConnectorDistributedRewriteSessionInner {
-                plan,
+                plan: Arc::new(plan),
                 lease,
                 write_session: None,
             }),
@@ -292,13 +292,60 @@ impl ConnectorDistributedRewriteSession {
 
         Ok(Self {
             inner: Arc::new(ConnectorDistributedRewriteSessionInner {
-                plan,
+                plan: Arc::new(plan),
                 lease,
                 write_session,
             }),
         })
     }
 
+    /// Pure seal of the exact accepted session. Its original begin receiver
+    /// remains an affirmative owner independently of this borrowed CPU work.
+    pub(crate) fn from_original_session(
+        plan: Arc<ConnectorDistributedRewritePlan>,
+        lease: ConnectorDistributedRewriteLease,
+        write_session: Option<Arc<ConnectorWriteSession>>,
+    ) -> Result<Self, ConnectorError> {
+        lease.validate_plan(plan.as_ref())?;
+        match (&write_session, plan.cohorts().is_empty()) {
+            (None, true) => {}
+            (Some(session), false) => validate_rewrite_target_groups(
+                plan.as_ref(),
+                session
+                    .targets()
+                    .iter()
+                    .map(|target| (target.ordinal(), target.rewrite_group_digest())),
+            )?,
+            _ => {
+                return Err(invalid(
+                    "Rewrite original session differs from its actual empty/nonempty plan",
+                ));
+            }
+        }
+        Ok(Self {
+            inner: Arc::new(ConnectorDistributedRewriteSessionInner {
+                plan,
+                lease,
+                write_session,
+            }),
+        })
+    }
+    pub(crate) fn original_source_layout() -> std::alloc::Layout {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            ConnectorDistributedRewriteSessionInner,
+        >())
+        .expect("fixed Rewrite session layout")
+    }
+    /// Borrowed invoice for the exact original request constructor below.
+    /// Typed value bindings clone their two immutable handles; Arrow root
+    /// Field names/maps and the actual request Vecs are owned here.
+    pub(crate) fn original_begin_request_from_identity(
+        plan: &ConnectorDistributedRewritePlan,
+        table: &novarocks_spi::connector::ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
+        rewrite_begin_request_from_identity(plan, table, context)
+    }
     pub fn plan(&self) -> &ConnectorDistributedRewritePlan {
         &self.inner.plan
     }
@@ -447,6 +494,14 @@ fn rewrite_begin_request(
     table: &novarocks_spi::connector::ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
+    rewrite_begin_request_from_identity(plan, &table.identity, context)
+}
+
+fn rewrite_begin_request_from_identity(
+    plan: &ConnectorDistributedRewritePlan,
+    table: &novarocks_spi::connector::ConnectorTableIdentity,
+    context: ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
     use novarocks_spi::connector::ConnectorWriteAdmissionPurpose;
 
     let mut cohorts = plan.cohorts().iter();
@@ -461,7 +516,7 @@ fn rewrite_begin_request(
     Ok(
         novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: Arc::from(
-                format!("{}.{}", table.identity.namespace, table.identity.table).as_str(),
+                format!("{}.{}", table.namespace, table.table).as_str(),
             ),
             target_ref: preparation.target_ref().clone(),
             intent: preparation.intent(),

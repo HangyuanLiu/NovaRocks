@@ -71,6 +71,19 @@ struct FrontendBackgroundMaintenanceAttemptFactory {
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
+    fn begin_original_root_maintenance_attempt(
+        &self,
+        owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<BackgroundMaintenanceAttempt, String> {
+        core_capabilities::original_background_maintenance_attempt(
+            self.role,
+            self.topology.clone(),
+            self.runtime_policy.max_attempt_duration(),
+            &self.runtime,
+            owner,
+        )
+    }
+
     fn begin_automatic_maintenance_attempt(
         &self,
         capacity: Option<
@@ -499,7 +512,25 @@ async fn build_frontend_role_products(
         Handle::current(),
         host.constant_policy(),
         host.static_plan_carrier(),
-    );
+    )
+    .with_rewrite_runtime(crate::query_execution::kernels::MaintenanceRewriteRuntime {
+        client: host.logical_execution_client(),
+        launcher: logical_execution_launcher.clone(),
+        completion: crate::query_execution::completion_facts::CompletionFactOwners::new(
+            catalog_service.clone(),
+            Some(catalog_application.clone()),
+            typed_connector_control.clone(),
+            unified_statistics.clone(),
+            mv_candidate_reader.clone(),
+            mv_storage_observation.clone(),
+            host.connector_blocking_io_supervisor(),
+        ),
+        execution: (
+            host.connector_blocking_io_supervisor(),
+            host.write_data_runtime(),
+        ),
+    });
+
     let maintenance_engine = core_capabilities::background_maintenance_engine(
         maintenance_ports.clone(),
         Arc::new(FrontendBackgroundMaintenanceAttemptFactory {

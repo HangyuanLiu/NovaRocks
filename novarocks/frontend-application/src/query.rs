@@ -503,7 +503,9 @@ fn maintenance_command_error(
         _ => None,
     };
     let control = error.compile_control;
-    let command = if let Some(input) = error.execution_failure {
+    let command = if let Some(cause) = error.failure_cause {
+        CommandError::from_failure_cause(cause)
+    } else if let Some(input) = error.execution_failure {
         CommandError::from_execution_failure(input)
     } else {
         match control.clone() {
@@ -841,6 +843,11 @@ impl SpecializedStatementRoute for TypedCommandRoute {
 }
 
 enum RoutedExecutionError {
+    FailureCause {
+        cause: novarocks_failure_contract::SharedFailureCause,
+        maintenance_publication_disposition:
+            Option<novarocks_spi::connector::LakePublicationDisposition>,
+    },
     Execution {
         input: Box<novarocks_query_application::execution_error::ExecutionFailureInput>,
         terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
@@ -951,6 +958,17 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
 
 fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceError {
     match error {
+        RoutedExecutionError::FailureCause {
+            cause,
+            maintenance_publication_disposition,
+        } => {
+            let service = QueryServiceError::from_failure_cause(cause);
+            if let Some(disposition) = maintenance_publication_disposition {
+                service.attach_maintenance_publication_disposition(disposition)
+            } else {
+                service
+            }
+        }
         RoutedExecutionError::Execution {
             input,
             terminal,
@@ -1001,9 +1019,10 @@ fn selected_execution_or_worker_fallback(
     fallback: QueryServiceError,
 ) -> QueryServiceError {
     match result {
-        Err(error @ RoutedExecutionError::Execution { .. }) => {
-            routed_execution_service_error(error)
-        }
+        Err(
+            error @ (RoutedExecutionError::Execution { .. }
+            | RoutedExecutionError::FailureCause { .. }),
+        ) => routed_execution_service_error(error),
         Err(RoutedExecutionError::MaintenancePublication {
             disposition,
             compile_control,
@@ -1134,6 +1153,12 @@ async fn execute_product_statement(
 
 fn product_command_error(error: CommandError) -> RoutedExecutionError {
     let disposition = error.publication_disposition();
+    if let Some(cause) = error.failure_cause() {
+        return RoutedExecutionError::FailureCause {
+            cause: cause.clone(),
+            maintenance_publication_disposition: disposition,
+        };
+    }
     let control = error.compile_control_error();
     let input = error.execution_failure().cloned().or_else(|| {
         // An original Source is already owner-selected, unlike a local caller
@@ -5956,5 +5981,41 @@ mod maintenance_selected_failure_tests {
             Some(LakePublicationDisposition::CommitUnknown)
         );
         assert!(service.message().contains("do not retry statement"));
+    }
+}
+
+#[cfg(test)]
+mod maintenance_failure_cause_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+    #[test]
+    fn command_projection_and_late_fallback_keep_original_source_and_publication() {
+        let mutation = novarocks_spi::connector::ConnectorMutationFailure::from_connector(
+            novarocks_spi::connector::ConnectorError::compile_interruption(
+                CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic),
+            ),
+        );
+        let cause = SharedFailureCause::new(mutation);
+        let fact = cause.failure_fact();
+        let original = novarocks_table_maintenance::runtime::TerminalError::commit_unknown(
+            "publication unknown",
+        )
+        .with_failure_cause(Some(cause.clone()));
+        let routed = product_command_error(maintenance_command_error(original));
+        let service =
+            selected_execution_or_worker_fallback(Err(routed), internal_error("late stop"));
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(service.execution_failure().unwrap().fact(), fact);
+        assert_eq!(
+            service.maintenance_publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::CommitUnknown)
+        );
+        assert!(service.compile_control_error().is_none());
+        assert_eq!(
+            std::error::Error::source(&service)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>(),
+            Some(&cause)
+        );
     }
 }

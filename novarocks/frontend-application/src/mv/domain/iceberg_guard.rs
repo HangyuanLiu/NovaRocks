@@ -214,6 +214,80 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_planning_lease_and_context_a
         })
         .await
         .map_err(|error| format!("bind MV mutation guard target: {error}"))?;
+    reject_bound_iceberg_mv_table_async(
+        exact_lease,
+        readiness,
+        target,
+        mutation,
+        context,
+        identity,
+        binding,
+    )
+    .await
+}
+
+/// Same original guard algorithm, with the selected generation's governed binding CPU.
+pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+    _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+    cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+) -> Result<(), String> {
+    if target.provider_id.as_str() != "iceberg" {
+        return Ok(());
+    }
+
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
+    if exact_lease.binding().descriptor().instance_id != instance_id {
+        return Err(
+            "MV mutation guard planning lease does not match the target connector".to_string(),
+        );
+    }
+    let context = crate::connector::context_for_planning_lease(exact_lease, context)?;
+    let identity = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    let (binding, _) = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_with_snapshot_cpu(
+            ConnectorTableObjectCaptureRequest {
+                table: identity.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context.clone(),
+            },
+            cpu,
+        )
+        .await
+        .map_err(|error| format!("bind governed MV mutation guard target: {error}"))?;
+    reject_bound_iceberg_mv_table_async(
+        exact_lease,
+        readiness,
+        target,
+        mutation,
+        context,
+        identity,
+        binding,
+    )
+    .await
+}
+
+async fn reject_bound_iceberg_mv_table_async(
+    exact_lease: &ConnectorControlPlanningLease,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+    identity: ConnectorTableIdentity,
+    binding: novarocks_spi::connector::ConnectorTableObjectBinding,
+) -> Result<(), String> {
     if binding.metadata.identity != identity {
         return Err(
             "connector loaded a different table while checking the MV mutation guard".to_string(),

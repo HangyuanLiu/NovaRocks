@@ -1445,6 +1445,47 @@ pub struct ConnectorWriteSessionReconcileRequest<'a> {
 /// methods own external catalog effects. None is reachable from a backend role
 /// binding.
 pub trait ConnectorWriteControl: Send + Sync {
+    /// Initial selected routes of THIS original Rewrite-begin factory. This
+    /// reports no SDK layout, byte allowance or concurrency quota.
+    fn rewrite_begin_initial_dependencies(
+        &self,
+    ) -> Result<Vec<crate::connector::SharedDependency>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "selected Rewrite begin factory has no original route facts",
+        ))
+    }
+
+    /// Exact first-party Rewrite begin source of this selected generation.
+    /// This observation grants neither CPU nor I/O or payload capacity.
+    fn rewrite_begin_cpu_author(
+        &self,
+    ) -> Option<(
+        crate::connector::ConnectorProviderBindingKey,
+        std::any::TypeId,
+    )> {
+        None
+    }
+
+    /// Install the original source before any foreign poll. Preserve the SAME
+    /// scope, absolute deadline and retention through actual request/plan exit.
+    /// Refusal leaves both receiving slots unchanged; unsupported capability
+    /// never delegates to an ordinary or synchronous begin path.
+    fn prepare_rewrite_begin_source_in(
+        self: std::sync::Arc<Self>,
+        request: &mut Option<ConnectorWriteBeginRequest>,
+        original: crate::connector::ConnectorOriginalResultScope,
+        receiving: &mut Option<
+            std::sync::Arc<dyn crate::connector::ConnectorRewriteWriteBeginSource>,
+        >,
+    ) -> Result<(), ConnectorError> {
+        let _ = (request, original, receiving);
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "selected write control has no governed Rewrite begin source",
+        ))
+    }
+
     /// Pure backing of the actual control factory and this exact generation's
     /// selected routes. The caller adds its own source backing before admission.
     /// This is a quote, never a grant.

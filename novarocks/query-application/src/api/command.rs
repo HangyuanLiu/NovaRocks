@@ -139,6 +139,7 @@ pub enum CommandErrorKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandError {
+    failure_cause: Option<novarocks_failure_contract::SharedFailureCause>,
     kind: CommandErrorKind,
     message: Arc<str>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
@@ -154,6 +155,7 @@ impl CommandError {
             compile_control: None,
             execution_failure: None,
             publication_disposition: None,
+            failure_cause: None,
         }
     }
 
@@ -171,6 +173,21 @@ impl CommandError {
         &self,
     ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
         self.publication_disposition
+    }
+
+    pub fn from_failure_cause(cause: novarocks_failure_contract::SharedFailureCause) -> Self {
+        let service = crate::session_error::QueryServiceError::from_failure_cause(cause.clone());
+        let mut error = Self::from_execution_failure(
+            service
+                .execution_failure()
+                .expect("same selected domain fact")
+                .clone(),
+        );
+        error.failure_cause = Some(cause);
+        error
+    }
+    pub fn failure_cause(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.failure_cause.as_ref()
     }
 
     pub fn from_execution_failure(input: crate::execution_error::ExecutionFailureInput) -> Self {
@@ -223,9 +240,14 @@ impl fmt::Display for CommandError {
 
 impl Error for CommandError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.compile_control
+        self.failure_cause
             .as_ref()
             .map(|cause| cause as &dyn Error)
+            .or_else(|| {
+                self.compile_control
+                    .as_ref()
+                    .map(|cause| cause as &dyn Error)
+            })
     }
 }
 
