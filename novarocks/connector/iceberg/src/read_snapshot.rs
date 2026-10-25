@@ -377,11 +377,27 @@ pub(crate) async fn make_scoped_read_snapshot(
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
-    let schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
+    let schema = match &kind {
+        crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotReadKind::ChangeWindow { schema } => schema.clone(),
+        _ => snapshot.schema(metadata).map_err(|e| e.to_string())?,
+    };
     let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
     let mut all_deletes = Vec::new();
     use crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotReadKind;
     let files = match kind {
+        SnapshotReadKind::ChangeWindow { .. } => {
+            // Preserve the original full endpoint projection and delete
+            // applicability. Both endpoints use the SAME To schema above.
+            observe_read_files_original::<DataFile>(
+                &table,
+                domain,
+                Some(&context),
+                Some(&capture),
+                None,
+                Some(io.as_ref()),
+            )
+            .await?
+        }
         SnapshotReadKind::Statistics => {
             observe_read_files_original::<FrozenCowDataFileProjection>(
                 &table,

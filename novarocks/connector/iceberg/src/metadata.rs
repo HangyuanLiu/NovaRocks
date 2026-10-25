@@ -1360,9 +1360,163 @@ impl IcebergMetadata {
     }
 }
 
+pub(crate) struct PreparedChangeWindowScan {
+    pub(crate) table: IcebergTablePayload,
+    pub(crate) output_schema: SchemaRef,
+    pub(crate) window: ConnectorChangeWindow,
+}
+impl IcebergMetadata {
+    /// Decode and check only the exact original value input. No Provider I/O.
+    pub(crate) fn prepare_change_window_scan(
+        &self,
+        table: &ConnectorTableHandle,
+        request: &ConnectorBeginScanRequest,
+    ) -> Result<PreparedChangeWindowScan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        validate_static_predicates(&request.static_predicates)?;
+        let ConnectorScanSelection::ChangeWindow(window) = request.selection else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg asynchronous scan planning currently requires a change window",
+            ));
+        };
+        let table = self.table_payload(table)?;
+        if table.metadata_table_type.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata aliases do not support change-window scans",
+            ));
+        }
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            corrupt("Iceberg change-window scan is missing its resolved table pin")
+        })?;
+        if table_info.current_snapshot_id != Some(window.to_inclusive()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg change-window upper endpoint does not match the exact table pin",
+            ));
+        }
+        let output_schema = projected_schema(&table, &request.projection)?;
+        Ok(PreparedChangeWindowScan {
+            table,
+            output_schema,
+            window,
+        })
+    }
+    pub(crate) fn validate_change_window_physical(
+        &self,
+        prepared: &PreparedChangeWindowScan,
+        physical: &crate::iceberg::table::Table,
+    ) -> Result<String, ConnectorError> {
+        let table_info = prepared.table.table_info.as_ref().ok_or_else(|| {
+            corrupt("Iceberg change-window scan is missing its resolved table pin")
+        })?;
+        let metadata = physical.metadata();
+        let uuid = metadata.uuid().to_string();
+        if metadata.current_snapshot_id() != Some(prepared.window.to_inclusive())
+            || table_info.table_uuid.as_deref() != Some(uuid.as_str())
+            || table_info.location != metadata.location()
+        {
+            return Err(corrupt(
+                "Iceberg change-window scan drifted from its exact table pin",
+            ));
+        }
+        Ok(uuid)
+    }
+    pub(crate) fn finish_change_window_scan(
+        &self,
+        prepared: &PreparedChangeWindowScan,
+        request: &ConnectorBeginScanRequest,
+        admission: novarocks_spi::connector::ConnectorChangeWindowAdmission,
+        metadata_uuid: String,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        let window = prepared.window;
+        let predicate_dispositions = request
+            .static_predicates
+            .iter()
+            .map(|predicate| ConnectorPredicateDisposition {
+                predicate_id: predicate.id,
+                kind: ConnectorPredicateDispositionKind::Unsupported,
+            })
+            .collect();
+        let fact_columns = scan_fact_columns(
+            &prepared.output_schema,
+            &request.projection,
+            &prepared.table,
+        )?;
+        let payload = IcebergScanPayload {
+            table: prepared.table.clone(),
+            snapshot_id: Some(window.to_inclusive()),
+            table_uuid: Some(metadata_uuid),
+            projection: request.projection.clone(),
+            limit: request.limit,
+            purpose: request.purpose.into(),
+            fact_columns,
+            physical_predicates: Vec::new(),
+            mode: IcebergScanModeV1::ChangeWindowAdmission,
+        };
+        ConnectorScan::try_new_change_window(
+            ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            window,
+            admission,
+            ConnectorScanHandle::try_new(
+                self.descriptor.instance_id.clone(),
+                encode_payload(
+                    &payload,
+                    "scan handle",
+                    request.context.max_handle_payload_bytes(),
+                )?,
+            )?,
+            prepared.output_schema.clone(),
+            predicate_dispositions,
+            &request.context,
+        )
+    }
+}
+
 impl ConnectorScanPlanning for IcebergMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
+    }
+
+    fn begin_scan_async_in<'a>(
+        &'a self,
+        table: &'a ConnectorTableHandle,
+        request: ConnectorBeginScanRequest,
+        cpu: &'a Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        original: &'a novarocks_spi::connector::ConnectorOriginalResultScope,
+        owner: &'a mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ConnectorScan, ConnectorError>> + Send + 'a>,
+    > {
+        if owner.is_some() {
+            return Box::pin(async {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "change-window original owner receiver is occupied",
+                ))
+            });
+        }
+        // The actual caller's original receiver holds the SAME Source before
+        // any foreign/worker poll. Neither F exit nor CPU retirement can drop
+        // its SDK inputs before the caller receives and validates the result.
+        let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::change_window_source(
+            self.clone(), table.clone(), request, original.clone(),
+        );
+        *owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            source.clone(),
+        ));
+        Box::pin(async move {
+            source.drive_change_window(cpu).await?;
+            source.take_change_window_result()
+        })
     }
 
     fn begin_scan(
@@ -1415,45 +1569,12 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 self.runtime.resources().catalog_runtime(),
                 &request.context,
             )?;
-            let predicate_dispositions = request
-                .static_predicates
-                .iter()
-                .map(|predicate| ConnectorPredicateDisposition {
-                    predicate_id: predicate.id,
-                    kind: ConnectorPredicateDispositionKind::Unsupported,
-                })
-                .collect();
-            let fact_columns = scan_fact_columns(&output_schema, &request.projection, &table)?;
-            let payload = IcebergScanPayload {
+            let prepared = PreparedChangeWindowScan {
                 table,
-                snapshot_id: Some(window.to_inclusive()),
-                table_uuid: Some(metadata_uuid),
-                projection: request.projection,
-                limit: request.limit,
-                purpose: request.purpose.into(),
-                fact_columns,
-                physical_predicates: Vec::new(),
-                mode: IcebergScanModeV1::ChangeWindowAdmission,
-            };
-            return ConnectorScan::try_new_change_window(
-                ConnectorProviderBindingKey {
-                    instance_id: self.descriptor.instance_id.clone(),
-                    incarnation: self.incarnation,
-                },
-                window,
-                admission,
-                ConnectorScanHandle::try_new(
-                    self.descriptor.instance_id.clone(),
-                    encode_payload(
-                        &payload,
-                        "scan handle",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
-                )?,
                 output_schema,
-                predicate_dispositions,
-                &request.context,
-            );
+                window,
+            };
+            return self.finish_change_window_scan(&prepared, &request, admission, metadata_uuid);
         }
 
         let ConnectorScanSelection::Snapshot(selector) = request.selection else {
@@ -3485,6 +3606,564 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.candidate_units_considered, 2);
         assert_eq!(metrics.candidate_units_pruned, 2);
         assert_eq!(metrics.scan_units_planned, 0);
+    }
+    #[test]
+    fn original_async_change_window_uses_loaded_exact_pin_without_cpu_catalog_io() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        use novarocks_spi::connector::{
+            ConnectorBatchBudget, ConnectorChangeWindowAdmission,
+            ConnectorChangeWindowFullRebuildReason, ConnectorOriginalResultScope,
+            ConnectorOriginalResultScopeCheck, OriginalResultCheckError, ProviderMetadataCpuInput,
+            ProviderMetadataCpuPort,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct OriginalScope(Instant);
+        impl ConnectorOriginalResultScopeCheck for OriginalScope {
+            fn original_deadline(&self) -> Instant {
+                self.0
+            }
+            fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+                Ok(())
+            }
+        }
+        // Like CaptureAfterOriginalIo above, this is a real-input phase fixture,
+        // not a physical CPU admission/exit oracle. The second pure phase must
+        // finish from the exact already-loaded facts after the catalog is gone.
+        struct LoadedPhasePort {
+            path: std::path::PathBuf,
+            descriptor: ConnectorInstanceDescriptor,
+            incarnation: ProviderBindingEpoch,
+            calls: AtomicUsize,
+        }
+        impl ProviderMetadataCpuPort for LoadedPhasePort {
+            fn submit_metadata_in(
+                &self,
+                input: &mut Option<ProviderMetadataCpuInput>,
+            ) -> Result<(), ConnectorError> {
+                let original = input.as_ref().unwrap();
+                assert_eq!(original.descriptor(), &self.descriptor);
+                assert_eq!(original.incarnation(), self.incarnation);
+                assert_eq!(
+                    original.original_source_type_id(),
+                    std::any::TypeId::of::<
+                        crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                    >()
+                );
+                let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+                assert!(turn < 2, "resolved lineage uses only Prepare and Inspect");
+                if turn == 1 {
+                    std::fs::remove_dir_all(&self.path).unwrap();
+                }
+                input.take().unwrap().run_original_phase();
+                Ok(())
+            }
+            fn poll_finished(
+                &self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), ConnectorError>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_closed(
+                &self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), ConnectorError>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+                None
+            }
+        }
+        for missing_from in [false, true] {
+            let (executor, warehouse, provider) = provider();
+            executor.block_on(async {
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                    provider.runtime(),
+                    provider.incarnation,
+                    CatalogPublicationRequest::CreateNamespace {
+                        namespace: CatalogNamespaceName::new("async_window"),
+                        properties: HashMap::new(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                    "{outcome:?}"
+                );
+                let schema = Schema::builder()
+                    .with_fields(vec![Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    ))])
+                    .build()
+                    .unwrap();
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                    provider.runtime(),
+                    provider.incarnation,
+                    CatalogPublicationRequest::CreateTable {
+                        namespace: CatalogNamespaceName::new("async_window"),
+                        creation: crate::iceberg::TableCreation::builder()
+                            .name("t".into())
+                            .schema(schema)
+                            .format_version(FormatVersion::V2)
+                            .build(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                    "{outcome:?}"
+                );
+                let loaded = provider
+                    .runtime()
+                    .load_table_for_request_async("async_window", "t", &context())
+                    .await
+                    .unwrap();
+                let snapshot = crate::commit::run::append_snapshot_for_test(
+                    provider.clone(),
+                    loaded.table,
+                    Vec::new(),
+                    "main".into(),
+                    std::collections::BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+                provider
+                    .runtime()
+                    .control_state()
+                    .invalidate_table_cache("async_window", "t");
+                let table = provider
+                    .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: provider.descriptor.instance_id.clone(),
+                            namespace: "async_window".into(),
+                            table: "t".into(),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        selector: ConnectorTableObjectSelector::Current,
+                        context: context(),
+                    })
+                    .await
+                    .unwrap()
+                    .metadata;
+                let from = if missing_from {
+                    snapshot.checked_add(1).unwrap_or(snapshot - 1)
+                } else {
+                    snapshot
+                };
+                let window = ConnectorChangeWindow::new(from, snapshot);
+                let request = ConnectorBeginScanRequest {
+                    projection: vec![0],
+                    static_predicates: Vec::new(),
+                    selection: ConnectorScanSelection::ChangeWindow(window),
+                    purpose: ConnectorReadPurpose::Query,
+                    limit: None,
+                    batch: ConnectorBatchBudget {
+                        max_rows: std::num::NonZeroUsize::new(4096).unwrap(),
+                        max_bytes: std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+                    },
+                    context: context(),
+                };
+                let original = ConnectorOriginalResultScope::from_original(Arc::new(
+                    OriginalScope(request.context.deadline()),
+                ));
+                let port = Arc::new(LoadedPhasePort {
+                    path: warehouse.path().to_path_buf(),
+                    descriptor: provider.descriptor.clone(),
+                    incarnation: provider.incarnation,
+                    calls: AtomicUsize::new(0),
+                });
+                let cpu: Arc<dyn ProviderMetadataCpuPort> = port.clone();
+                let mut owner = None;
+                let result = provider
+                    .begin_scan_async_in(&table.table, request.clone(), &cpu, &original, &mut owner)
+                    .await
+                    .unwrap();
+                let key = ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor.instance_id.clone(),
+                    incarnation: provider.incarnation,
+                };
+                owner.as_ref().unwrap().validate_owner(&key).unwrap();
+                let weak = Arc::downgrade(owner.as_ref().unwrap().value::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >(provider.descriptor.instance_id.as_str()).unwrap());
+                assert!(
+                    weak.upgrade().is_some(),
+                    "actual Source outlives the completed Provider F"
+                );
+                let rejected = provider
+                    .begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner)
+                    .await
+                    .err()
+                    .expect("same owner receiver cannot be overwritten");
+                assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
+                assert_eq!(
+                    rejected.message(),
+                    "change-window original owner receiver is occupied"
+                );
+                assert!(weak.upgrade().is_some());
+                assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+                result
+                    .validate(
+                        &ConnectorProviderBindingKey {
+                            instance_id: provider.descriptor.instance_id.clone(),
+                            incarnation: provider.incarnation,
+                        },
+                        ConnectorScanSelection::ChangeWindow(window),
+                    )
+                    .unwrap();
+                let expected = if missing_from {
+                    ConnectorChangeWindowAdmission::FullRebuild(
+                        ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                            from_snapshot_id: from,
+                        },
+                    )
+                } else {
+                    ConnectorChangeWindowAdmission::MetadataOnly
+                };
+                assert_eq!(
+                    result.admission(),
+                    &novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(expected)
+                );
+                // Value facts carry no runtime owner. The actual receiving
+                // slot, after result validation and F Drop above, retires it.
+                drop(owner.take());
+                assert!(weak.upgrade().is_none());
+                assert_eq!(result.output_schema().fields().len(), 1);
+            });
+        }
+    }
+    #[test]
+    fn original_async_change_window_reads_both_manifest_endpoints_across_a_rename() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
+        use novarocks_spi::connector::{
+            ConnectorBatchBudget, ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationRequest, ConnectorChangeWindowAdmission,
+            ConnectorChangeWindowPartitionImpact, ConnectorColumnPath, ConnectorIoAdmissionPort,
+            ConnectorIoCleanupFuture, ConnectorIoProgressSource, ConnectorIoRequest,
+            ConnectorIoRequestSource, ConnectorOriginalResultScope,
+            ConnectorOriginalResultScopeCheck, ConnectorPayloadRetentionGuard,
+            ConnectorSchemaChange, ExternalMutationEffect, ExternalMutationOutcome,
+            OriginalResultCheckError, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
+            SharedDependency,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+        struct OriginalScope(Instant);
+        impl ConnectorOriginalResultScopeCheck for OriginalScope {
+            fn original_deadline(&self) -> Instant {
+                self.0
+            }
+            fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+                Ok(())
+            }
+        }
+        // Explicit SPI resource-cell fixture. It observes the real FileIO
+        // requests; it does not certify a WC Root, a CPU offer or worker exit.
+        struct IoFixture {
+            in_cpu: Arc<AtomicBool>,
+            owned_reads: AtomicUsize,
+        }
+        struct IoCell;
+        impl ConnectorIoRequestSource for IoCell {
+            fn exit_waker(&self) -> Waker {
+                Waker::noop().clone()
+            }
+            fn reserve_stream(&self) -> Result<(), ConnectorError> {
+                panic!("snapshot whole-object reads do not open streams")
+            }
+            fn stream_closed(&self) {
+                panic!("no snapshot stream")
+            }
+            fn install_stream_cleanup_in(
+                &self,
+                _: &mut Option<ConnectorIoCleanupFuture>,
+            ) -> Result<(), ConnectorError> {
+                panic!("no snapshot stream cleanup")
+            }
+            fn stream_custody_lost(&self) {
+                panic!("no snapshot stream custody")
+            }
+            fn record_cleanup_failure(
+                &self,
+                original: Box<dyn std::any::Any + Send>,
+            ) -> Result<(), Box<dyn std::any::Any + Send>> {
+                Err(original)
+            }
+            fn attach_original_progress(
+                &self,
+                _: Arc<dyn ConnectorIoProgressSource>,
+            ) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            fn poll_admitted(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_include_dependency(
+                &self,
+                _: &SharedDependency,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl ConnectorIoAdmissionPort for IoFixture {
+            fn request_owned(
+                &self,
+                _: std::num::NonZeroU64,
+            ) -> Result<ConnectorIoRequest, ConnectorError> {
+                assert!(
+                    !self.in_cpu.load(Ordering::SeqCst),
+                    "raw snapshot read must be driven outside the pure CPU phase"
+                );
+                self.owned_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
+            }
+            fn request(&self, _: SharedDependency) -> Result<ConnectorIoRequest, ConnectorError> {
+                assert!(
+                    !self.in_cpu.load(Ordering::SeqCst),
+                    "selected physical I/O must not be polled by the pure CPU phase"
+                );
+                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
+            }
+            fn publication_obligation_started(&self) {
+                panic!("scan cannot publish")
+            }
+            fn retain_payload(&self) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                Ok(ConnectorPayloadRetentionGuard::new(()))
+            }
+        }
+        struct PhasePort {
+            in_cpu: Arc<AtomicBool>,
+            descriptor: ConnectorInstanceDescriptor,
+            incarnation: ProviderBindingEpoch,
+            calls: AtomicUsize,
+        }
+        impl ProviderMetadataCpuPort for PhasePort {
+            fn submit_metadata_in(
+                &self,
+                input: &mut Option<ProviderMetadataCpuInput>,
+            ) -> Result<(), ConnectorError> {
+                let source = input.as_ref().unwrap();
+                assert_eq!(source.descriptor(), &self.descriptor);
+                assert_eq!(source.incarnation(), self.incarnation);
+                assert_eq!(
+                    source.original_source_type_id(),
+                    std::any::TypeId::of::<
+                        crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                    >()
+                );
+                assert!(!self.in_cpu.swap(true, Ordering::SeqCst));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                input.take().unwrap().run_original_phase();
+                self.in_cpu.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+                None
+            }
+        }
+        fn written(
+            table: &crate::iceberg::table::Table,
+            label: &str,
+        ) -> crate::commit::WrittenFile {
+            crate::commit::WrittenFile {
+                path: format!("{}/data/{label}.parquet", table.metadata().location()),
+                format: DataFileFormat::Parquet,
+                content: DataContentType::Data,
+                partition_values: Struct::empty(),
+                partition_spec_id: table.metadata().default_partition_spec_id(),
+                record_count: 3,
+                file_size_in_bytes: 128,
+                split_offsets: Vec::new(),
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                referenced_data_file: None,
+                equality_ids: None,
+                first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            }
+        }
+        let (executor, _warehouse, provider) = provider();
+        let from = executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                provider.runtime(),
+                provider.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("endpoint_window"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                provider.runtime(),
+                provider.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("endpoint_window"),
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let loaded = provider
+                .runtime()
+                .load_table_for_request_async("endpoint_window", "t", &context())
+                .await
+                .unwrap();
+            let file = written(&loaded.table, "a");
+            crate::commit::run::append_snapshot_for_test(
+                provider.clone(),
+                loaded.table,
+                vec![file],
+                "main".into(),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+        });
+        // Seed the rename through the existing catalog mutation author outside
+        // the async driver. The scan below never calls this legacy sync route.
+        let outcome = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor.instance_id.clone(),
+                    incarnation: provider.incarnation,
+                },
+                operation: ConnectorCatalogMutationOperation::AlterSchema {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor.instance_id.clone(),
+                        namespace: "endpoint_window".into(),
+                        table: "t".into(),
+                    },
+                    changes: vec![ConnectorSchemaChange::RenameColumn {
+                        path: ConnectorColumnPath {
+                            segments: vec!["id".into()],
+                        },
+                        to: "renamed".into(),
+                    }],
+                },
+                context: context(),
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        executor.block_on(async {
+                    provider.runtime().control_state().invalidate_table_cache("endpoint_window", "t");
+                    let loaded = provider.runtime().load_table_for_request_async("endpoint_window", "t", &context()).await.unwrap();
+                    let file = written(&loaded.table, "b");
+                    let to = crate::commit::run::append_snapshot_for_test(provider.clone(), loaded.table, vec![file], "main".into(), std::collections::BTreeMap::new()).await.unwrap();
+                    provider.runtime().control_state().invalidate_table_cache("endpoint_window", "t");
+                    let physical = provider.runtime().load_table_for_request_async("endpoint_window", "t", &context()).await.unwrap();
+                    let from_schema = physical.table.metadata().snapshot_by_id(from).unwrap().schema(physical.table.metadata()).unwrap();
+                    let to_schema = physical.table.metadata().snapshot_by_id(to).unwrap().schema(physical.table.metadata()).unwrap();
+                    assert_eq!(from_schema.field_by_id(1).unwrap().name, "id");
+                    assert_eq!(to_schema.field_by_id(1).unwrap().name, "renamed");
+                    assert_ne!(from_schema.schema_id(), to_schema.schema_id());
+                    let table = provider.capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                        table: ConnectorTableIdentity { instance_id: provider.descriptor.instance_id.clone(), namespace: "endpoint_window".into(), table: "t".into() },
+                        resolution: ConnectorTableResolution::StrictBaseTable, selector: ConnectorTableObjectSelector::Current, context: context(),
+                    }).await.unwrap().metadata;
+                    let active = Arc::new(AtomicBool::new(false));
+                    let io = Arc::new(IoFixture { in_cpu: active.clone(), owned_reads: AtomicUsize::new(0) });
+                    let phase = Arc::new(PhasePort { in_cpu: active, descriptor: provider.descriptor.clone(), incarnation: provider.incarnation, calls: AtomicUsize::new(0) });
+                    let cpu: Arc<dyn ProviderMetadataCpuPort> = phase.clone();
+                    let request_context = context().with_io_admission(io.clone());
+                    let original = ConnectorOriginalResultScope::from_original(Arc::new(OriginalScope(request_context.deadline())));
+                    let window = ConnectorChangeWindow::new(from, to);
+                    let request = ConnectorBeginScanRequest {
+                        projection: vec![0], static_predicates: Vec::new(), selection: ConnectorScanSelection::ChangeWindow(window),
+                        purpose: ConnectorReadPurpose::Query, limit: None,
+                        batch: ConnectorBatchBudget { max_rows: std::num::NonZeroUsize::new(4096).unwrap(), max_bytes: std::num::NonZeroUsize::new(1024 * 1024).unwrap() },
+                        context: request_context,
+                    };
+                    // The receiving slot is installed even if its borrower is dropped
+                    // before the first CPU or foreign poll. No input was dispatched.
+                    let mut unpolled_owner = None;
+                    let borrower = provider.begin_scan_async_in(&table.table, request.clone(), &cpu, &original, &mut unpolled_owner);
+                    drop(borrower);
+                    assert!(unpolled_owner.is_some());
+                    assert_eq!(phase.calls.load(Ordering::SeqCst), 0);
+                    drop(unpolled_owner);
+                    let mut owner = None;
+                    let scan = provider.begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner).await.unwrap();
+                    assert_eq!(scan.output_schema().field(0).name(), "renamed");
+                    scan.validate(&ConnectorProviderBindingKey { instance_id: provider.descriptor.instance_id.clone(), incarnation: provider.incarnation }, ConnectorScanSelection::ChangeWindow(window)).unwrap();
+                    assert_eq!(scan.admission(), &novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::Incremental {
+                        has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                    }));
+                    assert!(phase.calls.load(Ordering::SeqCst) > 3, "both endpoint readers suspend and resume before the common Finish phase");
+                    assert!(io.owned_reads.load(Ordering::SeqCst) >= 4, "both nonempty manifest lists and their data manifests were actually read");
+                    let weak = Arc::downgrade(owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap());
+                    assert!(weak.upgrade().is_some());
+                    let endpoints = owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap().change_window_endpoint_facts_for_test();
+                    assert_eq!(endpoints[0].len(), 1);
+                    assert_eq!(endpoints[1].len(), 2);
+                    assert!(endpoints[0][0].path.ends_with("/a.parquet"));
+                    let mut to_names = endpoints[1].iter().map(|file| file.path.rsplit('/').next().unwrap()).collect::<Vec<_>>();
+                    to_names.sort_unstable();
+                    assert_eq!(to_names, ["a.parquet", "b.parquet"]);
+                    for (index, files) in endpoints.iter().enumerate() {
+                        for file in files {
+                            assert_eq!(file.record_count, Some(3));
+                            let endpoint = file.read_domain().endpoint();
+                            assert_eq!(endpoint.snapshot_id(), [from, to][index]);
+                            assert_eq!(endpoint.schema().unwrap().field_by_id(1).unwrap().name, "renamed", "both real readers use the original To schema");
+                        }
+                    }
+                    drop(endpoints);
+                    drop(owner);
+                    assert!(weak.upgrade().is_none(), "the received value does not hide a runtime Source alias");
+                });
     }
 }
 

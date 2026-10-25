@@ -31,10 +31,13 @@ use std::{
     task::{Context, Poll},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum SnapshotReadKind {
     Statistics,
     Rewrite,
+    ChangeWindow {
+        schema: Arc<crate::iceberg::spec::Schema>,
+    },
 }
 pub(crate) struct ScopedReadSnapshot {
     pub(crate) files: Vec<crate::read_model::IcebergReadFile>,

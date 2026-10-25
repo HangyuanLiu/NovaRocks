@@ -52,8 +52,29 @@ pub(crate) fn plan_change_window(
     runtime: &IcebergCatalogRuntime,
     context: &ConnectorRequestContext,
 ) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
+    let schema =
+        match prepare_change_window(table.metadata(), from_exclusive, to_inclusive, context)? {
+            ChangeWindowPlan::Resolved(admission) => return Ok(admission),
+            ChangeWindowPlan::Endpoints { schema } => schema,
+        };
+    let from = build_snapshot_controlled(table, from_exclusive, &schema, runtime, context)?;
+    let to = build_snapshot_controlled(table, to_inclusive, &schema, runtime, context)?;
+    endpoint_admission(table.metadata(), &from.files, &to.files, context)
+}
+
+pub(crate) enum ChangeWindowPlan {
+    Resolved(ConnectorChangeWindowAdmission),
+    Endpoints { schema: Arc<Schema> },
+}
+
+/// Pure lineage and the one original upper-endpoint schema author.
+pub(crate) fn prepare_change_window(
+    metadata: &TableMetadata,
+    from_exclusive: i64,
+    to_inclusive: i64,
+    context: &ConnectorRequestContext,
+) -> Result<ChangeWindowPlan, ConnectorError> {
     check_active(context)?;
-    let metadata = table.metadata();
     if !matches!(
         metadata.format_version(),
         FormatVersion::V2 | FormatVersion::V3
@@ -63,18 +84,26 @@ pub(crate) fn plan_change_window(
         ));
     }
     match classify_lineage(metadata, from_exclusive, to_inclusive)? {
-        LineageAdmission::MetadataOnly => return Ok(ConnectorChangeWindowAdmission::MetadataOnly),
-        LineageAdmission::FullRebuild(reason) => {
-            return Ok(ConnectorChangeWindowAdmission::FullRebuild(reason));
-        }
-        LineageAdmission::Incremental => {}
+        LineageAdmission::MetadataOnly => Ok(ChangeWindowPlan::Resolved(
+            ConnectorChangeWindowAdmission::MetadataOnly,
+        )),
+        LineageAdmission::FullRebuild(reason) => Ok(ChangeWindowPlan::Resolved(
+            ConnectorChangeWindowAdmission::FullRebuild(reason),
+        )),
+        LineageAdmission::Incremental => Ok(ChangeWindowPlan::Endpoints {
+            schema: resolved_window_schema(metadata, to_inclusive)?,
+        }),
     }
-    // Admission and execution observe the same complete endpoint semantics.
-    // No manifest event or newly introduced delete artifact is a row delta.
-    let schema = resolved_window_schema(metadata, to_inclusive)?;
-    let from = build_snapshot_controlled(table, from_exclusive, &schema, runtime, context)?;
-    let to = build_snapshot_controlled(table, to_inclusive, &schema, runtime, context)?;
-    endpoint_admission(metadata, &from.files, &to.files, context)
+}
+
+/// The actual endpoint comparison, shared with the existing synchronous author.
+pub(crate) fn finish_change_window(
+    metadata: &TableMetadata,
+    from: &[crate::read_model::IcebergReadFile],
+    to: &[crate::read_model::IcebergReadFile],
+    context: &ConnectorRequestContext,
+) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
+    endpoint_admission(metadata, from, to, context)
 }
 
 /// Admission and execution use the same pinned upper-endpoint interpretation.
@@ -1086,5 +1115,45 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    #[test]
+    fn shared_lineage_plan_preserves_the_upper_endpoint_schema_for_both_reads() {
+        let from = snapshot(1, None, Operation::Append, &[], 0);
+        let metadata = metadata_with_snapshots(vec![from]);
+        let renamed = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "renamed",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = metadata
+            .into_builder(None)
+            .add_current_schema(renamed)
+            .unwrap()
+            .add_snapshot(snapshot(2, Some(1), Operation::Append, &[], 1))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata
+                .snapshot_by_id(1)
+                .unwrap()
+                .schema(&metadata)
+                .unwrap()
+                .schema_id(),
+            0
+        );
+        let ChangeWindowPlan::Endpoints { schema } =
+            prepare_change_window(&metadata, 1, 2, &request_context()).unwrap()
+        else {
+            panic!("rename-only lineage must retain incremental endpoint semantics");
+        };
+        assert_eq!(schema.schema_id(), 1);
+        assert_eq!(schema.as_struct().fields()[0].name, "renamed");
     }
 }

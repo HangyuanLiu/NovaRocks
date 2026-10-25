@@ -30,11 +30,14 @@ use std::sync::{Mutex, Weak};
 
 type PublicationResult = Result<async_publication::PreparedStatisticsPublication, ConnectorError>;
 type EvidenceResult = crate::iceberg::Result<(ExternalMutationEvidence, StatisticsReceipt)>;
+#[path = "scoped_change_window.rs"]
+pub(crate) mod scoped_change_window;
 #[path = "scoped_read.rs"]
 mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
+    ChangeWindow(scoped_change_window::ChangeWindowBody),
     Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
     Read(scoped_read::ReadBody),
@@ -265,6 +268,7 @@ impl IcebergMetadataCpuOriginal {
         assert!(!original.started, "one original Statistics CPU execution");
         original.started = true;
         match &mut original.body {
+            CpuBody::ChangeWindow(body) => body.run(),
             CpuBody::Cleanup(work) => work.run(),
             CpuBody::Read(body) => body.run(),
             CpuBody::ReadSnapshot(body) => body.run(),
@@ -590,6 +594,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                 matches!(
                     &body.as_ref().expect("same metadata source").body,
                     CpuBody::MetadataBinding { .. }
+                        | CpuBody::ChangeWindow(_)
                         | CpuBody::ReadSnapshot(_)
                         | CpuBody::Cleanup(_)
                 ) || matches!(&body.as_ref().unwrap().body,CpuBody::Read(read) if read.phase<=1

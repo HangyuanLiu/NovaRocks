@@ -43,7 +43,6 @@ pub(super) struct ReadBody {
 const READ_QUOTA_DETAIL: &str = "statistics read original payload check failed";
 #[derive(Debug)]
 struct ReadQuotaFailure {
-    kind: ConnectorErrorKind,
     original: novarocks_spi::connector::OriginalResultCheckError,
 }
 impl std::fmt::Display for ReadQuotaFailure {
@@ -59,7 +58,7 @@ impl std::error::Error for ReadQuotaFailure {
 impl novarocks_failure_contract::FailureProjection for ReadQuotaFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::FailureProjection;
-        self.kind.failure_fact()
+        self.original.failure_fact()
     }
 }
 pub(super) fn checked_read(error: ReadFailure) -> ConnectorError {
@@ -76,10 +75,7 @@ pub(super) fn checked_read(error: ReadFailure) -> ConnectorError {
             };
             ConnectorError::from_domain_static(
                 kind,
-                ReadQuotaFailure {
-                    kind,
-                    original: error,
-                },
+                ReadQuotaFailure { original: error },
                 READ_QUOTA_DETAIL,
             )
         }
@@ -441,11 +437,15 @@ mod failure_geometry_tests {
     fn original_quota_refusal_moves_once_and_retains_its_typed_source() {
         let drops = Arc::new(AtomicUsize::new(0));
         let input = OriginalResultCheckError::new(
-            OriginalResultCheckClass::Coverage,
+            OriginalResultCheckClass::Control,
             OriginalRefusal(drops.clone()),
         );
         let error = checked_read(ReadFailure::Original(input.into()));
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(error.kind(), ConnectorErrorKind::Interrupted);
+        assert_eq!(
+            error.failure_fact(),
+            ConnectorErrorKind::ResourceExhausted.failure_fact()
+        );
         assert_eq!(error.failure_fact().class(), FailureClass::Resource);
         assert_eq!(error.failure_fact().reason().code(), 7);
         assert_eq!(error.message(), READ_QUOTA_DETAIL);
@@ -455,7 +455,7 @@ mod failure_geometry_tests {
             .downcast_ref::<SharedFailureCause>()
             .unwrap();
         let quota = shared.downcast_ref::<ReadQuotaFailure>().unwrap();
-        assert_eq!(quota.original.class(), OriginalResultCheckClass::Coverage);
+        assert_eq!(quota.original.class(), OriginalResultCheckClass::Control);
         assert!(
             quota
                 .original
