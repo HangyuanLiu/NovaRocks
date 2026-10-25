@@ -840,6 +840,7 @@ fn project_failure(
     terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,
 ) -> QueryServiceError {
     match error {
+        DmlExecutionError::Application(error) => error.clone(),
         DmlExecutionError::Execution(input) => {
             QueryServiceError::from_execution_failure(input.clone())
         }

@@ -41,7 +41,9 @@ impl WriteStatementFamily for InsertFamily {
     type Input = PreparationInput;
     type Prepared = PreparedIcebergWrite;
 
-    async fn prepare(input: Arc<PreparationInput>) -> Result<Arc<PreparedIcebergWrite>, String> {
+    async fn prepare(
+        input: Arc<PreparationInput>,
+    ) -> Result<Arc<PreparedIcebergWrite>, crate::dml::error::DmlExecutionError> {
         use novarocks_spi::connector::{
             ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
         };
@@ -98,6 +100,7 @@ impl WriteStatementFamily for InsertFamily {
         )
         .await
         .map(Arc::new)
+        .map_err(Into::into)
     }
     async fn compile(
         prepared: Arc<PreparedIcebergWrite>,

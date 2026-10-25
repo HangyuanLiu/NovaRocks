@@ -198,7 +198,7 @@ pub(super) async fn prepare_delete_statement_async(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: ConnectorWriteOperationId,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
-) -> Result<super::PreparedDeleteWrite, String> {
+) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
     let target_binding =
         super::load_delete_target_async(target, planning_lease, connector_context).await?;
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(

@@ -71,7 +71,6 @@ enum CodecReason {
     ResourceLimit = 36,
     ResourceSchema = 37,
     EncodeInvalid = 39,
-    EncodeUnsupported = 40,
     EncodeSourceModel = 41,
     EncodeInvalidSource = 42,
 }
@@ -599,9 +598,10 @@ impl FailureProjection for crate::physical_package_v2::PhysicalEncodeError {
             Self::Binding(source) => source.failure_fact(),
             Self::Source(source) => source.failure_fact(),
             Self::Invalid(_) => CodecReason::EncodeInvalid.fact(FailureClass::Invariant),
-            Self::UnsupportedCapability(_) => {
-                CodecReason::EncodeUnsupported.fact(FailureClass::Unsupported)
-            }
+            Self::UnsupportedCapability(_) => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::plan_codec_reason::ENCODE_UNSUPPORTED,
+            ),
         }
     }
 }
@@ -653,7 +653,10 @@ mod compiled_encode_author_tests {
         let invalid = PhysicalEncodeError::Invalid("unsupported resource exhausted".into());
         assert_eq!(
             unsupported.failure_fact(),
-            CodecReason::EncodeUnsupported.fact(FailureClass::Unsupported)
+            FailureFact::new(
+                FailureClass::Unsupported,
+                FailureReason::new(domain::PLAN_CODEC, NonZeroU16::new(40).unwrap()),
+            )
         );
         assert_eq!(
             invalid.failure_fact(),

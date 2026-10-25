@@ -205,7 +205,10 @@ impl ExecutionFailureInput {
             K::NumericOutOfRange
         } else {
             match self.fact.class() {
-                FailureClass::Unsupported => K::UnsupportedCompiledShape,
+                FailureClass::Unsupported if self.is_compiled_capability() => {
+                    K::UnsupportedCompiledShape
+                }
+                FailureClass::Unsupported => K::Unsupported,
                 FailureClass::Data => K::Data,
                 FailureClass::Dependency => K::Dependency,
                 FailureClass::Resource => K::ResourceExhausted,
@@ -216,6 +219,44 @@ impl ExecutionFailureInput {
             }
         };
         SqlExecutionErrorDescriptor::for_kind(kind)
+    }
+    fn is_compiled_capability(&self) -> bool {
+        use novarocks_failure_contract::local_compiler_reason as compiler_failure;
+        use novarocks_function_contract::kernel_failure;
+        if self.fact.evidence()
+            != novarocks_execution_contract::failure::FailureEvidence::Originating
+        {
+            return false;
+        }
+        let reason = self.fact.reason();
+        // These exact reasons are emitted only by the compiled-plan authors.
+        if [
+            compiler_failure::UNSUPPORTED_FRAGMENT,
+            compiler_failure::UNSUPPORTED_EXPRESSION,
+            compiler_failure::UNSUPPORTED_CALL,
+            novarocks_failure_contract::plan_codec_reason::ENCODE_UNSUPPORTED,
+        ]
+        .contains(&reason)
+        {
+            return true;
+        }
+        // Function preparation is shared with non-compiler callers. Only the
+        // typed Task preparation path establishes compiled use here; every BE
+        // Task preparation consumes the original frozen compiled package.
+        matches!(
+            self.site,
+            ExecutionFailureSite::Task {
+                phase: TaskFailurePhase::Preparation,
+                ..
+            }
+        ) && [
+            kernel_failure::MISSING_PURE_IMPLEMENTATION,
+            kernel_failure::UNSUPPORTED_COMPARISON,
+            kernel_failure::UNSUPPORTED_ARITHMETIC,
+            kernel_failure::UNSUPPORTED_CAST,
+            novarocks_function_contract::UNAVAILABLE_IMPLEMENTATION,
+        ]
+        .contains(&reason)
     }
     pub fn user_error(&self) -> UserError {
         UserError::from_descriptor(
@@ -254,6 +295,10 @@ pub enum QueryFailureReason {
     RecoveryPreparationBudgetExceeded,
     LogicalFailureUnspecified,
     LogicalOwnerStopped,
+    BlockingWorkerPanicked,
+    BlockingExecutorClosed,
+    BlockingSourceContract,
+    BlockingQueueFull,
 }
 impl FailureProjection for QueryFailureReason {
     fn failure_fact(&self) -> FailureFact {
@@ -279,6 +324,10 @@ impl FailureProjection for QueryFailureReason {
             Self::RecoveryPreparationBudgetExceeded => (FailureClass::Dependency, 151),
             Self::LogicalFailureUnspecified => (FailureClass::Unexpected, 172),
             Self::LogicalOwnerStopped => (FailureClass::Control, 174),
+            Self::BlockingWorkerPanicked => (FailureClass::Unexpected, 177),
+            Self::BlockingExecutorClosed => (FailureClass::Dependency, 178),
+            Self::BlockingSourceContract => (FailureClass::Invariant, 179),
+            Self::BlockingQueueFull => (FailureClass::Resource, 180),
         };
         let reason = FailureReason::new(domain::QUERY, NonZeroU16::new(code).unwrap());
         if matches!(self, Self::LogicalOwnerStopped) {
@@ -292,6 +341,7 @@ impl FailureProjection for QueryFailureReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlExecutionErrorKind {
     UnsupportedCompiledShape,
+    Unsupported,
     ResourceExhausted,
     NumericOutOfRange,
     Data,
@@ -315,6 +365,7 @@ impl SqlExecutionErrorDescriptor {
         use SqlExecutionErrorKind::*;
         let (code, errno, sqlstate) = match kind {
             UnsupportedCompiledShape => ("UnsupportedCompiledShape", 1105, "HY000"),
+            Unsupported => ("query.execution.unsupported", 1105, "HY000"),
             ResourceExhausted => ("query.execution.resource_exhausted", 1041, "HY000"),
             NumericOutOfRange => ("query.execution.numeric_out_of_range", 1690, "22003"),
             Data => ("query.execution.invalid_data", 1105, "HY000"),
@@ -347,6 +398,7 @@ pub const UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR: ErrorCodeDescriptor =
 
 pub const EXECUTION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Unsupported).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::ResourceExhausted).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::NumericOutOfRange).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Data).descriptor,
@@ -363,6 +415,7 @@ pub fn execution_descriptor_for_code(code: ErrorCodeId) -> Option<SqlExecutionEr
     use SqlExecutionErrorKind::*;
     [
         UnsupportedCompiledShape,
+        Unsupported,
         ResourceExhausted,
         NumericOutOfRange,
         Data,
@@ -455,6 +508,154 @@ mod boundary_tests {
             AttemptFailureClass::ContractViolation
         );
         assert_ne!(invalid.descriptor().descriptor, descriptor.descriptor);
+    }
+
+    #[test]
+    fn ordinary_provider_unsupported_keeps_its_source_and_generic_sql_identity() {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let source = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "UnsupportedCompiledShape is only diagnostic text here",
+        );
+        let cause = novarocks_failure_contract::SharedFailureCause::from_static_detail(
+            source,
+            "provider capability is unavailable",
+        );
+        let fact = cause.failure_fact();
+        let service = crate::session_error::QueryServiceError::from_failure_cause(cause.clone());
+        assert_eq!(service.failure_cause(), Some(&cause));
+        let input = service.execution_failure().unwrap();
+        assert_eq!(input.fact(), fact);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::Unsupported);
+        let descriptor = input.descriptor();
+        assert_eq!(
+            descriptor.descriptor.code.as_str(),
+            "query.execution.unsupported"
+        );
+        assert_eq!((descriptor.errno, descriptor.sqlstate), (1105, "HY000"));
+        assert_eq!(
+            execution_descriptor_for_code(descriptor.descriptor.code),
+            Some(descriptor)
+        );
+        assert!(EXECUTION_ERROR_CODE_DESCRIPTORS.contains(&descriptor.descriptor));
+        let stream = QueryExecutionError::from_execution(input.clone());
+        assert_eq!(stream.execution_failure(), Some(input));
+        assert_eq!(
+            crate::session_error::execution_public_message(&stream),
+            service.message()
+        );
+        assert_eq!(input.user_error().retry(), RetryClass::Never);
+    }
+
+    #[test]
+    fn selected_preparation_keeps_exact_shared_function_capability_reasons() {
+        use novarocks_function_contract::{FunctionBindingError, kernel_failure};
+        let binding = FunctionBindingError::UnavailableImplementation(
+            novarocks_type_contract::FunctionOverloadId::try_new("fixture/missing/pure-v1")
+                .unwrap(),
+        );
+        assert_eq!(
+            binding.failure_fact().reason(),
+            novarocks_function_contract::UNAVAILABLE_IMPLEMENTATION
+        );
+        let facts = [
+            FailureFact::new(
+                FailureClass::Unsupported,
+                kernel_failure::MISSING_PURE_IMPLEMENTATION,
+            ),
+            FailureFact::new(
+                FailureClass::Unsupported,
+                kernel_failure::UNSUPPORTED_COMPARISON,
+            ),
+            FailureFact::new(
+                FailureClass::Unsupported,
+                kernel_failure::UNSUPPORTED_ARITHMETIC,
+            ),
+            FailureFact::new(FailureClass::Unsupported, kernel_failure::UNSUPPORTED_CAST),
+            binding.failure_fact(),
+        ];
+        for fact in facts {
+            let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
+                task(9),
+                TerminationDetail::Failed(TaskFailure::new_in_phase(
+                    fact,
+                    SafeDetail::truncating("original function preparation capability"),
+                    TaskFailurePhase::Preparation,
+                )),
+            );
+            let input = ExecutionFailureInput::from_selected_task(&selected).unwrap();
+            assert_eq!(input.fact(), fact);
+            assert_eq!(
+                input.descriptor().descriptor,
+                UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR
+            );
+            // The same shared producer fact alone does not prove compiled use.
+            for site in [
+                ExecutionFailureSite::Coordinator,
+                ExecutionFailureSite::Task {
+                    identity: task(9),
+                    phase: TaskFailurePhase::Execution,
+                },
+            ] {
+                let other = ExecutionFailureInput::new(fact, input.detail().clone(), site);
+                assert_eq!(other.fact(), fact);
+                assert_eq!(
+                    other.descriptor().descriptor.code.as_str(),
+                    "query.execution.unsupported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_site_and_diagnostic_do_not_upgrade_foreign_unsupported_facts() {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let provider = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "compiled shape unavailable",
+        );
+        for fact in [
+            provider.failure_fact(),
+            FailureFact::new(
+                FailureClass::Unsupported,
+                FailureReason::new(domain::LOCAL_COMPILER, NonZeroU16::new(65000).unwrap()),
+            ),
+            FailureFact::new(
+                FailureClass::Unsupported,
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(65000).unwrap()),
+            ),
+        ] {
+            let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
+                task(9),
+                TerminationDetail::Failed(TaskFailure::new_in_phase(
+                    fact,
+                    SafeDetail::truncating("UnsupportedCompiledShape"),
+                    TaskFailurePhase::Preparation,
+                )),
+            );
+            let input = ExecutionFailureInput::from_selected_task(&selected).unwrap();
+            assert_eq!(input.fact(), fact);
+            assert_eq!(
+                input.descriptor().descriptor.code.as_str(),
+                "query.execution.unsupported"
+            );
+        }
+        let stop = FailureFact::stop_observation(
+            novarocks_function_contract::kernel_failure::UNSUPPORTED_CAST,
+        );
+        let input = ExecutionFailureInput::new(
+            stop,
+            SafeDetail::truncating("original stop"),
+            ExecutionFailureSite::Task {
+                identity: task(9),
+                phase: TaskFailurePhase::Preparation,
+            },
+        );
+        assert_eq!(input.fact(), stop);
+        assert_eq!(
+            input.descriptor().descriptor.code.as_str(),
+            "query.execution.control"
+        );
     }
 
     #[test]

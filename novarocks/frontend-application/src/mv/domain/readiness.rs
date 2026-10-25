@@ -489,6 +489,7 @@ impl MvCandidateReader {
         Ok(observed)
     }
 
+    /// Legacy MV preparation still renders at its pre-Action String boundary.
     pub(crate) async fn observe_current_async(
         &self,
         lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
@@ -497,19 +498,32 @@ impl MvCandidateReader {
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
         String,
     > {
+        self.observe_current_application_async(lease, request)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn observe_current_application_async(
+        &self,
+        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::document_storage::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
         let Self {
             service,
             management,
             ..
         } = self;
-        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),Default::default(),management).await.map_err(|e|e.to_string())?;
+        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),Default::default(),management).await.map_err(document_application_error)?;
         if observed.deployment_owner != *management.owner()
             || observed.process_incarnation != *management.incarnation()
         {
             management
                 .close_on_keyed_current_management_mismatch_async(lease, request.clone())
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(document_application_error)?;
             struct ReadOnly(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments);
             #[async_trait::async_trait]
             impl MvKeyedReadOnlyCurrentProjectionSource for ReadOnly {
@@ -528,7 +542,7 @@ impl MvCandidateReader {
                 request.context,
                 Default::default(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(projection_application_error)?;
             service
                 .observe_current_read_only_and_install(
                     Uuid::now_v7(),
@@ -537,14 +551,14 @@ impl MvCandidateReader {
                     "fresh MV management slot names another writer".into(),
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(projection_application_error)?;
             return Ok(observed);
         }
         if convergence.reinstall_current_projection {
             let (fresh, admission, _) = management
                 .observe_keyed_admission_async(lease, request.clone(), Default::default())
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(document_application_error)?;
             observed = fresh;
             struct Source{observed:novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,admission:std::sync::Mutex<Option<novarocks_mv_application::management::MvCurrentManagementAdmission>>}
             #[async_trait::async_trait]
@@ -564,7 +578,7 @@ impl MvCandidateReader {
                 request.context,
                 Default::default(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(projection_application_error)?;
             service
                 .observe_and_install(
                     Uuid::now_v7(),
@@ -575,10 +589,64 @@ impl MvCandidateReader {
                     },
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(projection_application_error)?;
         }
         Ok(observed)
     }
+}
+
+/// Project only the concrete Connector author; never classify a display string.
+pub(crate) fn connector_failure_cause(
+    error: novarocks_spi::connector::ConnectorError,
+) -> novarocks_failure_contract::SharedFailureCause {
+    use novarocks_failure_contract::SharedFailureCause;
+    if let Some(cause) = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+    {
+        return cause.clone();
+    }
+    SharedFailureCause::from_static_detail(error, "MV guard provider operation failed")
+}
+
+pub(crate) fn connector_application_error(
+    error: novarocks_spi::connector::ConnectorError,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    novarocks_query_application::session_error::QueryServiceError::from_failure_cause(connector_failure_cause(
+        error,
+    ))
+}
+
+pub(crate) fn document_application_error(
+    error: novarocks_mv_application::persistence::documents::MvDocumentError,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    use novarocks_mv_application::persistence::documents::MvDocumentError;
+    match error {
+        MvDocumentError::Connector(error)
+        | MvDocumentError::KeyedStorage(
+            novarocks_spi::connector::KeyedDocumentReadError::Invalid(error),
+        ) => connector_application_error(error),
+        error => application_error(error.to_string()),
+    }
+}
+
+fn projection_application_error(
+    error: MvProjectionError,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    match error.original_failure() {
+        Some(cause) => {
+            novarocks_query_application::session_error::QueryServiceError::from_failure_cause(cause.clone())
+        }
+        None => application_error(error.to_string()),
+    }
+}
+
+pub(crate) fn application_error(
+    message: impl Into<String>,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    novarocks_query_application::session_error::QueryServiceError::new(
+        novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+        message,
+    )
 }
 
 #[cfg(all(test, unix, novarocks_dev_controls))]
@@ -749,5 +817,46 @@ mod controlled_wipe_tests {
         assert!(repeated.contains("panicked"));
         assert!(result.unwrap_err().contains("panicked"));
         assert_eq!(repository.list_keyed_projections().await.unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod guard_original_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, KeyedDocumentReadError};
+
+    #[test]
+    fn keyed_invalid_and_mva_projection_keep_the_same_original_cause() {
+        let connector = ConnectorError::from_domain_static(
+            ConnectorErrorKind::Interrupted,
+            novarocks_type_contract::CompileControlError::Cancelled,
+            "actual document read refused",
+        );
+        let cause = connector_failure_cause(connector.clone());
+        let keyed = document_application_error(
+            novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage(
+                KeyedDocumentReadError::Invalid(connector),
+            ),
+        );
+        assert_eq!(keyed.failure_cause(), Some(&cause));
+        let projection = MvProjectionError::new(
+            novarocks_mv_application::readiness::MvProjectionErrorKind::Cancelled,
+            "projection refused",
+        )
+        .with_original_failure(cause.clone());
+        let service = projection_application_error(projection);
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            cause.failure_fact()
+        );
+        let plain = projection_application_error(MvProjectionError::new(
+            novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,
+            "MV projection admission already consumed",
+        ));
+        assert!(plain.failure_cause().is_none());
+        assert!(plain.execution_failure().is_none());
+        assert_eq!(plain.message(), "MV projection admission already consumed");
     }
 }

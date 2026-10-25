@@ -165,10 +165,32 @@ struct ProductExecution {
     finalizer: Arc<Finalizer>,
 }
 impl TableMaintenanceEffectPort for ProductExecution {
+    fn observe_cleanup_owned_ref<'a>(
+        &'a self,
+        _: &'a novarocks_table_maintenance::gc_observation::GcOwnedRefObservationAccelerator,
+        _: novarocks_table_maintenance::gc_observation::GcOwnedRefObservation,
+        _: i64,
+        _: i64,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<
+            novarocks_table_maintenance::gc_observation::GcOwnedRefObservationDecision,
+            novarocks_table_maintenance::runtime::TerminalError,
+        >,
+    > {
+        Box::pin(async {
+            Err(
+                novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed(
+                    "this effect source cannot observe owned-ref cleanup",
+                ),
+            )
+        })
+    }
     fn reject_user_action_on_mv<'a>(
         &'a self,
         _: &'a MaintenanceTarget,
-    ) -> MaintenanceFuture<'a, Result<(), String>> {
+    ) -> MaintenanceFuture<'a, Result<(), novarocks_table_maintenance::runtime::TerminalError>>
+    {
         Box::pin(async { panic!("the job already owns its original activity") })
     }
     fn execute_metadata<'a>(
@@ -193,7 +215,10 @@ impl TableMaintenanceEffectPort for ProductExecution {
         &'a self,
         _: &'a MaintenanceTarget,
         _: i64,
-    ) -> MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>> {
+    ) -> MaintenanceFuture<
+        'a,
+        Result<Box<dyn CleanupSession + 'a>, novarocks_table_maintenance::runtime::TerminalError>,
+    > {
         Box::pin(async { panic!("business terminal does not run unrelated GC") })
     }
 }

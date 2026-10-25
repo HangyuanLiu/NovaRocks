@@ -53,7 +53,7 @@ pub(crate) async fn prepare_mutation_facts_async(
     execution: QueryExecutionContext,
     connector_context: &ConnectorRequestContext,
     operation_id: ConnectorWriteOperationId,
-) -> Result<PreparedMutationFacts, String> {
+) -> Result<PreparedMutationFacts, crate::dml::error::DmlExecutionError> {
     let mutation = match statement {
         OwnedMutationStatement::Update(_) => {
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update
@@ -110,6 +110,7 @@ pub(crate) async fn prepare_mutation_facts_async(
         )
         .map(PreparedMutationFacts::Merge),
     }
+    .map_err(Into::into)
 }
 
 fn arc_layout<T>() -> Result<std::alloc::Layout, LayoutError> {

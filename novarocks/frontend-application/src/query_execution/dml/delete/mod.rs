@@ -162,7 +162,7 @@ pub(crate) async fn prepare_delete_write_async(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
-) -> Result<PreparedDeleteWrite, String> {
+) -> Result<PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
     match statement {
         OwnedDeleteStatement::Predicate(statement) => {
             standard::prepare_delete_statement_async(

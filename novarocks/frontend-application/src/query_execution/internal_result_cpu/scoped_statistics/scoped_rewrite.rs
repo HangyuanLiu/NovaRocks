@@ -84,6 +84,41 @@ impl InternalResultCpu {
         Ok((source.clone(), source))
     }
 
+    pub(crate) fn cleanup_metadata_cpu_port(
+        &self,
+        scope: &WorkScope,
+        window: ResultWindowAlias,
+        lease: &novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+        cancellation: QueryCancellationView,
+        runtime: tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>, WorkError> {
+        if !window.is_for_scope(scope) || !window.is_root_backed_internal() {
+            return Err(WorkError::Conflict);
+        }
+        scope.check()?;
+        let _ = self.provider_creator_source(scope)?;
+        let source_type = lease.metadata_cpu_source_type_id().map_err(|_| {
+            WorkError::InvalidConfig("selected Cleanup metadata CPU author is unsupported")
+        })?;
+        Ok(Arc::new(ScopedProviderCreatorCpu {
+            cpu: self.clone(),
+            scope: scope.clone(),
+            window,
+            descriptor: lease.descriptor().clone(),
+            incarnation: lease.incarnation(),
+            source_type,
+            mode: CreatorCpuMode::ProviderMetadata,
+            cancellation,
+            runtime,
+            wake,
+            state: std::sync::Mutex::new(CreatorPortState {
+                job: None,
+                busy: false,
+            }),
+        }))
+    }
+
     pub(crate) fn provider_metadata_cpu_port(
         &self,
         scope: &WorkScope,

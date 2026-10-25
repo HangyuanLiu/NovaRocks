@@ -99,10 +99,48 @@ impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemory
         &PERSISTENT_TEST_STATE_STORE_DESCRIPTOR
     }
 
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        // This fixture performs no external physical work.
+        Some(Vec::new())
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(
+            novarocks_state_store_testkit::testing::pure_memory_original_vocabulary(
+                PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
+            ),
+        )
+    }
+    fn prepare_open_in(
+        self: Box<Self>,
+        request: StateStoreOpenRequest,
+        _: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        if target.is_some() {
+            return Err(StateStoreError::new(
+                novarocks_state_store_api::StateStoreErrorKind::InvalidRequest,
+                "persistent memory opening receiver is occupied",
+            )
+            .into_original_failure());
+        }
+        novarocks_state_store_testkit::testing::prepare_pure_memory_open_in(
+            self.open_instance(request),
+            target,
+        )
+    }
     async fn open(
         self: Box<Self>,
         request: StateStoreOpenRequest,
     ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+        Ok(self.open_instance(request))
+    }
+}
+impl PersistentInMemoryFactory {
+    fn open_instance(&self, request: StateStoreOpenRequest) -> Box<dyn StateStoreProviderInstance> {
         let stores = persistent_stores();
         let mut stores = stores
             .lock()
@@ -116,11 +154,17 @@ impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemory
                 ))
             })
             .clone();
-        Ok(Box::new(PersistentInMemoryInstance { state_store }))
+        Box::new(PersistentInMemoryInstance {
+            state_store,
+            scope: novarocks_state_store_api::InstanceScope::new(),
+            closed: false,
+        })
     }
 }
 
 struct PersistentInMemoryInstance {
+    scope: novarocks_state_store_api::InstanceScope,
+    closed: bool,
     state_store: Arc<InMemoryStateStore>,
 }
 
@@ -130,15 +174,47 @@ impl StateStoreProviderInstance for PersistentInMemoryInstance {
         &PERSISTENT_TEST_STATE_STORE_DESCRIPTOR
     }
 
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        // This fixture performs no external physical work.
+        Some(Vec::new())
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(
+            novarocks_state_store_testkit::testing::pure_memory_original_vocabulary(
+                PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
+            ),
+        )
+    }
+    fn blocking_instance_scope(&self) -> Option<novarocks_state_store_api::InstanceScope> {
+        Some(self.scope)
+    }
+    fn prepare_close_in(
+        &mut self,
+        _: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalClose>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        novarocks_state_store_testkit::testing::prepare_pure_memory_close_in(target)?;
+        self.closed = true;
+        Ok(())
+    }
     fn lifecycle(&self) -> StateStoreProviderLifecycle {
-        StateStoreProviderLifecycle::Ready
+        if self.closed {
+            StateStoreProviderLifecycle::Stopped
+        } else {
+            StateStoreProviderLifecycle::Ready
+        }
     }
 
     fn state_store(&self) -> Option<Arc<dyn StateStore>> {
-        Some(Arc::clone(&self.state_store) as Arc<dyn StateStore>)
+        (!self.closed).then(|| Arc::clone(&self.state_store) as Arc<dyn StateStore>)
     }
 
     async fn shutdown(&mut self, _deadline: Instant) -> Result<(), StateStoreError> {
+        self.closed = true;
         Ok(())
     }
 }

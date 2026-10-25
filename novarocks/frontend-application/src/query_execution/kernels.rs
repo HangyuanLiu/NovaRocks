@@ -446,6 +446,7 @@ impl ViewExecutionKernel {
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     rewrite_runtime: Option<MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -493,6 +494,7 @@ impl MaintenanceExecutionKernel {
         static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
+            state_store: None,
             rewrite_runtime: None,
             constant_policy,
             functions,
@@ -506,6 +508,24 @@ impl MaintenanceExecutionKernel {
             query_execution,
             service,
         }
+    }
+
+    pub(crate) fn with_state_store_original(
+        mut self,
+        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    ) -> Self {
+        self.state_store = binding;
+        self
+    }
+    pub(crate) fn state_store_original(
+        &self,
+    ) -> Result<
+        &crate::state_store::execution::StateStoreOriginalBinding,
+        novarocks_state_store_api::StateStoreOriginalUnsupported,
+    > {
+        self.state_store
+            .as_ref()
+            .ok_or(novarocks_state_store_api::StateStoreOriginalUnsupported)
     }
 
     pub(crate) fn with_rewrite_runtime(mut self, original: MaintenanceRewriteRuntime) -> Self {

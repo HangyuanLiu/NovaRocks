@@ -230,6 +230,13 @@ fn background_start_error(
         .with_execution_failure(error.execution_failure().cloned())
 }
 
+pub(crate) fn guard_terminal_error(error: QueryServiceError) -> TerminalError {
+    let mut terminal = computation_error(error);
+    terminal.state = novarocks_table_maintenance::runtime::MaintenanceJobState::PreDispatchFailed;
+    terminal.effect = Some(novarocks_coordination_contract::ExecutionEffect::None);
+    terminal
+}
+
 pub(crate) fn computation_error(error: QueryServiceError) -> TerminalError {
     if let Some(cause) = error.failure_cause() {
         return TerminalError::failed(error.to_string()).with_failure_cause(Some(cause.clone()));
@@ -1473,10 +1480,34 @@ impl novarocks_table_maintenance::product::DistributedRewriteSession for Governe
 impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
     for GovernedRewriteEffectPort
 {
+    fn observe_cleanup_owned_ref<'a>(
+        &'a self,
+        _: &'a novarocks_table_maintenance::gc_observation::GcOwnedRefObservationAccelerator,
+        _: novarocks_table_maintenance::gc_observation::GcOwnedRefObservation,
+        _: i64,
+        _: i64,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<
+            novarocks_table_maintenance::gc_observation::GcOwnedRefObservationDecision,
+            novarocks_table_maintenance::runtime::TerminalError,
+        >,
+    > {
+        Box::pin(async {
+            Err(
+                novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed(
+                    "this effect source cannot observe owned-ref cleanup",
+                ),
+            )
+        })
+    }
     fn reject_user_action_on_mv<'a>(
         &'a self,
         _target: &'a MaintenanceTarget,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<(), String>> {
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<(), novarocks_table_maintenance::runtime::TerminalError>,
+    > {
         Box::pin(product_port_reject_user_action_on_mv(self, _target))
     }
     fn execute_metadata<'a>(
@@ -1523,7 +1554,7 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
         _older: i64,
     ) -> novarocks_table_maintenance::product::MaintenanceFuture<
         'a,
-        Result<Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>, String>,
+        Result<Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>, TerminalError>,
     > {
         Box::pin(product_port_begin_cleanup(self, _target, _older))
     }
@@ -1614,8 +1645,10 @@ async fn product_session_finalize_committed<'a>(
 async fn product_port_reject_user_action_on_mv<'a>(
     _this: &'a GovernedRewriteEffectPort,
     _target: &'a MaintenanceTarget,
-) -> Result<(), String> {
-    Err("mounted Optimize uses its already admitted maintenance activity".into())
+) -> Result<(), TerminalError> {
+    Err(TerminalError::pre_dispatch_failed(
+        "mounted Optimize uses its already admitted maintenance activity",
+    ))
 }
 async fn product_port_execute_metadata<'a>(
     _this: &'a GovernedRewriteEffectPort,
@@ -1672,8 +1705,10 @@ async fn product_port_begin_cleanup<'a>(
     _this: &'a GovernedRewriteEffectPort,
     _target: &'a MaintenanceTarget,
     _older: i64,
-) -> Result<Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>, String> {
-    Err("Rewrite Source does not dispatch cleanup maintenance".into())
+) -> Result<Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>, TerminalError> {
+    Err(TerminalError::pre_dispatch_failed(
+        "Rewrite Source does not dispatch cleanup maintenance",
+    ))
 }
 
 async fn close_refused_cohort(

@@ -291,6 +291,7 @@ pub struct CtasFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CtasUserError {
+    Application(novarocks_query_application::session_error::QueryServiceError),
     Execution(ExecutionFailureInput),
     Compilation(novarocks_execution_contract::failure::SharedFailureCause),
     Analyze(novarocks_sql::analyze_error::AnalyzeError),
@@ -306,6 +307,7 @@ impl std::error::Error for CtasFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.user_error {
             Some(CtasUserError::Analyze(source)) => Some(source),
+            Some(CtasUserError::Application(source)) => Some(source),
             Some(CtasUserError::Control(source)) => Some(source),
             Some(CtasUserError::Compilation(source)) => Some(source),
             Some(CtasUserError::Execution(_)) | None => None,
@@ -324,6 +326,11 @@ impl CtasFailure {
     fn from_dml(error: DmlExecutionError) -> Self {
         match error {
             DmlExecutionError::Execution(input) => Self::from_execution(input),
+            DmlExecutionError::Application(error) => Self {
+                kind: CtasFailureKind::Internal,
+                message: error.message().to_owned(),
+                user_error: Some(CtasUserError::Application(error)),
+            },
             DmlExecutionError::Compilation(source) => Self {
                 kind: CtasFailureKind::Internal,
                 message: source.detail().to_owned(),
@@ -354,6 +361,7 @@ impl CtasFailure {
         use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
         match self.user_error.as_ref()? {
             CtasUserError::Execution(input) => Some(input.clone()),
+            CtasUserError::Application(error) => error.execution_failure().cloned(),
             CtasUserError::Compilation(source) => Some(ExecutionFailureInput::new(
                 source.failure_fact(),
                 SafeDetail::truncating("pure SQL compilation failed in its source domain"),
@@ -408,11 +416,21 @@ impl CtasFailure {
             user_error: Some(CtasUserError::Control(error)),
         }
     }
+    pub(crate) fn application_error(
+        &self,
+    ) -> Option<&novarocks_query_application::session_error::QueryServiceError> {
+        match &self.user_error {
+            Some(CtasUserError::Application(error)) => Some(error),
+            _ => None,
+        }
+    }
+
     pub(crate) fn compile_control_error(
         &self,
     ) -> Option<novarocks_type_contract::CompileControlError> {
         match self.user_error.as_ref() {
             Some(CtasUserError::Control(error)) => Some(error.clone()),
+            Some(CtasUserError::Application(error)) => error.compile_control_error(),
             Some(CtasUserError::Analyze(error)) => error.control_error(),
             Some(CtasUserError::Compilation(source)) => Some(
                 novarocks_type_contract::CompileControlError::Source(source.clone()),
@@ -425,6 +443,7 @@ impl CtasFailure {
         match self.user_error.as_ref()? {
             CtasUserError::Analyze(error) => Some(error.to_user_error(source)),
             CtasUserError::Execution(_)
+            | CtasUserError::Application(_)
             | CtasUserError::Control(_)
             | CtasUserError::Compilation(_) => None,
         }

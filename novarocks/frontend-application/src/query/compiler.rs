@@ -909,7 +909,7 @@ mod compile_control_tests {
             (
                 ComparisonPrepareError::Unsupported,
                 FailureClass::Unsupported,
-                "UnsupportedCompiledShape",
+                "query.execution.unsupported",
             ),
             (
                 ComparisonPrepareError::TypeMismatch,

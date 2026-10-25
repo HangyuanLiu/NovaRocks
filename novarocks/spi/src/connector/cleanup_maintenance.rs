@@ -199,10 +199,31 @@ impl ConnectorCleanupCandidate {
         }
     }
 
+    /// Prospective size of the exact original public spelling. This is not a
+    /// plan/SDK graph invoice or permission; the local result author checks its
+    /// real output contract before the report String is constructed.
+    pub fn display_key_len(&self) -> Result<usize, ConnectorError> {
+        match self {
+            Self::Object { location } => Ok(location.len()),
+            Self::OwnedRef { name, .. } => name.len().checked_add("ref:".len()).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "cleanup display length overflow",
+                )
+            }),
+        }
+    }
+    pub fn display_key_string(&self) -> String {
+        match self {
+            Self::Object { location } => location.to_string(),
+            Self::OwnedRef { name, .. } => format!("ref:{name}"),
+        }
+    }
+
     pub fn display_key(&self) -> Arc<str> {
         match self {
             Self::Object { location } => Arc::clone(location),
-            Self::OwnedRef { name, .. } => Arc::from(format!("ref:{name}")),
+            Self::OwnedRef { .. } => Arc::from(self.display_key_string()),
         }
     }
 
@@ -2047,6 +2068,9 @@ pub trait ConnectorCleanupAsyncSource: Send + Sync {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), ConnectorError>>;
     fn publication_fact(&self) -> (Option<super::LakePublicationDisposition>, bool);
+    /// One originating dispatch/required-finalization failure from the original
+    /// journal. The boolean proves required finalization, never actual exit.
+    fn original_failure(&self) -> Option<(ConnectorError, bool)>;
 }
 /// Read-only facts from the SAME original source; no dispatch/wait authority.
 #[derive(Clone)]
@@ -2056,6 +2080,9 @@ pub struct ConnectorCleanupAsyncObservation {
 impl ConnectorCleanupAsyncObservation {
     pub fn publication_fact(&self) -> (Option<super::LakePublicationDisposition>, bool) {
         self.original.publication_fact()
+    }
+    pub fn original_failure(&self) -> Option<(ConnectorError, bool)> {
+        self.original.original_failure()
     }
 
     pub fn publication_disposition(&self) -> Option<super::LakePublicationDisposition> {

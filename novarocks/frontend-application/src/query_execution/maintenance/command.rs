@@ -17,6 +17,7 @@
 
 //! Closed table-maintenance command capabilities.
 
+use super::TableMaintenanceEngine;
 use std::sync::Arc;
 
 use super::{
@@ -116,6 +117,53 @@ impl MaintenanceCommandExecutor {
                 current_catalog,
                 current_database,
             },
+            execution,
+            connector,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn prepare_cleanup_action(
+        &self,
+        command: &novarocks_sql::semantic::MaintenanceSqlCommand,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        connector: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
+        novarocks_table_maintenance::runtime::TerminalError,
+    > {
+        let context = MaintenanceRequestContext {
+            current_catalog,
+            current_database,
+        };
+        let lowered =
+            crate::table_maintenance::lower_semantic_maintenance_statement(command, context)?;
+        let crate::table_maintenance::ParsedMaintenanceStatement::Execute {
+            name_parts,
+            action:
+                crate::table_maintenance::ParsedMaintenanceAction::RemoveOrphanFiles { older_than_ms },
+        } = lowered
+        else {
+            return Ok(None);
+        };
+        let engine = RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            execution.clone(),
+            connector.clone(),
+        );
+        let target = engine
+            .resolve_target(&name_parts, context)
+            .map_err(novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed)?;
+        super::cleanup_action::prepare(
+            &self.kernel,
+            target,
+            older_than_ms,
+            matches!(
+                command,
+                novarocks_sql::semantic::MaintenanceSqlCommand::Call { .. }
+            ),
             execution,
             connector,
         )

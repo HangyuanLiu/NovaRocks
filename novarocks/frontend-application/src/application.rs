@@ -51,8 +51,8 @@ use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
 use novarocks_state_store_runtime::{
-    StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry, StateStoreRunPolicy,
-    validate_persistent_state_families,
+    PreparedStateStoreHost, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
+    StateStoreRunPolicy, validate_persistent_state_families,
 };
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
@@ -171,6 +171,8 @@ impl ClosingPressureRoleSource {
 pub struct FrontendApplicationError {
     kind: FrontendApplicationErrorKind,
     message: String,
+    original: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
+    original_cleanup: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
     #[cfg(feature = "mem-1-m07-closing-pressure")]
     pressure_failures: [Option<Box<ClosingPressureRoleSource>>; 4],
     #[cfg(feature = "mem-1-m07-root-observation")]
@@ -186,6 +188,8 @@ impl FrontendApplicationError {
         Self {
             kind,
             message: error.to_string(),
+            original: None,
+            original_cleanup: None,
             #[cfg(feature = "mem-1-m07-closing-pressure")]
             pressure_failures: std::array::from_fn(|_| None),
             #[cfg(feature = "mem-1-m07-root-observation")]
@@ -193,6 +197,40 @@ impl FrontendApplicationError {
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
             fixture_failures: std::array::from_fn(|_| None),
         }
+    }
+
+    fn original_state_store(cause: novarocks_state_store_api::StateStoreExecutionFailure) -> Self {
+        let mut error = Self::new(FrontendApplicationErrorKind::StateStoreHost, cause.detail());
+        error.original = Some(cause);
+        error
+    }
+    fn state_store(error: novarocks_state_store_runtime::StateStoreHostError) -> Self {
+        let cause = error.original_failure().cloned();
+        let mut result = Self::new(FrontendApplicationErrorKind::StateStoreHost, error);
+        result.original = cause;
+        result
+    }
+    pub fn original_state_store_failure(
+        &self,
+    ) -> Option<&novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.original.as_ref()
+    }
+
+    fn preserve_original_cleanup(&mut self, cleanup: &Self) {
+        if self.original.is_none() {
+            self.original = cleanup.original.clone();
+        } else if self.original_cleanup.is_none() {
+            self.original_cleanup = cleanup
+                .original
+                .clone()
+                .or_else(|| cleanup.original_cleanup.clone());
+        }
+    }
+    pub fn with_application_cleanup(mut self, cleanup: Self) -> Self {
+        self.preserve_original_cleanup(&cleanup);
+        self.message
+            .push_str(&format!("; cleanup failed: {cleanup}"));
+        self
     }
 
     /// Constructs a role-composition failure for the outer Server owner.
@@ -239,6 +277,7 @@ impl FrontendApplicationError {
         feature = "mem-1-m07-closing-pressure"
     ))]
     pub fn with_role_cleanup(mut self, cleanup: Self) -> Self {
+        self.preserve_original_cleanup(&cleanup);
         self.message
             .push_str(&format!("; cleanup failed: {cleanup}"));
         #[cfg(feature = "mem-1-m07-root-observation")]
@@ -292,6 +331,9 @@ impl fmt::Display for FrontendApplicationError {
 
 impl std::error::Error for FrontendApplicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Some(cause) = self.original.as_ref().or(self.original_cleanup.as_ref()) {
+            return Some(cause);
+        }
         #[cfg(feature = "mem-1-m07-root-observation")]
         if let Some(error) = &self.root_observation_io {
             return Some(&error.0);
@@ -315,6 +357,8 @@ impl std::error::Error for FrontendApplicationError {
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
+    #[cfg(novarocks_dev_controls)]
+    namespace: QueryProcessNamespace,
     native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     native_capacity_sources: crate::native_workload::FrontendNativeCapacitySources,
     clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
@@ -501,6 +545,8 @@ impl FrontendExecutionRuntimeOwner {
         Ok(Self {
             native_capacity_profile,
             native_capacity_sources,
+            #[cfg(novarocks_dev_controls)]
+            namespace,
             clock,
             connector_blocking_io,
             supervisor,
@@ -546,7 +592,7 @@ impl FrontendExecutionRuntimeOwner {
         })
     }
 
-    async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+    async fn drain_workload_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.close_admission();
         if self.shutdown_complete {
             return Ok(());
@@ -602,6 +648,18 @@ impl FrontendExecutionRuntimeOwner {
             .await
             .map_err(|_| "frontend joint progress service failed before actual join".to_string())?;
 
+        Ok(())
+    }
+
+    async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.drain_workload_until(deadline).await?;
+        self.shutdown_executors_until(deadline).await
+    }
+
+    /// Durable Host tails may still need the original ordinary executor after
+    /// statement Roots have drained. Join it only after those tails actually
+    /// close, using the same Host deadline and the same unique process owners.
+    async fn shutdown_executors_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.query_cpu.shutdown_until(deadline).await?;
 
         self.query_blocking.shutdown_until(deadline).await?;
@@ -846,6 +904,18 @@ impl FrontendCatalogRoleRuntime {
     }
 }
 
+mod state_store_opening;
+use state_store_opening::FrontendStateStoreOpening;
+
+struct FrontendStartupInput {
+    backend: ClusterBackendOpenConfig,
+    connector_control: Arc<ConnectorControlHost>,
+    catalog_source_input: CatalogDesiredStateSourceInput,
+    catalog_materialization: CatalogMaterializationConfig,
+    catalog_projection: CatalogProjectionConfig,
+    catalog_prune: CatalogPruneConfig,
+}
+
 pub struct FrontendApplicationHost {
     #[cfg(novarocks_dev_controls)]
     pub(crate) test_session: Option<crate::test_session::FrontendTestSession>,
@@ -858,6 +928,8 @@ pub struct FrontendApplicationHost {
     mv_repository:
         Option<Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>>,
     state_store_host: Option<StateStoreHost>,
+    state_store_opening: Option<FrontendStateStoreOpening>,
+    startup: Option<FrontendStartupInput>,
     query_runtime: FrontendQueryRuntimeConfig,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
@@ -1301,7 +1373,10 @@ impl FrontendApplicationHost {
             .and_then(|session| session.hms_listing_observation())
     }
 
+    /// Installs the original aggregate in the caller before any asynchronous
+    /// bootstrap. Failure leaves that same aggregate in receiving for teardown.
     pub async fn open(
+        receiving: &mut Option<Self>,
         state_store: Option<StateStoreHostInput>,
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
@@ -1310,6 +1385,7 @@ impl FrontendApplicationHost {
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
         Self::open_with_role_factories_and_state_store_registry(
+            receiving,
             state_store,
             &StateStoreProviderRegistry::new(),
             execution,
@@ -1323,6 +1399,40 @@ impl FrontendApplicationHost {
     }
 
     pub async fn open_with_role_factories_and_state_store_registry(
+        receiving: &mut Option<Self>,
+        state_store: Option<StateStoreHostInput>,
+        state_store_registry: &StateStoreProviderRegistry,
+        execution: FrontendExecutionConfig,
+        backend: ClusterBackendOpenConfig,
+        connector_role_factories: Vec<Arc<dyn ConnectorControlRoleBindingFactory>>,
+        data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
+    ) -> Result<Self, FrontendApplicationError> {
+        if receiving.is_some() {
+            return Err(FrontendApplicationError::server(
+                "frontend Host receiving slot is occupied",
+            ));
+        }
+        *receiving = Some(Self::prepare_with_role_factories_and_state_store_registry(
+            state_store,
+            state_store_registry,
+            execution,
+            backend,
+            connector_role_factories,
+            data_runtime,
+            native_trust,
+            native_transport,
+        )?);
+        receiving
+            .as_mut()
+            .expect("installed original Host")
+            .open_prepared()
+            .await?;
+        Ok(receiving.take().expect("normal bootstrap handoff"))
+    }
+
+    pub fn prepare_with_role_factories_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
         execution: FrontendExecutionConfig,
@@ -1342,7 +1452,7 @@ impl FrontendApplicationHost {
                 },
             )?,
         );
-        Self::open_with_connector_control_host_and_state_store_registry(
+        Self::prepare_with_connector_control_host_and_state_store_registry(
             state_store,
             state_store_registry,
             execution,
@@ -1352,10 +1462,9 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
         )
-        .await
     }
 
-    async fn open_with_connector_control_host_and_state_store_registry(
+    fn prepare_with_connector_control_host_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
         execution: FrontendExecutionConfig,
@@ -1393,6 +1502,17 @@ impl FrontendApplicationHost {
                 error,
             ));
         }
+        let state_store_opening = state_store
+            .map(|input| {
+                StateStoreHost::prepare_original_open(
+                    state_store_registry,
+                    input,
+                    Instant::now() + STATE_STORE_OPEN_TIMEOUT,
+                )
+                .map(FrontendStateStoreOpening::new)
+                .map_err(FrontendApplicationError::state_store)
+            })
+            .transpose()?;
         // The role composition root mints one identity for both signed Native
         // calls and logical execution. Transport subjects remain diagnostic.
         let frontend_process_id = FrontendProcessId::new_v7();
@@ -1451,7 +1571,8 @@ impl FrontendApplicationHost {
         )?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
-        let mut host = Self {
+        let execution_role = backend.role();
+        let host = Self {
             #[cfg(novarocks_dev_controls)]
             test_session,
             catalog_role_runtime: None,
@@ -1460,6 +1581,15 @@ impl FrontendApplicationHost {
             abandoned_attempt_sweeper: None,
             mv_repository: None,
             state_store_host: None,
+            state_store_opening,
+            startup: Some(FrontendStartupInput {
+                backend,
+                connector_control,
+                catalog_source_input,
+                catalog_materialization: execution.catalog_materialization,
+                catalog_projection: execution.catalog_projection.clone(),
+                catalog_prune: execution.catalog_prune.clone(),
+            }),
             query_runtime: FrontendQueryRuntimeConfig {
                 native_compatibility_id: execution.native_compatibility_id,
                 runtime_filter_worker_count: execution.runtime_filter_worker_count,
@@ -1470,10 +1600,10 @@ impl FrontendApplicationHost {
                 abort_capacity: execution.logical_abort_effect_capacity,
             },
             execution_runtime_owner,
-            execution_role: backend.role(),
+            execution_role,
             data_runtime,
             topology: None,
-            optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
+            optimizer_query_mem_limit_bytes: execution.optimizer_query_mem_limit_bytes(),
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
             mv_scheduler_config: execution.mv_scheduler.clone(),
             mv_maintenance_config: execution.mv_maintenance.clone(),
@@ -1485,6 +1615,24 @@ impl FrontendApplicationHost {
             static_plan_carrier: execution.static_plan_carrier,
         };
 
+        Ok(host)
+    }
+
+    /// Borrows the aggregate already installed by its process/role owner.
+    /// Cancelling this future cannot consume the original opening receiver.
+    pub async fn open_prepared(&mut self) -> Result<(), FrontendApplicationError> {
+        let FrontendStartupInput {
+            backend,
+            connector_control,
+            catalog_source_input,
+            catalog_materialization,
+            catalog_projection,
+            catalog_prune,
+        } = self.startup.take().ok_or_else(|| {
+            FrontendApplicationError::server("frontend bootstrap was already started")
+        })?;
+        let catalog_source_mode = catalog_source_input.mode();
+        let host = self;
         // Every fallible observer activation runs after the original process
         // owner aggregate is in Host, so startup failure uses its real drain.
         #[cfg(novarocks_dev_controls)]
@@ -1508,11 +1656,7 @@ impl FrontendApplicationHost {
             // Retain the existing startup attribution evidence only for the
             // explicitly installed, live statement observation owner.
             if owner.is_active() {
-                let bytes = frontend_process_id.to_bytes();
-                let namespace = QueryProcessNamespace::new(
-                    u64::from_be_bytes(bytes[..8].try_into().expect("UUID high half"))
-                        ^ u64::from_be_bytes(bytes[8..].try_into().expect("UUID low half")),
-                );
+                let namespace = host.execution_runtime_owner.namespace;
                 eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
             }
         }
@@ -1562,11 +1706,7 @@ impl FrontendApplicationHost {
                 .await);
         }
 
-        if let Some(state_store) = state_store
-            && let Err(error) = host
-                .open_configured(state_store, state_store_registry)
-                .await
-        {
+        if let Err(error) = host.open_configured().await {
             return Err(host.cleanup_open_error(error).await);
         }
         let attachments = if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore
@@ -1614,7 +1754,7 @@ impl FrontendApplicationHost {
                 Arc::clone(&connector_control),
                 host.catalog_runtime_projection.publisher(),
                 tokio::runtime::Handle::current(),
-                execution.catalog_materialization,
+                catalog_materialization,
                 Arc::new(MvCatalogReferenceReader),
             ));
         host.catalog_role_runtime = Some(FrontendCatalogRoleRuntime::new(
@@ -1628,7 +1768,7 @@ impl FrontendApplicationHost {
             let controller = match FrontendCatalogController::new(
                 store,
                 Arc::clone(&host.catalog_role_runtime().application),
-                execution.catalog_projection.clone(),
+                catalog_projection.clone(),
             ) {
                 Ok(controller) => controller,
                 Err(error) => {
@@ -1672,8 +1812,8 @@ impl FrontendApplicationHost {
             let projection = Arc::clone(&host.catalog_role_runtime().application);
             match projection
                 .reconcile_snapshot_with_page_size(
-                    execution.catalog_projection.page_size,
-                    execution.catalog_projection.worker_count,
+                    catalog_projection.page_size,
+                    catalog_projection.worker_count,
                 )
                 .await
             {
@@ -1726,7 +1866,7 @@ impl FrontendApplicationHost {
             Arc::clone(&host.catalog_role_runtime().application),
             host.backend_topology_port(),
             host.data_runtime.clone(),
-            execution.catalog_prune.clone(),
+            catalog_prune.clone(),
         );
         if let Err(error) = catalog_prune.start() {
             return Err(host
@@ -1758,8 +1898,6 @@ impl FrontendApplicationHost {
         // Freeze the policy consumed by the role-product coordinator before
         // constructing any product service, so no path can observe an
         // all-in-one-only direct execution fallback.
-        host.optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
-        host.lake_publication_runtime_policy = execution.lake_publication_runtime_policy();
         match host.state_store() {
             Some(store) => match StateStoreMvRepository::open(store, host.run_policy()).await {
                 Ok(repository) => {
@@ -1791,7 +1929,7 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
-        Ok(host)
+        Ok(())
     }
 
     pub fn catalog_application_port(
@@ -2069,6 +2207,21 @@ impl FrontendApplicationHost {
         self.catalog_role_runtime().typed_connector_control()
     }
 
+    pub(crate) fn state_store_original_binding(
+        &self,
+    ) -> Option<crate::state_store::execution::StateStoreOriginalBinding> {
+        let host = self.state_store_host.as_ref()?;
+        let (vocabulary, instance) = host.original_blocking_sources()?;
+        let dependencies = host.original_blocking_dependency_facts()?.to_vec();
+        Some(crate::state_store::execution::StateStoreOriginalBinding {
+            dependencies,
+            vocabulary,
+            instance,
+            executor: self.execution_runtime_owner.query_blocking_executor(),
+            policy: host.run_policy(),
+        })
+    }
+
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
         self.state_store_host
             .as_ref()
@@ -2297,7 +2450,14 @@ impl FrontendApplicationHost {
             }
         };
         resources.map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
+            let mut result =
+                FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error);
+            result.original = self
+                .state_store_opening
+                .as_ref()
+                .and_then(FrontendStateStoreOpening::original_failure)
+                .cloned();
+            result
         })
     }
 
@@ -2320,23 +2480,26 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.abandon_for_process_exit();
     }
 
-    async fn open_configured(
-        &mut self,
-        input: StateStoreHostInput,
-        registry: &StateStoreProviderRegistry,
-    ) -> Result<(), FrontendApplicationError> {
-        self.state_store_host = Some(
-            StateStoreHost::open(registry, input, Instant::now() + STATE_STORE_OPEN_TIMEOUT)
-                .await
-                .map_err(|error| {
-                    FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::StateStoreHost,
-                        error,
-                    )
-                })?,
-        );
-
-        Ok(())
+    async fn open_configured(&mut self) -> Result<(), FrontendApplicationError> {
+        let Some(opening) = self.state_store_opening.as_mut() else {
+            return Ok(());
+        };
+        let executor = self.execution_runtime_owner.query_blocking_executor();
+        opening
+            .start(&executor)
+            .map_err(FrontendApplicationError::original_state_store)?;
+        let deadline = opening.deadline();
+        let open = std::future::poll_fn(|cx| opening.poll_open(cx, &mut self.state_store_host));
+        match tokio::time::timeout_at(deadline.into(), open).await {
+            Ok(result) => result,
+            Err(_) => Err(FrontendApplicationError::original_state_store(
+                novarocks_state_store_api::StateStoreError::new(
+                    novarocks_state_store_api::StateStoreErrorKind::DeadlineExceeded,
+                    "frontend state store opening deadline exceeded",
+                )
+                .into_original_failure(),
+            )),
+        }
     }
 
     async fn cleanup_open_error(
@@ -2348,7 +2511,7 @@ impl FrontendApplicationHost {
             .await
         {
             Ok(()) => primary,
-            Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
+            Err(cleanup_error) => primary.with_application_cleanup(cleanup_error),
         }
     }
 
@@ -2357,7 +2520,7 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.close_admission();
         let mut primary_error: Option<String> = None;
         let execution_result = {
-            let shutdown = self.execution_runtime_owner.shutdown_until(deadline);
+            let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
             tokio::pin!(shutdown);
             // The healthy continuous reaper stays active throughout logical
             // teardown. If it fails, borrow the SAME owner here so its original
@@ -2466,18 +2629,43 @@ impl FrontendApplicationHost {
                 None => error,
             });
         }
-        if let Some(host) = self.state_store_host.as_mut() {
-            match host.shutdown(deadline).await {
-                Ok(()) => {
-                    self.state_store_host.take();
+        // Preserve the existing best-effort final abandoned-attempt drain.
+        // Its legacy evidence path remains a separate migration boundary;
+        // opening/instance-close purpose grants no transaction authority.
+        if let Some(host) = self.state_store_host.as_ref()
+            && let Err(error) = host.release_abandoned_attempts().await
+        {
+            tracing::warn!(%error, "abandoned state store attempts were not released before shutdown");
+        }
+        drop(self.mv_repository.take());
+        if let Some(opening) = self.state_store_opening.as_mut() {
+            let executor = self.execution_runtime_owner.query_blocking_executor();
+            let close = std::future::poll_fn(|cx| {
+                opening.poll_close(&mut self.state_store_host, &executor, deadline, cx)
+            });
+            match tokio::time::timeout_at(deadline.into(), close).await {
+                Ok(Ok(())) => {
+                    self.state_store_opening.take();
                 }
-                Err(error) => {
-                    let host_error = format!("shutdown frontend StateStore host failed: {error}");
-                    if let Some(primary) = primary_error.as_mut() {
-                        primary.push_str(&format!("; cleanup failed: {host_error}"));
-                    } else {
-                        primary_error = Some(host_error);
-                    }
+                Ok(Err(error)) => {
+                    return Err(match primary_error {
+                        Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                        None => error.to_string(),
+                    });
+                }
+                Err(_) => return Err("frontend original StateStore close remains pending".into()),
+            }
+        }
+        if self.state_store_host.is_none() && self.state_store_opening.is_none() {
+            if let Err(error) = self
+                .execution_runtime_owner
+                .shutdown_executors_until(deadline)
+                .await
+            {
+                if let Some(primary) = primary_error.as_mut() {
+                    primary.push_str(&format!("; cleanup failed: {error}"));
+                } else {
+                    primary_error = Some(error);
                 }
             }
         }
@@ -2833,7 +3021,9 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
+        let mut host_receiving_11 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_11,
             Some(test_state_store_input(name)),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -3062,7 +3252,9 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("valid frontend backend config");
+        let mut host_receiving_10 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_10,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(

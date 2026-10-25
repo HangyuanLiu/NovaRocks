@@ -144,8 +144,38 @@ fn original_f_drop_unwind_keeps_its_output_and_cannot_become_an_exit_receipt() {
 #[test]
 fn cleanup_cpu_factory_uses_the_selected_metadata_original_not_statistics_product() {
     let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
-    let (descriptor, key, plan, _) = super::super::tests::contract_values();
+    let (descriptor, key, _, _) = super::super::tests::contract_values();
     let adapter = IcebergCleanupMaintenanceAdapter::new(key.clone(), runtime).unwrap();
+    let payload = PlanPayload {
+        version: ARTIFACT_VERSION,
+        namespace: "db".into(),
+        table: "t".into(),
+        table_uuid: uuid::Uuid::from_u128(31).to_string(),
+    };
+    let request = ConnectorCleanupPlanningRequest::try_new(
+        ConnectorCleanupOperationId::new(),
+        key.clone(),
+        novarocks_spi::connector::ConnectorCleanupOperation::remove_unreferenced_objects(
+            novarocks_spi::connector::ConnectorTableHandle::try_new(
+                key.instance_id.clone(),
+                bytes::Bytes::from_static(b"table"),
+            )
+            .unwrap(),
+            1,
+        )
+        .unwrap(),
+        super::super::tests::context(),
+    )
+    .unwrap();
+    let plan = ConnectorCleanupPlan::try_new(
+        &request,
+        [6; 32],
+        [7; 32],
+        novarocks_spi::connector::ConnectorCleanupPlanSummary::try_new(3, 30, 1).unwrap(),
+        canonical(&serde_json::to_value(&payload).unwrap()).unwrap(),
+        novarocks_spi::connector::ConnectorProcessLocalPayload::new(key.clone(), Arc::new(())),
+    )
+    .unwrap();
     let source = IcebergMetadataCpuOriginal::cleanup_source(
         descriptor,
         key.incarnation,
@@ -163,11 +193,47 @@ fn cleanup_cpu_factory_uses_the_selected_metadata_original_not_statistics_produc
         adapter.metadata_cpu_source_type_id().unwrap()
     );
     input.run_original_phase();
-    let error = match source.take_cleanup_output() {
-        Err(error) => error,
-        Ok(_) => panic!("foreign legacy payload must fail"),
+    let CpuOutput::Payload(decoded) = source.take_cleanup_output().unwrap() else {
+        panic!("selected metadata original must run the Cleanup payload phase");
     };
-    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    assert_eq!(decoded.version, payload.version);
+    assert_eq!(decoded.namespace, payload.namespace);
+    assert_eq!(decoded.table, payload.table);
+    assert_eq!(decoded.table_uuid, payload.table_uuid);
+}
+
+#[test]
+fn cleanup_metadata_original_preserves_corrupt_provider_payload_after_neutral_validation() {
+    use novarocks_failure_contract::FailureProjection;
+    let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+    let (descriptor, key, plan, _) = super::super::tests::contract_values();
+    let adapter = IcebergCleanupMaintenanceAdapter::new(key.clone(), runtime).unwrap();
+    assert_eq!(plan.owner(), &key);
+    plan.validate().unwrap();
+    // The neutral contract fixture has a valid digest and exact owner, but
+    // its opaque `plan` bytes are intentionally not an Iceberg JSON payload.
+    assert_eq!(plan.provider_payload().as_ref(), b"plan");
+    assert!(serde_json::from_slice::<serde_json::Value>(plan.provider_payload()).is_err());
+    let expected = match adapter.plan_payload(&plan) {
+        Err(error) => error,
+        Ok(_) => panic!("malformed provider bytes must fail canonical decoding"),
+    };
+    assert_eq!(expected.kind(), ConnectorErrorKind::CorruptData);
+    let source = IcebergMetadataCpuOriginal::cleanup_source(
+        descriptor,
+        key.incarnation,
+        CpuWork {
+            input: CpuInput::Payload { adapter, plan },
+            result: None,
+        },
+    );
+    ProviderMetadataCpuInput(source.clone()).run_original_phase();
+    let actual = match source.take_cleanup_output() {
+        Err(error) => error,
+        Ok(_) => panic!("Cleanup CPU must preserve the provider decoder refusal"),
+    };
+    assert_eq!(actual, expected);
+    assert_eq!(actual.failure_fact(), expected.failure_fact());
 }
 
 #[test]
@@ -295,6 +361,25 @@ impl PreparedCatalogDispatch for ReturnedDispatch {
         }
     }
 }
+// Rejected evidence has no positive-applied finalization authority. Hold the
+// actual dispatch return instead of inventing a required finalize for it.
+struct HeldRejectedDispatch {
+    held: tokio::sync::oneshot::Receiver<()>,
+    failure: ConnectorMutationFailure,
+}
+#[async_trait::async_trait]
+impl PreparedCatalogDispatch for HeldRejectedDispatch {
+    async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+        self.held.await.expect("original rejected dispatch returns");
+        DispatchCompletion {
+            evidence: DispatchEvidence::Rejected {
+                failure: self.failure,
+                observation: ProtocolObservation::default(),
+            },
+            finalization: None,
+        }
+    }
+}
 struct HeldFinalization(tokio::sync::oneshot::Receiver<()>);
 #[async_trait::async_trait]
 impl FinalizationWork for HeldFinalization {
@@ -394,6 +479,8 @@ fn applied_and_noop_are_visible_while_finalize_waits_and_survive_receipt_cpu_ref
         ExternalMutationEffect::NoOp,
     ] {
         let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+        // Journal dispatch constructs its real Tokio deadline/barrier futures.
+        let _entered = _executor.enter();
         let (descriptor, key) = values();
         let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
             descriptor,
@@ -485,6 +572,8 @@ fn original_not_dispatched_survives_receipt_cpu_refusal_and_closes() {
 #[test]
 fn unknown_is_retained_until_the_same_original_positive_proof_exists() {
     let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+    // Journal dispatch constructs its real Tokio deadline/barrier futures.
+    let _entered = _executor.enter();
     let (descriptor, key) = values();
     let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
         descriptor,
@@ -517,6 +606,27 @@ fn unknown_is_retained_until_the_same_original_positive_proof_exists() {
         original.publication_fact(),
         (Some(LakePublicationDisposition::CommitUnknown), false)
     );
+    // The closing tag creates no new work and cannot turn Unknown into an
+    // exit receipt, even when foreground time has already expired.
+    let (_, _, plan, _) = super::super::tests::contract_values();
+    *original.shared.plan_stamp.lock().unwrap() =
+        Some((plan.plan_digest(), plan.manifest_digest()));
+    let mut closing = Some(Step::Finalize(
+        novarocks_spi::connector::ConnectorCleanupFinalizeRequest {
+            plan,
+            context: super::super::tests::context()
+                .with_earlier_deadline(Instant::now() - std::time::Duration::from_secs(1)),
+        },
+    ));
+    original.install_step_in(&mut closing).unwrap();
+    assert!(matches!(
+        original.poll_output(&mut cx),
+        Poll::Ready(Ok(Output::Finalized))
+    ));
+    assert_eq!(
+        original.publication_fact(),
+        (Some(LakePublicationDisposition::CommitUnknown), false)
+    );
     assert!(matches!(original.poll_closed(&mut cx), Poll::Pending));
     assert!(original.shared.cpu_original.lock().unwrap().is_none());
     assert_eq!(original.shared.journals.lock().unwrap().len(), 1);
@@ -542,6 +652,8 @@ fn unknown_is_retained_until_the_same_original_positive_proof_exists() {
 #[test]
 fn original_rejected_dispatch_survives_receipt_cpu_refusal_and_closes() {
     let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+    // Journal dispatch constructs its real Tokio deadline/barrier futures.
+    let _entered = _executor.enter();
     let (descriptor, key) = values();
     let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
         descriptor,
@@ -633,6 +745,8 @@ impl FinalizationWork for FailedFinalization {
 #[test]
 fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_close() {
     let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+    // Journal dispatch constructs its real Tokio deadline/barrier futures.
+    let _entered = _executor.enter();
     let (descriptor, key) = values();
     let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
         descriptor,
@@ -650,21 +764,19 @@ fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_clos
         &original,
         journal,
         context,
-        returned_evidence(
-            DispatchEvidence::Rejected {
-                failure,
-                observation: ProtocolObservation::default(),
-            },
-            Some(Box::new(HeldFinalization(held))),
-        ),
+        Ok(PreparedPublication::Mutation {
+            binding: None,
+            dispatch: Box::new(HeldRejectedDispatch { held, failure }),
+        }),
     );
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(original.poll_output(&mut cx), Poll::Pending));
     assert_eq!(
         original.publication_fact(),
-        (Some(LakePublicationDisposition::KnownUncommitted), false)
+        (Some(LakePublicationDisposition::CommitUnknown), false)
     );
+    assert!(ConnectorCleanupAsyncSource::original_failure(&original).is_none());
     assert!(matches!(original.poll_closed(&mut cx), Poll::Pending));
     assert_eq!(cpu.submitted.load(Ordering::SeqCst), 0);
     assert_eq!(cpu.closed.load(Ordering::SeqCst), 0);
@@ -673,6 +785,13 @@ fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_clos
         panic!("receipt CPU refusal must return the original rejection");
     };
     assert_same_original_cause(&actual, &primary);
+    assert_eq!(
+        original.publication_fact(),
+        (Some(LakePublicationDisposition::KnownUncommitted), false)
+    );
+    let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
+    assert_same_original_cause(&observed, &primary);
+    assert_eq!(required, false);
     assert!(matches!(
         original.shared.first_failure.lock().unwrap().as_ref(),
         Some(OriginalFailure::Publication(
@@ -696,6 +815,9 @@ fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_clos
     assert_eq!(cpu.closed.load(Ordering::SeqCst), 1);
     assert!(original.shared.cpu_original.lock().unwrap().is_none());
     assert_same_original_cause(&original.shared.original_failure().unwrap(), &primary);
+    let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
+    assert_same_original_cause(&observed, &primary);
+    assert_eq!(required, false);
     assert_eq!(
         original.publication_fact(),
         (Some(LakePublicationDisposition::KnownUncommitted), false)
@@ -705,6 +827,8 @@ fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_clos
 #[test]
 fn applied_required_finalize_cause_precedes_receipt_cpu_refusal_and_survives_actual_close() {
     let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+    // Journal dispatch constructs its real Tokio deadline/barrier futures.
+    let _entered = _executor.enter();
     let (descriptor, key) = values();
     let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
         descriptor,
@@ -744,6 +868,9 @@ fn applied_required_finalize_cause_precedes_receipt_cpu_refusal_and_survives_act
         panic!("receipt CPU refusal must return the original required-finalize failure");
     };
     assert_same_original_cause(&actual, &primary);
+    let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
+    assert_same_original_cause(&observed, &primary);
+    assert_eq!(required, true);
     assert!(matches!(
         original.shared.first_failure.lock().unwrap().as_ref(),
         Some(OriginalFailure::Publication(
@@ -767,8 +894,54 @@ fn applied_required_finalize_cause_precedes_receipt_cpu_refusal_and_survives_act
     assert_eq!(cpu.closed.load(Ordering::SeqCst), 1);
     assert!(original.shared.cpu_original.lock().unwrap().is_none());
     assert_same_original_cause(&original.shared.original_failure().unwrap(), &primary);
+    let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
+    assert_same_original_cause(&observed, &primary);
+    assert_eq!(required, true);
     assert_eq!(
         original.publication_fact(),
         (Some(LakePublicationDisposition::KnownCommitted), true)
     );
+}
+
+#[test]
+fn pure_finalize_after_deadline_preserves_owner_and_starts_no_cpu_or_io() {
+    let (_executor, _warehouse, runtime) = super::super::tests::local_runtime();
+    let (descriptor, key, plan, _) = super::super::tests::contract_values();
+    let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
+        descriptor,
+        key.incarnation,
+        runtime.clone(),
+    ));
+    let adapter = IcebergCleanupMaintenanceAdapter::new(key, runtime).unwrap();
+    let cpu = Arc::new(NoPhysicalCpu::default());
+    let original = completed_original(adapter, metadata, cpu.clone());
+    *original.shared.plan_stamp.lock().unwrap() =
+        Some((plan.plan_digest(), plan.manifest_digest()));
+    original.body.lock().unwrap().as_mut().unwrap().result = None;
+    let expired = super::super::tests::context()
+        .with_earlier_deadline(Instant::now() - std::time::Duration::from_secs(1));
+    assert!(
+        validate_context(&expired).is_err(),
+        "foreground calls remain stopped"
+    );
+    let mut step = Some(Step::Finalize(
+        novarocks_spi::connector::ConnectorCleanupFinalizeRequest {
+            plan,
+            context: expired,
+        },
+    ));
+    original.install_step_in(&mut step).unwrap();
+    assert!(step.is_none());
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        original.poll_output(&mut cx),
+        Poll::Ready(Ok(Output::Finalized))
+    ));
+    assert_eq!(
+        original.publication_fact(),
+        (None, false),
+        "Finalize creates no publication or effect proof"
+    );
+    assert!(matches!(original.poll_closed(&mut cx), Poll::Ready(Ok(()))));
+    assert_eq!(cpu.closes.load(Ordering::SeqCst), 0);
 }

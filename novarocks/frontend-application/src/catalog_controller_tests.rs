@@ -720,7 +720,9 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
     for mode in [CatalogDesiredStateSourceMode::ManagedController] {
         // No StateStore input at all: if the rejection depended on anything the
         // frontend opens, this could not fail here.
+        let mut host_receiving_1 = None;
         let error = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_1,
             None,
             &registry,
             FrontendExecutionConfig::new_for_test(

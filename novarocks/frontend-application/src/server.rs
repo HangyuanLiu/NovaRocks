@@ -299,12 +299,12 @@ impl FrontendRoleProducts {
     }
 }
 
-/// Opens the frontend services once for an externally composed server.
-pub async fn open_frontend_application_for_server(
+/// Synchronously installs the original process owner before borrowed bootstrap.
+pub fn prepare_frontend_application_for_server(
     config: &FrontendApplicationOpenConfig,
     data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+    FrontendApplicationHost::prepare_with_role_factories_and_state_store_registry(
         config.state_store_input.clone(),
         &config.state_store_provider_registry,
         config.execution.clone(),
@@ -314,7 +314,25 @@ pub async fn open_frontend_application_for_server(
         Arc::clone(&config.native_trust),
         config.native_transport.clone(),
     )
-    .await
+}
+
+/// Convenience borrower; an error leaves the same Host in receiving.
+pub async fn open_frontend_application_for_server(
+    receiving: &mut Option<FrontendApplicationHost>,
+    config: &FrontendApplicationOpenConfig,
+    data_runtime: Handle,
+) -> Result<FrontendApplicationHost, FrontendApplicationError> {
+    if receiving.is_some() {
+        return Err(FrontendApplicationError::server(
+            "frontend Host receiving slot is occupied",
+        ));
+    }
+    *receiving = Some(prepare_frontend_application_for_server(
+        config,
+        data_runtime,
+    )?);
+    receiving.as_mut().unwrap().open_prepared().await?;
+    Ok(receiving.take().expect("normal original Host handoff"))
 }
 
 /// Complete the one Frontend-owned startup graph and return a ready SQL
@@ -513,6 +531,7 @@ async fn build_frontend_role_products(
         host.constant_policy(),
         host.static_plan_carrier(),
     )
+    .with_state_store_original(host.state_store_original_binding())
     .with_rewrite_runtime(crate::query_execution::kernels::MaintenanceRewriteRuntime {
         client: host.logical_execution_client(),
         launcher: logical_execution_launcher.clone(),
@@ -1718,7 +1737,9 @@ mod tests {
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
         let state_store = test_state_store_input("cp2-cutover");
         let registry = test_state_store_registry();
+        let mut host_receiving_9 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_9,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1833,7 +1854,9 @@ mod tests {
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
         let state_store = test_state_store_input("frontend-report-listener");
         let registry = test_state_store_registry();
+        let mut host_receiving_8 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_8,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1882,7 +1905,9 @@ mod tests {
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
         let state_store = test_state_store_input("statistics-application-port");
         let registry = test_state_store_registry();
+        let mut host_receiving_7 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_7,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1937,7 +1962,9 @@ mod tests {
     async fn role_products_inject_their_unique_mv_product_into_the_frontend_adapter() {
         let state_store = test_state_store_input("mv-product-role-composition");
         let registry = test_state_store_registry();
+        let mut host_receiving_6 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_6,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -2051,7 +2078,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn production_shutdown_has_a_finite_process_exit_boundary() {
         let registry = test_state_store_registry();
+        let mut host_receiving_5 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_5,
             Some(test_state_store_input("server-bounded-shutdown-owner")),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -2101,7 +2130,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serving_drain_refuses_new_governed_roots() {
         let registry = test_state_store_registry();
+        let mut host_receiving_4 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_4,
             Some(test_state_store_input("server-drain-closes-root-admission")),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -2445,8 +2476,10 @@ mod tests {
             let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
             let mut runner = RunnerSession::start(declaration)?;
             let registry = test_state_store_registry();
+            let mut host_receiving_3 = None;
             let opened =
                 FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+                    &mut host_receiving_3,
                     Some(test_state_store_input("g2-real-entry")),
                     &registry,
                     execution_config.with_test_session(
@@ -2643,8 +2676,10 @@ mod tests {
             let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
             let mut runner = RunnerSession::start(declaration)?;
             let registry = test_state_store_registry();
+            let mut host_receiving_2 = None;
             let opened =
                 FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+                    &mut host_receiving_2,
                     Some(test_state_store_input("g2-real-entry")),
                     &registry,
                     execution_config.with_test_session(

@@ -38,7 +38,9 @@ impl WriteStatementFamily for DeleteFamily {
     type Input = PreparationInput;
     type Prepared = PreparedDeleteWrite;
 
-    async fn prepare(input: Arc<PreparationInput>) -> Result<Arc<PreparedDeleteWrite>, String> {
+    async fn prepare(
+        input: Arc<PreparationInput>,
+    ) -> Result<Arc<PreparedDeleteWrite>, crate::dml::error::DmlExecutionError> {
         crate::query_execution::dml::delete::prepare_delete_write_async(
             &input.kernel,
             &input.statement,

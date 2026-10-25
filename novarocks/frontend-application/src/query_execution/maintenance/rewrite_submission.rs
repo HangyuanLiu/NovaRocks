@@ -86,6 +86,7 @@ struct OptimizeSubmissionState {
     wake: Arc<SubmitWake>,
     prepare: Option<PrepareFuture>,
     prepare_result: Option<Result<(), TerminalError>>,
+    ordinary_io_failure: Option<WorkError>,
     prepare_exited: bool,
     observe: Option<ObserveFuture>,
     observed: Option<Result<ObservedEffect, TerminalError>>,
@@ -188,6 +189,7 @@ pub(crate) fn prepare(
             wake: Arc::new(SubmitWake::default()),
             prepare: None,
             prepare_result: None,
+            ordinary_io_failure: None,
             prepare_exited: false,
             observe: None,
             observed: None,
@@ -283,12 +285,13 @@ impl OptimizeSubmissionState {
         }
         // No original local producer F/CPU or physical metadata request can
         // borrow the SQL permit across this transfer.
-        std::task::ready!(io.poll_quiescent(original, cx)).map_err(producer_service)?;
-        if let Some(Err(error)) = self.prepare_result.as_ref() {
-            return Poll::Ready(Err(super::rewrite_job::computation_service_error(
-                error.clone(),
-            )));
-        }
+        std::task::ready!(poll_preparation_close(
+            &io,
+            &self.prepare_result,
+            &mut self.ordinary_io_failure,
+            &mut self.health,
+            cx,
+        ))?;
         if !self.installed {
             let Ok(mut source) = self.source.try_lock() else {
                 return Poll::Pending;
@@ -375,7 +378,7 @@ impl OptimizeSubmissionState {
                 if let Some(failure) = io.health_failure() {
                     return Poll::Ready(Err(failure));
                 }
-                let _ordinary = error;
+                self.ordinary_io_failure.get_or_insert(error);
             }
         }
         std::task::ready!(self.poll_prepare_exit(cx));
@@ -400,16 +403,56 @@ impl OptimizeSubmissionState {
         if let Some(io) = self.io.as_ref() {
             match io.withdraw_unstarted_in().map_err(unproven)? {
                 Some(observed) => {
-                    let _ordinary = observed.into_ordinary_failure();
+                    if let Some(failure) = observed.into_ordinary_failure() {
+                        self.ordinary_io_failure.get_or_insert(failure);
+                    }
                 }
                 None => {
-                    let _ordinary = std::task::ready!(io.poll_actual_quiescent_continuing(cx))?;
+                    let observed = std::task::ready!(io.poll_actual_quiescent_continuing(cx))?;
+                    if let Some(failure) = observed.into_ordinary_failure() {
+                        self.ordinary_io_failure.get_or_insert(failure);
+                    }
                 }
             }
         }
         Poll::Ready(Ok(()))
     }
 }
+// The result receiver already owns the preparation conclusion. Actual I/O
+// exit is a separate prerequisite; its ordinary refusal cannot replace that
+// original conclusion with a newly projected cause during close.
+fn poll_preparation_close(
+    io: &Arc<MetadataIoAdmission>,
+    conclusion: &Option<Result<(), TerminalError>>,
+    ordinary_failure: &mut Option<WorkError>,
+    health: &mut Option<StatementNativeHealthFailure>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<(), QueryServiceError>> {
+    let observed = match std::task::ready!(io.poll_actual_quiescent_continuing(cx)) {
+        Ok(observed) => observed,
+        Err(failure) => {
+            health.get_or_insert(failure);
+            return Poll::Ready(Err(service("Optimize original metadata exit is unproven")));
+        }
+    };
+    if let Some(failure) = observed.into_ordinary_failure() {
+        ordinary_failure.get_or_insert(failure);
+    }
+    if let Some(Err(original)) = conclusion {
+        return Poll::Ready(Err(super::rewrite_job::computation_service_error(
+            original.clone(),
+        )));
+    }
+    if let Some(failure) = ordinary_failure {
+        return Poll::Ready(Err(producer_service(failure.clone())));
+    }
+    match conclusion {
+        Some(Ok(())) => Poll::Ready(Ok(())),
+        None => Poll::Ready(Err(service("Optimize preparation conclusion is absent"))),
+        Some(Err(_)) => unreachable!("the original preparation failure was selected above"),
+    }
+}
+
 impl GovernedStatementAction for OptimizeSubmissionAction {
     fn poll_action(
         &mut self,
@@ -474,7 +517,7 @@ async fn prepare_original_submission(
             original.cpu.as_ref().unwrap().clone(),
         )
         .await
-        .map_err(TerminalError::pre_dispatch_failed)?;
+        .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)?;
     #[cfg(novarocks_dev_controls)]
     if let Some(controls) = &original.controls {
         if let Some(nomination) = original.engine.execution.test_statement_nomination() {
@@ -759,3 +802,7 @@ mod observer_effect_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "rewrite_submission/guard_close_tests.rs"]
+mod guard_close_tests;

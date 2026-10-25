@@ -250,6 +250,16 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
     let capacity =
         QueryResultCapacityBinding::try_new(owner.scope(), owner.result_window_alias().unwrap())
             .unwrap();
+    if class == ResultWindowClass::Internal {
+        // Original Internal statement admission now pins its configured Root
+        // byte owner, not a computation position or a fabricated payload.
+        let retention = capacity.try_window_alias().unwrap();
+        assert!(retention.is_for_scope(owner.scope()));
+        assert!(retention.is_root_backed_internal());
+        assert_eq!(retention.class(), ResultWindowClass::Internal);
+        assert!(retention.internal_manifest_binding().unwrap().is_none());
+        assert_eq!(observation.snapshot().result_windows.held_positions, [0; 4]);
+    }
     let (started, entered) = mpsc::channel();
     let release_call = Arc::new(tokio::sync::Notify::new());
     let (exit_started, exit_entered) = mpsc::channel();
@@ -367,7 +377,9 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
     let expected = if class == ResultWindowClass::Local {
         [0, 1, 0, 0]
     } else {
-        [0, 0, 1, 0]
+        // No computation was dispatched by these fact-only callbacks. The
+        // exact Root retention pin below must still survive actual exit.
+        [0; 4]
     };
     let held = [&during_call, &during_exit].iter().all(|facts| {
         facts.root_responsibilities == 1
@@ -436,7 +448,10 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
         "original caller did not join as cancelled"
     );
     assert!(watchdog_joined, "rescue watchdog did not join");
-    assert!(held, "same original statement Root/window was not retained");
+    assert!(
+        held,
+        "same original statement Root/result owner was not retained"
+    );
     assert_eq!(provider.reads.load(Ordering::Acquire), 1);
     assert!(provider.exact_request.load(Ordering::Acquire));
     assert!(provider.stop_seen.load(Ordering::Acquire));
@@ -460,6 +475,6 @@ fn actual_statistics_port_keeps_local_window_through_stop_and_original_callback_
     observe_real_statistics_port(ResultWindowClass::Local);
 }
 #[test]
-fn actual_statistics_port_keeps_internal_window_through_stop_and_original_callback_exit() {
+fn actual_statistics_port_keeps_root_retention_through_stop_and_original_callback_exit() {
     observe_real_statistics_port(ResultWindowClass::Internal);
 }

@@ -724,7 +724,8 @@ fn projection_catalogs_are_admitted(
 }
 
 fn project_connector_error(error: ConnectorError) -> MvProjectionError {
-    MvProjectionError::from(MvDocumentError::Connector(error))
+    let cause = super::readiness::connector_failure_cause(error.clone());
+    MvProjectionError::from(MvDocumentError::Connector(error)).with_original_failure(cause)
 }
 
 #[cfg(test)]

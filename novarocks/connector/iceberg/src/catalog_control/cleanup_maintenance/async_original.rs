@@ -337,6 +337,19 @@ impl ConnectorCleanupAsyncSource for Original {
     fn publication_fact(&self) -> (Option<LakePublicationDisposition>, bool) {
         self.shared.publication_fact()
     }
+    fn original_failure(&self) -> Option<(ConnectorError, bool)> {
+        let failure = self
+            .shared
+            .first_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        let required = matches!(
+            &failure,
+            OriginalFailure::Publication(CatalogPublicationFailure::RequiredFinalization(_))
+        );
+        Some((failure.connector_error(), required))
+    }
 }
 pub(super) fn install_in(
     adapter: &IcebergCleanupMaintenanceAdapter,
@@ -612,7 +625,10 @@ async fn run_step(shared: Arc<Shared>, step: Step) -> Result<Output, ConnectorEr
             }
         }
         Step::Finalize(request) => {
-            validate_context(&request.context)?;
+            // Closing projects the SAME completed operation. It starts no I/O
+            // or CPU and must not replace returned journal facts with a late
+            // foreground stop. install_step_in already checked its plan stamp;
+            // the execution wrapper also verifies the exact owner/operation.
             shared.adapter.ensure_owner(request.plan.owner())?;
             Ok(Output::Finalized)
         }

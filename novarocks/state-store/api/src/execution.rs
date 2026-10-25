@@ -24,7 +24,6 @@
 
 use std::{
     any::Any,
-    error::Error,
     sync::{Arc, Weak},
     task::{Context, Poll},
     time::Instant,
@@ -43,6 +42,7 @@ pub enum StateStoreBlockingOrigin {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateStoreBlockingPhase {
     Open,
+    Close,
     BeginRead,
     BeginWrite,
     Get,
@@ -69,18 +69,51 @@ pub struct StateStoreBlockingRequest {
 pub trait StateStoreBlockingOriginal: Any + Send + Sync {
     fn origin(&self) -> StateStoreBlockingOrigin;
     fn requested(&self) -> Option<StateStoreBlockingRequest>;
+    /// Pure same-source stop observation for an unpublished business phase.
+    /// Settlement must remain possible after a method/borrower is abandoned.
+    /// This is not health, dispatch authority, or proof of actual exit.
+    fn publication_refusal(
+        &self,
+        request: StateStoreBlockingRequest,
+    ) -> Option<StateStoreExecutionFailure>;
     /// Called only by the accepted physical worker for this exact request.
     /// Must reject a stale request inside the original without redispatch.
     fn run_original_phase(&self, request: StateStoreBlockingRequest);
+    /// Original physical receiving is already stable. No I/O or queue publish
+    /// occurs here; commit registers evidence and marks only this same attempt.
+    fn before_publish(
+        &self,
+        request: StateStoreBlockingRequest,
+    ) -> Result<(), StateStoreExecutionFailure>;
+    /// Called once per same request, outside receiving/custody locks. The
+    /// original retains a physical failure even if later evidence resolves it.
+    fn receive_result(
+        &self,
+        request: StateStoreBlockingRequest,
+        result: Result<(), StateStoreExecutionFailure>,
+    );
+    /// Only this receipt proof permits the original's next serial phase.
+    /// An uncertain publication or failed destructor is never NeverPublished.
+    fn receive_exit(
+        &self,
+        request: StateStoreBlockingRequest,
+        exit: Result<StateStoreBlockingExit, StateStoreExecutionFailure>,
+    );
+    /// Idle is not complete. Transactions and unresolved attempts remain held.
+    fn is_complete(&self) -> bool;
+    fn local_failure(&self) -> Option<StateStoreExecutionFailure>;
+    /// Abandons the transaction/undelivered opening result, unlike interrupting
+    /// just one method. Existing owner progress performs rollback/settlement.
+    fn request_close(&self);
     /// Nonblocking stop request. Transaction abandonment/rollback obligation
     /// is a separate original-owned fact, not implied by a method F dropping.
     fn request_interrupt(&self);
 }
 
-/// Preserves the actual executor/provider source without formatting or
-/// replacing it with a domain string. Business results stay in Original;
-/// this carrier reports physical admission/health/exit failures only.
-pub type StateStoreExecutionFailure = Arc<dyn Error + Send + Sync>;
+/// The originating author freezes its fact and raw cause together. Consumers
+/// share that same identity; they do not infer classification from concrete
+/// foreign types or diagnostics. Business results remain in Original.
+pub type StateStoreExecutionFailure = novarocks_failure_contract::SharedFailureCause;
 
 /// These are distinct proofs. NeverPublishedReturned requires normal return
 /// from destruction of the same unpublished call and reservation; it is not a
@@ -128,6 +161,9 @@ pub trait StateStoreExecutionPort: Send + Sync {
         deadline: Instant,
         target: &mut Option<Box<dyn StateStoreBlockingSlot>>,
     ) -> Result<(), StateStoreExecutionFailure>;
+    /// Wake the existing owner only, without dispatching or creating a task.
+    /// Implementations retain a notification failure in original owner health.
+    fn request_progress(&self);
 }
 
 /// Weak borrower of an already-installed port, not a permission constructor.
@@ -148,26 +184,164 @@ impl StateStoreExecutionContext {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
+    /// Borrows the same owner with a deadline that can only become earlier.
+    /// This neither extends business time nor supplies settlement authority.
+    pub fn with_deadline(&self, deadline: Instant) -> Self {
+        Self {
+            port: self.port.clone(),
+            deadline: self.deadline.min(deadline),
+        }
+    }
+    /// Identity comparison of borrowers only, never a Root/source grant.
+    pub fn shares_owner(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.port, &other.port)
+    }
+    pub fn request_progress(&self) {
+        if let Some(port) = self.port.upgrade() {
+            port.request_progress();
+        }
+    }
     pub fn bind_original_in(
         &self,
         original: &Arc<dyn StateStoreBlockingOriginal>,
         target: &mut Option<Box<dyn StateStoreBlockingSlot>>,
     ) -> Result<(), StateStoreExecutionFailure> {
         if target.is_some() {
-            return Err(Arc::new(StateStoreError::new(
+            return Err(StateStoreError::new(
                 StateStoreErrorKind::Internal,
                 "state store original receiving slot is not empty",
-            )));
+            )
+            .into_original_failure());
         }
         let port = self
             .port
             .upgrade()
             .ok_or_else(|| -> StateStoreExecutionFailure {
-                Arc::new(StateStoreError::new(
+                StateStoreError::new(
                     StateStoreErrorKind::ProviderUnavailable,
                     "state store original execution owner is unavailable",
-                ))
+                )
+                .into_original_failure()
             })?;
         port.bind_original_in(original, self.deadline, target)
+    }
+}
+
+/// Selected factory-authored private vocabulary. These facts confer no queue,
+/// Root, provider access, or permission to accept a caller's arbitrary object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateStoreBlockingSourceVocabulary {
+    provider: StateStoreProviderId,
+    open: std::any::TypeId,
+    transaction: std::any::TypeId,
+    evidence: std::any::TypeId,
+}
+impl StateStoreBlockingSourceVocabulary {
+    pub fn for_provider<
+        O: StateStoreBlockingOriginal,
+        T: StateStoreBlockingOriginal,
+        E: StateStoreBlockingOriginal,
+    >(
+        provider: StateStoreProviderId,
+    ) -> Self {
+        Self {
+            provider,
+            open: std::any::TypeId::of::<O>(),
+            transaction: std::any::TypeId::of::<T>(),
+            evidence: std::any::TypeId::of::<E>(),
+        }
+    }
+    pub fn provider(&self) -> StateStoreProviderId {
+        self.provider
+    }
+    pub fn open_type(&self) -> std::any::TypeId {
+        self.open
+    }
+    pub fn transaction_type(&self) -> std::any::TypeId {
+        self.transaction
+    }
+    pub fn evidence_type(&self) -> std::any::TypeId {
+        self.evidence
+    }
+}
+
+/// A provider without the governed original contract explicitly refuses it.
+/// It must not delegate a new *_in caller to legacy blocking/spawn methods.
+#[derive(Debug)]
+pub struct StateStoreOriginalUnsupported;
+impl std::fmt::Display for StateStoreOriginalUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("state store provider does not support original execution")
+    }
+}
+impl std::error::Error for StateStoreOriginalUnsupported {}
+
+#[async_trait::async_trait]
+pub trait OriginalReadTransaction: Send {
+    async fn get_in(
+        &mut self,
+        key: &crate::Key,
+    ) -> Result<Option<crate::StateRecord>, StateStoreExecutionFailure>;
+    async fn range_in(
+        &mut self,
+        request: &crate::RangeRequest,
+    ) -> Result<crate::RangePage, StateStoreExecutionFailure>;
+    /// Borrows the same session; its original owns rollback even if F drops.
+    async fn close_in(&mut self) -> Result<(), StateStoreExecutionFailure>;
+}
+#[async_trait::async_trait]
+pub trait OriginalWriteTransaction: OriginalReadTransaction {
+    fn attempt(&self) -> crate::AttemptId;
+    /// Physical origin remains observable even if durable evidence resolved it.
+    fn original_failure(&self) -> Option<StateStoreExecutionFailure>;
+    async fn put_in(
+        &mut self,
+        key: crate::Key,
+        value: crate::Value,
+        precondition: crate::Precondition,
+    ) -> Result<(), StateStoreExecutionFailure>;
+    async fn delete_in(
+        &mut self,
+        key: crate::Key,
+        precondition: crate::Precondition,
+    ) -> Result<(), StateStoreExecutionFailure>;
+    /// Retains the one attempt and operation result in its stable Original.
+    /// Unknown does not authorize another commit.
+    async fn commit_in(&mut self) -> Result<crate::CommitOutcome, StateStoreExecutionFailure>;
+}
+
+/// A borrowed opening source. The instance never becomes unique custody of a
+/// disposable opening F: only a synchronous move into original role receiving
+/// can consume the provider's already-stable result after actual exit.
+pub trait StateStoreOriginalOpen: Send {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StateStoreExecutionFailure>>;
+    fn take_instance_in(
+        &mut self,
+        target: &mut Option<Box<dyn crate::StateStoreProviderInstance>>,
+    ) -> Result<(), StateStoreExecutionFailure>;
+}
+
+/// A borrowed close handle. Only the original Source's actual worker footers
+/// prove closure; dropping this handle never releases the instance or its file.
+pub trait StateStoreOriginalClose: Send {
+    fn poll_closed(&mut self, cx: &mut Context<'_>)
+    -> Poll<Result<(), StateStoreExecutionFailure>>;
+}
+
+impl novarocks_failure_contract::FailureProjection for StateStoreOriginalUnsupported {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::STATE_STORE, std::num::NonZeroU16::new(20).unwrap()),
+        )
+    }
+}
+impl StateStoreOriginalUnsupported {
+    pub fn into_original_failure(self) -> StateStoreExecutionFailure {
+        StateStoreExecutionFailure::from_static_detail(
+            self,
+            "state store provider does not support original execution",
+        )
     }
 }

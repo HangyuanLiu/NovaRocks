@@ -196,6 +196,7 @@ pub enum CleanupCandidate {
 /// that fact maps to a statement failure and whether retry is safe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CleanupTerminal {
+    NoOp { locations: Vec<String> },
     KnownCommitted { locations: Vec<String> },
     KnownUncommitted { failure: String },
     CommitUnknown { failure: String },
@@ -213,10 +214,10 @@ pub trait CleanupSession: Send {
     fn select_owned_refs<'a>(
         &'a mut self,
         candidate_indexes: &'a [usize],
-    ) -> crate::product::MaintenanceFuture<'a, Result<(), String>>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>>;
     fn execute<'a>(
         &'a mut self,
-    ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, String>>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, TerminalError>>;
 }
 
 /// The only adapter surface needed by the table-maintenance product.
@@ -225,10 +226,20 @@ pub trait CleanupSession: Send {
 /// but return only typed effect facts.  They do not own activity gates, GC
 /// maturity, worker lifecycle, or commit terminal interpretation.
 pub trait TableMaintenanceEffectPort: Sync {
+    /// Observe the owned-ref safety window through this effect owner's actual
+    /// execution context. The Product alone decides which indexes are mature.
+    fn observe_cleanup_owned_ref<'a>(
+        &'a self,
+        observations: &'a GcOwnedRefObservationAccelerator,
+        observation: GcOwnedRefObservation,
+        now_ms: i64,
+        safe_gc_age_ms: i64,
+    ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>>;
+
     fn reject_user_action_on_mv<'a>(
         &'a self,
         target: &'a MaintenanceTarget,
-    ) -> crate::product::MaintenanceFuture<'a, Result<(), String>>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>>;
     fn execute_metadata<'a>(
         &'a self,
         request: MaintenanceActionRequest,
@@ -281,7 +292,7 @@ pub trait TableMaintenanceEffectPort: Sync {
         &'a self,
         target: &'a MaintenanceTarget,
         older_than_ms: i64,
-    ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, TerminalError>>;
 }
 
 /// Single process-local business owner for every table-maintenance operation.
@@ -440,10 +451,7 @@ impl TableMaintenanceProduct {
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
                 older_than_ms,
-            } => self
-                .execute_cleanup(effects, target, older_than_ms)
-                .await
-                .map_err(TerminalError::from),
+            } => self.execute_cleanup(effects, target, older_than_ms).await,
             request => {
                 let target = request.target().clone();
                 let _permit = self
@@ -617,7 +625,7 @@ impl TableMaintenanceProduct {
         effects: &P,
         target: MaintenanceTarget,
         older_than_ms: i64,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         let _permit = self
             .acquire_activity(&target, MaintenanceActivityFamily::Cleanup)
             .map_err(|error| error.to_string())?;
@@ -632,7 +640,9 @@ impl TableMaintenanceProduct {
             .iter()
             .any(|candidate| matches!(candidate, CleanupCandidate::Object));
         if has_owned && has_objects {
-            return Err("cleanup discovery mixed owned-ref and object candidates".to_string());
+            return Err(TerminalError::pre_dispatch_failed(
+                "cleanup discovery mixed owned-ref and object candidates",
+            ));
         }
         if has_objects {
             session.require_scanned_object_gc()?;
@@ -643,7 +653,8 @@ impl TableMaintenanceProduct {
                     .to_string()
             })?;
             let indexes =
-                mature_owned_ref_indexes(observations, candidates, now_ms, safe_gc_age_ms).await?;
+                mature_owned_ref_indexes(effects, observations, candidates, now_ms, safe_gc_age_ms)
+                    .await?;
             if indexes.is_empty() {
                 return Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
                     orphan_file_locations: Vec::new(),
@@ -652,20 +663,24 @@ impl TableMaintenanceProduct {
             session.select_owned_refs(&indexes).await?;
         }
         match session.execute().await? {
-            CleanupTerminal::KnownCommitted { locations } => {
+            CleanupTerminal::NoOp { locations } | CleanupTerminal::KnownCommitted { locations } => {
                 Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
                     orphan_file_locations: locations,
                 })
             }
-            CleanupTerminal::KnownUncommitted { failure } => {
-                Err(format!("orphan cleanup was not applied: {failure}"))
+            CleanupTerminal::KnownUncommitted { failure } => Err(TerminalError::known_uncommitted(
+                format!("orphan cleanup was not applied: {failure}"),
+            )),
+            CleanupTerminal::CommitUnknown { failure } => {
+                Err(TerminalError::commit_unknown(format!(
+                    "orphan cleanup dispatch outcome is unknown: {failure}; do not retry automatically"
+                )))
             }
-            CleanupTerminal::CommitUnknown { failure } => Err(format!(
-                "orphan cleanup dispatch outcome is unknown: {failure}; do not retry automatically"
-            )),
-            CleanupTerminal::KnownCommittedFinalizationFailed { failure } => Err(format!(
-                "orphan cleanup committed but finalization failed: {failure}"
-            )),
+            CleanupTerminal::KnownCommittedFinalizationFailed { failure } => {
+                Err(TerminalError::known_committed_finalization_failed(format!(
+                    "orphan cleanup committed but finalization failed: {failure}"
+                )))
+            }
         }
     }
 
@@ -689,12 +704,13 @@ impl TableMaintenanceProduct {
     }
 }
 
-async fn mature_owned_ref_indexes(
+async fn mature_owned_ref_indexes<P: TableMaintenanceEffectPort + ?Sized>(
+    effects: &P,
     observations: &GcOwnedRefObservationAccelerator,
     candidates: &[CleanupCandidate],
     now_ms: i64,
     safe_gc_age_ms: i64,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>, TerminalError> {
     let mut indexes = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let CleanupCandidate::OwnedRef(candidate) = candidate else {
@@ -710,10 +726,9 @@ async fn mature_owned_ref_indexes(
         )
         .map_err(|error| format!("build GC owned-ref observation failed: {error}"))?;
         if matches!(
-            observations
-                .observe(observation, now_ms, safe_gc_age_ms)
-                .await
-                .map_err(|error| format!("record GC owned-ref observation failed: {error}"))?,
+            effects
+                .observe_cleanup_owned_ref(observations, observation, now_ms, safe_gc_age_ms)
+                .await?,
             GcOwnedRefObservationDecision::Mature { .. }
         ) {
             indexes.push(index);
@@ -976,10 +991,19 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for FixedRewritePort {
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
             Box::pin(async move { Ok(()) })
         }
 
@@ -1012,8 +1036,10 @@ mod tests {
             &'a self,
             _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>>
-        {
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
             Box::pin(async move { unreachable!("rewrite test never starts cleanup") })
         }
     }
@@ -1105,10 +1131,19 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for AutomaticPort {
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
             Box::pin(async move { Ok(()) })
         }
 
@@ -1177,8 +1212,10 @@ mod tests {
             &'a self,
             _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>>
-        {
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
             Box::pin(async move { unreachable!("automatic action must not use cleanup") })
         }
     }
@@ -1719,10 +1756,19 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for ReleaseRewritePort {
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
             Box::pin(async move { Ok(()) })
         }
 
@@ -1760,8 +1806,10 @@ mod tests {
             &'a self,
             _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>>
-        {
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
             Box::pin(async move { unreachable!("rewrite release test never starts cleanup") })
         }
     }
@@ -1888,14 +1936,14 @@ mod tests {
     struct ReleaseCleanupPort {
         content: Mutex<Option<Arc<()>>>,
         executed: Arc<Mutex<bool>>,
-        terminal: Result<CleanupTerminal, String>,
+        terminal: Result<CleanupTerminal, TerminalError>,
         object_candidates: bool,
     }
 
     struct ReleaseCleanupSession {
         _content: Arc<()>,
         executed: Arc<Mutex<bool>>,
-        terminal: Result<CleanupTerminal, String>,
+        terminal: Result<CleanupTerminal, TerminalError>,
         object_candidates: bool,
     }
 
@@ -1911,13 +1959,13 @@ mod tests {
         fn select_owned_refs<'a>(
             &'a mut self,
             _candidate_indexes: &'a [usize],
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
             Box::pin(async move { unreachable!("object cleanup has no owned refs") })
         }
 
         fn execute<'a>(
             &'a mut self,
-        ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, TerminalError>> {
             Box::pin(async move {
                 *self.executed.lock().unwrap() = true;
                 self.terminal.clone()
@@ -1926,10 +1974,19 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for ReleaseCleanupPort {
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
             Box::pin(async move { Ok(()) })
         }
 
@@ -1956,8 +2013,10 @@ mod tests {
             &'a self,
             _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>>
-        {
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
             Box::pin(async move {
                 Ok(Box::new(ReleaseCleanupSession {
                     _content: self.content.lock().unwrap().take().expect("begin once"),
@@ -1973,13 +2032,21 @@ mod tests {
     async fn cleanup_terminal_paths_release_attempt_content() {
         let cases = [
             (
+                Ok(CleanupTerminal::NoOp {
+                    locations: Vec::new(),
+                }),
+                None,
+            ),
+            (
                 Ok(CleanupTerminal::KnownCommitted {
                     locations: Vec::new(),
                 }),
                 None,
             ),
             (
-                Err("cleanup execution failed".to_string()),
+                Err(TerminalError::pre_dispatch_failed(
+                    "cleanup execution failed",
+                )),
                 Some("cleanup execution failed"),
             ),
             (
@@ -2043,6 +2110,71 @@ mod tests {
             );
         }
     }
+    #[derive(Debug)]
+    struct CleanupOrigin;
+    impl std::fmt::Display for CleanupOrigin {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original cleanup domain refusal")
+        }
+    }
+    impl std::error::Error for CleanupOrigin {}
+    impl novarocks_failure_contract::FailureProjection for CleanupOrigin {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            use novarocks_failure_contract::*;
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(31).unwrap()),
+            )
+        }
+    }
+    #[tokio::test]
+    async fn cleanup_product_preserves_original_cause_fact_and_effect() {
+        use novarocks_coordination_contract::ExecutionEffect;
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
+        for state in [
+            MaintenanceJobState::KnownUncommitted,
+            MaintenanceJobState::CommitUnknown,
+            MaintenanceJobState::KnownCommittedFinalizationFailed,
+        ] {
+            let cause =
+                SharedFailureCause::from_static_detail(CleanupOrigin, "original cleanup refusal");
+            let original = match state {
+                MaintenanceJobState::KnownUncommitted => {
+                    TerminalError::known_uncommitted("original")
+                }
+                MaintenanceJobState::CommitUnknown => TerminalError::commit_unknown("original"),
+                _ => TerminalError::known_committed_finalization_failed("original"),
+            }
+            .with_failure_cause(Some(cause.clone()));
+            let expected_effect = original.effect;
+            let port = ReleaseCleanupPort {
+                content: Mutex::new(Some(Arc::new(()))),
+                executed: Arc::new(Mutex::new(false)),
+                terminal: Err(original),
+                object_candidates: false,
+            };
+            let actual = product
+                .execute_action(
+                    &port,
+                    MaintenanceActionRequest::RemoveOrphanFiles {
+                        target: target(),
+                        older_than_ms: 1,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(actual.state, state);
+            assert_eq!(actual.failure_cause.as_ref(), Some(&cause));
+            assert_eq!(actual.selected_failure_fact(), Some(cause.failure_fact()));
+            assert_eq!(actual.effect, expected_effect);
+            if state == MaintenanceJobState::KnownCommittedFinalizationFailed {
+                assert_eq!(actual.effect, Some(ExecutionEffect::External));
+            }
+            assert!(*port.executed.lock().unwrap());
+        }
+    }
+
     #[tokio::test]
     async fn unproven_object_cleanup_never_executes_even_with_safe_age() {
         let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
@@ -2118,10 +2250,19 @@ mod async_metadata_tests {
         release: tokio::sync::Notify,
     }
     impl TableMaintenanceEffectPort for GatedMetadata {
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _: &'a MaintenanceTarget,
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), String>> {
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
             Box::pin(async move { Ok(()) })
         }
         fn execute_metadata<'a>(
@@ -2156,8 +2297,10 @@ mod async_metadata_tests {
             &'a self,
             _: &'a MaintenanceTarget,
             _: i64,
-        ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, String>>
-        {
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
             Box::pin(async move { panic!("metadata cannot enter cleanup") })
         }
     }
@@ -2254,3 +2397,7 @@ mod async_metadata_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "product/gc_original_tests.rs"]
+mod gc_original_tests;

@@ -57,6 +57,18 @@ pub(super) fn prepare(
     {
         return Ok(action);
     }
+    if let Some(action) = executor
+        .prepare_cleanup_action(
+            command,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            context.execution(),
+            command_context.connector_context(),
+        )
+        .map_err(maintenance_command_error)?
+    {
+        return Ok(action);
+    }
     let capacity = context.execution().result_capacity().ok_or_else(|| {
         CommandError::new(
             CommandErrorKind::Rejected,

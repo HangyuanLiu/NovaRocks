@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 mod action_state;
+pub(crate) mod cleanup_action;
 pub mod command;
 pub(crate) mod io_admission;
 mod rewrite_capture;
@@ -416,7 +417,10 @@ pub trait TableMaintenanceEngine: Send + Sync {
         expected_object_id: &ConnectorTableObjectId,
     ) -> Result<MaintenanceTargetRebind, String>;
 
-    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
+    async fn reject_user_action_on_mv(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError>;
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String>;
 
@@ -676,7 +680,7 @@ impl RequestScopedMaintenanceEngine {
         &self,
         target: &MaintenanceTarget,
         exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    ) -> Result<(), String> {
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
         crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
             self.kernel.mv_storage_observation().as_ref(),
             exact_lease,
@@ -698,7 +702,7 @@ impl RequestScopedMaintenanceEngine {
         target: &MaintenanceTarget,
         exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
-    ) -> Result<(), String> {
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
         crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
             self.kernel.mv_storage_observation().as_ref(),
             exact_lease,
@@ -1150,15 +1154,21 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         self.rebind_target_object_with_context(target, expected_object_id)
     }
 
-    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+    async fn reject_user_action_on_mv(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
         use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
-        let instance_id = ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
+        let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+            crate::mv::domain::readiness::application_error(format!(
+                "parse Iceberg catalog identity for MV guard: {error}"
+            ))
+        })?;
         let exact_lease = ConnectorControlResolver::acquire_current(
             self.kernel.connector_control().as_ref(),
             &instance_id,
         )
-        .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
+        .map_err(crate::mv::domain::readiness::connector_application_error)?;
         self.reject_direct_rewrite_on_mv(target, &exact_lease).await
     }
 
@@ -1496,8 +1506,12 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             .rebind_target_object(target, expected_object_id)
     }
 
-    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        self.request_engine()?
+    async fn reject_user_action_on_mv(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+        self.request_engine()
+            .map_err(crate::mv::domain::readiness::application_error)?
             .reject_user_action_on_mv(target)
             .await
     }

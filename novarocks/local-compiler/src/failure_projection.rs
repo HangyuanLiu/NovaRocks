@@ -24,10 +24,7 @@ use std::{error::Error, num::NonZeroU16};
 
 #[repr(u16)]
 enum Reason {
-    UnsupportedFragment = 1,
     InvalidFragment = 2,
-    UnsupportedExpression = 10,
-    UnsupportedCall = 11,
     InvalidExpression = 12,
     InvalidChannels = 20,
     InvalidRepeat = 21,
@@ -49,9 +46,10 @@ impl FailureProjection for FragmentCompileError {
             Self::ProjectMetadataRequest(source) => source.failure_fact(),
             Self::ProjectMetadataHost { error } | Self::Owner { error, .. } => error.failure_fact(),
             Self::Control(source) => source.failure_fact(),
-            Self::Unsupported { .. } => {
-                fact(FailureClass::Unsupported, Reason::UnsupportedFragment)
-            }
+            Self::Unsupported { .. } => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_FRAGMENT,
+            ),
             Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidFragment),
         }
     }
@@ -90,10 +88,14 @@ impl FailureProjection for crate::expressions::ExpressionLoweringError {
             Self::Arithmetic(source) => source.failure_fact(),
             Self::Cast(source) => source.failure_fact(),
             Self::Comparison(source) => source.failure_fact(),
-            Self::UnsupportedExpression(_) => {
-                fact(FailureClass::Unsupported, Reason::UnsupportedExpression)
-            }
-            Self::UnsupportedCall(_) => fact(FailureClass::Unsupported, Reason::UnsupportedCall),
+            Self::UnsupportedExpression(_) => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_EXPRESSION,
+            ),
+            Self::UnsupportedCall(_) => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_CALL,
+            ),
             Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidExpression),
         }
     }

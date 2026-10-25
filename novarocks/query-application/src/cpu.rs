@@ -129,6 +129,20 @@ impl std::fmt::Display for QueryBlockingFailure {
     }
 }
 impl std::error::Error for QueryBlockingFailure {}
+impl novarocks_failure_contract::FailureProjection for QueryBlockingFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::execution_error::QueryFailureReason;
+        use novarocks_failure_contract::FailureProjection;
+        match self {
+            Self::Panicked(_) => QueryFailureReason::BlockingWorkerPanicked,
+            Self::ExecutorClosed | Self::SubmissionClosed => {
+                QueryFailureReason::BlockingExecutorClosed
+            }
+            Self::InvalidResultType(_) => QueryFailureReason::BlockingSourceContract,
+        }
+        .failure_fact()
+    }
+}
 
 /// Reuse window for one idle synchronous-preparation worker. This does not
 /// bound query concurrency or keep a backlog: every admitted job either takes

@@ -36,8 +36,8 @@ pub(crate) use self::admission::{
 };
 use self::result::{action_result, optimize_jobs_result};
 use self::worker::{
-    FrontendMaintenanceEffectPort, FrontendOptimizeJobAdmissionPort,
-    FrontendOptimizeJobExecutionPort, FrontendOptimizeTargetCapturePort,
+    FrontendOptimizeJobAdmissionPort, FrontendOptimizeJobExecutionPort,
+    FrontendOptimizeTargetCapturePort, LegacyMaintenanceEffects,
 };
 use crate::query_execution::maintenance::{
     MaintenanceRequestContext, MaintenanceStatementResult, TableMaintenanceEngine,
@@ -316,10 +316,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 let request = action.into_request(engine, target)?;
                 let outcome = self
                     .product
-                    .execute_user_action(
-                        &FrontendMaintenanceEffectPort::new(engine, state),
-                        request,
-                    )
+                    .execute_user_action(&LegacyMaintenanceEffects::new(engine, state), request)
                     .await?;
                 if spark_procedure {
                     action_result(outcome).map_err(TerminalError::from)
@@ -329,7 +326,9 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             }
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
                 let target = engine.resolve_target(&name_parts, context)?;
-                engine.reject_user_action_on_mv(&target).await?;
+                engine.reject_user_action_on_mv(&target).await.map_err(
+                    crate::query_execution::maintenance::rewrite_job::guard_terminal_error,
+                )?;
                 let submission = self.submit_statement_optimize(engine, target)?;
                 if matches!(
                     submission,
@@ -398,7 +397,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(TerminalError::cancelled_before_dispatch)?;
         self.product
             .execute_automatic_action(
-                &FrontendMaintenanceEffectPort::new(engine, state),
+                &LegacyMaintenanceEffects::new(engine, state),
                 request,
                 effect_id,
             )

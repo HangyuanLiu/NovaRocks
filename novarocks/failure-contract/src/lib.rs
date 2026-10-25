@@ -22,6 +22,12 @@
 
 use std::{fmt, num::NonZeroU16};
 
+/// LocalCompiler-owned IDs shared only for their existing public consumers.
+/// Their projection and meaning remain defined by the producing compiler.
+pub mod local_compiler_reason;
+/// The compiled-package encoder's original reason used by its public consumer.
+pub mod plan_codec_reason;
+
 /// Bound for retained diagnostics. Size and redaction are separate claims.
 pub const DIAGNOSTIC_MAX_BYTES: usize = 512;
 
@@ -116,7 +122,8 @@ impl fmt::Display for FailureReason {
     }
 }
 
-/// Stable namespaces. A new reason is defined by its owning domain, not here.
+/// Stable namespaces. Each reason is defined by its owning producer domain.
+/// Cross-boundary symbols retain that ownership when shared from this crate.
 pub mod domain {
     use std::num::NonZeroU16;
     pub const KERNEL: NonZeroU16 = NonZeroU16::new(1).unwrap();
@@ -142,6 +149,7 @@ pub mod domain {
     pub const WORKLOAD: NonZeroU16 = NonZeroU16::new(21).unwrap();
     pub const VALUE_ARRAYS: NonZeroU16 = NonZeroU16::new(22).unwrap();
     pub const STORAGE_AUTHORITY: NonZeroU16 = NonZeroU16::new(23).unwrap();
+    pub const STATE_STORE: NonZeroU16 = NonZeroU16::new(24).unwrap();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

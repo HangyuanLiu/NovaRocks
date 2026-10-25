@@ -109,13 +109,25 @@ pub enum MvProjectionErrorKind {
 pub struct MvProjectionError {
     kind: MvProjectionErrorKind,
     message: String,
+    original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
 }
 impl MvProjectionError {
     pub fn new(kind: MvProjectionErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            original_failure: None,
         }
+    }
+    pub fn with_original_failure(
+        mut self,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        self.original_failure = Some(cause);
+        self
+    }
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original_failure.as_ref()
     }
     pub fn kind(&self) -> MvProjectionErrorKind {
         self.kind
@@ -126,7 +138,11 @@ impl std::fmt::Display for MvProjectionError {
         f.write_str(&self.message)
     }
 }
-impl std::error::Error for MvProjectionError {}
+impl std::error::Error for MvProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_failure.as_ref().map(|cause| cause as _)
+    }
+}
 impl From<MvRepositoryError> for MvProjectionError {
     fn from(error: MvRepositoryError) -> Self {
         Self::new(MvProjectionErrorKind::Repository, error.to_string())

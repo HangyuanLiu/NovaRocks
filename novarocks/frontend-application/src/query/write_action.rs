@@ -57,7 +57,7 @@ pub(crate) trait WriteStatementFamily: Send + Sync + 'static {
 
     fn prepare(
         input: Arc<Self::Input>,
-    ) -> impl Future<Output = Result<Arc<Self::Prepared>, String>> + Send;
+    ) -> impl Future<Output = Result<Arc<Self::Prepared>, crate::dml::error::DmlExecutionError>> + Send;
 
     fn compile(
         prepared: Arc<Self::Prepared>,
@@ -91,7 +91,14 @@ pub(crate) struct WriteStatementStart<P: WriteStatementFamily> {
 }
 
 type Preparation<P> = Pin<
-    Box<dyn Future<Output = Result<Arc<<P as WriteStatementFamily>::Prepared>, String>> + Send>,
+    Box<
+        dyn Future<
+                Output = Result<
+                    Arc<<P as WriteStatementFamily>::Prepared>,
+                    crate::dml::error::DmlExecutionError,
+                >,
+            > + Send,
+    >,
 >;
 type Compilation = Pin<
     Box<
@@ -255,7 +262,7 @@ struct WriteStatementAction<P: WriteStatementFamily> {
     session_receiving: Arc<Mutex<Option<Arc<ConnectorWriteSession>>>>,
     begin_receiving: Arc<WriteBeginReceiving>,
     preparation: Option<Preparation<P>>,
-    preparation_result: Option<Result<Arc<P::Prepared>, String>>,
+    preparation_result: Option<Result<Arc<P::Prepared>, crate::dml::error::DmlExecutionError>>,
     prepared: Option<Arc<P::Prepared>>,
     compilation: Option<Compilation>,
     assembly: Option<PreparedDmlWriteAssembly>,
@@ -396,7 +403,9 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
         if let Some(result) = self.preparation_result.take() {
             match result {
                 Ok(prepared) => self.prepared = Some(prepared),
-                Err(e) => self.fail(internal_error(e)),
+                Err(error) => self.fail(routed_execution_service_error(
+                    dml_result::<()>(Err(error.into_dml_error(Some(&self.sql)))).unwrap_err(),
+                )),
             }
         }
         if self.prepared.is_some()

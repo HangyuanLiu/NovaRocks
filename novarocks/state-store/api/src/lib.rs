@@ -44,14 +44,17 @@ pub use contract::{
 };
 pub use error::{StateStoreError, StateStoreErrorKind};
 pub use execution::{
-    StateStoreBlockingExit, StateStoreBlockingOrigin, StateStoreBlockingOriginal,
-    StateStoreBlockingPhase, StateStoreBlockingRequest, StateStoreBlockingSlot,
+    OriginalReadTransaction, OriginalWriteTransaction, StateStoreBlockingExit,
+    StateStoreBlockingOrigin, StateStoreBlockingOriginal, StateStoreBlockingPhase,
+    StateStoreBlockingRequest, StateStoreBlockingSlot, StateStoreBlockingSourceVocabulary,
     StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreExecutionPort,
+    StateStoreOriginalClose, StateStoreOriginalOpen, StateStoreOriginalUnsupported,
 };
 pub use limits::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
     MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
+pub use novarocks_resource_contract::SharedDependency;
 pub use provider::{
     StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
     StateStoreProviderId, StateStoreProviderIdError, StateStoreProviderInstance,

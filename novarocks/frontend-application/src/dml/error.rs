@@ -35,6 +35,7 @@ pub enum DmlErrorKind {
 enum DmlErrorBody {
     Legacy(String),
     Execution(Box<ExecutionFailureInput>),
+    Application(novarocks_query_application::session_error::QueryServiceError),
 }
 
 #[derive(Debug)]
@@ -53,10 +54,12 @@ pub struct DmlError {
 /// boundary renders it as a [`UserError`].
 ///
 /// COW begin failures keep their original typed cause until the original
-/// command worker retires it. Other failures retain their existing text route;
+/// command worker retires it. Governed application refusals retain their original
+/// QueryServiceError. Other failures retain their existing text route;
 /// no user-facing code is inferred from that text.
 #[derive(Debug)]
 pub enum DmlExecutionError {
+    Application(novarocks_query_application::session_error::QueryServiceError),
     Execution(ExecutionFailureInput),
     Engine(String),
     Compilation(novarocks_failure_contract::SharedFailureCause),
@@ -111,6 +114,7 @@ impl DmlExecutionError {
     pub(crate) fn into_dml_error(self, source: Option<&str>) -> DmlError {
         match self {
             Self::Execution(input) => DmlError::from_execution(input),
+            Self::Application(error) => DmlError::from_application(error),
             Self::Engine(error) => DmlError::executor(error),
             Self::Compilation(source) => DmlError::compile_control(
                 novarocks_type_contract::CompileControlError::Source(source),
@@ -139,6 +143,12 @@ impl From<novarocks_plan_codec::PhysicalEncodeError> for DmlExecutionError {
 impl From<crate::query_execution::contract::DistributedQueryError> for DmlExecutionError {
     fn from(error: crate::query_execution::contract::DistributedQueryError) -> Self {
         Self::from_distributed(error)
+    }
+}
+
+impl From<novarocks_query_application::session_error::QueryServiceError> for DmlExecutionError {
+    fn from(error: novarocks_query_application::session_error::QueryServiceError) -> Self {
+        Self::Application(error)
     }
 }
 
@@ -174,6 +184,7 @@ impl std::fmt::Display for DmlExecutionError {
         match self {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
             Self::Engine(error) => formatter.write_str(error),
+            Self::Application(error) => error.fmt(formatter),
             Self::Compilation(source) => source.fmt(formatter),
             Self::Analyze(error) => error.fmt(formatter),
             Self::Cow(error) => error.fmt(formatter),
@@ -186,6 +197,7 @@ impl std::error::Error for DmlExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Cow(error) => Some(error),
+            Self::Application(error) => Some(error),
             Self::Compilation(source) => Some(source),
             Self::Analyze(source) => Some(source),
             Self::Control(source) => Some(source),
@@ -221,6 +233,28 @@ pub struct DmlStagedCreateFailure {
 }
 
 impl DmlError {
+    pub(crate) fn from_application(error: novarocks_query_application::session_error::QueryServiceError) -> Self {
+        Self {
+            kind: DmlErrorKind::Executor,
+            body: DmlErrorBody::Application(error),
+            publication_terminal: None,
+            user_error: None,
+            engine_error_code: None,
+            cow_failure: None,
+            compile_control: None,
+            staged_create_preparation: None,
+        }
+    }
+
+    pub(crate) fn application_error(
+        &self,
+    ) -> Option<&novarocks_query_application::session_error::QueryServiceError> {
+        match &self.body {
+            DmlErrorBody::Application(error) => Some(error),
+            _ => None,
+        }
+    }
+
     pub(crate) fn from_execution(input: ExecutionFailureInput) -> Self {
         Self {
             kind: DmlErrorKind::Executor,
@@ -236,7 +270,10 @@ impl DmlError {
 
     /// Publication observations cannot replace an already selected Task input.
     pub(crate) fn prefer_selected_execution(self, later: Self) -> Self {
-        if matches!(&self.body, DmlErrorBody::Execution(_)) {
+        if matches!(
+            &self.body,
+            DmlErrorBody::Execution(_) | DmlErrorBody::Application(_)
+        ) {
             tracing::warn!(publication_error = %later, "publication observation accompanies the selected execution failure");
             self
         } else {
@@ -247,6 +284,7 @@ impl DmlError {
     pub(crate) fn execution_failure(&self) -> Option<&ExecutionFailureInput> {
         match &self.body {
             DmlErrorBody::Execution(input) => Some(input.as_ref()),
+            DmlErrorBody::Application(error) => error.execution_failure(),
             DmlErrorBody::Legacy(_) => None,
         }
     }
@@ -261,7 +299,7 @@ impl DmlError {
                 *message =
                     crate::connector::mutation::known_uncommitted_message(&*message, cleanup);
             }
-            DmlErrorBody::Execution(_) => {
+            DmlErrorBody::Execution(_) | DmlErrorBody::Application(_) => {
                 if let novarocks_spi::connector::ExternalMutationFinalization::Failed(error) =
                     cleanup
                 {
@@ -439,11 +477,12 @@ impl DmlError {
 
 impl fmt::Display for DmlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match &self.body {
-            DmlErrorBody::Legacy(message) => message.as_str(),
-            DmlErrorBody::Execution(input) => input.detail().as_str(),
-        };
-        write!(formatter, "{:?}: {}", self.kind, message)?;
+        write!(formatter, "{:?}: ", self.kind)?;
+        match &self.body {
+            DmlErrorBody::Legacy(message) => formatter.write_str(message)?,
+            DmlErrorBody::Execution(input) => formatter.write_str(input.detail().as_str())?,
+            DmlErrorBody::Application(error) => fmt::Display::fmt(error, formatter)?,
+        }
         if let Some(terminal) = &self.publication_terminal {
             let target = terminal.target();
             write!(
@@ -472,6 +511,9 @@ impl fmt::Display for DmlError {
 
 impl std::error::Error for DmlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let DmlErrorBody::Application(error) = &self.body {
+            return Some(error);
+        }
         self.cow_failure
             .as_ref()
             .map(|error| error as &(dyn std::error::Error + 'static))

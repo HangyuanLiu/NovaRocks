@@ -4196,6 +4196,7 @@ dependencies = [
  "futures",
  "hex",
  "novarocks-catalog-application",
+ "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-query-application",
  "novarocks-spi",
@@ -4621,6 +4622,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "novarocks-failure-contract",
+ "novarocks-resource-contract",
  "sha2 0.10.9",
  "tokio",
  "uuid",
@@ -4675,9 +4678,11 @@ dependencies = [
 name = "novarocks-state-store-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "hex",
+ "novarocks-failure-contract",
  "novarocks-state-store-api",
  "novarocks-state-store-testkit",
  "serde",
@@ -4694,6 +4699,8 @@ dependencies = [
  "bytes",
  "fs2",
  "log",
+ "novarocks-failure-contract",
+ "novarocks-query-application",
  "novarocks-state-store-api",
  "novarocks-state-store-testkit",
  "rusqlite",

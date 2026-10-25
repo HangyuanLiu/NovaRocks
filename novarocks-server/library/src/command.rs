@@ -133,10 +133,14 @@ fn run_frontend(
         #[cfg(novarocks_dev_controls)]
         role.test_session.clone(),
     )?;
+    // The synchronous process aggregate owns Host before its borrowed role F.
+    let mut frontend_owner = {
+        let _entered = runtime.enter();
+        crate::roles::frontend::FrontendRoleOwner::prepare(frontend, runtime.handle().clone())?
+    };
     runtime
         .block_on(crate::roles::frontend::run_until_shutdown(
-            frontend,
-            runtime.handle().clone(),
+            &mut frontend_owner,
             termination_signal(),
         ))
         .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
@@ -279,11 +283,18 @@ async fn run_all_in_one(
     let backend_scan_io = scan_io.services();
     let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);
     let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
-    let frontend_runtime = runtime.clone();
-    let frontend_run = async move {
+    let mut frontend_owner =
+        match crate::roles::frontend::FrontendRoleOwner::prepare(frontend, runtime.clone()) {
+            Ok(owner) => owner,
+            Err(error) => {
+                scan_io.shutdown().await?;
+                return Err(error.into());
+            }
+        };
+    // Owner stays in this existing process aggregate, outside the role F.
+    let frontend_run = async {
         crate::roles::frontend::run_until_shutdown(
-            frontend,
-            frontend_runtime,
+            &mut frontend_owner,
             wait_for_stop(frontend_stop_rx),
         )
         .await

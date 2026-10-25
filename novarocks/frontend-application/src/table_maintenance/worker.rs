@@ -52,12 +52,12 @@ use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 /// Frontend provider/native-query adapter for the neutral maintenance product.
 /// It keeps opaque connector sessions and fragment encoding here, while the
 /// product crate owns all target-gate, cohort and terminal business decisions.
-pub(crate) struct FrontendMaintenanceEffectPort<'a> {
+pub(crate) struct LegacyMaintenanceEffects<'a> {
     engine: &'a dyn TableMaintenanceEngine,
     state: Option<&'a crate::query_execution::maintenance::MaintenanceActionState>,
 }
 
-impl<'a> FrontendMaintenanceEffectPort<'a> {
+impl<'a> LegacyMaintenanceEffects<'a> {
     pub(crate) fn new(
         engine: &'a dyn TableMaintenanceEngine,
         state: &'a crate::query_execution::maintenance::MaintenanceActionState,
@@ -77,12 +77,47 @@ impl<'a> FrontendMaintenanceEffectPort<'a> {
     }
 }
 
-impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
+impl TableMaintenanceEffectPort for LegacyMaintenanceEffects<'_> {
+    fn observe_cleanup_owned_ref<'a>(
+        &'a self,
+        observations: &'a novarocks_table_maintenance::gc_observation::GcOwnedRefObservationAccelerator,
+        observation: novarocks_table_maintenance::gc_observation::GcOwnedRefObservation,
+        now_ms: i64,
+        safe_gc_age_ms: i64,
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<
+            novarocks_table_maintenance::gc_observation::GcOwnedRefObservationDecision,
+            OptimizeTerminalError,
+        >,
+    > {
+        // Only this explicitly legacy command adapter calls the old runner.
+        // Governed CleanupEffects always requires its Original context.
+        Box::pin(async move {
+            observations
+                .observe(observation, now_ms, safe_gc_age_ms)
+                .await
+                .map_err(|error| {
+                    OptimizeTerminalError::pre_dispatch_failed(format!(
+                        "record GC owned-ref observation failed: {error}"
+                    ))
+                })
+        })
+    }
+
     fn reject_user_action_on_mv<'a>(
         &'a self,
         target: &'a MaintenanceTarget,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.engine.reject_user_action_on_mv(target).await })
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<(), novarocks_table_maintenance::runtime::TerminalError>,
+    > {
+        Box::pin(async move {
+            self.engine
+                .reject_user_action_on_mv(target)
+                .await
+                .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)
+        })
     }
 
     fn execute_metadata<'a>(
@@ -198,7 +233,7 @@ impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
         older_than_ms: i64,
     ) -> novarocks_table_maintenance::product::MaintenanceFuture<
         'a,
-        Result<Box<dyn CleanupSession + 'a>, String>,
+        Result<Box<dyn CleanupSession + 'a>, novarocks_table_maintenance::runtime::TerminalError>,
     > {
         Box::pin(async move {
             let session = self.engine.plan_cleanup_maintenance(
@@ -446,7 +481,10 @@ impl CleanupSession for FrontendCleanupSession<'_> {
     fn select_owned_refs<'a>(
         &'a mut self,
         candidate_indexes: &'a [usize],
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<(), String>> {
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<(), novarocks_table_maintenance::runtime::TerminalError>,
+    > {
         Box::pin(async move {
             let identities = candidate_indexes
                 .iter()
@@ -475,8 +513,10 @@ impl CleanupSession for FrontendCleanupSession<'_> {
 
     fn execute<'a>(
         &'a mut self,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<'a, Result<CleanupTerminal, String>>
-    {
+    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
+        'a,
+        Result<CleanupTerminal, novarocks_table_maintenance::runtime::TerminalError>,
+    > {
         Box::pin(async move {
             // The report is the candidate set, which the manifest fixes before
             // any batch runs. Collect it first, under the local result bound, so

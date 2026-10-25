@@ -281,6 +281,16 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
     let capacity =
         QueryResultCapacityBinding::try_new(owner.scope(), owner.result_window_alias().unwrap())
             .unwrap();
+    if class == ResultWindowClass::Internal {
+        // Original Internal statement admission now pins its configured Root
+        // byte owner, not a computation position or a fabricated payload.
+        let retention = capacity.try_window_alias().unwrap();
+        assert!(retention.is_for_scope(owner.scope()));
+        assert!(retention.is_root_backed_internal());
+        assert_eq!(retention.class(), ResultWindowClass::Internal);
+        assert!(retention.internal_manifest_binding().unwrap().is_none());
+        assert_eq!(observation.snapshot().result_windows.held_positions, [0; 4]);
+    }
     let calls = Arc::new(AtomicUsize::new(0));
     let other_calls = Arc::new(AtomicUsize::new(0));
     let exact = Arc::new(AtomicBool::new(false));
@@ -506,7 +516,9 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
     let expected = if class == ResultWindowClass::Local {
         [0, 1, 0, 0]
     } else {
-        [0, 0, 1, 0]
+        // No computation was dispatched by these fact-only callbacks. The
+        // exact Root retention pin below must still survive actual exit.
+        [0; 4]
     };
     let held = [&during_call, &during_drop].iter().all(|facts| {
         facts.result_windows.held_positions == expected
@@ -556,7 +568,7 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
             && watchdog_joined
     );
     // The retired QB child is not recreated: the original same statement
-    // Source retains this EXACT Root and window through callback and Drop.
+    // Source retains this EXACT Root and result owner through callback and Drop.
     assert!(held);
     assert_eq!(calls.load(Ordering::Acquire), 1);
     assert_eq!(other_calls.load(Ordering::Acquire), 0);
@@ -575,7 +587,7 @@ fn actual_catalog_admit_keeps_local_window_through_waiter_cancel_and_dependency_
     observe_actual_completion_port(ActualCompletionPort::Catalog, ResultWindowClass::Local);
 }
 #[test]
-fn actual_catalog_admit_keeps_internal_window_through_waiter_cancel_and_dependency_drop() {
+fn actual_catalog_admit_keeps_root_retention_through_waiter_cancel_and_dependency_drop() {
     observe_actual_completion_port(ActualCompletionPort::Catalog, ResultWindowClass::Internal);
 }
 #[test]
@@ -586,7 +598,7 @@ fn actual_mv_keyed_state_store_range_keeps_local_window_through_waiter_cancel_an
     );
 }
 #[test]
-fn actual_mv_keyed_state_store_range_keeps_internal_window_through_waiter_cancel_and_store_drop() {
+fn actual_mv_keyed_state_store_range_keeps_root_retention_through_waiter_cancel_and_store_drop() {
     observe_actual_completion_port(
         ActualCompletionPort::MaterializedView,
         ResultWindowClass::Internal,

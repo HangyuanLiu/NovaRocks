@@ -615,7 +615,7 @@ mod tests {
             "CALL ice.system.remove_orphan_files(table => 'db.orders', older_than => TIMESTAMP '2020-01-01 00:00:00')",
             "CALL ice.other.rewrite_data_files(table => 'db.orders')",
             "CALL ice.system.rewrite_manifests(table => 'db.orders')",
-            "SHOW OPTIMIZE",
+            "SHOW ALTER TABLE OPTIMIZE",
         ] {
             let statement = parse_single_statement(sql).expect("original typed management parser");
             assert_eq!(

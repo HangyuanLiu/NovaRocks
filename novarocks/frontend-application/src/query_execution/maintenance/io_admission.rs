@@ -1868,6 +1868,52 @@ mod original_governor_tests {
     }
 
     #[test]
+    fn cleanup_initial_domains_keep_provider_and_supplied_original_store_facts() {
+        let (control, mut driver, root) = original_governor();
+        let provider = SharedDependency::Network(
+            novarocks_spi::connector::NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse("https://cleanup-catalog.example.test:8443/root").unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut dependencies = vec![provider.clone()];
+        // This input is the provider-declared route, not one inferred by MIO
+        // from a WorkScope or vocabulary. SQLite's actual declaration has its
+        // own factory/instance test; this component exercises Source capture.
+        let store_facts = vec![SharedDependency::LocalHost];
+        super::super::cleanup_action::extend_original_dependencies(&mut dependencies, &store_facts);
+        super::super::cleanup_action::extend_original_dependencies(&mut dependencies, &store_facts);
+        assert_eq!(dependencies.len(), 2);
+        let source = MetadataIoAdmission::for_original_source(&root.owner, dependencies).unwrap();
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source
+                .poll_progress(&root.owner, &mut Context::from_waker(Waker::noop()))
+                .unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            let full = body.full.as_ref().unwrap();
+            assert!(full.contains(&provider));
+            assert!(full.contains(&SharedDependency::LocalHost));
+            assert_eq!(full.len(), 2);
+        }
+        assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+        drop(source);
+        root.business.release();
+        root.owner.complete();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
     fn original_owner_constructor_preserves_selected_domains_and_actual_byte_author() {
         let (control, mut driver, root) = original_governor();
         let selected = SharedDependency::Network(

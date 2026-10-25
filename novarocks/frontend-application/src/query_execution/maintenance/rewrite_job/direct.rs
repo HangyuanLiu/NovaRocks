@@ -174,7 +174,7 @@ async fn run_direct_product(
             binding_cpu,
         )
         .await
-        .map_err(TerminalError::pre_dispatch_failed)?;
+        .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)?;
     input
         .product
         .execute_rewrite_terminal(&effects, &input.target, input.intent.clone())
@@ -418,8 +418,8 @@ mod tests {
         WorkloadControl,
     };
 
-    #[test]
-    fn direct_result_uses_a_separate_positive_local_ticket_on_the_same_sql_root() {
+    #[tokio::test]
+    async fn direct_result_uses_a_separate_positive_local_ticket_on_the_same_sql_root() {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -433,20 +433,36 @@ mod tests {
             .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
         control.mark_ready().unwrap();
-        let (root, internal) = control
+        // Match the actual Internal SQL admission: one registered Query Root,
+        // a byte-retention owner and the original warehouse queue permit.
+        // A nonqueued try_begin_root_with_result cannot admit Query work.
+        let root = control
             .root_admission()
-            .try_begin_root_with_result(
-                WorkRequest::new(WorkClass::Query),
-                ResultWindowClass::Internal,
-            )
+            .begin_query_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = root.owner.scope();
+        let internal = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(&root.owner).unwrap();
+        let query_permit = scope.admit_query().unwrap().await.unwrap();
+        assert!(internal.is_root_backed_internal());
+        assert!(
+            internal
+                .try_window_alias()
+                .unwrap()
+                .internal_manifest_binding()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         let local = capacity
             .try_acquire(&scope, ResultWindowClass::Local)
             .unwrap();
         assert!(local.is_for_scope(&scope));
         assert_eq!(local.class(), ResultWindowClass::Local);
-        assert_eq!(internal.class(), ResultWindowClass::Internal);
+        assert_eq!(
+            internal.try_window_alias().unwrap().class(),
+            ResultWindowClass::Internal
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
         let producer = LocalResultProducer::try_new(&scope, local.retain_alias()).unwrap();
         let result = produce_local(
             producer,
@@ -466,7 +482,7 @@ mod tests {
         assert_eq!(result.columns().len(), 5);
         drop((local, internal));
         root.owner.complete();
-        root.business.release();
+        query_permit.release();
         control.close_admission();
         let failure = match control.shutdown() {
             Err(failure) => failure,

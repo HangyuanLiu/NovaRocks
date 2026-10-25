@@ -54,8 +54,8 @@ pub use native_workload::{
 
 pub(crate) mod application;
 pub use application::{
-    FrontendApplicationError, FrontendApplicationErrorKind, FrontendExecutionConfig,
-    FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
     FrontendResultCapacityProfile,
 };
 pub(crate) mod capabilities;
@@ -89,8 +89,9 @@ pub use catalog_application::admission_completion::{
 };
 pub use metrics::FrontendProcessMemoryObservation;
 pub use server::{
-    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
-    open_frontend_application_for_server, serve_ready_frontend_session_factory,
+    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendManagementServer,
+    FrontendServingConfig, open_frontend_application_for_server,
+    prepare_frontend_application_for_server, serve_ready_frontend_session_factory,
     shutdown_frontend_application_to_convergence, start_frontend_management_server,
 };
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]

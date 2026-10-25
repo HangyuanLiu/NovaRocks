@@ -843,6 +843,7 @@ impl SpecializedStatementRoute for TypedCommandRoute {
 }
 
 enum RoutedExecutionError {
+    Application(QueryServiceError),
     FailureCause {
         cause: novarocks_failure_contract::SharedFailureCause,
         maintenance_publication_disposition:
@@ -905,6 +906,15 @@ fn dml_statement_result(
 
 fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
     result.map_err(|mut error| {
+        if let Some(original) = error.application_error() {
+            let original = match error.publication_terminal() {
+                Some(terminal) => original
+                    .clone()
+                    .attach_publication_terminal(terminal.clone()),
+                None => original.clone(),
+            };
+            return RoutedExecutionError::Application(original);
+        }
         if let Some(input) = error.execution_failure().cloned() {
             return RoutedExecutionError::Execution {
                 input: Box::new(input),
@@ -958,6 +968,7 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
 
 fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceError {
     match error {
+        RoutedExecutionError::Application(error) => error,
         RoutedExecutionError::FailureCause {
             cause,
             maintenance_publication_disposition,
@@ -1020,7 +1031,8 @@ fn selected_execution_or_worker_fallback(
 ) -> QueryServiceError {
     match result {
         Err(
-            error @ (RoutedExecutionError::Execution { .. }
+            error @ (RoutedExecutionError::Application(_)
+            | RoutedExecutionError::Execution { .. }
             | RoutedExecutionError::FailureCause { .. }),
         ) => routed_execution_service_error(error),
         Err(RoutedExecutionError::MaintenancePublication {
@@ -6017,5 +6029,52 @@ mod maintenance_failure_cause_tests {
                 .downcast_ref::<SharedFailureCause>(),
             Some(&cause)
         );
+    }
+}
+
+#[cfg(test)]
+mod mv_guard_application_cause_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+
+    #[test]
+    fn dml_guard_application_retains_original_qse_and_cause_through_late_stop() {
+        let provider = novarocks_spi::connector::ConnectorError::from_domain_static(
+            novarocks_spi::connector::ConnectorErrorKind::Interrupted,
+            CompileControlError::ResourceExhausted,
+            "original guarded DML provider refusal",
+        );
+        let cause = std::error::Error::source(&provider)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let original = crate::mv::domain::readiness::connector_application_error(provider);
+        let failure =
+            crate::dml::error::DmlExecutionError::from(original.clone()).into_dml_error(None);
+        let routed = dml_result::<()>(Err(failure));
+        let service = selected_execution_or_worker_fallback(
+            routed.map(|_| StatementResult::Ok),
+            QueryServiceError::from_compile_control(CompileControlError::Cancelled),
+        );
+        assert_eq!(service, original);
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            cause.failure_fact()
+        );
+    }
+
+    #[test]
+    fn dml_guard_plain_policy_message_stays_plain() {
+        let original = crate::mv::domain::readiness::application_error(
+            "table is a materialized view; use its MV command",
+        );
+        let failure =
+            crate::dml::error::DmlExecutionError::from(original.clone()).into_dml_error(None);
+        let service = routed_execution_service_error(dml_result::<()>(Err(failure)).unwrap_err());
+        assert_eq!(service, original);
+        assert!(service.failure_cause().is_none());
+        assert!(service.execution_failure().is_none());
     }
 }

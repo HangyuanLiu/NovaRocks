@@ -388,6 +388,9 @@ fn unknown_failure(
 }
 
 fn ctas_failure(source_text: &str, failure: CtasFailure) -> DmlError {
+    if let Some(original) = failure.application_error() {
+        return DmlError::from_application(original.clone());
+    }
     if let Some(input) = failure.execution_failure() {
         return DmlError::from_execution(input)
             .with_compile_control(failure.compile_control_error());

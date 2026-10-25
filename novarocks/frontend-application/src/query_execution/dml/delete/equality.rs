@@ -165,7 +165,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
-) -> Result<super::PreparedDeleteWrite, String> {
+) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
     // Preserve the original MV guard before metadata loading and admission.
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
         state.mv_storage_observation().as_ref(),
