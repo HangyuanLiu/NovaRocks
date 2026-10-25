@@ -792,6 +792,11 @@ pub(crate) fn document_application_error(
         | MvDocumentError::KeyedStorage(
             novarocks_spi::connector::KeyedDocumentReadError::Invalid(error),
         ) => connector_application_error(error),
+        MvDocumentError::KeyedStorage(
+            legacy @ novarocks_spi::connector::KeyedDocumentReadError::LegacyFormat { .. },
+        ) => novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+            novarocks_failure_contract::SharedFailureCause::new(legacy),
+        ),
         error => application_error(error.to_string()),
     }
 }
@@ -1027,6 +1032,62 @@ mod guard_original_projection_tests {
         assert!(plain.failure_cause().is_none());
         assert!(plain.execution_failure().is_none());
         assert_eq!(plain.message(), "MV projection admission already consumed");
+    }
+
+    #[test]
+    fn legacy_document_and_projection_bridges_keep_generic_unsupported_and_codec_source() {
+        use novarocks_failure_contract::{FailureClass, SharedFailureCause, domain};
+        let legacy = KeyedDocumentReadError::LegacyFormat {
+            key: "original-legacy-key".into(),
+        };
+        let document = document_application_error(
+            novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage(
+                legacy.clone(),
+            ),
+        );
+        let projection = MvProjectionError::from(
+            novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage(
+                legacy.clone(),
+            ),
+        );
+        let original_projection_cause = projection.original_failure().unwrap().clone();
+        let projected = projection_application_error(projection);
+        assert_eq!(projected.failure_cause(), Some(&original_projection_cause));
+        for service in [document, projected] {
+            let cause = service.failure_cause().unwrap();
+            assert_eq!(
+                cause.downcast_ref::<KeyedDocumentReadError>(),
+                Some(&legacy)
+            );
+            assert_eq!(cause.failure_fact().class(), FailureClass::Unsupported);
+            assert_eq!(
+                cause.failure_fact().reason().domain(),
+                domain::METADATA.get()
+            );
+            assert_eq!(cause.failure_fact().reason().code(), 916);
+            assert_eq!(
+                std::error::Error::source(&service)
+                    .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+                Some(cause)
+            );
+            assert_eq!(
+                service.execution_failure().unwrap().fact(),
+                cause.failure_fact()
+            );
+            assert_eq!(
+                service
+                    .execution_failure()
+                    .unwrap()
+                    .descriptor()
+                    .descriptor
+                    .code
+                    .as_str(),
+                "query.execution.unsupported"
+            );
+            assert!(service.compile_control_error().is_none());
+            assert!(service.compile_control_provenance().is_none());
+            assert!(!service.message().contains("[UnsupportedCompiledShape]"));
+        }
     }
 }
 

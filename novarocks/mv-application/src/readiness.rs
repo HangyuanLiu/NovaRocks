@@ -151,29 +151,43 @@ impl From<MvRepositoryError> for MvProjectionError {
 }
 impl From<MvDocumentError> for MvProjectionError {
     fn from(error: MvDocumentError) -> Self {
-        use novarocks_spi::connector::ConnectorErrorKind as K;
-        let kind = match &error {
-            MvDocumentError::KeyedStorage(
-                novarocks_spi::connector::KeyedDocumentReadError::LegacyFormat { .. },
-            ) => MvProjectionErrorKind::Unsupported,
-            MvDocumentError::KeyedStorage(
-                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error),
-            ) => return Self::from(MvDocumentError::Connector(error.clone())),
-            MvDocumentError::Connector(error) => match error.kind() {
-                K::Unsupported => MvProjectionErrorKind::Unsupported,
-                K::Cancelled => MvProjectionErrorKind::Cancelled,
-                K::DeadlineExceeded => MvProjectionErrorKind::DeadlineExceeded,
-                K::ResourceExhausted => MvProjectionErrorKind::BudgetExceeded,
-                K::NotFound | K::InvalidRequest => MvProjectionErrorKind::SourceConflict,
-                K::CorruptData => MvProjectionErrorKind::CorruptDocument,
-                _ => MvProjectionErrorKind::Unavailable,
-            },
-            MvDocumentError::Codec(
-                crate::persistence::codec::PersistenceCodecError::ResourceBudget { .. },
-            ) => MvProjectionErrorKind::BudgetExceeded,
-            _ => MvProjectionErrorKind::CorruptDocument,
-        };
-        Self::new(kind, error.to_string())
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_spi::connector::{ConnectorErrorKind as K, KeyedDocumentReadError};
+        let message = error.to_string();
+        match error {
+            MvDocumentError::KeyedStorage(legacy @ KeyedDocumentReadError::LegacyFormat { .. }) => {
+                Self::new(MvProjectionErrorKind::Unsupported, message)
+                    .with_original_failure(SharedFailureCause::new(legacy))
+            }
+            MvDocumentError::KeyedStorage(KeyedDocumentReadError::Invalid(error)) => {
+                Self::from(MvDocumentError::Connector(error))
+            }
+            MvDocumentError::Connector(error) => {
+                let kind = match error.kind() {
+                    K::Unsupported => MvProjectionErrorKind::Unsupported,
+                    K::Cancelled => MvProjectionErrorKind::Cancelled,
+                    K::DeadlineExceeded => MvProjectionErrorKind::DeadlineExceeded,
+                    K::ResourceExhausted => MvProjectionErrorKind::BudgetExceeded,
+                    K::NotFound | K::InvalidRequest => MvProjectionErrorKind::SourceConflict,
+                    K::CorruptData => MvProjectionErrorKind::CorruptDocument,
+                    _ => MvProjectionErrorKind::Unavailable,
+                };
+                let original = std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+                    .cloned()
+                    .unwrap_or_else(|| SharedFailureCause::new(error));
+                Self::new(kind, message).with_original_failure(original)
+            }
+            error => {
+                let kind = match &error {
+                    MvDocumentError::Codec(
+                        crate::persistence::codec::PersistenceCodecError::ResourceBudget { .. },
+                    ) => MvProjectionErrorKind::BudgetExceeded,
+                    _ => MvProjectionErrorKind::CorruptDocument,
+                };
+                Self::new(kind, message)
+            }
+        }
     }
 }
 
@@ -1512,5 +1526,70 @@ impl ReadinessRepository {
                     .await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod keyed_original_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause, domain};
+    use novarocks_spi::connector::{ConnectorError, KeyedDocumentReadError};
+
+    #[test]
+    fn document_projection_keeps_connector_origin_for_both_actual_envelopes() {
+        let error = ConnectorError::compile_interruption(
+            novarocks_type_contract::CompileControlError::Cancelled,
+        );
+        let cause = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+            .unwrap()
+            .clone();
+        for envelope in [
+            MvDocumentError::Connector(error.clone()),
+            MvDocumentError::KeyedStorage(KeyedDocumentReadError::Invalid(error)),
+        ] {
+            let projected = MvProjectionError::from(envelope);
+            assert_eq!(projected.kind(), MvProjectionErrorKind::Cancelled);
+            assert_eq!(projected.original_failure(), Some(&cause));
+            assert_eq!(
+                projected.original_failure().unwrap().failure_fact(),
+                cause.failure_fact()
+            );
+            assert_eq!(
+                std::error::Error::source(&projected)
+                    .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+                Some(&cause)
+            );
+        }
+    }
+
+    #[test]
+    fn document_projection_keeps_the_actual_legacy_codec_source() {
+        let legacy = KeyedDocumentReadError::LegacyFormat {
+            key: "original-legacy-key".into(),
+        };
+        let projected = MvProjectionError::from(MvDocumentError::KeyedStorage(legacy.clone()));
+        assert_eq!(projected.kind(), MvProjectionErrorKind::Unsupported);
+        let cause = projected.original_failure().unwrap();
+        assert_eq!(
+            cause.downcast_ref::<KeyedDocumentReadError>(),
+            Some(&legacy)
+        );
+        assert_eq!(cause.failure_fact(), legacy.failure_fact());
+        assert_eq!(cause.failure_fact().class(), FailureClass::Unsupported);
+        assert_eq!(
+            cause.failure_fact().reason().domain(),
+            domain::METADATA.get()
+        );
+        assert_eq!(cause.failure_fact().reason().code(), 916);
+        assert_eq!(
+            std::error::Error::source(&projected)
+                .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+            Some(cause)
+        );
+        assert_eq!(
+            projected.to_string(),
+            MvDocumentError::KeyedStorage(legacy).to_string()
+        );
     }
 }
