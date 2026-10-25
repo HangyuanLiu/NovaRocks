@@ -32,6 +32,7 @@ struct OpenInput {
 }
 struct InstanceCloseBody {
     store: Option<Arc<crate::SqliteStateStore>>,
+    evidence: Option<Arc<crate::evidence::SqliteCommitEvidence>>,
     lifetime: Option<Arc<crate::SqliteInstanceLifetime>>,
     progressed: bool,
 }
@@ -60,10 +61,11 @@ impl OpenOriginal {
             }
             let ready = lock(&self.core.body).as_ref().is_some_and(|body| {
                 let close = body.instance_close.as_ref().unwrap();
-                match (&close.store, &close.lifetime) {
-                    (Some(store), _) => Arc::strong_count(store) == 1,
-                    (None, Some(lifetime)) => Arc::strong_count(lifetime) == 1,
-                    (None, None) => false,
+                match (&close.store, &close.evidence, &close.lifetime) {
+                    (Some(store), _, _) => Arc::strong_count(store) == 1,
+                    (None, Some(evidence), _) => Arc::strong_count(evidence) == 1,
+                    (None, None, Some(lifetime)) => Arc::strong_count(lifetime) == 1,
+                    (None, None, None) => false,
                 }
             });
             // Counts only avoid useless work. The same worker's try_unwrap is
@@ -170,6 +172,18 @@ impl Original for OpenOriginal {
                             }
                             Err(store) => close.store = Some(store),
                         }
+                    } else if let Some(evidence) = close.evidence.take() {
+                        match Arc::try_unwrap(evidence) {
+                            Ok(evidence) => {
+                                // An external Observation can outlive Store.
+                                // Keep its same Evidence until this worker is
+                                // its last owner. A legacy worker can still
+                                // hold the original connection/file bundle.
+                                drop(evidence);
+                                close.progressed = true;
+                            }
+                            Err(evidence) => close.evidence = Some(evidence),
+                        }
                     } else if let Some(lifetime) = close.lifetime.take() {
                         match Arc::try_unwrap(lifetime) {
                             Ok(lifetime) => {
@@ -207,7 +221,7 @@ impl Original for OpenOriginal {
                 let body = lock(&self.core.body);
                 let close = body.as_ref().unwrap().instance_close.as_ref().unwrap();
                 (
-                    close.store.is_none() && close.lifetime.is_none(),
+                    close.store.is_none() && close.evidence.is_none() && close.lifetime.is_none(),
                     close.progressed,
                 )
             };
@@ -461,6 +475,7 @@ pub(crate) fn prepare_instance_close_in(
         core: Core::new(
             OpenBody {
                 instance_close: Some(InstanceCloseBody {
+                    evidence: Some(store.evidence.clone()),
                     store: Some(store),
                     lifetime: Some(lifetime),
                     progressed: false,

@@ -80,9 +80,8 @@ struct InMemoryEvidence {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[async_trait]
-impl InDoubtAdjudicator for InMemoryEvidence {
-    async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+impl InMemoryEvidence {
+    fn adjudicate_pure(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
         // A read that cannot be performed is not proof that nothing happened.
         let Ok(inner) = self.inner.lock() else {
             return Ok(AttemptOutcome::Unresolved);
@@ -95,7 +94,7 @@ impl InDoubtAdjudicator for InMemoryEvidence {
             .unwrap_or(AttemptOutcome::Unresolved))
     }
 
-    async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+    fn release_pure(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
         let mut inner = self.inner.lock().map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::Internal,
@@ -104,6 +103,34 @@ impl InDoubtAdjudicator for InMemoryEvidence {
         })?;
         inner.commits.remove(&attempt);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl InDoubtAdjudicator for InMemoryEvidence {
+    async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+        self.adjudicate_pure(attempt)
+    }
+    async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+        self.release_pure(attempt)
+    }
+    async fn adjudicate_in(
+        &self,
+        attempt: AttemptId,
+        _execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<AttemptOutcome, novarocks_state_store_api::StateStoreExecutionFailure> {
+        // This explicit testkit implementation has no physical source. Both
+        // API shapes consume the same pure algorithm, never a legacy future.
+        self.adjudicate_pure(attempt)
+            .map_err(StateStoreError::into_original_failure)
+    }
+    async fn release_evidence_in(
+        &self,
+        attempt: AttemptId,
+        _execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.release_pure(attempt)
+            .map_err(StateStoreError::into_original_failure)
     }
 }
 

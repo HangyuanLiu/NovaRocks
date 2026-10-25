@@ -239,11 +239,12 @@ fn open_blocking(
     let lifetime = Arc::new(SqliteInstanceLifetime {
         _owner_lock: owner_lock,
     });
-    let evidence = Arc::new(SqliteCommitEvidence::new(connection, Arc::clone(&lifetime)));
+    let evidence = SqliteCommitEvidence::new(connection, Arc::clone(&lifetime));
     let attempts = AttemptSupervisor::new(
         outstanding_attempts,
         Arc::clone(&evidence) as Arc<dyn InDoubtAdjudicator>,
     );
+    evidence.initialize_original_scope(attempts.scope())?;
 
     Ok(SqliteStateStore {
         path,

@@ -56,6 +56,9 @@ enum Purpose {
     ClosingInstance {
         instance: InstanceScope,
     },
+    InstanceEvidence {
+        instance: InstanceScope,
+    },
     Instance {
         instance: InstanceScope,
         root: WorkScope,
@@ -133,6 +136,28 @@ impl StateStoreOriginalOwner {
             policy,
         )
     }
+    /// Host evidence for issued attempts of this exact installed instance.
+    /// This purpose cannot open a store or begin/read/write a transaction.
+    pub(crate) fn instance_evidence(
+        executor: &QueryBlockingExecutor,
+        vocabulary: Vocabulary,
+        instance: InstanceScope,
+        policy: novarocks_state_store_runtime::StateStoreRunPolicy,
+    ) -> Result<Self, Failure> {
+        Self::new(
+            executor,
+            vocabulary,
+            Purpose::InstanceEvidence { instance },
+            policy,
+        )
+    }
+    /// A cadence may poll the original inventory, but never retain its owner.
+    /// Host custody must already hold this owner before lending this handle.
+    pub(crate) fn progress_handle(&self) -> StateStoreOriginalProgress {
+        StateStoreOriginalProgress {
+            port: Arc::downgrade(&self.port),
+        }
+    }
     pub(crate) fn for_root(
         executor: &QueryBlockingExecutor,
         vocabulary: Vocabulary,
@@ -198,80 +223,8 @@ impl StateStoreOriginalOwner {
         }
         self.port.wake.notify();
     }
-    /// Cooperative batches bound one turn's observation cost, never admission
-    /// or retained responsibility. New insertions wake a subsequent full round.
     pub(crate) fn poll_progress(&self, cx: &mut Context<'_>) -> Result<bool, Failure> {
-        self.port.wake.owner.register(cx.waker());
-        let (batch, more) = {
-            let mut inventory = self
-                .port
-                .inventory
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if inventory.high.is_none() {
-                self.port.wake.dirty.swap(false, Ordering::AcqRel);
-                inventory.high = inventory.entries.last_key_value().map(|(key, _)| *key);
-                inventory.cursor = None;
-            }
-            let Some(high) = inventory.high else {
-                return Ok(true);
-            };
-            let batch = match inventory.cursor {
-                Some(cursor) => inventory.entries.range((Excluded(cursor), Included(high))),
-                None => inventory.entries.range(..=high),
-            }
-            .take(32)
-            .map(|(key, cell)| (*key, cell.clone()))
-            .collect::<Vec<_>>();
-            inventory.cursor = batch.last().map(|(key, _)| *key).or(inventory.cursor);
-            let more = inventory.cursor.is_some_and(|cursor| {
-                inventory
-                    .entries
-                    .range((Excluded(cursor), Included(high)))
-                    .next()
-                    .is_some()
-            });
-            if !more {
-                inventory.high = None;
-                inventory.cursor = None;
-            }
-            (batch, more)
-        };
-        let owner_waker = Waker::from(self.port.wake.clone());
-        let mut owner_cx = Context::from_waker(&owner_waker);
-        let mut first_failure = None;
-        for (key, cell) in batch {
-            match cell.poll_original(&mut owner_cx, &self.port) {
-                Ok(true) => {
-                    let retired = {
-                        let mut inventory = self
-                            .port
-                            .inventory
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner());
-                        inventory.entries.remove(&key)
-                    };
-                    drop(retired);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    first_failure.get_or_insert(error);
-                }
-            }
-        }
-        if more || self.port.wake.dirty.load(Ordering::Acquire) {
-            cx.waker().wake_by_ref();
-        }
-        if let Some(error) = first_failure {
-            return Err(error);
-        }
-        Ok(self
-            .port
-            .inventory
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entries
-            .is_empty())
+        poll_originals(&self.port, cx)
     }
     pub(crate) fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Failure>> {
         if !self.close_requested {
@@ -321,6 +274,94 @@ impl StateStoreOriginalOwner {
         })
     }
 }
+/// Weak polling capability, never source custody or execution permission.
+#[derive(Clone)]
+pub(crate) struct StateStoreOriginalProgress {
+    port: Weak<Port>,
+}
+impl StateStoreOriginalProgress {
+    pub(crate) fn context(&self, deadline: Instant) -> Result<StateStoreExecutionContext, Failure> {
+        let port = self
+            .port
+            .upgrade()
+            .ok_or_else(|| protocol("original StateStore Host custody is unavailable"))?;
+        let port: Arc<dyn StateStoreExecutionPort> = port;
+        Ok(StateStoreExecutionContext::new(&port, deadline))
+    }
+    pub(crate) fn poll_progress(&self, cx: &mut Context<'_>) -> Result<bool, Failure> {
+        let port = self
+            .port
+            .upgrade()
+            .ok_or_else(|| protocol("original StateStore Host custody is unavailable"))?;
+        poll_originals(&port, cx)
+    }
+}
+/// Cooperative batches bound one turn's observation cost, never admission
+/// or retained responsibility. All callers poll this same original inventory.
+fn poll_originals(port: &Arc<Port>, cx: &mut Context<'_>) -> Result<bool, Failure> {
+    port.wake.owner.register(cx.waker());
+    let (batch, more) = {
+        let mut inventory = port.inventory.lock().unwrap_or_else(|p| p.into_inner());
+        if inventory.high.is_none() {
+            port.wake.dirty.swap(false, Ordering::AcqRel);
+            inventory.high = inventory.entries.last_key_value().map(|(key, _)| *key);
+            inventory.cursor = None;
+        }
+        let Some(high) = inventory.high else {
+            return Ok(true);
+        };
+        let batch = match inventory.cursor {
+            Some(cursor) => inventory.entries.range((Excluded(cursor), Included(high))),
+            None => inventory.entries.range(..=high),
+        }
+        .take(32)
+        .map(|(key, cell)| (*key, cell.clone()))
+        .collect::<Vec<_>>();
+        inventory.cursor = batch.last().map(|(key, _)| *key).or(inventory.cursor);
+        let more = inventory.cursor.is_some_and(|cursor| {
+            inventory
+                .entries
+                .range((Excluded(cursor), Included(high)))
+                .next()
+                .is_some()
+        });
+        if !more {
+            inventory.high = None;
+            inventory.cursor = None;
+        }
+        (batch, more)
+    };
+    let owner_waker = Waker::from(port.wake.clone());
+    let mut owner_cx = Context::from_waker(&owner_waker);
+    let mut first_failure = None;
+    for (key, cell) in batch {
+        match cell.poll_original(&mut owner_cx, port) {
+            Ok(true) => {
+                let retired = {
+                    let mut inventory = port.inventory.lock().unwrap_or_else(|p| p.into_inner());
+                    inventory.entries.remove(&key)
+                };
+                drop(retired);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                first_failure.get_or_insert(error);
+            }
+        }
+    }
+    if more || port.wake.dirty.load(Ordering::Acquire) {
+        cx.waker().wake_by_ref();
+    }
+    if let Some(error) = first_failure {
+        return Err(error);
+    }
+    Ok(port
+        .inventory
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entries
+        .is_empty())
+}
 fn protocol(message: &'static str) -> Failure {
     StateStoreError::new(StateStoreErrorKind::Internal, message).into_original_failure()
 }
@@ -342,6 +383,16 @@ impl Port {
                 actual == self.vocabulary.open_type()
                     && origin == StateStoreBlockingOrigin::Instance(*instance)
                     && phase.is_none_or(|p| p == Phase::Close)
+            }
+            Purpose::InstanceEvidence { instance } => {
+                actual == self.vocabulary.evidence_type()
+                    && origin == StateStoreBlockingOrigin::Instance(*instance)
+                    && phase.is_none_or(|p| {
+                        matches!(
+                            p,
+                            Phase::EvidenceRead | Phase::EvidenceRelease | Phase::Close
+                        )
+                    })
             }
             Purpose::Instance { instance, .. } => {
                 origin == StateStoreBlockingOrigin::Instance(*instance)
@@ -392,7 +443,10 @@ impl StateStoreExecutionPort for Port {
         self.validate(original.as_ref(), original.requested().map(|r| r.phase))?;
         // A shutdown waiting deadline grants no new business work and cannot
         // revoke the existing Host's obligation to destroy its exact instance.
-        if !matches!(self.purpose, Purpose::ClosingInstance { .. }) {
+        if !matches!(
+            self.purpose,
+            Purpose::ClosingInstance { .. } | Purpose::InstanceEvidence { .. }
+        ) {
             if let Some(error) = self.business_stop(deadline) {
                 return Err(error);
             }
@@ -545,7 +599,9 @@ impl Cell {
                     let reserve = Box::pin(async move { executor.reserve().await });
                     let deadline = self.deadline;
                     let root = match &port.purpose {
-                        Purpose::Opening | Purpose::ClosingInstance { .. } => None,
+                        Purpose::Opening
+                        | Purpose::ClosingInstance { .. }
+                        | Purpose::InstanceEvidence { .. } => None,
                         Purpose::Instance { root, .. } => Some(root.clone()),
                     };
                     let gate = Box::pin(async move {

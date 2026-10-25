@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -104,9 +104,23 @@ enum Liveness {
 // legacy async callers whose already-dispatched worker keeps the last alias.
 struct ConnectionCustody {
     connection: Mutex<Connection>,
+    // This field drops after the real Connection field, not at Drop entry.
+    #[cfg(test)]
+    connection_exit: ConnectionExitObservation,
     _lifetime: Arc<super::SqliteInstanceLifetime>,
     #[cfg(test)]
     legacy_pause: Mutex<Option<LegacyEvidencePause>>,
+}
+#[cfg(test)]
+struct ConnectionExitObservation {
+    thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+}
+#[cfg(test)]
+impl Drop for ConnectionExitObservation {
+    fn drop(&mut self) {
+        *self.thread.lock().expect("connection exit observation") =
+            Some(std::thread::current().id());
+    }
 }
 impl std::ops::Deref for ConnectionCustody {
     type Target = Mutex<Connection>;
@@ -134,6 +148,8 @@ impl ConnectionCustody {
 }
 
 pub(super) struct SqliteCommitEvidence {
+    original: Weak<Self>,
+    original_scope: OnceLock<novarocks_state_store_api::InstanceScope>,
     /// A dedicated connection, so adjudicating and releasing never wait on
     /// opening a database file and never borrow a live transaction's
     /// connection.
@@ -150,10 +166,16 @@ impl SqliteCommitEvidence {
     pub(super) fn new(
         connection: Connection,
         lifetime: Arc<super::SqliteInstanceLifetime>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|original| Self {
+            original: original.clone(),
+            original_scope: OnceLock::new(),
             connection: Arc::new(ConnectionCustody {
                 connection: Mutex::new(connection),
+                #[cfg(test)]
+                connection_exit: ConnectionExitObservation {
+                    thread: Arc::new(Mutex::new(None)),
+                },
                 _lifetime: lifetime,
                 #[cfg(test)]
                 legacy_pause: Mutex::new(None),
@@ -162,7 +184,38 @@ impl SqliteCommitEvidence {
             deferred: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             fail_next_release: AtomicBool::new(false),
-        }
+        })
+    }
+
+    pub(super) fn initialize_original_scope(
+        &self,
+        scope: novarocks_state_store_api::InstanceScope,
+    ) -> Result<(), StateStoreError> {
+        self.original_scope
+            .set(scope)
+            .map_err(|_| internal("SQLite evidence original scope was already initialized"))
+    }
+    pub(super) fn original_scope(
+        &self,
+    ) -> Result<
+        novarocks_state_store_api::InstanceScope,
+        novarocks_state_store_api::StateStoreExecutionFailure,
+    > {
+        self.original_scope.get().copied().ok_or_else(|| {
+            internal("SQLite evidence original scope is not initialized").into_original_failure()
+        })
+    }
+    fn original_arc(
+        &self,
+    ) -> Result<Arc<Self>, novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.original.upgrade().ok_or_else(|| {
+            internal("SQLite evidence original owner is unavailable").into_original_failure()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn connection_exit_thread(&self) -> Arc<Mutex<Option<std::thread::ThreadId>>> {
+        self.connection.connection_exit.thread.clone()
     }
 
     #[cfg(test)]
@@ -397,6 +450,20 @@ pub(super) async fn release_witnessed_evidence(
 
 #[async_trait]
 impl InDoubtAdjudicator for SqliteCommitEvidence {
+    async fn adjudicate_in(
+        &self,
+        attempt: AttemptId,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<AttemptOutcome, novarocks_state_store_api::StateStoreExecutionFailure> {
+        super::original::adjudicate_evidence_in(self.original_arc()?, attempt, execution).await
+    }
+    async fn release_evidence_in(
+        &self,
+        attempt: AttemptId,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        super::original::release_evidence_in(self.original_arc()?, attempt, execution).await
+    }
     async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
         self.drain_deferred().await;
         match self.liveness(attempt) {

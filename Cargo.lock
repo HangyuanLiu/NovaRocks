@@ -4003,6 +4003,7 @@ dependencies = [
  "novarocks-sql",
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
+ "novarocks-state-store-sqlite",
  "novarocks-state-store-testkit",
  "novarocks-statistics-application",
  "novarocks-table-maintenance",

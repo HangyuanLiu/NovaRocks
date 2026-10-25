@@ -391,3 +391,6 @@ async fn early_original_close_failure_is_retained_until_the_same_actual_footer()
     assert_eq!(original.calls.load(Ordering::SeqCst), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
+
+#[path = "state_store_opening_tests/sqlite_composition.rs"]
+mod sqlite_composition;

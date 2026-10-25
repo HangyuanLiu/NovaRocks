@@ -924,7 +924,7 @@ pub struct FrontendApplicationHost {
     serving_lifecycle: Arc<FrontendServingLifecycle>,
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
-    abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
+    abandoned_attempt_sweeper: Option<crate::state_store::AbandonedAttemptSweeper>,
     mv_repository:
         Option<Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>>,
     state_store_host: Option<StateStoreHost>,
@@ -1878,23 +1878,6 @@ impl FrontendApplicationHost {
         }
         host.catalog_role_runtime_mut().prune = Some(catalog_prune);
 
-        // Abandoned write attempts hold a capacity slot and a row of provider
-        // evidence until someone hands them back. The attempt contract makes
-        // that a host obligation on purpose, so this is where the obligation is
-        // met; without it the mechanism has no caller and the instance leaks.
-        if let Some(store) = host.state_store() {
-            let sweeper =
-                std::sync::Arc::new(crate::state_store::AbandonedAttemptSweeper::new(store));
-            if let Err(error) = sweeper.start() {
-                return Err(host
-                    .cleanup_open_error(FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::StateStoreHost,
-                        error,
-                    ))
-                    .await);
-            }
-            host.abandoned_attempt_sweeper = Some(sweeper);
-        }
         // Freeze the policy consumed by the role-product coordinator before
         // constructing any product service, so no path can observe an
         // all-in-one-only direct execution fallback.
@@ -2491,15 +2474,48 @@ impl FrontendApplicationHost {
         let deadline = opening.deadline();
         let open = std::future::poll_fn(|cx| opening.poll_open(cx, &mut self.state_store_host));
         match tokio::time::timeout_at(deadline.into(), open).await {
-            Ok(result) => result,
-            Err(_) => Err(FrontendApplicationError::original_state_store(
-                novarocks_state_store_api::StateStoreError::new(
-                    novarocks_state_store_api::StateStoreErrorKind::DeadlineExceeded,
-                    "frontend state store opening deadline exceeded",
-                )
-                .into_original_failure(),
-            )),
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(FrontendApplicationError::original_state_store(
+                    novarocks_state_store_api::StateStoreError::new(
+                        novarocks_state_store_api::StateStoreErrorKind::DeadlineExceeded,
+                        "frontend state store opening deadline exceeded",
+                    )
+                    .into_original_failure(),
+                ));
+            }
         }
+        if let Some(store) = self.state_store() {
+            let ready = self
+                .state_store_host
+                .as_ref()
+                .expect("validated original instance");
+            let progress = self
+                .state_store_opening
+                .as_mut()
+                .expect("original opening custody")
+                .evidence_progress(ready, &executor)
+                .map_err(FrontendApplicationError::original_state_store)?;
+            let sweeper = crate::state_store::AbandonedAttemptSweeper::new(
+                store,
+                progress,
+                ready.run_policy(),
+            );
+            // Install custody before starting the existing cadence or any
+            // subsequent bootstrap operation can abandon a dispatched attempt.
+            self.abandoned_attempt_sweeper = Some(sweeper);
+            self.abandoned_attempt_sweeper
+                .as_mut()
+                .unwrap()
+                .start()
+                .map_err(|error| {
+                    FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::StateStoreHost,
+                        error,
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     async fn cleanup_open_error(
@@ -2562,7 +2578,7 @@ impl FrontendApplicationHost {
         // Stop the cadence before the store closes. The store host performs one
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.
-        if let Some(sweeper) = self.abandoned_attempt_sweeper.take() {
+        if let Some(sweeper) = self.abandoned_attempt_sweeper.as_mut() {
             sweeper.shutdown().await;
         }
         let catalog_runtime_error = match self.catalog_role_runtime.as_mut() {
@@ -2629,14 +2645,26 @@ impl FrontendApplicationHost {
                 None => error,
             });
         }
-        // Preserve the existing best-effort final abandoned-attempt drain.
-        // Its legacy evidence path remains a separate migration boundary;
-        // opening/instance-close purpose grants no transaction authority.
-        if let Some(host) = self.state_store_host.as_ref()
-            && let Err(error) = host.release_abandoned_attempts().await
-        {
-            tracing::warn!(%error, "abandoned state store attempts were not released before shutdown");
+        // The same cadence's final pass borrows the Host-owned evidence
+        // inventory. A waiting timeout retains that inventory and queued debt.
+        if let Some(sweeper) = self.abandoned_attempt_sweeper.as_ref() {
+            match tokio::time::timeout_at(deadline.into(), sweeper.sweep_once()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(cause)) => {
+                    tracing::warn!(%cause, "abandoned state store attempts were not released before shutdown");
+                    if let Some(opening) = self.state_store_opening.as_mut() {
+                        opening.retain_evidence_failure(cause);
+                    }
+                }
+                Err(_) => {
+                    return Err("frontend original StateStore evidence remains pending".into());
+                }
+            }
         }
+        // No running cadence remains. Its store alias must leave before the
+        // actual instance Store/File destruction; its physical sources stay
+        // with the same opening/evidence owner below.
+        self.abandoned_attempt_sweeper.take();
         drop(self.mv_repository.take());
         if let Some(opening) = self.state_store_opening.as_mut() {
             let executor = self.execution_runtime_owner.query_blocking_executor();

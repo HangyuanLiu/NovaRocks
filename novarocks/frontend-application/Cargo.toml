@@ -87,6 +87,7 @@ novarocks-catalog-application = { workspace = true }
 novarocks-query-application = { workspace = true }
 novarocks-result-render.workspace = true
 novarocks-secret.workspace = true
+novarocks-state-store-sqlite.workspace = true
 novarocks-state-store-testkit.workspace = true
 novarocks-sql = { workspace = true }
 tempfile.workspace = true

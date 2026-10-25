@@ -41,9 +41,11 @@ struct Call {
     original: Arc<dyn Original>,
     request: Request,
     panic_after_run: std::sync::atomic::AtomicBool,
+    ran_on: Mutex<Option<std::thread::ThreadId>>,
 }
 impl QueryBlockingOriginal for Call {
     fn run_original(&self) {
+        *lock(&self.ran_on) = Some(std::thread::current().id());
         self.original.run_original_phase(self.request);
         assert!(
             !self
@@ -97,7 +99,11 @@ impl StateStoreExecutionPort for Receiving {
         assert_eq!(original.origin(), self.origin);
         let vocabulary = vocabulary();
         let actual = original.as_ref().type_id();
-        assert!(actual == vocabulary.open_type() || actual == vocabulary.transaction_type());
+        assert!(
+            actual == vocabulary.open_type()
+                || actual == vocabulary.transaction_type()
+                || actual == vocabulary.evidence_type()
+        );
         let observation = Arc::new(Mutex::new(Observation::default()));
         lock(&self.cells).push(Arc::new(Cell {
             original: original.clone(),
@@ -215,11 +221,15 @@ impl Rig {
                     .map(|request| (cell.clone(), request))
             })
             .expect("one original request is pending");
+        self.prepare_selected(cell, request).await
+    }
+    async fn prepare_selected(&self, cell: Arc<Cell>, request: Request) -> Prepared {
         let reservation = self.executor.reserve().await.expect("real queue slot");
         let call = Arc::new(Call {
             original: cell.original.clone(),
             request,
             panic_after_run: std::sync::atomic::AtomicBool::new(false),
+            ran_on: Mutex::new(None),
         });
         let mut receipt = None;
         let prepared = self
@@ -853,7 +863,7 @@ async fn instance_close_fixture() -> (
 }
 
 #[tokio::test]
-async fn instance_close_drops_last_store_then_file_only_on_same_actual_workers() {
+async fn instance_close_drops_store_evidence_and_file_in_three_actual_close_phases() {
     use novarocks_state_store_api::StateStoreProviderLifecycle;
     let (_temp, path, mut instance, lifetime) = instance_close_fixture().await;
     let scope = instance.blocking_instance_scope().unwrap();
@@ -896,9 +906,17 @@ async fn instance_close_drops_last_store_then_file_only_on_same_actual_workers()
     assert!(!cell.original.is_complete());
     assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Draining);
     assert!(crate::acquire_owner_lock(&path).is_err());
+    let close_evidence = rig.prepare_next().await;
+    assert_eq!(close_evidence.request.phase, Phase::Close);
+    assert!(close_evidence.request.revision > first_revision);
+    let evidence_revision = close_evidence.request.revision;
+    close_evidence.publish(&rig.executor).await;
+    assert!(!cell.original.is_complete());
+    assert!(lifetime.upgrade().is_some());
+    assert!(crate::acquire_owner_lock(&path).is_err());
     let close_file = rig.prepare_next().await;
     assert_eq!(close_file.request.phase, Phase::Close);
-    assert!(close_file.request.revision > first_revision);
+    assert!(close_file.request.revision > evidence_revision);
     close_file.publish(&rig.executor).await;
     assert!(matches!(
         closing
@@ -921,9 +939,19 @@ async fn instance_close_drops_last_store_then_file_only_on_same_actual_workers()
 }
 
 #[tokio::test]
-async fn external_observation_file_pin_keeps_instance_draining_after_store_actual_exit() {
+async fn external_observation_cannot_drop_evidence_connection_outside_close_worker() {
     use novarocks_state_store_api::StateStoreProviderLifecycle;
-    let (_temp, path, mut instance, lifetime) = instance_close_fixture().await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("observation-close.sqlite");
+    let value_store = store(path.clone()).await;
+    let lifetime = Arc::downgrade(&value_store.lifetime);
+    let connection_exit = value_store.evidence.connection_exit_thread();
+    let weak_evidence = Arc::downgrade(&value_store.evidence);
+    let descriptor = novarocks_state_store_api::StateStoreProviderDescriptor::new(
+        crate::SQLITE_STATE_STORE_PROVIDER_ID,
+        novarocks_state_store_api::MAX_KEY_BYTES,
+    );
+    let mut instance = crate::provider::instance_from_store(descriptor, value_store);
     let external = instance.state_store().unwrap();
     let (attempt, observation) = external.attempts().reserve().unwrap();
     attempt.cancel_before_dispatch().unwrap();
@@ -934,7 +962,9 @@ async fn external_observation_file_pin_keeps_instance_draining_after_store_actua
     let mut closing = None;
     instance.prepare_close_in(&execution, &mut closing).unwrap();
     drop(external);
-    rig.prepare_next().await.publish(&rig.executor).await;
+    let close_store = rig.prepare_next().await;
+    let store_revision = close_store.request.revision;
+    close_store.publish(&rig.executor).await;
     let source = lock(&rig.receiving.cells)[0].original.clone();
     assert!(!source.is_complete());
     for _ in 0..3 {
@@ -950,12 +980,51 @@ async fn external_observation_file_pin_keeps_instance_draining_after_store_actua
     assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Draining);
     assert!(lifetime.upgrade().is_some());
     assert!(crate::acquire_owner_lock(&path).is_err());
-    // The actual issued Observation pins its supervisor/adjudicator/connection,
-    // not a copied byte estimate or the vanished Store Arc.
     assert!(observation.peek().unwrap().is_none());
+    let caller_thread = std::thread::current().id();
     drop(observation);
+    // The same source owns Evidence; Observation is no longer its last alias.
+    // This marker drops AFTER the real Connection field, not at Drop entry.
+    assert!(lock(&connection_exit).is_none());
+    assert!(weak_evidence.upgrade().is_some());
+    let selected = rig.prepare_next().await;
+    assert_eq!(selected.request.phase, Phase::Close);
+    assert!(selected.request.revision > store_revision);
+    let selected_revision = selected.request.revision;
+    let raced = weak_evidence
+        .upgrade()
+        .expect("same original Evidence alias");
+    let before = rig
+        .receiving
+        .progress_notifications
+        .load(std::sync::atomic::Ordering::SeqCst);
+    selected.publish(&rig.executor).await;
+    assert_eq!(
+        rig.receiving
+            .progress_notifications
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert!(!source.is_complete());
+    assert!(source.requested().is_none());
+    assert!(lock(&connection_exit).is_none());
+    drop(raced);
+    assert!(lock(&connection_exit).is_none());
+    let close_evidence = rig.prepare_next().await;
+    assert!(close_evidence.request.revision > selected_revision);
+    let evidence_revision = close_evidence.request.revision;
+    let physical = close_evidence.call.clone();
+    close_evidence.publish(&rig.executor).await;
+    let worker_thread = lock(&physical.ran_on).expect("same real QB worker ran");
+    assert_ne!(worker_thread, caller_thread);
+    assert_eq!(*lock(&connection_exit), Some(worker_thread));
+    assert!(weak_evidence.upgrade().is_none());
+    assert!(!source.is_complete());
+    assert!(lifetime.upgrade().is_some());
+    assert!(crate::acquire_owner_lock(&path).is_err());
     let close_file = rig.prepare_next().await;
     assert_eq!(close_file.request.phase, Phase::Close);
+    assert!(close_file.request.revision > evidence_revision);
     close_file.publish(&rig.executor).await;
     assert!(matches!(
         closing
@@ -967,6 +1036,7 @@ async fn external_observation_file_pin_keeps_instance_draining_after_store_actua
     assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Stopped);
     assert!(lifetime.upgrade().is_none());
     assert!(crate::acquire_owner_lock(&path).is_ok());
+    drop(physical);
     drop(source);
     drop(closing);
     drop(instance);
@@ -1216,6 +1286,9 @@ async fn cancelled_legacy_evidence_workers_keep_actual_connection_and_file_until
         let mut closing = None;
         instance.prepare_close_in(&execution, &mut closing).unwrap();
         rig.prepare_next().await.publish(&rig.executor).await;
+        let close_evidence = rig.prepare_next().await;
+        assert_eq!(close_evidence.request.phase, Phase::Close);
+        close_evidence.publish(&rig.executor).await;
         let source = lock(&rig.receiving.cells).last().unwrap().original.clone();
         assert!(
             source.requested().is_none(),
@@ -1261,3 +1334,5 @@ async fn cancelled_legacy_evidence_workers_keep_actual_connection_and_file_until
         rig.stop().await;
     }
 }
+
+mod evidence_tests;

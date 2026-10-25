@@ -18,6 +18,7 @@
 //! Provider-private, purpose-closed originals. Physical fields remain in the
 //! selected role/Action's receiving record. This module never opens an executor.
 
+mod evidence;
 mod open;
 #[cfg(test)]
 mod tests;
@@ -36,16 +37,20 @@ use std::{
     task::{Context, Poll},
 };
 
+pub(super) use evidence::{adjudicate_evidence_in, release_evidence_in};
 pub(super) use open::{
     OpenOriginal, borrow_instance_close_in, prepare_instance_close_in, prepare_open_in,
 };
 pub(super) use transaction::{begin_read_in, begin_write_in};
 
 pub(super) fn vocabulary() -> Vocabulary {
-    // Txn and evidence intentionally share one actual serial source/receiver.
-    Vocabulary::for_provider::<open::OpenOriginal, transaction::TxnOriginal, transaction::TxnOriginal>(
-        super::SQLITE_STATE_STORE_PROVIDER_ID,
-    )
+    // Transaction settlement stays with its original; standalone evidence
+    // has a distinct private source and cannot start a transaction.
+    Vocabulary::for_provider::<
+        open::OpenOriginal,
+        transaction::TxnOriginal,
+        evidence::EvidenceOriginal,
+    >(super::SQLITE_STATE_STORE_PROVIDER_ID)
 }
 fn error(kind: StateStoreErrorKind, detail: &'static str) -> Failure {
     StateStoreError::new(kind, detail).into_original_failure()

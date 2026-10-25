@@ -32,6 +32,7 @@ pub(super) struct FrontendStateStoreOpening {
     prepared: PreparedStateStoreHost,
     owner: Option<StateStoreOriginalOwner>,
     instance_close: Option<InstanceClose>,
+    evidence_owner: Option<StateStoreOriginalOwner>,
     started: bool,
     closing: bool,
     first_failure: Option<Failure>,
@@ -42,10 +43,32 @@ impl FrontendStateStoreOpening {
             prepared,
             owner: None,
             instance_close: None,
+            evidence_owner: None,
             started: false,
             closing: false,
             first_failure: None,
         }
+    }
+    pub(super) fn evidence_progress(
+        &mut self,
+        ready: &StateStoreHost,
+        executor: &QueryBlockingExecutor,
+    ) -> Result<crate::state_store::execution::StateStoreOriginalProgress, Failure> {
+        if self.evidence_owner.is_none() {
+            let (vocabulary, instance) = ready.original_blocking_sources().ok_or_else(|| {
+                novarocks_state_store_api::StateStoreOriginalUnsupported.into_original_failure()
+            })?;
+            self.evidence_owner = Some(StateStoreOriginalOwner::instance_evidence(
+                executor,
+                vocabulary,
+                instance,
+                ready.run_policy(),
+            )?);
+        }
+        Ok(self.evidence_owner.as_ref().unwrap().progress_handle())
+    }
+    pub(super) fn retain_evidence_failure(&mut self, cause: Failure) {
+        self.first_failure.get_or_insert(cause);
     }
     pub(super) fn deadline(&self) -> Instant {
         self.prepared.deadline()
@@ -154,6 +177,17 @@ impl FrontendStateStoreOpening {
                 Poll::Ready(Ok(())) => {}
             }
         }
+        // The cadence was stopped/joined and its final borrowed pass ended
+        // before this method. Keep the same evidence receiver until real exit;
+        // otherwise its connection bundle would pin the following File close.
+        if let Some(owner) = self.evidence_owner.as_mut() {
+            match owner.poll_closed(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(cause)) => return Poll::Ready(Err(cause)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        self.evidence_owner.take();
         // This selected actual instance may have failed validation; it is not
         // dropped or handed to a legacy shutdown future on that error path.
         let scope = if let Some(instance) = self.prepared.retained_instance_mut() {

@@ -891,3 +891,87 @@ async fn observer_wake_panic_preserves_same_original_cause_and_cell_after_withdr
     drop(owner); // Test teardown after proving the unpublished physical tuple returned.
     shutdown(&mut workers).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_evidence_accepts_only_its_actual_instance_author_and_settlement_phases() {
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let selected = Vocabulary::for_provider::<NotSelected, NotSelected, TestOriginal>(PROVIDER);
+    let mut owner = StateStoreOriginalOwner::instance_evidence(
+        &executor,
+        selected,
+        instance,
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .unwrap();
+    let context = owner.context(Instant::now() - Duration::from_secs(1));
+    for phase in [
+        Phase::Open,
+        Phase::BeginRead,
+        Phase::BeginWrite,
+        Phase::Get,
+        Phase::Range,
+        Phase::Put,
+        Phase::Delete,
+        Phase::Commit,
+        Phase::Rollback,
+    ] {
+        let original: Arc<dyn StateStoreBlockingOriginal> =
+            TestOriginal::new(StateStoreBlockingOrigin::Instance(instance), phase, None);
+        let mut target = None;
+        assert!(context.bind_original_in(&original, &mut target).is_err());
+        assert!(target.is_none());
+    }
+    for original in [
+        TestOriginal::new(
+            StateStoreBlockingOrigin::Instance(InstanceScope::new()),
+            Phase::EvidenceRead,
+            None,
+        ) as Arc<dyn StateStoreBlockingOriginal>,
+        Arc::new(NotSelected(TestOriginal::new(
+            StateStoreBlockingOrigin::Instance(instance),
+            Phase::EvidenceRead,
+            None,
+        ))) as Arc<dyn StateStoreBlockingOriginal>,
+    ] {
+        let mut target = None;
+        assert!(context.bind_original_in(&original, &mut target).is_err());
+        assert!(target.is_none());
+    }
+    assert!(owner.port.inventory.lock().unwrap().entries.is_empty());
+    let source = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::EvidenceRead,
+        None,
+    );
+    let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+    let mut target = None;
+    context.bind_original_in(&original, &mut target).unwrap();
+    *source.slot.lock().unwrap() = target;
+    let progress = owner.progress_handle();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| match progress.poll_progress(cx) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(cause) => Poll::Ready(Err(cause)),
+        }),
+    )
+    .await
+    .expect("same evidence inventory actual exit")
+    .unwrap();
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+    );
+    assert_eq!(source.runs.load(Ordering::Acquire), 1);
+    closed(&mut owner).await;
+    drop(owner);
+    assert!(
+        progress
+            .poll_progress(&mut Context::from_waker(Waker::noop()))
+            .is_err(),
+        "weak cadence cannot replace missing Host custody"
+    );
+    shutdown(&mut workers).await;
+}
