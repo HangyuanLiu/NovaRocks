@@ -497,8 +497,9 @@ impl ManagementEntrance {
     }
 
     /// Revoke from the exact actual Current management slot independently of
-    /// publication or root decoding. This private path grants no capability.
-    pub(crate) fn revoke_foreign_current_management(
+    /// publication or root decoding. The caller supplies the actual view from
+    /// its exact document lease; this negative observation grants no capability.
+    pub fn revoke_foreign_current_management(
         &self,
         view: &novarocks_spi::connector::KeyedDocumentView,
         catalog: &CatalogHandle,

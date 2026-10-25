@@ -4317,3 +4317,106 @@ fn borrowed_terminal_releases_real_activity_before_the_stable_lease_is_destroyed
         MvManagementPhase::Manageable
     );
 }
+
+#[test]
+fn actual_provider_view_revokes_foreign_management_without_projection_or_another_observation() {
+    use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+    for publication in ["valid", "missing", "malformed"] {
+        let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+        let (_, prior, _) = entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .unwrap();
+        {
+            let mut reply = caps.reply.lock().unwrap();
+            let view = reply.as_mut().unwrap();
+            view.slots
+                .get_mut(&management_slot_name().unwrap())
+                .unwrap()
+                .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+            match publication {
+                "missing" => view.current_records.clear(),
+                "malformed" => view.current_records[0].payload = Bytes::from_static(b"invalid P"),
+                _ => {}
+            }
+        }
+        let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+        // This is the same provider observation the guard already obtained.
+        // The negative author does not decode P or issue another storage call.
+        let view = lease.observe_keyed_documents(request.clone()).unwrap();
+        assert!(
+            entrance
+                .revoke_foreign_current_management(&view, &request.catalog_handle)
+                .unwrap()
+        );
+        assert_eq!(
+            caps.calls.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        assert!(!prior.is_open());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::OwnerMismatch
+        );
+        assert!(
+            entrance
+                .acquire(
+                    ManagementRequest::try_new(
+                        target.catalog().clone(),
+                        target.table().clone(),
+                        Some(target.object_id().clone()),
+                        ConnectorDocumentManagementOperation::Publication,
+                        Some(dependencies),
+                        EffectScope::CATALOG_COMMIT,
+                    )
+                    .unwrap(),
+                    || false
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn actual_foreign_provider_scope_cannot_revoke_another_management_target() {
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    let (_, prior, _) = entrance
+        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .unwrap();
+    {
+        use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+        caps.reply
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .slots
+            .get_mut(&management_slot_name().unwrap())
+            .unwrap()
+            .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+    }
+    let view = lease.observe_keyed_documents(request.clone()).unwrap();
+    let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let mut foreign = view.clone();
+    foreign.object_id =
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"another-object")).unwrap();
+    assert!(
+        !entrance
+            .revoke_foreign_current_management(&foreign, &request.catalog_handle)
+            .unwrap()
+    );
+    let other_catalog = CatalogHandle::new(
+        target.table().instance_id.clone(),
+        CatalogVersion::from_bytes([91; 32]),
+    );
+    assert!(
+        !entrance
+            .revoke_foreign_current_management(&view, &other_catalog)
+            .unwrap()
+    );
+    assert!(prior.is_open());
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+    assert_eq!(caps.calls.load(std::sync::atomic::Ordering::SeqCst), before);
+}

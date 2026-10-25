@@ -124,6 +124,17 @@ pub(crate) struct MvReadinessExecution<'a> {
 }
 
 impl MvReadinessPort {
+    /// A mutation guard already holds the exact Provider observation. Revoke
+    /// foreign local management without reading or refreshing an Accelerator.
+    pub(crate) fn revoke_foreign_current_management(
+        &self,
+        view: &novarocks_spi::connector::KeyedDocumentView,
+        catalog: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<bool, novarocks_query_application::session_error::QueryServiceError> {
+        self.management
+            .revoke_foreign_current_management(view, catalog)
+            .map_err(document_application_error)
+    }
     /// Construct the role-local synchronous adapter from the already-owned
     /// product readiness service. This adapter cannot create an independent
     /// repository/runtime state pair.

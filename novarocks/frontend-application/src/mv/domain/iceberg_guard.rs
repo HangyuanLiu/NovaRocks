@@ -162,9 +162,11 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
         || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
         || view.versions.values().any(|v| v.owner() == "novarocks.mv")
     {
+        // The Provider marker decides denial. Keep its actual negative
+        // management observation, without refreshing an unrelated Accelerator.
         readiness
-            .candidate_reader()
-            .observe_current(&documents, request)?;
+            .revoke_foreign_current_management(&view, &request.catalog_handle)
+            .map_err(|error| error.to_string())?;
         return Err(format!(
             "table {}.{}.{} is a materialized view; {}",
             target.catalog,
@@ -334,10 +336,9 @@ async fn reject_bound_iceberg_mv_table_async(
         || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
         || view.versions.values().any(|v| v.owner() == "novarocks.mv")
     {
-        readiness
-            .candidate_reader()
-            .observe_current_application_async(&documents, request)
-            .await?;
+        // Denial needs no projection install, evidence resolution or reload.
+        // Existing unsettled effects remain with their original management owner.
+        readiness.revoke_foreign_current_management(&view, &request.catalog_handle)?;
         return Err(materialized_view_denial(target, mutation));
     }
 
