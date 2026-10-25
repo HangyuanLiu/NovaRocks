@@ -175,18 +175,17 @@ impl FrozenInstallation {
             Ok(access) => access,
             Err(error) => return failure(connector_error(error)),
         };
-        if access.scheme() != novarocks_fs::FsScheme::Local {
-            if let Some(parent) =
+        if access.scheme() != novarocks_fs::FsScheme::Local
+            && let Some(parent) =
                 std::path::Path::new(access.paths()[0].operator_relative_path()).parent()
+        {
+            let parent = parent.to_string_lossy();
+            if !parent.is_empty()
+                && let Err(error) = access.operator().create_dir(&format!("{parent}/")).await
             {
-                let parent = parent.to_string_lossy();
-                if !parent.is_empty() {
-                    if let Err(error) = access.operator().create_dir(&format!("{parent}/")).await {
-                        return failure(file_error(novarocks_fs::map_object_store_listing_error(
-                            error,
-                        )));
-                    }
-                }
+                return failure(file_error(novarocks_fs::map_object_store_listing_error(
+                    error,
+                )));
             }
         }
         if let Err(error) = HadoopFileSystemCatalog::check_publication_budget(Some(context)) {
