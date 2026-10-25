@@ -166,6 +166,36 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         execute_existing_publication(self, &request)
     }
 
+    fn execute_async<'a>(
+        &'a self,
+        request: ConnectorCatalogMutationRequest,
+        receiving: &'a novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+                        ConnectorError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if let Err(error) = ConnectorCatalogMutation::admit(self, &request) {
+                return Ok(known_uncommitted(error));
+            }
+            if let ConnectorCatalogMutationOperation::KeyedDocuments { intent } = &request.operation
+            {
+                return keyed::execute_async(self, &request, intent, receiving).await;
+            }
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg catalog operation has no direct asynchronous mutation author",
+            ))
+        })
+    }
+
     fn reconcile(
         &self,
         request: ConnectorCatalogMutationReconcileRequest,
@@ -4969,6 +4999,14 @@ mod tests {
     fn document_storage_lease(
         provider: &IcebergMetadata,
     ) -> novarocks_spi::connector::ConnectorDocumentStorageLease {
+        document_control_planning_lease(provider)
+            .derive_document_storage_lease()
+            .expect("document storage lease")
+    }
+
+    fn document_control_planning_lease(
+        provider: &IcebergMetadata,
+    ) -> ConnectorControlPlanningLease {
         let descriptor = provider.descriptor().clone();
         let incarnation = provider.incarnation();
         let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
@@ -5022,8 +5060,6 @@ mod tests {
         .and_then(|binding| binding.try_with_document_storage(Some(document_storage)))
         .expect("control binding");
         ConnectorControlPlanningLease::new(Arc::new(binding), || {})
-            .derive_document_storage_lease()
-            .expect("document storage lease")
     }
 
     fn schema() -> Schema {
@@ -7228,145 +7264,184 @@ mod tests {
             ready.notify_all();
         }
     }
-    #[test]
-    fn activity_producer_keyed_reload_is_finalization_after_applied_evidence() {
+    struct KeyedFinalizationFixture {
+        // Release the actual HTTP handler before any server/runtime teardown.
+        release: ReleaseProducerRead,
+        wire: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        server: crate::rest_protocol::test_server::TestServer,
+        root: Arc<crate::activity::CatalogActivity>,
+        executor: tokio::runtime::Runtime,
+        provider: IcebergMetadata,
+        request: ConnectorCatalogMutationRequest,
+        operation_id: ConnectorMutationOperationId,
+        stop: novarocks_spi::connector::ConnectorStopOwner,
+        entered_rx: std::sync::mpsc::Receiver<()>,
+    }
+
+    fn keyed_finalization_fixture(projection_error: bool) -> KeyedFinalizationFixture {
         use crate::rest_protocol::test_server::{Reply, Script, TestServer};
         use novarocks_spi::connector::{
-            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
-            ConnectorMarkerKey, ConnectorMarkerValue, ConnectorStopOwner, KeyedMarkerWrite,
-            KeyedMutation,
+            CatalogScopeIdentity, ConnectorMarkerKey, ConnectorMarkerValue, ConnectorStopOwner,
+            KeyedMarkerWrite, KeyedMutation,
         };
+        struct ReplyState {
+            before: serde_json::Value,
+            after: Option<serde_json::Value>,
+            desired: HashMap<String, String>,
+            committed: bool,
+        }
+        let before = test_metadata(HashMap::new());
+        let state = Arc::new(std::sync::Mutex::new(ReplyState {
+            before: serde_json::json!({
+                "metadata-location": "memory://warehouse/managed/mv/metadata/before.json",
+                "metadata": before,
+            }),
+            after: None,
+            desired: HashMap::new(),
+            committed: false,
+        }));
+        let wire = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let get_wire = wire.clone();
+        let get_state = state.clone();
+        let post_state = state.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on_fn("GET", "/v1/namespaces/managed/tables/mv", move |_, _| {
+                    let (committed, mut reply) = {
+                        let state = get_state.lock().unwrap();
+                        (
+                            state.committed,
+                            if state.committed {
+                                state.after.clone().unwrap()
+                            } else {
+                                state.before.clone()
+                            },
+                        )
+                    };
+                    if committed {
+                        entered_tx.send(()).unwrap();
+                        let (lock, ready) = &*get_wire;
+                        drop(
+                            ready
+                                .wait_timeout_while(
+                                    lock.lock().unwrap(),
+                                    Duration::from_secs(20),
+                                    |released| !*released,
+                                )
+                                .unwrap(),
+                        );
+                        if projection_error {
+                            reply["metadata"]["table-uuid"] =
+                                serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+                        }
+                    }
+                    Reply::json(200, &reply)
+                })
+                .on_fn(
+                    "POST",
+                    "/v1/namespaces/managed/tables/mv",
+                    move |request, _| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request.body).unwrap();
+                        let mut state = post_state.lock().unwrap();
+                        assert!(!state.committed, "one actual mutation only");
+                        assert_eq!(
+                            body["updates"],
+                            serde_json::json!([
+                                {"action": "set-properties", "updates": state.desired}
+                            ])
+                        );
+                        state.committed = true;
+                        Reply::json(200, state.after.as_ref().unwrap())
+                    },
+                ),
+        );
+        let _server_release = ReleaseProducerRead(wire.clone());
+        let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::parse("ice").unwrap(),
+            uuid::Uuid::now_v7(),
+        ));
+        let (_executor, provider) =
+            variant_definition_provider_observed(&server.url(), Some(root.generation()));
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "managed".into(),
+            table: "mv".into(),
+        };
+        let markers = KeyedMarkerWrite {
+            markers: BTreeMap::from([(
+                ConnectorMarkerKey {
+                    owner: "novarocks.mv".into(),
+                    name: "pending".into(),
+                    binding: "activity-finalization".into(),
+                },
+                ConnectorMarkerValue {
+                    format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1).unwrap(),
+                    content: Bytes::from_static(b"intent"),
+                },
+            )]),
+        };
+        let mut request =
+            keyed_channel_request(&provider, &table, KeyedMutation::Markers(markers.clone()));
+        let operation_id = request.operation_id;
+        let stop = ConnectorStopOwner::new();
+        request.context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(20),
+            stop.view(),
+            64 * 1024,
+            256 * 1024,
+        )
+        .unwrap();
+        let desired =
+            crate::document_storage::keyed::write::marker_properties(&before, &markers).unwrap();
+        let mut after = serde_json::to_value(&before).unwrap();
+        for (key, value) in &desired {
+            after["properties"][key] = serde_json::Value::String(value.clone());
+        }
+        {
+            let mut state = state.lock().unwrap();
+            state.desired = desired;
+            state.after = Some(serde_json::json!({
+                "metadata-location": "memory://warehouse/managed/mv/metadata/after.json",
+                "metadata": after,
+            }));
+        }
+        KeyedFinalizationFixture {
+            release: _server_release,
+            wire,
+            server,
+            root,
+            executor: _executor,
+            provider,
+            request,
+            operation_id,
+            stop,
+            entered_rx,
+        }
+    }
+
+    #[test]
+    fn activity_producer_keyed_reload_is_finalization_after_applied_evidence() {
+        use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
         // Exercise both a usable projection and an actual wrong-object response
         // after the exact same Applied dispatch. Cancellation belongs to the
         // preparation request and cannot revoke either publication fact.
         for projection_error in [false, true] {
-            struct ReplyState {
-                before: serde_json::Value,
-                after: Option<serde_json::Value>,
-                desired: HashMap<String, String>,
-                committed: bool,
-            }
-            let before = test_metadata(HashMap::new());
-            let state = Arc::new(std::sync::Mutex::new(ReplyState {
-                before: serde_json::json!({
-                    "metadata-location": "memory://warehouse/managed/mv/metadata/before.json",
-                    "metadata": before,
-                }),
-                after: None,
-                desired: HashMap::new(),
-                committed: false,
-            }));
-            let wire = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-            let get_wire = wire.clone();
-            let get_state = state.clone();
-            let post_state = state.clone();
-            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let server = TestServer::start(
-                Script::new()
-                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
-                    .on_fn("GET", "/v1/namespaces/managed/tables/mv", move |_, _| {
-                        let (committed, mut reply) = {
-                            let state = get_state.lock().unwrap();
-                            (
-                                state.committed,
-                                if state.committed {
-                                    state.after.clone().unwrap()
-                                } else {
-                                    state.before.clone()
-                                },
-                            )
-                        };
-                        if committed {
-                            entered_tx.send(()).unwrap();
-                            let (lock, ready) = &*get_wire;
-                            drop(
-                                ready
-                                    .wait_timeout_while(
-                                        lock.lock().unwrap(),
-                                        Duration::from_secs(20),
-                                        |released| !*released,
-                                    )
-                                    .unwrap(),
-                            );
-                            if projection_error {
-                                reply["metadata"]["table-uuid"] =
-                                    serde_json::Value::String(uuid::Uuid::new_v4().to_string());
-                            }
-                        }
-                        Reply::json(200, &reply)
-                    })
-                    .on_fn(
-                        "POST",
-                        "/v1/namespaces/managed/tables/mv",
-                        move |request, _| {
-                            let body: serde_json::Value =
-                                serde_json::from_slice(&request.body).unwrap();
-                            let mut state = post_state.lock().unwrap();
-                            assert!(!state.committed, "one actual mutation only");
-                            assert_eq!(
-                                body["updates"],
-                                serde_json::json!([
-                                    {"action": "set-properties", "updates": state.desired}
-                                ])
-                            );
-                            state.committed = true;
-                            Reply::json(200, state.after.as_ref().unwrap())
-                        },
-                    ),
-            );
-            let _server_release = ReleaseProducerRead(wire.clone());
-            let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
-                ConnectorProviderId::parse("iceberg").unwrap(),
-                ConnectorInstanceId::parse("ice").unwrap(),
-                uuid::Uuid::now_v7(),
-            ));
-            let (_executor, provider) =
-                variant_definition_provider_observed(&server.url(), Some(root.generation()));
-            let table = ConnectorTableIdentity {
-                instance_id: provider.descriptor().instance_id.clone(),
-                namespace: "managed".into(),
-                table: "mv".into(),
-            };
-            let markers = KeyedMarkerWrite {
-                markers: BTreeMap::from([(
-                    ConnectorMarkerKey {
-                        owner: "novarocks.mv".into(),
-                        name: "pending".into(),
-                        binding: "activity-finalization".into(),
-                    },
-                    ConnectorMarkerValue {
-                        format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1)
-                            .unwrap(),
-                        content: Bytes::from_static(b"intent"),
-                    },
-                )]),
-            };
-            let mut request =
-                keyed_channel_request(&provider, &table, KeyedMutation::Markers(markers.clone()));
-            let operation_id = request.operation_id;
-            let stop = ConnectorStopOwner::new();
-            request.context = ConnectorRequestContext::try_new(
-                Instant::now() + Duration::from_secs(20),
-                stop.view(),
-                64 * 1024,
-                256 * 1024,
-            )
-            .unwrap();
-            let desired =
-                crate::document_storage::keyed::write::marker_properties(&before, &markers)
-                    .unwrap();
-            let mut after = serde_json::to_value(&before).unwrap();
-            for (key, value) in &desired {
-                after["properties"][key] = serde_json::Value::String(value.clone());
-            }
-            {
-                let mut state = state.lock().unwrap();
-                state.desired = desired;
-                state.after = Some(serde_json::json!({
-                    "metadata-location": "memory://warehouse/managed/mv/metadata/after.json",
-                    "metadata": after,
-                }));
-            }
+            let KeyedFinalizationFixture {
+                release: _server_release,
+                wire,
+                server,
+                root,
+                executor: _executor,
+                provider,
+                request,
+                operation_id,
+                stop,
+                entered_rx,
+            } = keyed_finalization_fixture(projection_error);
             std::thread::scope(|threads| {
                 // The real HTTP request is released before scope joins on panic.
                 let release = ReleaseProducerRead(wire.clone());
@@ -9037,5 +9112,442 @@ mod tests {
                 .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn async_keyed_slot_receiving_preserves_actual_receipts_owner_and_stale_refusal() {
+        use novarocks_spi::connector::{ConnectorCatalogMutationReceiving, ConnectorSlotName};
+        let (executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let planning = document_control_planning_lease(&provider);
+        let lease = planning.derive_mutation_lease().unwrap();
+        let first = keyed_channel_request(&provider, &table, keyed_configuration_change());
+        let operation_id = first.operation_id;
+        let operation_kind = first.operation.kind();
+        let original_request = first.clone();
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(first, &receiving))
+            .unwrap();
+        let original_owner_address = {
+            let observed = receiving.observation();
+            assert!(observed.provider_exited());
+            assert!(!receiving.foreign_exit_unproven());
+            assert_eq!(observed.validation(), Some(&Ok(())));
+            assert_eq!(observed.needed_validation(), Some(&Ok(())));
+            let applied = observed.applied_receipt().unwrap();
+            assert_eq!(applied.descriptor(), provider.descriptor());
+            assert_eq!(applied.incarnation(), provider.incarnation());
+            assert_eq!(applied.operation_id(), operation_id);
+            assert_eq!(applied.operation_kind(), operation_kind);
+            let needed = observed.needed_committed().unwrap();
+            assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+            assert_eq!(needed.receipt().operation_id(), operation_id);
+            assert_eq!(
+                needed.finalization(),
+                &ExternalMutationFinalization::Complete
+            );
+            let Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+                cleanup,
+            })) = observed.raw_outcome()
+            else {
+                panic!("actual async raw committed result")
+            };
+            assert_eq!(*effect, ExternalMutationEffect::Applied);
+            assert_eq!(receipt, needed.receipt());
+            assert_eq!(finalization, needed.finalization());
+            assert_eq!(cleanup, &ExternalMutationFinalization::Complete);
+            let owner = observed
+                .original_owner()
+                .expect("actual operation and journal stay received after child exit");
+            owner.validate_owner(&original_request.target).unwrap();
+            owner as *const _ as usize
+        };
+        let first_table = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let first_id = first_table.table.metadata().current_snapshot_id().unwrap();
+        assert_eq!(
+            first_table
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Append
+        );
+        assert!(
+            receiving
+                .observation()
+                .needed_committed()
+                .unwrap()
+                .receipt()
+                .committed_version()
+                .is_some()
+        );
+        // The same receiving cannot publish a second mutation or discard its original owner.
+        assert_eq!(
+            executor
+                .block_on(lease.execute_async_in(original_request, &receiving))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            receiving.observation().original_owner().unwrap() as *const _ as usize,
+            original_owner_address
+        );
+        assert_eq!(
+            provider
+                .runtime()
+                .load_table(&table.namespace, &table.table)
+                .unwrap()
+                .table
+                .metadata()
+                .snapshots()
+                .len(),
+            1
+        );
+
+        let late = keyed_channel_request(&provider, &table, keyed_configuration_change());
+        let next = keyed_channel_request(&provider, &table, keyed_configuration_change());
+        let next_id = next.operation_id;
+        let next_receiving = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(next, &next_receiving))
+            .unwrap();
+        assert_eq!(
+            next_receiving
+                .observation()
+                .needed_committed()
+                .unwrap()
+                .receipt()
+                .operation_id(),
+            next_id
+        );
+        let actual = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let snapshot_id = actual.table.metadata().current_snapshot_id().unwrap();
+        assert_ne!(first_id, snapshot_id);
+        assert_eq!(
+            actual
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Replace
+        );
+        let properties = crate::document_storage::keyed::view::parse_properties(
+            actual.table.metadata().properties(),
+        )
+        .unwrap();
+        assert_eq!(
+            properties.slots[&ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap()]
+                .writer,
+            Some(snapshot_id)
+        );
+        let stale = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(late, &stale))
+            .unwrap();
+        {
+            let observed = stale.observation();
+            assert!(
+                matches!(observed.raw_outcome(), Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, .. })) if failure.kind()==ConnectorMutationFailureKind::Conflict)
+            );
+            assert!(observed.applied_receipt().is_none());
+            assert!(observed.needed_committed().is_none());
+            assert_eq!(observed.validation(), Some(&Ok(())));
+            assert!(observed.provider_exited());
+        }
+        assert!(!stale.foreign_exit_unproven());
+        assert_eq!(
+            provider
+                .runtime()
+                .load_table(&table.namespace, &table.table)
+                .unwrap()
+                .table
+                .metadata()
+                .snapshots()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn async_keyed_applied_is_received_before_necessary_reload_and_normal_child_exit() {
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, ConnectorCatalogMutationReceiving,
+        };
+        // The same two real HTTP replies as the original synchronous oracle.
+        for projection_error in [false, true] {
+            let KeyedFinalizationFixture {
+                release: _server_release,
+                wire,
+                server,
+                root,
+                executor,
+                provider,
+                request,
+                operation_id,
+                stop,
+                entered_rx,
+            } = keyed_finalization_fixture(projection_error);
+            let expected_owner = request.target.clone();
+            let operation_kind = request.operation.kind();
+            let planning = document_control_planning_lease(&provider);
+            let lease = planning.derive_mutation_lease().unwrap();
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            std::thread::scope(|threads| {
+                // Declared after the scope so panic releases I/O before join.
+                let release = ReleaseProducerRead(wire.clone());
+                let worker = threads
+                    .spawn(|| executor.block_on(lease.execute_async_in(request, &receiving)));
+                entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("actual async keyed post-publication reload entered");
+                let owner_address = {
+                    let observed = receiving.observation();
+                    let applied = observed
+                        .applied_receipt()
+                        .expect("actual Applied proof before finalization I/O");
+                    assert_eq!(applied.descriptor(), provider.descriptor());
+                    assert_eq!(applied.incarnation(), provider.incarnation());
+                    assert_eq!(applied.operation_id(), operation_id);
+                    assert_eq!(applied.operation_kind(), operation_kind);
+                    assert!(observed.needed_committed().is_none());
+                    assert!(observed.raw_outcome().is_none());
+                    assert!(observed.validation().is_none());
+                    assert!(!observed.provider_exited());
+                    let owner = observed
+                        .original_owner()
+                        .expect("same actual journal and operation are already received");
+                    owner.validate_owner(&expected_owner).unwrap();
+                    owner as *const _ as usize
+                };
+                let snapshot = root.snapshot();
+                for phase in [P::Evidence, P::Dispatch, P::PreDispatch] {
+                    assert_eq!(snapshot.phases[phase as usize].inflight, 0);
+                }
+                assert_eq!(snapshot.phases[P::Finalization as usize].inflight, 1);
+                assert_eq!(
+                    snapshot.phases[P::Bridge as usize].inflight,
+                    0,
+                    "actual async path has no blocking runtime bridge"
+                );
+                assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+                stop.request_stop();
+                assert!(!worker.is_finished());
+                {
+                    let observed = receiving.observation();
+                    assert_eq!(
+                        observed.applied_receipt().unwrap().operation_id(),
+                        operation_id
+                    );
+                    assert!(observed.needed_committed().is_none());
+                    assert!(observed.raw_outcome().is_none());
+                    assert!(!observed.provider_exited());
+                }
+                drop(release);
+                worker.join().unwrap().unwrap();
+                let observed = receiving.observation();
+                assert_eq!(observed.validation(), Some(&Ok(())));
+                assert_eq!(observed.needed_validation(), Some(&Ok(())));
+                assert_eq!(
+                    observed.applied_receipt().unwrap().operation_id(),
+                    operation_id
+                );
+                let needed = observed
+                    .needed_committed()
+                    .expect("necessary finalization is separately received");
+                assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+                assert_eq!(needed.receipt().operation_id(), operation_id);
+                let Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect,
+                    receipt,
+                    finalization,
+                    cleanup,
+                })) = observed.raw_outcome()
+                else {
+                    panic!("late preparation cancellation cannot downgrade actual Applied")
+                };
+                assert_eq!(*effect, ExternalMutationEffect::Applied);
+                assert_eq!(receipt, needed.receipt());
+                assert_eq!(finalization, needed.finalization());
+                if projection_error {
+                    assert!(receipt.committed_version().is_none());
+                    assert!(matches!(
+                        finalization,
+                        ExternalMutationFinalization::Failed(_)
+                    ));
+                } else {
+                    assert!(receipt.committed_version().is_some());
+                    assert_eq!(finalization, &ExternalMutationFinalization::Complete);
+                }
+                assert_eq!(
+                    cleanup,
+                    &ExternalMutationFinalization::Complete,
+                    "the SAME original journal reports actual safe GC"
+                );
+                assert!(observed.provider_exited());
+                assert!(!receiving.foreign_exit_unproven());
+                let owner = observed
+                    .original_owner()
+                    .expect("Provider child exit does not discard original journal custody");
+                owner.validate_owner(&expected_owner).unwrap();
+                assert_eq!(owner as *const _ as usize, owner_address);
+            });
+            let snapshot = root.snapshot();
+            for phase in [
+                P::Evidence,
+                P::Dispatch,
+                P::PreDispatch,
+                P::Finalization,
+                P::Bridge,
+            ] {
+                let row = &snapshot.phases[phase as usize];
+                assert_eq!(row.inflight, 0);
+                assert_eq!(row.started, row.exited);
+                assert_eq!(row.elapsed_count, row.exited);
+            }
+            assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+            drop(receiving);
+            drop(lease);
+            drop(planning);
+            drop(provider);
+            server.shut_down();
+            assert!(root.snapshot().generations.is_empty());
+        }
+    }
+
+    #[test]
+    fn async_keyed_preparation_refusal_keeps_original_connector_failure_after_diagnostic() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationReceiving, ConnectorMarkerKey, ConnectorMarkerValue,
+            KeyedDocumentLimits, KeyedMarkerWrite, KeyedMutation,
+        };
+
+        let (executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let planning = document_control_planning_lease(&provider);
+        let lease = planning.derive_mutation_lease().unwrap();
+        let before = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let before_files = metadata_file_count(before.table.metadata().location());
+        let markers = KeyedMarkerWrite {
+            markers: BTreeMap::from([(
+                ConnectorMarkerKey {
+                    owner: "novarocks.mv".into(),
+                    name: "pending".into(),
+                    binding: "original-preparation-refusal".into(),
+                },
+                ConnectorMarkerValue {
+                    format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1).unwrap(),
+                    content: Bytes::from(vec![
+                        b'x';
+                        KeyedDocumentLimits::default().private_property_bytes
+                    ]),
+                },
+            )]),
+        };
+        // Token/format admission succeeds. Only the actual encoded-property
+        // preparation, not an artificial test refusal, rejects this request.
+        markers.validate().unwrap();
+        let expected = crate::document_storage::keyed::write::marker_properties(
+            before.table.metadata(),
+            &markers,
+        )
+        .unwrap_err();
+        assert_eq!(expected.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            expected
+                .message()
+                .starts_with("document private properties table encoded size ")
+        );
+        let request = keyed_channel_request(&provider, &table, KeyedMutation::Markers(markers));
+        let target = request.target.clone();
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(request, &receiving))
+            .unwrap();
+
+        {
+            let observed = receiving.observation();
+            assert!(observed.dispatched());
+            assert_eq!(observed.validation(), Some(&Ok(())));
+            assert!(observed.provider_exited());
+            assert!(observed.applied_receipt().is_none());
+            assert!(observed.needed_committed().is_none());
+            assert!(observed.needed_validation().is_none());
+            // This slot is installed immediately before the real attempt, so a
+            // lease-level refusal cannot satisfy this regression.
+            observed
+                .original_owner()
+                .unwrap()
+                .validate_owner(&target)
+                .unwrap();
+            let Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup })) =
+                observed.raw_outcome()
+            else {
+                panic!("actual preparation must return an original uncommitted refusal")
+            };
+            assert_eq!(cleanup, &ExternalMutationFinalization::Complete);
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::InvalidRequest);
+            assert_eq!(failure.message(), expected.to_string());
+            let source = failure
+                .connector_source()
+                .expect("the actual preparer's ConnectorError stays attached");
+            assert_eq!(source, &expected);
+            assert_eq!(source.failure_fact(), expected.failure_fact());
+            assert_eq!(failure.failure_fact(), expected.failure_fact());
+            assert!(!source.message().contains("retained snapshot"));
+            assert!(!failure.message().contains("diagnostic"));
+        }
+        assert!(!receiving.foreign_exit_unproven());
+
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+        let after = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        assert_eq!(
+            after.table.metadata_location(),
+            before.table.metadata_location()
+        );
+        assert_eq!(
+            after.table.metadata().uuid(),
+            before.table.metadata().uuid()
+        );
+        assert_eq!(
+            after.table.metadata().properties(),
+            before.table.metadata().properties()
+        );
+        assert_eq!(
+            after.table.metadata().current_snapshot_id(),
+            before.table.metadata().current_snapshot_id()
+        );
+        assert_eq!(
+            after.table.metadata().snapshots().len(),
+            before.table.metadata().snapshots().len()
+        );
+        assert_eq!(
+            metadata_file_count(after.table.metadata().location()),
+            before_files
+        );
     }
 }

@@ -224,6 +224,21 @@ pub fn dispatch_catalog_mutation_once_with_lease(
     }
 }
 
+/// Dispatch the original asynchronous mutation once. The caller retains both
+/// this future and receiving across cancelled borrows, then reads the original
+/// validated outcome without taking or replaying it. No reconciliation occurs.
+pub async fn dispatch_catalog_mutation_once_with_lease_async_in(
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    operation_id: ConnectorMutationOperationId,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+    receiving: &novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+) -> Result<(), ConnectorError> {
+    lease
+        .execute_operation_async_in(operation_id, operation, context, receiving)
+        .await
+}
+
 fn resolve_outcome(
     lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
     outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,

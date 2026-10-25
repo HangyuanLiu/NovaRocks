@@ -227,8 +227,10 @@ pub use metadata_maintenance::{
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{
-    ConnectorCatalogMutation, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
-    ConnectorCatalogMutationReceipt, ConnectorCatalogMutationReconcileRequest,
+    ConnectorCatalogMutation, ConnectorCatalogMutationLease,
+    ConnectorCatalogMutationNeededCommitted, ConnectorCatalogMutationObservation,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
+    ConnectorCatalogMutationReceiving, ConnectorCatalogMutationReconcileRequest,
     ConnectorCatalogMutationRequest, ConnectorCatalogMutationResolver, ConnectorColumnAggregation,
     ConnectorColumnDefinition, ConnectorColumnPath, ConnectorColumnPosition,
     ConnectorCommittedVersion, ConnectorDataType, ConnectorDefaultValue,
