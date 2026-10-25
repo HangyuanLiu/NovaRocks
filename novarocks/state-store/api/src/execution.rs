@@ -166,6 +166,15 @@ pub trait StateStoreExecutionPort: Send + Sync {
     fn request_progress(&self);
 }
 
+/// A read request borrows the same installed execution owner. Each call
+/// supplies one fixed transaction context; Get/Range never renew that context.
+/// Existing absolute contexts keep their original deadline when used here.
+pub trait StateStoreReadExecution: Send + Sync {
+    fn read_transaction_context(
+        &self,
+    ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure>;
+}
+
 /// Weak borrower of an already-installed port, not a permission constructor.
 /// The real role/Action must keep the port and its strong custody alive through
 /// rollback/evidence/actual exit, including after this context or outer F drops.
@@ -224,6 +233,14 @@ impl StateStoreExecutionContext {
                 .into_original_failure()
             })?;
         port.bind_original_in(original, self.deadline, target)
+    }
+}
+
+impl StateStoreReadExecution for StateStoreExecutionContext {
+    fn read_transaction_context(
+        &self,
+    ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+        Ok(self.clone())
     }
 }
 

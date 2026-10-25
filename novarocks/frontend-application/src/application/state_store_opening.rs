@@ -33,6 +33,7 @@ pub(super) struct FrontendStateStoreOpening {
     owner: Option<StateStoreOriginalOwner>,
     instance_close: Option<InstanceClose>,
     evidence_owner: Option<StateStoreOriginalOwner>,
+    bootstrap_read: Option<StateStoreOriginalOwner>,
     started: bool,
     closing: bool,
     first_failure: Option<Failure>,
@@ -44,6 +45,7 @@ impl FrontendStateStoreOpening {
             owner: None,
             instance_close: None,
             evidence_owner: None,
+            bootstrap_read: None,
             started: false,
             closing: false,
             first_failure: None,
@@ -67,6 +69,55 @@ impl FrontendStateStoreOpening {
         }
         Ok(self.evidence_owner.as_ref().unwrap().progress_handle())
     }
+    /// Install the finite startup reader before any repository future exists.
+    pub(super) fn bootstrap_read_execution(
+        &mut self,
+        ready: &StateStoreHost,
+        executor: &QueryBlockingExecutor,
+    ) -> Result<crate::state_store::execution::StateStoreOriginalReadExecution, Failure> {
+        if self.closing {
+            return Err(
+                novarocks_state_store_api::StateStoreOriginalUnsupported.into_original_failure()
+            );
+        }
+        if self.bootstrap_read.is_none() {
+            let (vocabulary, instance) = ready.original_blocking_sources().ok_or_else(|| {
+                novarocks_state_store_api::StateStoreOriginalUnsupported.into_original_failure()
+            })?;
+            self.bootstrap_read = Some(StateStoreOriginalOwner::bootstrap_read(
+                executor,
+                vocabulary,
+                instance,
+                ready.run_policy(),
+            )?);
+        }
+        let store = ready.state_store().ok_or_else(|| {
+            novarocks_state_store_api::StateStoreOriginalUnsupported.into_original_failure()
+        })?;
+        self.bootstrap_read
+            .as_ref()
+            .unwrap()
+            .read_execution(store.limits().transaction_deadline)
+    }
+    pub(super) fn poll_bootstrap_read(&mut self, cx: &mut Context<'_>) -> Result<bool, Failure> {
+        self.bootstrap_read
+            .as_ref()
+            .ok_or_else(|| {
+                novarocks_state_store_api::StateStoreOriginalUnsupported.into_original_failure()
+            })?
+            .poll_progress(cx)
+    }
+    pub(super) fn poll_bootstrap_read_closed(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Failure>> {
+        if let Some(reader) = self.bootstrap_read.as_mut() {
+            std::task::ready!(reader.poll_closed(cx))?;
+        }
+        self.bootstrap_read.take();
+        Poll::Ready(Ok(()))
+    }
+
     pub(super) fn retain_evidence_failure(&mut self, cause: Failure) {
         self.first_failure.get_or_insert(cause);
     }
@@ -177,6 +228,9 @@ impl FrontendStateStoreOpening {
                 Poll::Ready(Ok(())) => {}
             }
         }
+        // A cancelled startup borrower may leave an exact read/close receipt.
+        // It remains in this Host field until its original physical exit.
+        std::task::ready!(self.poll_bootstrap_read_closed(cx))?;
         // The cadence was stopped/joined and its final borrowed pass ended
         // before this method. Keep the same evidence receiver until real exit;
         // otherwise its connection bundle would pin the following File close.

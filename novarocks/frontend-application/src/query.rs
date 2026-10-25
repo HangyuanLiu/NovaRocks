@@ -287,18 +287,49 @@ where
 #[derive(Clone)]
 struct FrontendCatalogCommandConsumer {
     catalog: CatalogCommandExecutor,
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     view: ViewCommandExecutor,
     iceberg_ref: IcebergRefCommandExecutor,
     executor: QueryBlockingExecutor,
 }
 
 impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
+    fn prepare_statement_action(
+        &self,
+        command: novarocks_sql::semantic::CatalogSqlCommand,
+        _request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        crate::catalog_application::statement_action::prepare(
+            &self.catalog,
+            self.state_store.clone(),
+            command,
+            command_context,
+        )
+        .map_err(CommandError::from_failure_cause)
+    }
+
     fn execute(
         &self,
         command: novarocks_sql::semantic::CatalogSqlCommand,
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture {
+        if matches!(
+            command,
+            novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
+                | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }
+        ) {
+            return Box::pin(async {
+                Err(CommandError::new(
+                    CommandErrorKind::Conflict,
+                    "catalog mutation requires its original registered statement source",
+                ))
+            });
+        }
         let catalog = self.catalog.clone();
         let view = self.view.clone();
         let iceberg_ref = self.iceberg_ref.clone();
@@ -487,6 +518,20 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
     }
 }
 
+/// Project only the domain author's retained verdict into supervisor metadata.
+/// The original Lake terminal, target, receipt, and cause remain domain-owned.
+pub(crate) const fn external_effect_from_lake(
+    disposition: novarocks_spi::connector::LakePublicationDisposition,
+) -> novarocks_query_application::api::StatementExternalEffectDisposition {
+    use novarocks_query_application::api::StatementExternalEffectDisposition as E;
+    use novarocks_spi::connector::LakePublicationDisposition as D;
+    match disposition {
+        D::KnownUncommitted => E::KnownUncommitted,
+        D::CommitUnknown => E::CommitUnknown,
+        D::KnownCommitted => E::KnownCommitted,
+    }
+}
+
 fn maintenance_command_error(
     error: novarocks_table_maintenance::runtime::TerminalError,
 ) -> CommandError {
@@ -515,7 +560,7 @@ fn maintenance_command_error(
     };
     command
         .with_compile_control(control)
-        .with_publication_disposition(disposition)
+        .with_external_effect_disposition(disposition.map(external_effect_from_lake))
 }
 
 /// Builds the role-local product adapters at Frontend role composition.
@@ -532,10 +577,12 @@ pub(crate) fn product_command_router(
     maintenance: MaintenanceCommandExecutor,
     maintenance_read: MaintenanceReadCommandExecutor,
     executor: QueryBlockingExecutor,
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
 ) -> ProductCommandRouter {
     ProductCommandRouter::new(
         Arc::new(FrontendCatalogCommandConsumer {
             catalog,
+            state_store,
             view,
             iceberg_ref,
             executor: executor.clone(),
@@ -846,19 +893,19 @@ enum RoutedExecutionError {
     Application(QueryServiceError),
     FailureCause {
         cause: novarocks_failure_contract::SharedFailureCause,
-        maintenance_publication_disposition:
-            Option<novarocks_spi::connector::LakePublicationDisposition>,
+        external_effect_disposition:
+            Option<novarocks_query_application::api::StatementExternalEffectDisposition>,
     },
     Execution {
         input: Box<novarocks_query_application::execution_error::ExecutionFailureInput>,
         terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
         compile_control: Option<novarocks_type_contract::CompileControlError>,
-        maintenance_publication_disposition:
-            Option<novarocks_spi::connector::LakePublicationDisposition>,
+        external_effect_disposition:
+            Option<novarocks_query_application::api::StatementExternalEffectDisposition>,
     },
-    MaintenancePublication {
+    ExternalEffect {
         message: String,
-        disposition: novarocks_spi::connector::LakePublicationDisposition,
+        disposition: novarocks_query_application::api::StatementExternalEffectDisposition,
         compile_control: Option<novarocks_type_contract::CompileControlError>,
     },
     Engine(String),
@@ -894,7 +941,7 @@ fn routed_distributed_query_failure(
         input: Box::new(error.into_execution_failure_input()),
         terminal: None,
         compile_control,
-        maintenance_publication_disposition: None,
+        external_effect_disposition: None,
     }
 }
 
@@ -920,7 +967,7 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
                 input: Box::new(input),
                 terminal: error.publication_terminal().cloned(),
                 compile_control: error.compile_control_error(),
-                maintenance_publication_disposition: None,
+                external_effect_disposition: None,
             };
         }
         if let Some(failure) = error.take_cow_failure() {
@@ -971,11 +1018,11 @@ fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceEr
         RoutedExecutionError::Application(error) => error,
         RoutedExecutionError::FailureCause {
             cause,
-            maintenance_publication_disposition,
+            external_effect_disposition,
         } => {
             let service = QueryServiceError::from_failure_cause(cause);
-            if let Some(disposition) = maintenance_publication_disposition {
-                service.attach_maintenance_publication_disposition(disposition)
+            if let Some(disposition) = external_effect_disposition {
+                service.attach_external_effect_disposition(disposition)
             } else {
                 service
             }
@@ -984,19 +1031,19 @@ fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceEr
             input,
             terminal,
             compile_control,
-            maintenance_publication_disposition,
+            external_effect_disposition,
         } => {
             let mut service = QueryServiceError::from_execution_failure(*input)
                 .with_compile_control(compile_control);
-            if let Some(disposition) = maintenance_publication_disposition {
-                service = service.attach_maintenance_publication_disposition(disposition);
+            if let Some(disposition) = external_effect_disposition {
+                service = service.attach_external_effect_disposition(disposition);
             }
             if let Some(terminal) = terminal {
                 service = service.attach_publication_terminal(terminal);
             }
             service
         }
-        RoutedExecutionError::MaintenancePublication {
+        RoutedExecutionError::ExternalEffect {
             message,
             disposition,
             compile_control,
@@ -1007,7 +1054,7 @@ fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceEr
             };
             service
                 .with_compile_control(compile_control)
-                .attach_maintenance_publication_disposition(disposition)
+                .attach_external_effect_disposition(disposition)
         }
         RoutedExecutionError::Control(error) => QueryServiceError::from_compile_control(error),
         RoutedExecutionError::Engine(error) => internal_error(error),
@@ -1035,13 +1082,13 @@ fn selected_execution_or_worker_fallback(
             | RoutedExecutionError::Execution { .. }
             | RoutedExecutionError::FailureCause { .. }),
         ) => routed_execution_service_error(error),
-        Err(RoutedExecutionError::MaintenancePublication {
+        Err(RoutedExecutionError::ExternalEffect {
             disposition,
             compile_control,
             ..
         }) => fallback
             .with_compile_control(compile_control)
-            .attach_maintenance_publication_disposition(disposition),
+            .attach_external_effect_disposition(disposition),
         Err(RoutedExecutionError::Publication {
             terminal,
             compile_control,
@@ -1164,11 +1211,11 @@ async fn execute_product_statement(
 }
 
 fn product_command_error(error: CommandError) -> RoutedExecutionError {
-    let disposition = error.publication_disposition();
+    let disposition = error.external_effect_disposition();
     if let Some(cause) = error.failure_cause() {
         return RoutedExecutionError::FailureCause {
             cause: cause.clone(),
-            maintenance_publication_disposition: disposition,
+            external_effect_disposition: disposition,
         };
     }
     let control = error.compile_control_error();
@@ -1189,11 +1236,11 @@ fn product_command_error(error: CommandError) -> RoutedExecutionError {
             input: Box::new(input),
             terminal: None,
             compile_control: control,
-            maintenance_publication_disposition: disposition,
+            external_effect_disposition: disposition,
         };
     }
     if let Some(disposition) = disposition {
-        return RoutedExecutionError::MaintenancePublication {
+        return RoutedExecutionError::ExternalEffect {
             message: error.to_string(),
             disposition,
             compile_control: control,
@@ -2316,6 +2363,28 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
+        if let Ok(Some(ProductSqlCommand::Catalog(
+            command @ (novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
+            | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }),
+        ))) = lower_product_sql_command(&parsed_statement)
+        {
+            let action = match self
+                .service
+                .product_command_router
+                .prepare_catalog_statement_action(command, context, command_context)
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(
+                        routed_execution_service_error(product_command_error(error)),
+                        statement,
+                    ));
+                }
+            };
+            return self
+                .execute_observed_statement_action(statement, action)
+                .await;
+        }
         if let Ok(Some(ProductSqlCommand::Statistics(
             command @ (novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable { .. }
             | novarocks_sql::semantic::StatisticsSqlCommand::ShowTableStats { .. }),
@@ -4435,7 +4504,7 @@ mod tests {
                 input: Box::new(input.clone()),
                 terminal: Some(terminal.clone()),
                 compile_control: None,
-                maintenance_publication_disposition: None,
+                external_effect_disposition: None,
             }),
             cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }),
         );
@@ -4491,7 +4560,7 @@ mod tests {
                 input,
                 terminal: actual,
                 compile_control,
-                maintenance_publication_disposition,
+                external_effect_disposition,
             }) = result
             else {
                 panic!("the originating input, publication and rich source must survive")
@@ -4507,7 +4576,7 @@ mod tests {
                 input: input.clone(),
                 terminal: actual,
                 compile_control,
-                maintenance_publication_disposition,
+                external_effect_disposition,
             });
             assert_eq!(service.execution_failure(), Some(input.as_ref()));
             assert_eq!(service.user_error(), Some(&input.user_error()));
@@ -5906,21 +5975,21 @@ mod maintenance_selected_failure_tests {
 
     #[test]
     fn maintenance_selected_input_and_publication_verdict_both_reach_sql() {
-        use novarocks_spi::connector::LakePublicationDisposition;
+        use novarocks_query_application::api::StatementExternalEffectDisposition;
         for (state, disposition, label) in [
             (
                 MaintenanceJobState::CommitUnknown,
-                LakePublicationDisposition::CommitUnknown,
+                StatementExternalEffectDisposition::CommitUnknown,
                 "CommitUnknown",
             ),
             (
                 MaintenanceJobState::KnownCommittedFinalizationFailed,
-                LakePublicationDisposition::KnownCommitted,
+                StatementExternalEffectDisposition::KnownCommitted,
                 "KnownCommitted",
             ),
             (
                 MaintenanceJobState::KnownUncommitted,
-                LakePublicationDisposition::KnownUncommitted,
+                StatementExternalEffectDisposition::KnownUncommitted,
                 "KnownUncommitted",
             ),
         ] {
@@ -5932,14 +6001,11 @@ mod maintenance_selected_failure_tests {
             terminal.state = state;
             let command = maintenance_command_error(terminal);
             assert_eq!(command.execution_failure(), Some(&input));
-            assert_eq!(command.publication_disposition(), Some(disposition));
+            assert_eq!(command.external_effect_disposition(), Some(disposition));
             let service = routed_execution_service_error(product_command_error(command));
             assert_eq!(service.execution_failure(), Some(&input));
             assert_eq!(service.compile_control_error(), Some(control));
-            assert_eq!(
-                service.maintenance_publication_disposition(),
-                Some(disposition)
-            );
+            assert_eq!(service.external_effect_disposition(), Some(disposition));
             assert_eq!(service.publication_terminal(), None); // No invented identity/header.
             assert_eq!(
                 service.user_error().unwrap().code(),
@@ -5961,22 +6027,22 @@ mod maintenance_selected_failure_tests {
         ));
         assert_eq!(command.execution_failure(), None);
         assert_eq!(
-            command.publication_disposition(),
-            Some(LakePublicationDisposition::CommitUnknown)
+            command.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::CommitUnknown)
         );
         assert!(command.to_string().contains("original publication verdict"));
         let service = routed_execution_service_error(product_command_error(command));
         assert_eq!(service.execution_failure(), None);
         assert_eq!(
-            service.maintenance_publication_disposition(),
-            Some(LakePublicationDisposition::CommitUnknown)
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::CommitUnknown)
         );
         assert!(service.message().contains("original publication verdict"));
         assert!(service.message().contains("do not retry statement"));
     }
     #[test]
     fn maintenance_untyped_publication_survives_original_caller_control_fallback() {
-        use novarocks_spi::connector::LakePublicationDisposition;
+        use novarocks_query_application::api::StatementExternalEffectDisposition;
         let command =
             maintenance_command_error(TerminalError::commit_unknown("original abort uncertainty"));
         let fallback =
@@ -5989,8 +6055,8 @@ mod maintenance_selected_failure_tests {
         assert_eq!(service.execution_failure(), expected.as_ref());
         assert_eq!(service.kind(), fallback.kind());
         assert_eq!(
-            service.maintenance_publication_disposition(),
-            Some(LakePublicationDisposition::CommitUnknown)
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::CommitUnknown)
         );
         assert!(service.message().contains("do not retry statement"));
     }
@@ -6000,6 +6066,39 @@ mod maintenance_selected_failure_tests {
 mod maintenance_failure_cause_tests {
     use super::*;
     use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+
+    #[test]
+    fn neutral_command_effect_preserves_non_lake_cause_without_domain_terminal() {
+        use novarocks_query_application::api::StatementExternalEffectDisposition;
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original statement input",
+        ));
+        let fact = cause.failure_fact();
+        for disposition in [
+            StatementExternalEffectDisposition::KnownUncommitted,
+            StatementExternalEffectDisposition::CommitUnknown,
+            StatementExternalEffectDisposition::KnownCommitted,
+        ] {
+            let command = CommandError::from_failure_cause(cause.clone())
+                .with_external_effect_disposition(Some(disposition));
+            let service = selected_execution_or_worker_fallback(
+                Err(product_command_error(command)),
+                internal_error("late observer failure"),
+            );
+            assert_eq!(service.failure_cause(), Some(&cause));
+            assert_eq!(service.execution_failure().unwrap().fact(), fact);
+            assert_eq!(service.external_effect_disposition(), Some(disposition));
+            assert!(service.publication_terminal().is_none());
+            assert!(service.compile_control_error().is_none());
+            assert!(!service.message().contains("maintenance publication"));
+            assert!(!service.message().contains("lake publication"));
+            assert_eq!(
+                service.message().contains("do not retry statement"),
+                disposition.do_not_retry()
+            );
+        }
+    }
+
     #[test]
     fn command_projection_and_late_fallback_keep_original_source_and_publication() {
         let mutation = novarocks_spi::connector::ConnectorMutationFailure::from_connector(
@@ -6019,8 +6118,10 @@ mod maintenance_failure_cause_tests {
         assert_eq!(service.failure_cause(), Some(&cause));
         assert_eq!(service.execution_failure().unwrap().fact(), fact);
         assert_eq!(
-            service.maintenance_publication_disposition(),
-            Some(novarocks_spi::connector::LakePublicationDisposition::CommitUnknown)
+            service.external_effect_disposition(),
+            Some(
+                novarocks_query_application::api::StatementExternalEffectDisposition::CommitUnknown
+            )
         );
         assert!(service.compile_control_error().is_none());
         assert_eq!(

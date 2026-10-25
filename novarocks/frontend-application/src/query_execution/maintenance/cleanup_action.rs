@@ -403,7 +403,8 @@ impl State {
         let outcome = result.map_err(|error| {
             let error = super::rewrite_job::computation_service_error(error);
             match disposition {
-                Some(d) => error.attach_maintenance_publication_disposition(d),
+                Some(d) => error
+                    .attach_external_effect_disposition(crate::query::external_effect_from_lake(d)),
                 None => error,
             }
         })?;
@@ -547,8 +548,13 @@ impl GovernedStatementAction for Action {
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         self.state.as_mut().unwrap().poll_action(owner, cx)
     }
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
-        self.state.as_ref().and_then(State::disposition)
+    fn external_effect_disposition(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        self.state
+            .as_ref()
+            .and_then(State::disposition)
+            .map(crate::query::external_effect_from_lake)
     }
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         self.state.as_ref().and_then(State::local_health)

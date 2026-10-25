@@ -19,9 +19,9 @@
 use super::statement_action::{StatementActionFailure, StatementActionSource};
 use super::*;
 use crate::admitted_query_context::QueryExecutionContext;
+use crate::api::StatementExternalEffectDisposition;
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::session_error::QueryServiceError;
-use novarocks_spi::connector::LakePublicationDisposition;
 use novarocks_workload_control::joint_admission::RetainedPayloadGrant;
 use std::{
     alloc::Layout,
@@ -31,7 +31,7 @@ use std::{
 /// FA retains its domain result/proof in its original typed action slots.
 /// Ready here is one neutral business completion; it grants no domain proof.
 pub trait GovernedBackgroundAction: Send + 'static {
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+    fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
         None
     }
     fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {

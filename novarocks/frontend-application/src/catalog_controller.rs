@@ -69,6 +69,8 @@ use tokio::time::Instant;
 
 use novarocks_catalog_application::CatalogApplicationService;
 use novarocks_catalog_application::CatalogAttachmentWakeupSignal;
+mod original;
+use original::CatalogOriginalRounds;
 
 #[derive(Default)]
 struct CatalogProjectionMetrics {
@@ -140,7 +142,9 @@ pub struct FrontendCatalogController {
     /// merely unlikely.
     generation: AtomicU64,
     metrics: CatalogProjectionMetrics,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    original: Option<CatalogOriginalRounds>,
+    worker_failure: Mutex<Option<Arc<tokio::task::JoinError>>>,
 }
 
 impl FrontendCatalogController {
@@ -172,8 +176,46 @@ impl FrontendCatalogController {
             bootstrap_identity: Mutex::new(None),
             generation: AtomicU64::new(0),
             metrics: CatalogProjectionMetrics::default(),
-            worker: Mutex::new(None),
+            worker: tokio::sync::Mutex::new(None),
+            original: None,
+            worker_failure: Mutex::new(None),
         }))
+    }
+
+    pub(crate) fn new_with_original(
+        store: Arc<dyn StateStore>,
+        projection: Arc<CatalogApplicationService>,
+        config: CatalogProjectionConfig,
+        admission: novarocks_workload_control::RootAdmissionHandle,
+        binding: crate::state_store::execution::StateStoreOriginalBinding,
+    ) -> Result<Arc<Self>, String> {
+        let mut controller = Self::new(store, projection, config)?;
+        Arc::get_mut(&mut controller)
+            .expect("unpublished controller")
+            .original = Some(CatalogOriginalRounds::new(admission, binding));
+        Ok(controller)
+    }
+
+    pub(crate) async fn bootstrap_in(
+        &self,
+        execution: &dyn novarocks_state_store_api::StateStoreReadExecution,
+    ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
+        self.projection
+            .reconcile_snapshot_in(self.config.page_size, self.config.worker_count, execution)
+            .await?;
+        let identity = self.store.identity().await.map_err(|error| {
+            novarocks_catalog_application::CatalogApplicationError::from_domain(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable,
+                error,
+            )
+        })?;
+        *self.bootstrap_identity.lock().map_err(|_| {
+            novarocks_catalog_application::CatalogApplicationError::new(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Internal,
+                "catalog bootstrap identity lock is poisoned",
+            )
+        })? = Some(identity);
+        Ok(())
     }
 
     /// Performs the first complete authoritative reread.
@@ -201,8 +243,8 @@ impl FrontendCatalogController {
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
         let mut worker = self
             .worker
-            .lock()
-            .map_err(|_| "catalog controller worker lock is poisoned".to_string())?;
+            .try_lock()
+            .map_err(|_| "catalog controller worker is being joined".to_string())?;
         if worker.is_some() {
             return Err("catalog controller is already running".to_string());
         }
@@ -217,18 +259,40 @@ impl FrontendCatalogController {
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.request_stop_for_process_exit();
-        let handle = self
-            .worker
+        if let Some(cause) = self
+            .worker_failure
             .lock()
-            .map_err(|_| "catalog controller worker lock is poisoned".to_string())?
-            .take();
-        if let Some(mut handle) = handle
-            && tokio::time::timeout(self.config.shutdown_deadline, &mut handle)
-                .await
-                .is_err()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
         {
-            handle.abort();
-            let _ = handle.await;
+            return Err(format!(
+                "catalog controller retains failed original worker: {cause}"
+            ));
+        }
+        // The async guard only borrows this stable field. Cancelling either
+        // timeout drops the guard, leaving the SAME JoinHandle to be rejoined.
+        let mut worker = self.worker.lock().await;
+        if let Some(handle) = worker.as_mut() {
+            let result = tokio::time::timeout(self.config.shutdown_deadline, handle)
+                .await
+                .map_err(|_| {
+                    "catalog controller still retains its current physical round".to_string()
+                })?;
+            if let Err(cause) = result {
+                // Tokio already consumed this completed Join; retain the raw
+                // health and original round, and never repoll a panicked F.
+                worker.take();
+                let cause = Arc::new(cause);
+                *self
+                    .worker_failure
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(cause.clone());
+                return Err(format!("catalog controller worker failed: {cause}"));
+            }
+        }
+        worker.take();
+        if let Some(original) = &self.original {
+            original.close().await?;
         }
         self.projection.unpublish_all();
         self.publish_metrics();
@@ -397,14 +461,8 @@ impl FrontendCatalogController {
     async fn run_round(&self, expiry: Option<Instant>) -> ScanRound {
         let generation = self.generation.load(Ordering::Acquire);
         let mut scan = std::pin::pin!(self.scan_once());
-        let Some(expiry) = expiry else {
-            let (identity, outcome) = scan.await;
-            return ScanRound {
-                generation,
-                identity,
-                outcome,
-            };
-        };
+        let mut stop = self.stop.subscribe();
+        let mut stop_observed = false;
         let mut expired = false;
         loop {
             tokio::select! {
@@ -412,7 +470,17 @@ impl FrontendCatalogController {
                 (identity, outcome) = &mut scan => {
                     return ScanRound { generation, identity, outcome };
                 }
-                () = tokio::time::sleep_until(expiry), if !expired => {
+                _ = stop.wait_for(|stopping| *stopping), if !stop_observed => {
+                    // Re-poll the SAME scan so its stable original can observe
+                    // stop and settle its actual phase; never drop/restart it.
+                    stop_observed = true;
+                }
+                () = async {
+                    match expiry {
+                        Some(expiry) => tokio::time::sleep_until(expiry).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if !expired && expiry.is_some() => {
                     // Independent of the scan by construction: this fires on
                     // the clock the last completed reconcile set, so a scan
                     // that never returns cannot hold expired projections open.
@@ -435,7 +503,10 @@ impl FrontendCatalogController {
             .identity()
             .await
             .map_err(|error| error.to_string());
-        let outcome = self.reconcile().await;
+        let outcome = match &self.original {
+            Some(original) => original.scan(self).await,
+            None => self.reconcile().await,
+        };
         (identity, outcome)
     }
 
@@ -483,6 +554,10 @@ impl FrontendCatalogController {
 #[cfg(test)]
 #[path = "catalog_controller_tests.rs"]
 mod integration_tests;
+
+#[cfg(test)]
+#[path = "catalog_controller/original_tests.rs"]
+mod original_tests;
 
 #[cfg(test)]
 mod tests {
@@ -947,7 +1022,7 @@ mod tests {
             .expect("state store shutdown");
     }
 
-    async fn open_store() -> (tempfile::TempDir, StateStoreHost, Arc<dyn StateStore>) {
+    pub(super) async fn open_store() -> (tempfile::TempDir, StateStoreHost, Arc<dyn StateStore>) {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
             builtin_state_store_provider_registry().expect("builtin StateStore registry");
@@ -988,7 +1063,7 @@ mod tests {
         }
     }
 
-    fn projection(
+    pub(super) fn projection(
         repository: CatalogAttachmentRepository,
     ) -> (
         Arc<ConnectorControlHost>,

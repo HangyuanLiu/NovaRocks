@@ -146,6 +146,7 @@ impl std::error::Error for MvProjectionError {
 impl From<MvRepositoryError> for MvProjectionError {
     fn from(error: MvRepositoryError) -> Self {
         Self::new(MvProjectionErrorKind::Repository, error.to_string())
+            .with_original_failure(novarocks_failure_contract::SharedFailureCause::new(error))
     }
 }
 impl From<MvDocumentError> for MvProjectionError {
@@ -215,6 +216,190 @@ pub struct MvKeyedReadinessService {
     repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
     runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
 }
+/// Request-local selection of the repository's existing execution path.
+/// Context is a weak borrower; the Action/Residual retains the physical owner.
+#[derive(Clone)]
+pub struct MvKeyedReadinessExecution {
+    repository: ReadinessRepository,
+    runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
+}
+#[derive(Clone)]
+enum ReadinessExecution {
+    Legacy,
+    Original(novarocks_state_store_api::StateStoreExecutionContext),
+}
+#[derive(Clone)]
+struct ReadinessRepository {
+    repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+    execution: ReadinessExecution,
+}
+impl MvKeyedReadinessService {
+    pub fn new(
+        repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
+    ) -> Self {
+        Self {
+            repository,
+            runtime,
+        }
+    }
+    /// Borrow this request's exact owner/deadline without changing the service.
+    pub fn in_execution(
+        &self,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> MvKeyedReadinessExecution {
+        self.request(ReadinessExecution::Original(execution.clone()))
+    }
+    fn legacy(&self) -> MvKeyedReadinessExecution {
+        self.request(ReadinessExecution::Legacy)
+    }
+    fn request(&self, execution: ReadinessExecution) -> MvKeyedReadinessExecution {
+        MvKeyedReadinessExecution {
+            repository: ReadinessRepository {
+                repository: Arc::clone(&self.repository),
+                execution,
+            },
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+    pub async fn observe_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.legacy()
+            .observe_and_install(operation_id, request, source)
+            .await
+    }
+    pub async fn load_ready(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        self.legacy().load_ready(target).await
+    }
+    pub fn candidate_reader(&self) -> MvKeyedCandidateReader {
+        self.legacy().candidate_reader()
+    }
+    pub async fn invalidate_current(
+        &self,
+        target: MvTarget,
+        reason: String,
+    ) -> Result<(), MvProjectionError> {
+        self.legacy().invalidate_current(target, reason).await
+    }
+    pub fn begin_publication(
+        &self,
+        target: MvTarget,
+        publication_id: LakePublicationId,
+    ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
+        self.legacy().begin_publication(target, publication_id)
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
+        self.legacy().ensure_no_active_publications()
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvProjectionError> {
+        self.legacy().wipe_accelerator(operation_id).await
+    }
+    pub async fn query_admission(
+        &self,
+        target: &MvTarget,
+    ) -> Result<MvQueryAdmission, MvRepositoryError> {
+        self.legacy().query_admission(target).await
+    }
+    pub async fn load_ready_settled(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        self.legacy().load_ready_settled(target).await
+    }
+    pub async fn bounded_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
+        self.legacy().bounded_projection_inventory(bound).await
+    }
+    pub async fn list_ready_projections(
+        &self,
+    ) -> Result<Vec<crate::state_store_repository::keyed::LoadedKeyedMvProjection>, MvRepositoryError>
+    {
+        self.legacy().list_ready_projections().await
+    }
+    pub async fn list_ready_dependencies_by_downstream_bounded(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+        bound: crate::repository::MvDependencyReadBound,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        self.legacy()
+            .list_ready_dependencies_by_downstream_bounded(loaded, bound)
+            .await
+    }
+    pub async fn ensure_no_ready_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectIdentity,
+    ) -> Result<(), MvRepositoryError> {
+        self.legacy()
+            .ensure_no_ready_downstream_dependencies(upstream)
+            .await
+    }
+    pub async fn reserve_projection_delete(
+        &self,
+        target: MvTarget,
+    ) -> Result<MvKeyedProjectionDeleteGuard, MvProjectionError> {
+        self.legacy().reserve_projection_delete(target).await
+    }
+    pub async fn delete_after_provider_drop(
+        &self,
+        operation: Uuid,
+        guard: MvKeyedProjectionDeleteGuard,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.legacy()
+            .delete_after_provider_drop(operation, guard)
+            .await
+    }
+    pub async fn prepare_drop(
+        &self,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
+        self.legacy().prepare_drop(target, if_exists).await
+    }
+    pub async fn observe_current_read_only_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedReadOnlyCurrentProjectionSource,
+        reason: String,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.legacy()
+            .observe_current_read_only_and_install(operation_id, request, source, reason)
+            .await
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub async fn seed_projection(
+        &self,
+        operation: Uuid,
+        facts: crate::persistence::keyed_documents::MvKeyedDocumentProjection,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.legacy().seed_projection(operation, facts).await
+    }
+    pub async fn list_ready_dependencies_by_downstream(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        self.legacy()
+            .list_ready_dependencies_by_downstream(loaded)
+            .await
+    }
+}
 #[async_trait::async_trait]
 pub trait MvKeyedCurrentProjectionSource: Send + Sync {
     async fn observe_current_keyed(
@@ -237,16 +422,7 @@ pub enum MvKeyedProjectionInstallOutcome {
     Unchanged(crate::state_store_repository::keyed::LoadedKeyedMvProjection),
     Superseded,
 }
-impl MvKeyedReadinessService {
-    pub fn new(
-        repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
-        runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
-    ) -> Self {
-        Self {
-            repository,
-            runtime,
-        }
-    }
+impl MvKeyedReadinessExecution {
     /// Reserve order before invoking the provider. A slower earlier read can
     /// never overwrite a later observation or an explicit invalidation.
     pub async fn observe_and_install(
@@ -383,7 +559,7 @@ impl MvKeyedReadinessService {
 
 #[derive(Clone)]
 pub struct MvKeyedCandidateReader {
-    repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+    repository: ReadinessRepository,
 }
 impl MvKeyedCandidateReader {
     pub async fn list_candidate_definitions(
@@ -400,7 +576,7 @@ impl MvKeyedCandidateReader {
     }
 }
 pub struct MvBoundedKeyedProjectionInventory {
-    service: MvKeyedReadinessService,
+    service: MvKeyedReadinessExecution,
     entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
     bound: MvProjectionInventoryBound,
 }
@@ -507,6 +683,7 @@ impl MvBoundedKeyedProjectionInventory {
     }
 }
 pub struct MvKeyedProjectionDeleteGuard {
+    request: MvKeyedReadinessExecution,
     target: MvTarget,
     generation: u64,
     expected: Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
@@ -535,7 +712,7 @@ pub trait MvKeyedReadOnlyCurrentProjectionSource: Send + Sync {
         MvProjectionError,
     >;
 }
-impl MvKeyedReadinessService {
+impl MvKeyedReadinessExecution {
     pub fn candidate_reader(&self) -> MvKeyedCandidateReader {
         MvKeyedCandidateReader {
             repository: self.repository.clone(),
@@ -734,6 +911,7 @@ impl MvKeyedReadinessService {
         };
         drop(cell);
         Ok(MvKeyedProjectionDeleteGuard {
+            request: self.clone(),
             target,
             generation,
             expected,
@@ -746,11 +924,14 @@ impl MvKeyedReadinessService {
         guard: MvKeyedProjectionDeleteGuard,
     ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
         let mut cell = guard.order.lock().await;
+        // The guard retains its original weak borrower, even if a caller uses
+        // another service entry to finish the provider-side deletion.
+        let request = &guard.request;
         if cell.generation != guard.generation {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
         cell.settle(guard.generation);
-        let current = self
+        let current = request
             .repository
             .find_keyed_by_target(&guard.target, PersistenceDecodeBudget::default())
             .await?;
@@ -760,12 +941,13 @@ impl MvKeyedReadinessService {
         let Some(expected) = guard.expected else {
             return Ok(MvKeyedProjectionInstallOutcome::AlreadyAbsent);
         };
-        let removed = self
+        let removed = request
             .repository
             .delete_keyed_projection(operation, expected)
             .await?;
         cell.installed = None;
-        self.runtime
+        request
+            .runtime
             .set_unavailable(guard.target, "MV target was removed".into());
         Ok(if removed {
             MvKeyedProjectionInstallOutcome::Removed
@@ -1117,7 +1299,7 @@ mod keyed_tests {
     }
 }
 
-impl MvKeyedReadinessService {
+impl MvKeyedReadinessExecution {
     pub async fn list_ready_dependencies_by_downstream(
         &self,
         loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
@@ -1142,3 +1324,185 @@ impl MvKeyedReadinessService {
 #[cfg(test)]
 #[path = "readiness_tests.rs"]
 mod readiness_tests;
+
+// Only dispatch differs; both paths retain the repository's one algorithm.
+impl ReadinessRepository {
+    async fn find_keyed_by_target(
+        &self,
+        target: &MvTarget,
+        budget: PersistenceDecodeBudget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository.find_keyed_by_target(target, budget).await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .find_keyed_by_target(target, budget)
+                    .await
+            }
+        }
+    }
+    async fn find_keyed_by_target_object(
+        &self,
+        object: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        match &self.execution {
+            ReadinessExecution::Legacy => self.repository.find_keyed_by_target_object(object).await,
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .find_keyed_by_target_object(object)
+                    .await
+            }
+        }
+    }
+    async fn find_keyed_by_target_bounded(
+        &self,
+        target: &MvTarget,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository
+                    .find_keyed_by_target_bounded(target, bound)
+                    .await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .find_keyed_by_target_bounded(target, bound)
+                    .await
+            }
+        }
+    }
+    async fn list_keyed_projections(
+        &self,
+    ) -> Result<Vec<crate::state_store_repository::keyed::LoadedKeyedMvProjection>, MvRepositoryError>
+    {
+        match &self.execution {
+            ReadinessExecution::Legacy => self.repository.list_keyed_projections().await,
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .list_keyed_projections()
+                    .await
+            }
+        }
+    }
+    async fn list_keyed_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository.list_keyed_projection_inventory(bound).await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .list_keyed_projection_inventory(bound)
+                    .await
+            }
+        }
+    }
+    async fn list_keyed_dependencies_by_downstream_bounded(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+        bound: crate::repository::MvDependencyReadBound,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository
+                    .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
+                    .await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
+                    .await
+            }
+        }
+    }
+    async fn list_keyed_dependencies_by_downstream(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository
+                    .list_keyed_dependencies_by_downstream(loaded)
+                    .await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .list_keyed_dependencies_by_downstream(loaded)
+                    .await
+            }
+        }
+    }
+    async fn install_keyed_projection(
+        &self,
+        operation_id: Uuid,
+        facts: crate::persistence::keyed_documents::MvKeyedDocumentProjection,
+        expected: Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+    ) -> Result<crate::state_store_repository::keyed::LoadedKeyedMvProjection, MvRepositoryError>
+    {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository
+                    .install_keyed_projection(operation_id, facts, expected)
+                    .await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .install_keyed_projection(operation_id, facts, expected)
+                    .await
+            }
+        }
+    }
+    async fn delete_keyed_projection(
+        &self,
+        operation_id: Uuid,
+        expected: crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        match &self.execution {
+            ReadinessExecution::Legacy => {
+                self.repository
+                    .delete_keyed_projection(operation_id, expected)
+                    .await
+            }
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .delete_keyed_projection(operation_id, expected)
+                    .await
+            }
+        }
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError> {
+        match &self.execution {
+            ReadinessExecution::Legacy => self.repository.wipe_accelerator(operation_id).await,
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_execution(execution)
+                    .wipe_accelerator(operation_id)
+                    .await
+            }
+        }
+    }
+}

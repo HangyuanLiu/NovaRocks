@@ -100,6 +100,10 @@ impl CatalogMutationContext for CatalogCommandExecutor {
 }
 
 impl CatalogCommandExecutor {
+    pub(super) fn original_catalog_application(&self) -> Option<Arc<dyn CatalogApplicationPort>> {
+        self.catalog_application.clone()
+    }
+
     pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -276,7 +280,7 @@ impl CatalogCommandExecutor {
     }
 }
 
-fn lower_semantic_create_catalog(
+pub(super) fn lower_semantic_create_catalog(
     command: &SemanticCatalogCreateCommand,
 ) -> Result<CatalogCreateCommand, String> {
     let properties = command

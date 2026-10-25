@@ -1722,16 +1722,22 @@ impl FrontendApplicationHost {
                         .await);
                 }
             };
-            match CatalogAttachmentRepository::open(store, host.run_policy()).await {
+            let policy = host.run_policy();
+            let context = match host.catalog_bootstrap_read_execution() {
+                Ok(context) => context,
+                Err(error) => return Err(host.cleanup_open_error(error).await),
+            };
+            match host
+                .drive_catalog_bootstrap(async {
+                    let transaction = novarocks_state_store_api::StateStoreReadExecution::read_transaction_context(&context)?;
+                    CatalogAttachmentRepository::open_in(store, policy, &transaction)
+                        .await
+                        .map_err(novarocks_failure_contract::SharedFailureCause::new)
+                })
+                .await
+            {
                 Ok(repository) => Some(repository),
-                Err(error) => {
-                    return Err(host
-                        .cleanup_open_error(FrontendApplicationError::new(
-                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
-                            error,
-                        ))
-                        .await);
-                }
+                Err(error) => return Err(host.cleanup_open_error(error).await),
             }
         } else {
             None
@@ -1765,10 +1771,15 @@ impl FrontendApplicationHost {
             let store = host
                 .state_store()
                 .expect("dynamic catalog source required a StateStore above");
-            let controller = match FrontendCatalogController::new(
+            let binding = host
+                .state_store_original_binding()
+                .expect("dynamic store has original binding");
+            let controller = match FrontendCatalogController::new_with_original(
                 store,
                 Arc::clone(&host.catalog_role_runtime().application),
                 catalog_projection.clone(),
+                host.workload_root_admission(),
+                binding,
             ) {
                 Ok(controller) => controller,
                 Err(error) => {
@@ -1780,13 +1791,21 @@ impl FrontendApplicationHost {
                         .await);
                 }
             };
-            if let Err(error) = controller.bootstrap().await {
-                return Err(host
-                    .cleanup_open_error(FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::CatalogControllerOpen,
-                        error,
-                    ))
-                    .await);
+            host.catalog_role_runtime_mut().controller = Some(controller.clone());
+            let context = match host.catalog_bootstrap_read_execution() {
+                Ok(context) => context,
+                Err(error) => return Err(host.cleanup_open_error(error).await),
+            };
+            if let Err(error) = host
+                .drive_catalog_bootstrap(async {
+                    controller
+                        .bootstrap_in(&context)
+                        .await
+                        .map_err(novarocks_failure_contract::SharedFailureCause::new)
+                })
+                .await
+            {
+                return Err(host.cleanup_open_error(error).await);
             }
             let counts = host.catalog_role_runtime().application.projection_counts();
             host.serving_lifecycle.publish_catalog_bootstrap(
@@ -1799,15 +1818,10 @@ impl FrontendApplicationHost {
                     unavailable: counts.unavailable,
                 },
             );
-            if let Err(error) = controller.start() {
-                return Err(host
-                    .cleanup_open_error(FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::CatalogControllerOpen,
-                        error,
-                    ))
-                    .await);
+            // Background rounds start only after the real workload Ready cut.
+            if let Err(error) = host.close_catalog_bootstrap().await {
+                return Err(host.cleanup_open_error(error).await);
             }
-            host.catalog_role_runtime_mut().controller = Some(controller);
         } else if catalog_source_mode == CatalogDesiredStateSourceMode::StaticFile {
             let projection = Arc::clone(&host.catalog_role_runtime().application);
             match projection
@@ -2068,6 +2082,19 @@ impl FrontendApplicationHost {
                 "mark frontend workload authority ready after bootstrap: {error}"
             ))
         })?;
+        if let Some(controller) = self
+            .catalog_role_runtime
+            .as_ref()
+            .and_then(|role| role.controller.as_ref())
+        {
+            controller.start().map_err(|error| {
+                self.execution_runtime_owner.close_admission();
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::CatalogControllerOpen,
+                    error,
+                )
+            })?;
+        }
         if let Err(error) = self.serving_lifecycle.mark_ready() {
             self.execution_runtime_owner.close_admission();
             return Err(FrontendApplicationError::server(format!(
@@ -2463,6 +2490,62 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.abandon_for_process_exit();
     }
 
+    fn catalog_bootstrap_read_execution(
+        &mut self,
+    ) -> Result<
+        crate::state_store::execution::StateStoreOriginalReadExecution,
+        FrontendApplicationError,
+    > {
+        let executor = self.execution_runtime_owner.query_blocking_executor();
+        let ready = self
+            .state_store_host
+            .as_ref()
+            .ok_or_else(|| FrontendApplicationError::server("catalog startup has no StateStore"))?;
+        self.state_store_opening
+            .as_mut()
+            .ok_or_else(|| {
+                FrontendApplicationError::server("catalog startup has no original receiver")
+            })?
+            .bootstrap_read_execution(ready, &executor)
+            .map_err(FrontendApplicationError::original_state_store)
+    }
+    async fn drive_catalog_bootstrap<T>(
+        &mut self,
+        future: impl std::future::Future<
+            Output = Result<T, novarocks_failure_contract::SharedFailureCause>,
+        >,
+    ) -> Result<T, FrontendApplicationError> {
+        let opening = self.state_store_opening.as_mut().ok_or_else(|| {
+            FrontendApplicationError::server("catalog startup original receiver is unavailable")
+        })?;
+        tokio::pin!(future);
+        std::future::poll_fn(|cx| {
+            // F may register a new phase during this turn; always poll the
+            // original inventory again before returning Pending or its value.
+            if let Err(cause) = opening.poll_bootstrap_read(cx) {
+                return std::task::Poll::Ready(Err(
+                    FrontendApplicationError::original_state_store(cause),
+                ));
+            }
+            let result = future.as_mut().poll(cx);
+            if let Err(cause) = opening.poll_bootstrap_read(cx) {
+                return std::task::Poll::Ready(Err(
+                    FrontendApplicationError::original_state_store(cause),
+                ));
+            }
+            result.map(|value| value.map_err(FrontendApplicationError::original_state_store))
+        })
+        .await
+    }
+    async fn close_catalog_bootstrap(&mut self) -> Result<(), FrontendApplicationError> {
+        let opening = self.state_store_opening.as_mut().ok_or_else(|| {
+            FrontendApplicationError::server("catalog startup original receiver is unavailable")
+        })?;
+        std::future::poll_fn(|cx| opening.poll_bootstrap_read_closed(cx))
+            .await
+            .map_err(FrontendApplicationError::original_state_store)
+    }
+
     async fn open_configured(&mut self) -> Result<(), FrontendApplicationError> {
         let Some(opening) = self.state_store_opening.as_mut() else {
             return Ok(());
@@ -2535,6 +2618,19 @@ impl FrontendApplicationHost {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
         let mut primary_error: Option<String> = None;
+        // Stop and physically settle the current Management round before WC
+        // drain waits for that same Root. Keep both receivers on timeout.
+        if let Some(controller) = self
+            .catalog_role_runtime
+            .as_ref()
+            .and_then(|role| role.controller.as_ref())
+        {
+            tokio::time::timeout_at(deadline.into(), controller.shutdown())
+                .await
+                .map_err(|_| {
+                    "frontend deadline elapsed joining catalog controller".to_string()
+                })??;
+        }
         let execution_result = {
             let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
             tokio::pin!(shutdown);

@@ -14,7 +14,8 @@ use novarocks_mv_application::readiness::{
     MvCurrentProjectionRequest, MvKeyedCandidateReader as ProductCandidateReader,
     MvKeyedCurrentProjectionSource, MvKeyedDropReadiness, MvKeyedProjectionDeleteGuard,
     MvKeyedProjectionInstallOutcome, MvKeyedReadOnlyCurrentProjectionSource,
-    MvKeyedReadinessService, MvProjectionError,
+    MvKeyedReadinessExecution as ProductReadinessExecution, MvKeyedReadinessService,
+    MvProjectionError,
 };
 #[cfg(novarocks_dev_controls)]
 use std::sync::Arc;
@@ -28,19 +29,11 @@ use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
-/// The synchronous face of an asynchronous MV projection store.
+/// Role-local readiness facade over the same product service.
 ///
-/// The repository contract is async because its work is durable I/O. Almost
-/// every reader of MV readiness, though, sits inside the `spawn_blocking`
-/// closure that runs SQL statements, or on one of the two dedicated maintenance
-/// threads. Propagating `await` through them would not remove the bridge — it
-/// would move it onto a thread that has to block anyway — and would further
-/// require restructuring statement admission, which belongs to the
-/// query-application and query-preparation work lines rather than here.
-///
-/// So the adaptation lives in this one type, whose job is adaptation, and in no
-/// domain contract. It is a single place to delete once those work lines lift
-/// the surrounding boundaries.
+/// Unmigrated synchronous callers retain an explicit legacy bridge. Governed
+/// async callers select an original request view; it never blocks its Source
+/// driver or changes this role-local service's execution mode.
 pub struct MvReadinessPort {
     service: MvKeyedReadinessService,
     management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
@@ -115,6 +108,19 @@ pub(crate) struct MvCandidateReader {
     service: MvKeyedReadinessService,
     management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
     handle: tokio::runtime::Handle,
+    execution: CandidateExecution,
+}
+#[derive(Clone)]
+enum CandidateExecution {
+    Legacy,
+    Original(novarocks_state_store_api::StateStoreExecutionContext),
+}
+
+/// Borrower only: the caller keeps the same Source/Root in stable custody.
+pub(crate) struct MvReadinessExecution<'a> {
+    port: &'a MvReadinessPort,
+    execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    service: ProductReadinessExecution,
 }
 
 impl MvReadinessPort {
@@ -156,6 +162,17 @@ impl MvReadinessPort {
         self.controls.clone()
     }
 
+    pub(crate) fn in_execution<'a>(
+        &'a self,
+        execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> MvReadinessExecution<'a> {
+        MvReadinessExecution {
+            port: self,
+            execution,
+            service: self.service.in_execution(execution),
+        }
+    }
+
     /// Construct the separate query inventory from the same product-owned
     /// repository. The reader intentionally does not inherit this port's
     /// process-local readiness or refresh authority.
@@ -165,11 +182,12 @@ impl MvReadinessPort {
             service: self.service.clone(),
             management: self.management.clone(),
             handle: self.handle.clone(),
+            execution: CandidateExecution::Legacy,
         }
     }
 
-    /// Drives one durable MV operation from a synchronous caller. Confined to
-    /// this type on purpose; see the type-level note.
+    /// Legacy bridge only. Original request views expose async methods and
+    /// never pass their borrowed context through this blocking adapter.
     fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
         match tokio::runtime::Handle::try_current() {
             Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(future)),
@@ -385,7 +403,173 @@ impl MvReadinessPort {
     }
 }
 
+impl MvReadinessExecution<'_> {
+    pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
+        self.port.candidate_reader().in_execution(self.execution)
+    }
+    pub(crate) async fn observe_current_and_install(
+        &self,
+        operation: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.service
+            .observe_and_install(operation, request, source)
+            .await
+    }
+    pub(crate) async fn observe_current_read_only_and_install(
+        &self,
+        operation: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedReadOnlyCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.service
+            .observe_current_read_only_and_install(
+                operation,
+                request,
+                source,
+                "read-only lake observation requires management readmission".into(),
+            )
+            .await
+    }
+    pub(crate) async fn quarantine(
+        &self,
+        target: CanonicalMvTarget,
+        reason: String,
+    ) -> Result<(), MvProjectionError> {
+        self.service.invalidate_current(target, reason).await
+    }
+    pub(crate) async fn quarantine_catalog(
+        &self,
+        catalog: &str,
+        reason: String,
+    ) -> Result<(), MvProjectionError> {
+        for projection in self
+            .service
+            .candidate_reader()
+            .list_candidate_definitions()
+            .await?
+        {
+            if projection.facts.target().catalog() == Some(catalog) {
+                self.service
+                    .invalidate_current(projection.facts.target().clone(), reason.clone())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn query_admission(
+        &self,
+        target: &MvTarget,
+    ) -> Result<novarocks_mv_application::readiness::MvQueryAdmission, MvRepositoryError> {
+        self.service
+            .query_admission(&canonical_mv_target(target))
+            .await
+    }
+    pub(crate) async fn load_ready(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
+        self.service
+            .load_ready_settled(&canonical_mv_target(target))
+            .await
+    }
+    /// The returned inventory already retains this same weak request selection;
+    /// its next_ready/next_listable methods are async product methods.
+    pub(crate) async fn local_projection_inventory(
+        &self,
+    ) -> Result<
+        novarocks_mv_application::readiness::MvBoundedKeyedProjectionInventory,
+        MvRepositoryError,
+    > {
+        self.service
+            .bounded_projection_inventory(local_inventory_bound())
+            .await
+    }
+    pub(crate) async fn list_ready_projections(
+        &self,
+    ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
+        self.service.list_ready_projections().await
+    }
+    pub(crate) async fn list_ready_projections_async(
+        &self,
+    ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
+        self.list_ready_projections().await
+    }
+    pub(crate) async fn list_ready_dependencies_by_downstream(
+        &self,
+        projection: &LoadedKeyedMvProjection,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        self.service
+            .list_ready_dependencies_by_downstream(projection)
+            .await
+    }
+    pub(crate) async fn list_local_dependencies_by_downstream(
+        &self,
+        projection: &LoadedKeyedMvProjection,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        self.service
+            .list_ready_dependencies_by_downstream_bounded(
+                projection,
+                novarocks_mv_application::repository::MvDependencyReadBound {
+                    inventory: local_inventory_bound(),
+                    entries: 4096,
+                    collection_bytes: 4 * 1024 * 1024,
+                },
+            )
+            .await
+    }
+    pub(crate) async fn ensure_no_ready_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectIdentity,
+    ) -> Result<(), MvRepositoryError> {
+        self.service
+            .ensure_no_ready_downstream_dependencies(upstream)
+            .await
+    }
+    pub(crate) async fn prepare_drop(
+        &self,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
+        self.service
+            .prepare_drop(&canonical_mv_target(target), if_exists)
+            .await
+    }
+    pub(crate) async fn delete_after_provider_drop(
+        &self,
+        operation: Uuid,
+        guard: MvKeyedProjectionDeleteGuard,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        self.service
+            .delete_after_provider_drop(operation, guard)
+            .await
+    }
+}
+
 impl MvCandidateReader {
+    /// A request clone retains only the exact weak Context, never a new owner.
+    pub(crate) fn in_execution(
+        &self,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Self {
+        Self {
+            reader: self.service.in_execution(execution).candidate_reader(),
+            service: self.service.clone(),
+            management: self.management.clone(),
+            handle: self.handle.clone(),
+            execution: CandidateExecution::Original(execution.clone()),
+        }
+    }
+    fn require_legacy_sync(&self) -> Result<(), MvRepositoryError> {
+        match &self.execution {
+            CandidateExecution::Legacy => Ok(()),
+            CandidateExecution::Original(_) => Err(MvRepositoryError::new(
+                novarocks_mv_application::repository::MvRepositoryErrorKind::InvalidRequest,
+                "original MV candidate request requires asynchronous execution",
+            )),
+        }
+    }
     fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
         let handle = &self.handle;
         match tokio::runtime::Handle::try_current() {
@@ -396,6 +580,7 @@ impl MvCandidateReader {
     pub(crate) fn list_candidate_definitions(
         &self,
     ) -> Result<Vec<StoredKeyedMvProjection>, MvRepositoryError> {
+        self.require_legacy_sync()?;
         self.block_on(self.reader.list_candidate_definitions())
     }
 
@@ -412,81 +597,9 @@ impl MvCandidateReader {
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
         String,
     > {
-        let Self {
-            service,
-            management,
-            ..
-        } = self;
-        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(lease,request.clone(),Default::default(),management).map_err(|e|e.to_string())?;
-        if observed.deployment_owner != *management.owner()
-            || observed.process_incarnation != *management.incarnation()
-        {
-            management
-                .close_on_keyed_current_management_mismatch(lease, request.clone())
-                .map_err(|e| e.to_string())?;
-            struct ReadOnly(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments);
-            #[async_trait::async_trait]
-            impl MvKeyedReadOnlyCurrentProjectionSource for ReadOnly {
-                async fn observe_current_keyed_read_only(&self,_:MvCurrentProjectionRequest)->Result<novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,MvProjectionError>{
-                    Ok(self.0.clone())
-                }
-            }
-            let target = CanonicalMvTarget::from_parts(
-                Some(request.target.instance_id.as_str()),
-                &request.target.namespace,
-                &request.target.table,
-            );
-            let projection_request = MvCurrentProjectionRequest::try_new(
-                request.catalog_handle,
-                target,
-                request.context,
-                Default::default(),
-            )
-            .map_err(|e| e.to_string())?;
-            self.block_on(service.observe_current_read_only_and_install(
-                Uuid::now_v7(),
-                projection_request,
-                &ReadOnly(observed.clone()),
-                "fresh MV management slot names another writer".into(),
-            ))
-            .map_err(|e| e.to_string())?;
-            return Ok(observed);
-        }
-        if convergence.reinstall_current_projection {
-            let (fresh, admission, _) = management
-                .observe_keyed_admission(lease, request.clone(), Default::default())
-                .map_err(|e| e.to_string())?;
-            observed = fresh;
-            struct Source{observed:novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,admission:std::sync::Mutex<Option<novarocks_mv_application::management::MvCurrentManagementAdmission>>}
-            #[async_trait::async_trait]
-            impl MvKeyedCurrentProjectionSource for Source {
-                async fn observe_current_keyed(&self,_:MvCurrentProjectionRequest)->Result<(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,novarocks_mv_application::management::MvCurrentManagementAdmission),MvProjectionError>{
-                    Ok((self.observed.clone(), self.admission.lock().map_err(|_|MvProjectionError::new(novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,"slot projection admission lock poisoned"))?.take().ok_or_else(||MvProjectionError::new(novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,"slot projection admission already consumed"))?))
-                }
-            }
-            let target = CanonicalMvTarget::from_parts(
-                Some(request.target.instance_id.as_str()),
-                &request.target.namespace,
-                &request.target.table,
-            );
-            let projection_request = MvCurrentProjectionRequest::try_new(
-                request.catalog_handle,
-                target,
-                request.context,
-                Default::default(),
-            )
-            .map_err(|e| e.to_string())?;
-            self.block_on(service.observe_and_install(
-                Uuid::now_v7(),
-                projection_request,
-                &Source {
-                    observed: observed.clone(),
-                    admission: std::sync::Mutex::new(Some(admission)),
-                },
-            ))
-            .map_err(|e| e.to_string())?;
-        }
-        Ok(observed)
+        self.require_legacy_sync()
+            .map_err(|error| error.to_string())?;
+        self.block_on(self.observe_current_async(lease, request))
     }
 
     /// Legacy MV preparation still renders at its pre-Action String boundary.
@@ -543,15 +656,33 @@ impl MvCandidateReader {
                 Default::default(),
             )
             .map_err(projection_application_error)?;
-            service
-                .observe_current_read_only_and_install(
-                    Uuid::now_v7(),
-                    projection_request,
-                    &ReadOnly(observed.clone()),
-                    "fresh MV management slot names another writer".into(),
-                )
-                .await
-                .map_err(projection_application_error)?;
+            let operation = Uuid::now_v7();
+            let source = ReadOnly(observed.clone());
+            let reason = "fresh MV management slot names another writer".into();
+            match &self.execution {
+                CandidateExecution::Legacy => {
+                    service
+                        .observe_current_read_only_and_install(
+                            operation,
+                            projection_request,
+                            &source,
+                            reason,
+                        )
+                        .await
+                }
+                CandidateExecution::Original(execution) => {
+                    service
+                        .in_execution(execution)
+                        .observe_current_read_only_and_install(
+                            operation,
+                            projection_request,
+                            &source,
+                            reason,
+                        )
+                        .await
+                }
+            }
+            .map_err(projection_application_error)?;
             return Ok(observed);
         }
         if convergence.reinstall_current_projection {
@@ -579,17 +710,25 @@ impl MvCandidateReader {
                 Default::default(),
             )
             .map_err(projection_application_error)?;
-            service
-                .observe_and_install(
-                    Uuid::now_v7(),
-                    projection_request,
-                    &Source {
-                        observed: observed.clone(),
-                        admission: std::sync::Mutex::new(Some(admission)),
-                    },
-                )
-                .await
-                .map_err(projection_application_error)?;
+            let operation = Uuid::now_v7();
+            let source = Source {
+                observed: observed.clone(),
+                admission: std::sync::Mutex::new(Some(admission)),
+            };
+            match &self.execution {
+                CandidateExecution::Legacy => {
+                    service
+                        .observe_and_install(operation, projection_request, &source)
+                        .await
+                }
+                CandidateExecution::Original(execution) => {
+                    service
+                        .in_execution(execution)
+                        .observe_and_install(operation, projection_request, &source)
+                        .await
+                }
+            }
+            .map_err(projection_application_error)?;
         }
         Ok(observed)
     }
@@ -611,9 +750,9 @@ pub(crate) fn connector_failure_cause(
 pub(crate) fn connector_application_error(
     error: novarocks_spi::connector::ConnectorError,
 ) -> novarocks_query_application::session_error::QueryServiceError {
-    novarocks_query_application::session_error::QueryServiceError::from_failure_cause(connector_failure_cause(
-        error,
-    ))
+    novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+        connector_failure_cause(error),
+    )
 }
 
 pub(crate) fn document_application_error(
@@ -634,7 +773,9 @@ fn projection_application_error(
 ) -> novarocks_query_application::session_error::QueryServiceError {
     match error.original_failure() {
         Some(cause) => {
-            novarocks_query_application::session_error::QueryServiceError::from_failure_cause(cause.clone())
+            novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                cause.clone(),
+            )
         }
         None => application_error(error.to_string()),
     }
@@ -858,5 +999,174 @@ mod guard_original_projection_tests {
         assert!(plain.failure_cause().is_none());
         assert!(plain.execution_failure().is_none());
         assert_eq!(plain.message(), "MV projection admission already consumed");
+    }
+}
+
+#[cfg(test)]
+mod original_request_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_state_store_api::{StateStoreExecutionContext, StateStoreExecutionPort};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    struct NoPhysicalPort;
+    impl StateStoreExecutionPort for NoPhysicalPort {
+        fn bind_original_in(
+            &self,
+            _: &Arc<dyn novarocks_state_store_api::StateStoreBlockingOriginal>,
+            _: Instant,
+            _: &mut Option<Box<dyn novarocks_state_store_api::StateStoreBlockingSlot>>,
+        ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+            panic!("pure readiness fixture must not dispatch physical work")
+        }
+        fn request_progress(&self) {}
+    }
+    fn context() -> (Arc<dyn StateStoreExecutionPort>, StateStoreExecutionContext) {
+        let port: Arc<dyn StateStoreExecutionPort> = Arc::new(NoPhysicalPort);
+        let context =
+            StateStoreExecutionContext::new(&port, Instant::now() + Duration::from_secs(5));
+        (port, context)
+    }
+    async fn readiness(store: Arc<dyn novarocks_state_store_api::StateStore>) -> MvReadinessPort {
+        let repository =
+            novarocks_mv_application::state_store_repository::StateStoreMvRepository::open(
+                store,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        MvReadinessPort::from_product(
+            MvKeyedReadinessService::new(repository, Arc::default()),
+            tokio::runtime::Handle::current(),
+            crate::mv::domain::test_admission::management_entrance(),
+        )
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_candidate_refusal_preserves_repository_fact_without_legacy_fallback() {
+        let (owner, context) = context();
+        let port = readiness(Arc::new(
+            novarocks_state_store_testkit::testing::InMemoryStateStore::new(
+                "readiness-no-original",
+            ),
+        ))
+        .await;
+        let legacy = port.candidate_reader();
+        assert!(
+            legacy
+                .list_candidate_definitions_async()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let original = legacy.in_execution(&context);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "request carries only the weak context"
+        );
+        let error = original
+            .list_candidate_definitions_async()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            novarocks_state_store_api::StateStoreOriginalUnsupported.failure_fact()
+        );
+        assert!(
+            error.original_failure().is_some(),
+            "keep the whole repository cause"
+        );
+        assert!(
+            original.list_candidate_definitions().is_err(),
+            "sync original must refuse before block_in_place"
+        );
+        let cloned = original.clone();
+        assert_eq!(
+            cloned
+                .list_candidate_definitions_async()
+                .await
+                .unwrap_err()
+                .failure_fact(),
+            error.failure_fact()
+        );
+        // Selecting a request must not mutate the role-local legacy facade.
+        assert!(
+            legacy
+                .list_candidate_definitions_async()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let execution = port.in_execution(&context);
+        assert_eq!(
+            execution
+                .candidate_reader()
+                .list_candidate_definitions_async()
+                .await
+                .unwrap_err()
+                .failure_fact(),
+            error.failure_fact()
+        );
+        assert!(execution.local_projection_inventory().await.is_err());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn pure_original_request_is_async_and_expired_request_keeps_its_actual_failure() {
+        let mut host = crate::state_store::testing::open_persistent(format!(
+            "mv-original-readiness-{}",
+            Uuid::now_v7()
+        ))
+        .await;
+        let (owner, context) = context();
+        let port = readiness(host.state_store().unwrap()).await;
+        let execution = port.in_execution(&context);
+        assert!(
+            execution
+                .candidate_reader()
+                .list_candidate_definitions_async()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let target = MvTarget {
+            catalog: Some("ice".into()),
+            database: "db".into(),
+            name: "absent".into(),
+        };
+        assert!(execution.load_ready(&target).await.unwrap().is_none());
+        assert!(matches!(
+            execution.query_admission(&target).await.unwrap(),
+            novarocks_mv_application::readiness::MvQueryAdmission::NotAnMv
+        ));
+        let mut inventory = execution.local_projection_inventory().await.unwrap();
+        assert!(inventory.next_ready().await.unwrap().is_none());
+        assert!(inventory.next_listable().await.unwrap().is_none());
+        let expired = context.with_deadline(Instant::now() - Duration::from_secs(1));
+        let error = port
+            .candidate_reader()
+            .in_execution(&expired)
+            .list_candidate_definitions_async()
+            .await
+            .unwrap_err();
+        let cause = error
+            .original_failure()
+            .expect("original provider error survives facade");
+        assert_eq!(
+            cause
+                .downcast_ref::<novarocks_state_store_api::StateStoreError>()
+                .unwrap()
+                .kind(),
+            novarocks_state_store_api::StateStoreErrorKind::DeadlineExceeded
+        );
+        assert_eq!(error.failure_fact(), cause.failure_fact());
+        assert_eq!(Arc::strong_count(&owner), 1);
+        drop(inventory);
+        drop(execution);
+        drop(port);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 }

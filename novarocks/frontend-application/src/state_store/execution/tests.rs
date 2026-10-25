@@ -752,6 +752,11 @@ async fn settlement_health_waits_for_same_published_footer_before_outward_failur
             novarocks_failure_contract::FailureClass::Unexpected
         );
         assert!(owner.local_health_failure().is_none());
+        assert!(
+            !owner
+                .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+                .unwrap()
+        );
         if !health_visible_with_result {
             source.expose_health.store(true, Ordering::Release);
         }
@@ -801,6 +806,12 @@ async fn settlement_health_waits_for_same_published_footer_before_outward_failur
         .expect("actual footer wake must resume the same receiver");
         assert_eq!(reported, cause);
         assert_eq!(owner.local_health_failure(), Some(cause.clone()));
+        assert_eq!(
+            owner
+                .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+                .unwrap_err(),
+            cause
+        );
         assert_eq!(poll_once(&owner).unwrap_err(), cause);
         assert_eq!(
             source.original.events.lock().unwrap().as_slice(),
@@ -972,6 +983,380 @@ async fn host_evidence_accepts_only_its_actual_instance_author_and_settlement_ph
             .poll_progress(&mut Context::from_waker(Waker::noop()))
             .is_err(),
         "weak cadence cannot replace missing Host custody"
+    );
+    shutdown(&mut workers).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_read_port_has_exact_instance_type_and_read_only_phases() {
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let selected = Vocabulary::for_provider::<NotSelected, TestOriginal, NotSelected>(PROVIDER);
+    let mut owner = StateStoreOriginalOwner::bootstrap_read(
+        &executor,
+        selected,
+        instance,
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .unwrap();
+    let context = owner.context(Instant::now() + Duration::from_secs(5));
+    for phase in [
+        Phase::Open,
+        Phase::BeginWrite,
+        Phase::Put,
+        Phase::Delete,
+        Phase::Commit,
+        Phase::EvidenceRead,
+        Phase::EvidenceRelease,
+    ] {
+        let source = TestOriginal::new(StateStoreBlockingOrigin::Instance(instance), phase, None);
+        let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+        let mut target = None;
+        assert!(context.bind_original_in(&original, &mut target).is_err());
+        assert!(target.is_none());
+        assert_eq!(source.runs.load(Ordering::Acquire), 0);
+        assert!(source.events.lock().unwrap().is_empty());
+    }
+    for original in [
+        TestOriginal::new(
+            StateStoreBlockingOrigin::Instance(InstanceScope::new()),
+            Phase::BeginRead,
+            None,
+        ) as Arc<dyn StateStoreBlockingOriginal>,
+        TestOriginal::new(
+            StateStoreBlockingOrigin::Opening(PROVIDER),
+            Phase::BeginRead,
+            None,
+        ) as Arc<dyn StateStoreBlockingOriginal>,
+        Arc::new(NotSelected(TestOriginal::new(
+            StateStoreBlockingOrigin::Instance(instance),
+            Phase::BeginRead,
+            None,
+        ))) as Arc<dyn StateStoreBlockingOriginal>,
+    ] {
+        let mut target = None;
+        assert!(context.bind_original_in(&original, &mut target).is_err());
+        assert!(target.is_none());
+    }
+    let expired = owner.context(Instant::now() - Duration::from_secs(1));
+    let original: Arc<dyn StateStoreBlockingOriginal> = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::BeginRead,
+        None,
+    );
+    let mut target = None;
+    assert!(expired.bind_original_in(&original, &mut target).is_err());
+    assert!(target.is_none());
+    assert!(owner.port.inventory.lock().unwrap().entries.is_empty());
+
+    // These are the existing port's real QB receipt/exit components, not a
+    // SQLite transaction or a synthetic success for Catalog initialization.
+    let sources = [
+        Phase::BeginRead,
+        Phase::Get,
+        Phase::Range,
+        Phase::Rollback,
+        Phase::Close,
+    ]
+    .into_iter()
+    .map(|phase| {
+        let source = TestOriginal::new(StateStoreBlockingOrigin::Instance(instance), phase, None);
+        source.install(&owner);
+        source
+    })
+    .collect::<Vec<_>>();
+    let progress = owner.progress_handle();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| match progress.poll_progress(cx) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(cause) => Poll::Ready(Err(cause)),
+        }),
+    )
+    .await
+    .expect("actual bootstrap read physical calls exit")
+    .unwrap();
+    for source in sources {
+        assert_eq!(source.runs.load(Ordering::Acquire), 1);
+        assert_eq!(
+            source.events.lock().unwrap().as_slice(),
+            &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+        );
+    }
+    closed(&mut owner).await;
+    let mut target = None;
+    assert!(context.bind_original_in(&original, &mut target).is_err());
+    assert!(target.is_none());
+    drop(owner);
+    assert!(
+        progress
+            .poll_progress(&mut Context::from_waker(Waker::noop()))
+            .is_err()
+    );
+    shutdown(&mut workers).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_close_keeps_published_call_until_its_same_actual_footer() {
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let selected = Vocabulary::for_provider::<NotSelected, TestOriginal, NotSelected>(PROVIDER);
+    let mut owner = StateStoreOriginalOwner::bootstrap_read(
+        &executor,
+        selected,
+        instance,
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .unwrap();
+    let gate = Gate::new();
+    let _rescue = Rescue(gate.clone());
+    let source = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::BeginRead,
+        Some(gate.clone()),
+    );
+    source.install(&owner);
+    assert!(!poll_once(&owner).unwrap());
+    gate.reached().await;
+    assert_eq!(source.runs.load(Ordering::Acquire), 1);
+    assert!(
+        owner
+            .poll_closed(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert!(!source.is_complete());
+    assert!(source.events.lock().unwrap().is_empty());
+    assert_eq!(owner.port.inventory.lock().unwrap().entries.len(), 1);
+    gate.release();
+    closed(&mut owner).await;
+    assert_eq!(source.runs.load(Ordering::Acquire), 1);
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+    );
+    assert!(owner.port.inventory.lock().unwrap().entries.is_empty());
+    drop(owner);
+    shutdown(&mut workers).await;
+}
+
+// A closed two-phase port probe: actual evidence read, idle retained obligation,
+// then actual close. Both phases use the same existing TestOriginal operation
+// and physical executor. This is not a fabricated SQLite Unknown proof.
+struct IdleObligation {
+    read: Arc<TestOriginal>,
+    close: Arc<TestOriginal>,
+    closing: AtomicBool,
+}
+impl IdleObligation {
+    fn new(instance: InstanceScope, gate: Arc<Gate>) -> Arc<Self> {
+        let read = TestOriginal::new(
+            StateStoreBlockingOrigin::Instance(instance),
+            Phase::EvidenceRead,
+            Some(gate),
+        );
+        let mut close = TestOriginal::new(
+            StateStoreBlockingOrigin::Instance(instance),
+            Phase::Close,
+            None,
+        );
+        let close_fields = Arc::get_mut(&mut close).unwrap();
+        close_fields.request.revision = NonZeroU64::new(2).unwrap();
+        close_fields.slot = read.slot.clone();
+        Arc::new(Self {
+            read,
+            close,
+            closing: AtomicBool::new(false),
+        })
+    }
+    fn phase(&self, request: Request) -> &TestOriginal {
+        if request == self.read.request {
+            &self.read
+        } else {
+            assert_eq!(request, self.close.request);
+            &self.close
+        }
+    }
+}
+impl StateStoreBlockingOriginal for IdleObligation {
+    fn origin(&self) -> StateStoreBlockingOrigin {
+        self.read.origin()
+    }
+    fn requested(&self) -> Option<Request> {
+        if !self.read.is_complete() {
+            self.read.requested()
+        } else if self.closing.load(Ordering::Acquire) {
+            self.close.requested()
+        } else {
+            None
+        }
+    }
+    fn publication_refusal(&self, request: Request) -> Option<Failure> {
+        self.phase(request).publication_refusal(request)
+    }
+    fn before_publish(&self, request: Request) -> Result<(), Failure> {
+        self.phase(request).before_publish(request)
+    }
+    fn run_original_phase(&self, request: Request) {
+        self.phase(request).run_original_phase(request);
+    }
+    fn receive_result(&self, request: Request, result: Result<(), Failure>) {
+        self.phase(request).receive_result(request, result);
+    }
+    fn receive_exit(&self, request: Request, exit: Result<Exit, Failure>) {
+        self.phase(request).receive_exit(request, exit);
+    }
+    fn is_complete(&self) -> bool {
+        self.close.is_complete()
+    }
+    fn local_failure(&self) -> Option<Failure> {
+        None
+    }
+    fn request_close(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+    fn request_interrupt(&self) {
+        self.read.request_interrupt();
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn actual_quiescence_separates_idle_obligation_from_complete_and_new_request() {
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let selected = Vocabulary::for_provider::<NotSelected, NotSelected, IdleObligation>(PROVIDER);
+    let mut owner = StateStoreOriginalOwner::instance_evidence(
+        &executor,
+        selected,
+        instance,
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .unwrap();
+    let gate = Gate::new();
+    let _rescue = Rescue(gate.clone());
+    let source = IdleObligation::new(instance, gate.clone());
+    let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+    let context = owner.context(Instant::now() + Duration::from_secs(5));
+    let mut slot = None;
+    context.bind_original_in(&original, &mut slot).unwrap();
+    *source.read.slot.lock().unwrap() = slot;
+    context.request_progress();
+    assert!(
+        !owner
+            .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+            .unwrap()
+    );
+    gate.reached().await;
+    assert!(
+        !owner
+            .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+            .unwrap()
+    );
+    assert_eq!(source.read.runs.load(Ordering::Acquire), 1);
+    gate.release();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| match owner.poll_actual_quiescent(cx) {
+            Ok(true) => Poll::Ready(()),
+            Ok(false) => Poll::Pending,
+            Err(cause) => panic!("same original must be healthy: {cause}"),
+        }),
+    )
+    .await
+    .expect("same physical footer wakes the cut");
+    assert!(!source.is_complete());
+    assert_eq!(
+        source.read.events.lock().unwrap().as_slice(),
+        &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+    );
+    assert_eq!(owner.port.inventory.lock().unwrap().entries.len(), 1);
+    // The old footer is still present; a new same-Source revision forbids a
+    // positive cut even before the driver installs its next PhysicalPhase.
+    source.request_close();
+    assert!(!cell(&owner).actual_quiescent().unwrap());
+    assert_eq!(source.close.runs.load(Ordering::Acquire), 0);
+    // A concurrent loan cannot be mistaken for an empty inventory.
+    let original_cell = cell(&owner);
+    let body = original_cell.body.lock().unwrap().take().unwrap();
+    assert!(!original_cell.actual_quiescent().unwrap());
+    *original_cell.body.lock().unwrap() = Some(body);
+    closed(&mut owner).await;
+    assert!(source.is_complete());
+    assert_eq!(source.close.runs.load(Ordering::Acquire), 1);
+    assert!(
+        owner
+            .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+            .unwrap()
+    );
+    drop(owner);
+    shutdown(&mut workers).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_request_uses_independent_transaction_time_but_absolute_context_never_renews() {
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let mut owner = StateStoreOriginalOwner::bootstrap_read(
+        &executor,
+        vocabulary(),
+        instance,
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .unwrap();
+    let limit = Duration::from_secs(4);
+    let request = owner.read_execution(limit).unwrap();
+    let first_before = Instant::now();
+    let first = request.read_transaction_context().unwrap();
+    assert!(first.deadline() >= first_before.checked_add(limit).unwrap());
+    let next_before = Instant::now();
+    let second = request.read_transaction_context().unwrap();
+    assert!(second.deadline() >= next_before.checked_add(limit).unwrap());
+    assert!(second.shares_owner(&first));
+    assert_eq!(
+        first.read_transaction_context().unwrap().deadline(),
+        first.deadline()
+    );
+    let expired = owner.context(Instant::now() - Duration::from_secs(1));
+    let absolute = expired.read_transaction_context().unwrap();
+    assert_eq!(absolute.deadline(), expired.deadline());
+    assert_eq!(
+        absolute.with_deadline(second.deadline()).deadline(),
+        expired.deadline()
+    );
+    let source = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::BeginRead,
+        None,
+    );
+    let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+    let mut target = None;
+    assert!(absolute.bind_original_in(&original, &mut target).is_err());
+    assert!(target.is_none());
+    second.bind_original_in(&original, &mut target).unwrap();
+    *source.slot.lock().unwrap() = target;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| match owner.poll_progress(cx) {
+            Ok(true) => Poll::Ready(()),
+            Ok(false) => Poll::Pending,
+            Err(cause) => panic!("same read Source must complete: {cause}"),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.runs.load(Ordering::Acquire), 1);
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+    );
+    closed(&mut owner).await;
+    assert!(
+        request.read_transaction_context().is_err(),
+        "close forbids renewing business work"
+    );
+    drop(owner);
+    assert!(
+        request.read_transaction_context().is_err(),
+        "weak request retains no owner"
     );
     shutdown(&mut workers).await;
 }

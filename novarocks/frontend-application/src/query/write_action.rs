@@ -616,10 +616,13 @@ impl<P: WriteStatementFamily> GovernedStatementAction for WriteStatementAction<P
             })
             .or_else(|| self.io.as_ref().and_then(|io| io.health_failure()))
     }
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+    fn external_effect_disposition(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
         self.publication
             .as_ref()
             .and_then(StatementPublication::disposition)
+            .map(crate::query::external_effect_from_lake)
     }
     fn handoff_residual_in(
         &mut self,

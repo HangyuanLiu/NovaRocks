@@ -48,5 +48,6 @@ pub use provider::{
     StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
 };
 pub use runner::{
-    RunFailure, RunSuccess, StateStoreRunMetrics, run_side_effect_free, run_side_effect_free_in,
+    RunFailure, RunSuccess, StateStoreRunMetrics, StateStoreRunReceiving, run_side_effect_free,
+    run_side_effect_free_in, run_side_effect_free_in_receiving,
 };

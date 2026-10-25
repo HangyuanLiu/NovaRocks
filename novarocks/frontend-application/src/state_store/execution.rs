@@ -33,6 +33,7 @@ use novarocks_state_store_api::{
     StateStoreBlockingRequest as Request, StateStoreBlockingSlot,
     StateStoreBlockingSourceVocabulary as Vocabulary, StateStoreError, StateStoreErrorKind,
     StateStoreExecutionContext, StateStoreExecutionFailure as Failure, StateStoreExecutionPort,
+    StateStoreReadExecution,
 };
 use novarocks_workload_control::WorkScope;
 use std::{
@@ -53,6 +54,9 @@ use std::{
 /// neither a request nor its dynamic origin can extend the allowed types.
 enum Purpose {
     Opening,
+    BootstrapRead {
+        instance: InstanceScope,
+    },
     ClosingInstance {
         instance: InstanceScope,
     },
@@ -120,6 +124,22 @@ impl StateStoreOriginalOwner {
         policy: novarocks_state_store_runtime::StateStoreRunPolicy,
     ) -> Result<Self, Failure> {
         Self::new(executor, vocabulary, Purpose::Opening, policy)
+    }
+    /// Finite Host initialization reads of the exact installed instance.
+    /// No Root is minted before serving admission is ready. The Host must
+    /// retain this owner, poll it beside the bootstrap borrower, then close it.
+    pub(crate) fn bootstrap_read(
+        executor: &QueryBlockingExecutor,
+        vocabulary: Vocabulary,
+        instance: InstanceScope,
+        policy: novarocks_state_store_runtime::StateStoreRunPolicy,
+    ) -> Result<Self, Failure> {
+        Self::new(
+            executor,
+            vocabulary,
+            Purpose::BootstrapRead { instance },
+            policy,
+        )
     }
     /// Host custody for the same instance's physical destruction. This purpose
     /// accepts only the selected lifecycle author and no transaction work.
@@ -208,6 +228,22 @@ impl StateStoreOriginalOwner {
         let port: Arc<dyn StateStoreExecutionPort> = self.port.clone();
         StateStoreExecutionContext::new(&port, deadline)
     }
+    /// The selected instance supplies its existing physical transaction limit.
+    /// This view holds no source, Root, grant, or physical position.
+    pub(crate) fn read_execution(
+        &self,
+        transaction_deadline: std::time::Duration,
+    ) -> Result<StateStoreOriginalReadExecution, Failure> {
+        if transaction_deadline.is_zero() {
+            return Err(protocol(
+                "StateStore read transaction deadline must be positive",
+            ));
+        }
+        Ok(StateStoreOriginalReadExecution {
+            progress: self.progress_handle(),
+            transaction_deadline,
+        })
+    }
     pub(crate) fn request_close(&self) {
         let entries = {
             let mut inventory = self
@@ -225,6 +261,27 @@ impl StateStoreOriginalOwner {
     }
     pub(crate) fn poll_progress(&self, cx: &mut Context<'_>) -> Result<bool, Failure> {
         poll_originals(&self.port, cx)
+    }
+    /// Observe the current physical cut after the product borrower has ended.
+    /// An idle unresolved Original can still own evidence and require later
+    /// close; this observation does not complete or remove that responsibility.
+    pub(crate) fn poll_actual_quiescent(&self, cx: &mut Context<'_>) -> Result<bool, Failure> {
+        self.poll_progress(cx)?;
+        let entries = self
+            .port
+            .inventory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            if !entry.actual_quiescent()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     pub(crate) fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Failure>> {
         if !self.close_requested {
@@ -294,6 +351,37 @@ impl StateStoreOriginalProgress {
             .upgrade()
             .ok_or_else(|| protocol("original StateStore Host custody is unavailable"))?;
         poll_originals(&port, cx)
+    }
+}
+/// Explicit per-transaction read timing for Host/Controller reads, unlike an
+/// absolute statement request. The strong owner remains in its original slot.
+pub(crate) struct StateStoreOriginalReadExecution {
+    progress: StateStoreOriginalProgress,
+    transaction_deadline: std::time::Duration,
+}
+impl StateStoreReadExecution for StateStoreOriginalReadExecution {
+    fn read_transaction_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+        let port = self
+            .progress
+            .port
+            .upgrade()
+            .ok_or_else(|| protocol("original StateStore read custody is unavailable"))?;
+        let deadline = Instant::now()
+            .checked_add(self.transaction_deadline)
+            .ok_or_else(|| protocol("StateStore read transaction deadline is not representable"))?;
+        if let Some(cause) = port.business_stop(deadline) {
+            return Err(cause);
+        }
+        if !port
+            .inventory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .accepting
+        {
+            return Err(protocol("original StateStore read custody is closing"));
+        }
+        let port: Arc<dyn StateStoreExecutionPort> = port;
+        Ok(StateStoreExecutionContext::new(&port, deadline))
     }
 }
 /// Cooperative batches bound one turn's observation cost, never admission
@@ -378,6 +466,20 @@ impl Port {
                 actual == self.vocabulary.open_type()
                     && origin == StateStoreBlockingOrigin::Opening(self.vocabulary.provider())
                     && phase.is_none_or(|p| matches!(p, Phase::Open | Phase::Close))
+            }
+            Purpose::BootstrapRead { instance } => {
+                actual == self.vocabulary.transaction_type()
+                    && origin == StateStoreBlockingOrigin::Instance(*instance)
+                    && phase.is_none_or(|p| {
+                        matches!(
+                            p,
+                            Phase::BeginRead
+                                | Phase::Get
+                                | Phase::Range
+                                | Phase::Rollback
+                                | Phase::Close
+                        )
+                    })
             }
             Purpose::ClosingInstance { instance } => {
                 actual == self.vocabulary.open_type()
@@ -548,6 +650,38 @@ impl Drop for Loan<'_> {
     }
 }
 impl Cell {
+    fn actual_quiescent(&self) -> Result<bool, Failure> {
+        let Some(body) = self.body.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return Ok(false);
+        };
+        let mut loan = Loan {
+            cell: self,
+            body: Some(body),
+        };
+        let body = loan.body.as_ref().unwrap();
+        if let Some(cause) = body.reportable_health() {
+            return Err(cause);
+        }
+        if let Some(phase) = &body.phase {
+            match &phase.exit {
+                None => return Ok(false),
+                Some(Err(cause)) => return Err(cause.clone()),
+                Some(Ok(_)) => {}
+            }
+        }
+        // The Source can have queued the next revision while the old phase
+        // already has its footer. Never confuse that old exit with this cut.
+        // Loan keeps the same receiving stable, but holds no mutex here.
+        match catch_unwind(AssertUnwindSafe(|| self.original.requested())) {
+            Ok(request) => Ok(request.is_none()),
+            Err(payload) => {
+                let cause = failure(QueryBlockingFailure::panicked(payload));
+                let body = loan.body.as_mut().unwrap();
+                let first = body.health.get_or_insert(cause).clone();
+                Err(first)
+            }
+        }
+    }
     fn poll_original(&self, cx: &mut Context<'_>, port: &Port) -> Result<bool, Failure> {
         let Some(body) = self.body.lock().unwrap_or_else(|p| p.into_inner()).take() else {
             return Ok(false);
@@ -600,6 +734,7 @@ impl Cell {
                     let deadline = self.deadline;
                     let root = match &port.purpose {
                         Purpose::Opening
+                        | Purpose::BootstrapRead { .. }
                         | Purpose::ClosingInstance { .. }
                         | Purpose::InstanceEvidence { .. } => None,
                         Purpose::Instance { root, .. } => Some(root.clone()),

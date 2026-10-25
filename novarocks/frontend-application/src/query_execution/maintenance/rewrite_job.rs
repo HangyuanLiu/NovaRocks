@@ -641,8 +641,13 @@ impl GovernedBackgroundAction for RewriteAction {
     ) -> Poll<Result<(), QueryServiceError>> {
         self.state.as_mut().unwrap().poll_product(owner, cx)
     }
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
-        self.state.as_ref().and_then(|s| s.disposition)
+    fn external_effect_disposition(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        self.state
+            .as_ref()
+            .and_then(|s| s.disposition)
+            .map(crate::query::external_effect_from_lake)
     }
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         self.state

@@ -531,8 +531,14 @@ impl MetadataIoAdmission {
     /// authority for this metadata Source's preparation or I/O.
     pub(crate) fn for_original_source(
         owner: &WorkOwner,
-        initial_dependencies: Vec<SharedDependency>,
+        mut initial_dependencies: Vec<SharedDependency>,
     ) -> Result<Arc<Self>, WorkError> {
+        // This Source actually performs local preparation and retains its
+        // original metadata on this host, including for a pure Provider whose
+        // external dependency set is empty. This does not invent Provider I/O.
+        if !initial_dependencies.contains(&SharedDependency::LocalHost) {
+            initial_dependencies.push(SharedDependency::LocalHost);
+        }
         let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(owner)?;
         let configured_bytes = NonZeroU64::new(capacity.window_alias().payload_capacity_bytes())
             .ok_or(WorkError::NotReady)?;
@@ -1949,11 +1955,15 @@ mod original_governor_tests {
         {
             let body = source.original.lock().unwrap();
             let body = body.as_ref().unwrap();
-            assert_eq!(body.initial_dependencies, vec![selected.clone()]);
+            // Provider facts remain exact; this Source also performs its own
+            // local preparation before any Provider operation can begin.
+            assert_eq!(
+                body.initial_dependencies,
+                vec![selected.clone(), SharedDependency::LocalHost]
+            );
             assert!(body.full.as_ref().unwrap().contains(&selected));
             assert!(
-                !body
-                    .full
+                body.full
                     .as_ref()
                     .unwrap()
                     .contains(&SharedDependency::LocalHost)

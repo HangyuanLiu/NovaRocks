@@ -85,15 +85,13 @@ impl FrontendQuerySession {
         }
         let receipt = match waiter.as_mut().expect("published original observer").await {
             Ok(receipt) => receipt,
-            Err(StatementActionWaitError::Stopped { publication }) => {
+            Err(StatementActionWaitError::Stopped { external_effect }) => {
                 let error = match cancellation.reason() {
                     Some(reason) => cancellation_error(reason),
                     None => internal_error("statement stopped before delivery"),
                 };
-                return Err(match publication {
-                    Some(disposition) => {
-                        error.attach_maintenance_publication_disposition(disposition)
-                    }
+                return Err(match external_effect {
+                    Some(disposition) => error.attach_external_effect_disposition(disposition),
                     None => error,
                 });
             }
@@ -101,10 +99,8 @@ impl FrontendQuerySession {
                 let error = internal_error(
                     "statement action failed; original cause retained by supervisor",
                 );
-                return Err(match failure.publication_disposition() {
-                    Some(disposition) => {
-                        error.attach_maintenance_publication_disposition(disposition)
-                    }
+                return Err(match failure.external_effect_disposition() {
+                    Some(disposition) => error.attach_external_effect_disposition(disposition),
                     None => error,
                 });
             }

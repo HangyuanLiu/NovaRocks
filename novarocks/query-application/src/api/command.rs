@@ -137,6 +137,22 @@ pub enum CommandErrorKind {
     EffectUnknown,
 }
 
+/// Knowledge of an original statement's external effect. This is independent
+/// of provider identity, domain receipts, failure cause, and actual exit.
+/// None at the observation boundary means no effect fact has been supplied;
+/// it must not be interpreted as evidence of non-commit or safe retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatementExternalEffectDisposition {
+    KnownUncommitted,
+    CommitUnknown,
+    KnownCommitted,
+}
+impl StatementExternalEffectDisposition {
+    pub const fn do_not_retry(self) -> bool {
+        matches!(self, Self::CommitUnknown | Self::KnownCommitted)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandError {
     failure_cause: Option<novarocks_failure_contract::SharedFailureCause>,
@@ -144,7 +160,7 @@ pub struct CommandError {
     message: Arc<str>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     execution_failure: Option<crate::execution_error::ExecutionFailureInput>,
-    publication_disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+    external_effect_disposition: Option<StatementExternalEffectDisposition>,
 }
 
 impl CommandError {
@@ -154,25 +170,23 @@ impl CommandError {
             message: message.into(),
             compile_control: None,
             execution_failure: None,
-            publication_disposition: None,
+            external_effect_disposition: None,
             failure_cause: None,
         }
     }
 
-    /// An existing maintenance publication owner's verdict, independent of
-    /// the selected execution cause; it creates no publication identity.
-    pub fn with_publication_disposition(
+    /// The original action's external effect, independent of the selected
+    /// failure cause. This creates no domain identity or receipt.
+    pub fn with_external_effect_disposition(
         mut self,
-        disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+        disposition: Option<StatementExternalEffectDisposition>,
     ) -> Self {
-        self.publication_disposition = disposition;
+        self.external_effect_disposition = disposition;
         self
     }
 
-    pub fn publication_disposition(
-        &self,
-    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
-        self.publication_disposition
+    pub fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+        self.external_effect_disposition
     }
 
     pub fn from_failure_cause(cause: novarocks_failure_contract::SharedFailureCause) -> Self {
@@ -252,6 +266,18 @@ impl Error for CommandError {
 }
 
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
+    fn prepare_statement_action(
+        &self,
+        _command: CatalogSqlCommand,
+        _request_context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide a governed statement action",
+        ))
+    }
+
     fn execute(
         &self,
         command: CatalogSqlCommand,

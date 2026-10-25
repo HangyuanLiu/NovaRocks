@@ -184,6 +184,17 @@ impl ProductCommandRouter {
             .prepare_statement_action(command, request_context, command_context)
     }
 
+    pub fn prepare_catalog_statement_action(
+        &self,
+        command: CatalogSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        self.catalog
+            .prepare_statement_action(command, request_context, command_context)
+    }
+
     pub fn prepare_maintenance_statement_action(
         &self,
         command: MaintenanceSqlCommand,

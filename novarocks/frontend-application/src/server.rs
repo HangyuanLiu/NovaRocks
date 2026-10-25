@@ -763,6 +763,7 @@ fn build_frontend_query_session_factory_from_role_products(
         maintenance_command_executor,
         maintenance_read_command_executor,
         host.query_blocking_executor(),
+        host.state_store_original_binding(),
     );
     let dml_engines = core_capabilities::dml_engines(
         core_capabilities::DmlEnginePorts::new(
@@ -1575,6 +1576,10 @@ mod tests {
 
     fn settle_governed_completion(statement: QuerySessionStatement) {
         let (result, terminal) = statement.into_parts();
+        if let StatementResult::GovernedError(result) = result {
+            let (error, _protocol) = result.into_parts();
+            panic!("statement returned an error before terminal OK: {error:?}");
+        }
         let StatementResult::GovernedCompletion(result) = result else {
             panic!("successful statement must retain its owner through terminal OK");
         };

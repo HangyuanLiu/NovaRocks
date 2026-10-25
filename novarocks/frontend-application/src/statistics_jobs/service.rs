@@ -818,10 +818,10 @@ struct StatisticsSubmitResidual {
 impl novarocks_query_application::session_control::GovernedStatementAction
     for StatisticsSubmitAction
 {
-    fn publication_disposition(
+    fn external_effect_disposition(
         &self,
-    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
-        submission_publication(self.result.as_ref())
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        submission_publication(self.result.as_ref()).map(crate::query::external_effect_from_lake)
     }
     fn poll_action(
         &mut self,

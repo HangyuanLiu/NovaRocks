@@ -42,6 +42,23 @@ pub trait StateStoreRunMetrics: Send + Sync {
     fn record_unresolved(&self);
 }
 
+/// Stable receiving of the SAME observation issued by the open instance.
+/// This is observation custody only, not transaction or resource admission.
+/// Implementations must publish their receiving fields before returning or
+/// notifying, and drop any retired observation outside their metadata lock.
+pub trait StateStoreRunReceiving: Send + Sync {
+    fn receive_attempt(
+        &self,
+        observation: &CommitObservation,
+    ) -> Result<(), StateStoreExecutionFailure>;
+    /// Retire only the SAME slot's actual terminal NotCommitted observation.
+    /// This grants no right to publish or settle an attempt.
+    fn retire_not_committed(
+        &self,
+        observation: &CommitObservation,
+    ) -> Result<(), StateStoreExecutionFailure>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunSuccess<T> {
     pub value: T,
@@ -114,10 +131,67 @@ where
         &'a mut dyn OriginalWriteTransaction,
     ) -> BoxFuture<'a, Result<T, StateStoreExecutionFailure>>,
 {
+    run_original(
+        store,
+        metrics,
+        policy,
+        purpose,
+        execution,
+        None,
+        move |transaction| operation(transaction),
+    )
+    .await
+}
+
+/// Install every issued observation in the caller's original stable receiver
+/// before the first provider begin call, body invocation or await.
+pub async fn run_side_effect_free_in_receiving<T, F>(
+    store: &dyn StateStore,
+    metrics: &dyn StateStoreRunMetrics,
+    policy: StateStoreRunPolicy,
+    purpose: &str,
+    execution: &StateStoreExecutionContext,
+    receiving: &dyn StateStoreRunReceiving,
+    mut operation: F,
+) -> Result<RunSuccess<T>, RunFailure<StateStoreExecutionFailure>>
+where
+    F: for<'a> FnMut(
+        &'a mut dyn OriginalWriteTransaction,
+    ) -> BoxFuture<'a, Result<T, StateStoreExecutionFailure>>,
+{
+    run_original(
+        store,
+        metrics,
+        policy,
+        purpose,
+        execution,
+        Some(receiving),
+        move |transaction| operation(transaction),
+    )
+    .await
+}
+
+async fn run_original<T, F>(
+    store: &dyn StateStore,
+    metrics: &dyn StateStoreRunMetrics,
+    policy: StateStoreRunPolicy,
+    purpose: &str,
+    execution: &StateStoreExecutionContext,
+    receiving: Option<&dyn StateStoreRunReceiving>,
+    mut operation: F,
+) -> Result<RunSuccess<T>, RunFailure<StateStoreExecutionFailure>>
+where
+    F: for<'a> FnMut(
+        &'a mut dyn OriginalWriteTransaction,
+    ) -> BoxFuture<'a, Result<T, StateStoreExecutionFailure>>,
+{
     let deadline =
         (Instant::now() + policy.operation_timeout()).min(Instant::from_std(execution.deadline()));
     let execution = execution.with_deadline(deadline.into_std());
-    let mode = OriginalMode(&execution);
+    let mode = OriginalMode {
+        execution: &execution,
+        receiving,
+    };
     run::<OriginalMode<'_>, T, _>(
         &mode,
         store,
@@ -137,6 +211,12 @@ trait RunMode: Sync {
     type Error: Send;
     fn from_store(error: StateStoreError) -> Self::Error;
     fn kind(error: &Self::Error) -> Option<StateStoreErrorKind>;
+    fn receive_attempt(&self, _: &CommitObservation) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn retire_not_committed(&self, _: &CommitObservation) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn begin<'a>(
         &'a self,
         store: &'a dyn StateStore,
@@ -173,7 +253,10 @@ impl RunMode for LegacyMode {
         Box::pin(async move { Ok(transaction.commit().await) })
     }
 }
-struct OriginalMode<'a>(&'a StateStoreExecutionContext);
+struct OriginalMode<'a> {
+    execution: &'a StateStoreExecutionContext,
+    receiving: Option<&'a dyn StateStoreRunReceiving>,
+}
 impl RunMode for OriginalMode<'_> {
     type Transaction = dyn OriginalWriteTransaction;
     type Error = StateStoreExecutionFailure;
@@ -185,13 +268,25 @@ impl RunMode for OriginalMode<'_> {
             .downcast_ref::<StateStoreError>()
             .map(StateStoreError::kind)
     }
+    fn receive_attempt(&self, observation: &CommitObservation) -> Result<(), Self::Error> {
+        match self.receiving {
+            Some(receiving) => receiving.receive_attempt(observation),
+            None => Ok(()),
+        }
+    }
+    fn retire_not_committed(&self, observation: &CommitObservation) -> Result<(), Self::Error> {
+        match self.receiving {
+            Some(receiving) => receiving.retire_not_committed(observation),
+            None => Ok(()),
+        }
+    }
     fn begin<'a>(
         &'a self,
         store: &'a dyn StateStore,
         attempt: WriteAttempt,
         purpose: &'a str,
     ) -> BoxFuture<'a, Result<Box<Self::Transaction>, Self::Error>> {
-        Box::pin(store.begin_original_write_in(attempt, purpose, self.0))
+        Box::pin(store.begin_original_write_in(attempt, purpose, self.execution))
     }
     fn commit<'a>(
         &'a self,
@@ -228,6 +323,8 @@ where
             Err(error) => return Err(RunFailure::Begin(error)),
         };
 
+        mode.receive_attempt(&observation)
+            .map_err(RunFailure::Begin)?;
         attempts_spent += 1;
 
         let mut transaction =
@@ -268,6 +365,8 @@ where
             CommitOutcome::Committed(receipt) => return Ok(RunSuccess { value, receipt }),
             CommitOutcome::Conflict(error) | CommitOutcome::TransientBeforeCommit(error) => error,
             CommitOutcome::DefiniteFailure(error) => {
+                mode.retire_not_committed(&observation)
+                    .map_err(RunFailure::Operation)?;
                 return Err(RunFailure::DefiniteFailure(M::from_store(error)));
             }
             CommitOutcome::CommitUnknown(error) => {
@@ -278,6 +377,11 @@ where
                 });
             }
         };
+        // Release the receiver's strong alias before metrics, backoff and the
+        // next reservation. Its source must already have published the SAME
+        // slot's terminal NotCommitted proof; an outcome label alone is not it.
+        mode.retire_not_committed(&observation)
+            .map_err(RunFailure::Operation)?;
         let retry_error = M::from_store(retry_error);
 
         if attempts_spent >= policy.max_attempts() {
@@ -419,6 +523,61 @@ mod original_tests {
         assert_eq!(metrics.retries.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.unresolved.load(Ordering::Relaxed), 0);
     }
+    #[derive(Default)]
+    struct TestReceiving(Mutex<Option<CommitObservation>>);
+    impl StateStoreRunReceiving for TestReceiving {
+        fn receive_attempt(
+            &self,
+            observation: &CommitObservation,
+        ) -> Result<(), StateStoreExecutionFailure> {
+            *self.0.lock().unwrap() = Some(observation.clone());
+            Ok(())
+        }
+        fn retire_not_committed(
+            &self,
+            _: &CommitObservation,
+        ) -> Result<(), StateStoreExecutionFailure> {
+            panic!("unsupported provider never produces a commit outcome");
+        }
+    }
+    #[tokio::test]
+    async fn original_runner_receives_issued_observation_before_provider_capability_refusal() {
+        let store = InMemoryStateStore::new("original-receiving-before-begin");
+        let metrics = super::tests::TestMetrics::default();
+        let port: Arc<dyn StateStoreExecutionPort> = Arc::new(NoPhysicalPort);
+        let execution = StateStoreExecutionContext::new(
+            &port,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let receiving = TestReceiving::default();
+        let result = run_side_effect_free_in_receiving(
+            &store,
+            &metrics,
+            StateStoreRunPolicy::default(),
+            "receiving before unsupported begin",
+            &execution,
+            &receiving,
+            |_| {
+                Box::pin(async {
+                    panic!("unsupported begin must not enter body");
+                    #[allow(unreachable_code)]
+                    Ok::<(), StateStoreExecutionFailure>(())
+                })
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(RunFailure::Begin(_))));
+        let actual = receiving.0.lock().unwrap().take().unwrap();
+        assert_eq!(actual.id().scope(), store.attempts().scope());
+        assert_eq!(
+            actual.publication_state().unwrap(),
+            novarocks_state_store_api::CommitObservationState::NotDispatched
+        );
+        assert_eq!(store.attempts().outstanding(), 1);
+        drop(actual);
+        assert_eq!(store.attempts().outstanding(), 0);
+    }
+
     #[derive(Debug)]
     struct RawPhysicalFailure;
     impl std::fmt::Display for RawPhysicalFailure {

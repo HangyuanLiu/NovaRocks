@@ -2312,7 +2312,7 @@ mod tests {
     }
     #[test]
     fn original_statement_poll_panic_retains_same_cause_and_owner_without_repoll() {
-        use novarocks_spi::connector::LakePublicationDisposition;
+        use crate::api::StatementExternalEffectDisposition;
         use std::future::Future;
         type Observer =
             Arc<std::sync::Mutex<Option<crate::session_control::StatementActionWaiter>>>;
@@ -2328,7 +2328,7 @@ mod tests {
             observer: Observer,
         }
         impl crate::session_control::GovernedStatementAction for PanicAction {
-            fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+            fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
                 let mut observer = self.observer.lock().unwrap();
                 let observer = observer.as_mut().expect("same UI observer");
                 let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -2336,7 +2336,7 @@ mod tests {
                     std::pin::Pin::new(observer).poll(&mut cx).is_pending(),
                     "the first failure is not exposed before the original fact snapshot"
                 );
-                Some(LakePublicationDisposition::KnownCommitted)
+                Some(StatementExternalEffectDisposition::KnownCommitted)
             }
 
             fn poll_action(
@@ -2392,8 +2392,8 @@ mod tests {
         let failure = slot.failure().expect("same original cause");
         assert!(failure.panic_payload().unwrap().is::<Cause>());
         assert_eq!(
-            failure.publication_disposition(),
-            Some(LakePublicationDisposition::KnownCommitted)
+            failure.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
         );
         let mut waiter = observer.lock().unwrap().take().unwrap();
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -2403,8 +2403,8 @@ mod tests {
             )) => {
                 assert!(Arc::ptr_eq(&failure, &packet));
                 assert_eq!(
-                    packet.publication_disposition(),
-                    Some(LakePublicationDisposition::KnownCommitted)
+                    packet.external_effect_disposition(),
+                    Some(StatementExternalEffectDisposition::KnownCommitted)
                 );
             }
             _ => panic!("the original observer receives the complete stable failure"),
@@ -2624,7 +2624,7 @@ mod tests {
 
     #[test]
     fn original_statement_action_drop_panic_preserves_publication_and_raw_cause() {
-        use novarocks_spi::connector::LakePublicationDisposition;
+        use crate::api::StatementExternalEffectDisposition;
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Cause(Arc<AtomicUsize>);
         impl Drop for Cause {
@@ -2633,12 +2633,12 @@ mod tests {
             }
         }
         struct DropPanicAction {
-            disposition: LakePublicationDisposition,
+            disposition: StatementExternalEffectDisposition,
             polls: Arc<AtomicUsize>,
             cause: Option<Cause>,
         }
         impl crate::session_control::GovernedStatementAction for DropPanicAction {
-            fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+            fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
                 Some(self.disposition)
             }
             fn poll_action(
@@ -2663,9 +2663,9 @@ mod tests {
             }
         }
         for disposition in [
-            LakePublicationDisposition::KnownCommitted,
-            LakePublicationDisposition::CommitUnknown,
-            LakePublicationDisposition::KnownUncommitted,
+            StatementExternalEffectDisposition::KnownCommitted,
+            StatementExternalEffectDisposition::CommitUnknown,
+            StatementExternalEffectDisposition::KnownUncommitted,
         ] {
             let (control, service, workload) = governed_control();
             let session = register(&control, 7, 1, "root");
@@ -2703,7 +2703,7 @@ mod tests {
             drive_original_statement_actions(&slot);
             let failure = slot.failure().expect("same original destructor cause");
             assert!(failure.panic_payload().unwrap().is::<Cause>());
-            assert_eq!(failure.publication_disposition(), Some(disposition));
+            assert_eq!(failure.external_effect_disposition(), Some(disposition));
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             assert_eq!(workload.snapshot().root_responsibilities, 1);
             drop(observer.take());
@@ -2720,11 +2720,11 @@ mod tests {
 
     #[test]
     fn original_statement_stopped_observer_keeps_publication_after_actual_settlement() {
-        use novarocks_spi::connector::LakePublicationDisposition;
+        use crate::api::StatementExternalEffectDisposition;
         use std::future::Future;
-        struct PublishedAction(LakePublicationDisposition);
+        struct PublishedAction(StatementExternalEffectDisposition);
         impl crate::session_control::GovernedStatementAction for PublishedAction {
-            fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+            fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
                 Some(self.0)
             }
             fn poll_action(
@@ -2741,9 +2741,9 @@ mod tests {
             }
         }
         for disposition in [
-            LakePublicationDisposition::KnownCommitted,
-            LakePublicationDisposition::CommitUnknown,
-            LakePublicationDisposition::KnownUncommitted,
+            StatementExternalEffectDisposition::KnownCommitted,
+            StatementExternalEffectDisposition::CommitUnknown,
+            StatementExternalEffectDisposition::KnownUncommitted,
         ] {
             let (control, service, workload) = governed_control();
             let session = register(&control, 7, 1, "root");
@@ -2780,8 +2780,8 @@ mod tests {
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             match std::pin::Pin::new(&mut observer).poll(&mut cx) {
                 std::task::Poll::Ready(Err(
-                    crate::session_control::StatementActionWaitError::Stopped { publication },
-                )) => assert_eq!(publication, Some(disposition)),
+                    crate::session_control::StatementActionWaitError::Stopped { external_effect },
+                )) => assert_eq!(external_effect, Some(disposition)),
                 _ => panic!("actual source settlement keeps its original publication fact"),
             }
         }

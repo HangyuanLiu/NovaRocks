@@ -167,7 +167,9 @@ impl MetadataMaintenanceAction {
             Err(message) => {
                 return Poll::Ready(Err(match disposition {
                     Some(disposition) => internal_error(message)
-                        .attach_maintenance_publication_disposition(disposition),
+                        .attach_external_effect_disposition(
+                            crate::query::external_effect_from_lake(disposition),
+                        ),
                     None => internal_error(message),
                 }));
             }
@@ -225,10 +227,12 @@ impl GovernedStatementAction for MetadataMaintenanceAction {
         self.call.local_health_failure()
     }
 
-    fn publication_disposition(
+    fn external_effect_disposition(
         &self,
-    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
-        self.call.publication_disposition()
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        self.call
+            .publication_disposition()
+            .map(crate::query::external_effect_from_lake)
     }
 
     fn poll_action(
@@ -239,9 +243,9 @@ impl GovernedStatementAction for MetadataMaintenanceAction {
         match self.poll_result(owner, cx) {
             Poll::Ready(Err(error)) => {
                 Poll::Ready(Err(match self.call.publication_disposition() {
-                    Some(disposition) => {
-                        error.attach_maintenance_publication_disposition(disposition)
-                    }
+                    Some(disposition) => error.attach_external_effect_disposition(
+                        crate::query::external_effect_from_lake(disposition),
+                    ),
                     None => error,
                 }))
             }
@@ -274,7 +278,9 @@ fn select_maintenance_completion(
             Some(reason) if !(committed && applied) => {
                 let mut error = cancellation_error(reason);
                 if let Some(disposition) = disposition {
-                    error = error.attach_maintenance_publication_disposition(disposition);
+                    error = error.attach_external_effect_disposition(
+                        crate::query::external_effect_from_lake(disposition),
+                    );
                 }
                 drop(result);
                 Err(error)
@@ -324,8 +330,8 @@ mod tests {
                     .contains("required cache invalidation failed")
             );
             assert_eq!(
-                error.maintenance_publication_disposition(),
-                Some(LakePublicationDisposition::KnownCommitted)
+                error.external_effect_disposition(),
+                Some(novarocks_query_application::api::StatementExternalEffectDisposition::KnownCommitted)
             );
         }
     }
@@ -358,6 +364,6 @@ mod tests {
             error.kind(),
             cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }).kind()
         );
-        assert_eq!(error.maintenance_publication_disposition(), None);
+        assert_eq!(error.external_effect_disposition(), None);
     }
 }

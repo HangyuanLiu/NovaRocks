@@ -30,9 +30,9 @@ use novarocks_state_store_api::{
     StateStoreProviderDescriptor, StateStoreProviderId, StateStoreProviderInstance,
     StateStoreProviderLifecycle,
 };
-use novarocks_state_store_testkit::testing::{
-    InMemoryStateStore, InMemoryStateStoreProviderFactory,
-};
+use novarocks_state_store_testkit::testing::InMemoryStateStore;
+mod pure_original;
+use pure_original::PureOriginalMemoryStore;
 
 use novarocks_state_store_runtime::{
     StateStoreHost as FrontendStateStoreHost, StateStoreHostError, StateStoreHostInput,
@@ -54,9 +54,10 @@ pub fn registry() -> StateStoreProviderRegistry {
         .register(StateStoreProviderRegistration::new(
             TEST_STATE_STORE_DESCRIPTOR,
             |_| {
-                Ok(Box::new(InMemoryStateStoreProviderFactory::new(
-                    TEST_STATE_STORE_DESCRIPTOR,
-                )))
+                Ok(Box::new(FrontendMemoryFactory {
+                    descriptor: TEST_STATE_STORE_DESCRIPTOR,
+                    persistent: false,
+                }))
             },
         ))
         .expect("register Frontend unit-test StateStore provider");
@@ -91,12 +92,15 @@ fn persistent_stores() -> PersistentStores {
     Arc::clone(STORES.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))))
 }
 
-struct PersistentInMemoryFactory;
+struct FrontendMemoryFactory {
+    descriptor: StateStoreProviderDescriptor,
+    persistent: bool,
+}
 
 #[async_trait::async_trait]
-impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemoryFactory {
+impl novarocks_state_store_api::StateStoreProviderFactory for FrontendMemoryFactory {
     fn descriptor(&self) -> &StateStoreProviderDescriptor {
-        &PERSISTENT_TEST_STATE_STORE_DESCRIPTOR
+        &self.descriptor
     }
 
     fn blocking_dependency_facts(
@@ -110,7 +114,7 @@ impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemory
     ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
         Some(
             novarocks_state_store_testkit::testing::pure_memory_original_vocabulary(
-                PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
+                self.descriptor.id,
             ),
         )
     }
@@ -123,12 +127,13 @@ impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemory
         if target.is_some() {
             return Err(StateStoreError::new(
                 novarocks_state_store_api::StateStoreErrorKind::InvalidRequest,
-                "persistent memory opening receiver is occupied",
+                "frontend pure memory opening receiver is occupied",
             )
             .into_original_failure());
         }
         novarocks_state_store_testkit::testing::prepare_pure_memory_open_in(
-            self.open_instance(request),
+            self.open_instance(request)
+                .map_err(StateStoreError::into_original_failure)?,
             target,
         )
     }
@@ -136,42 +141,61 @@ impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemory
         self: Box<Self>,
         request: StateStoreOpenRequest,
     ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
-        Ok(self.open_instance(request))
+        self.open_instance(request)
     }
 }
-impl PersistentInMemoryFactory {
-    fn open_instance(&self, request: StateStoreOpenRequest) -> Box<dyn StateStoreProviderInstance> {
-        let stores = persistent_stores();
-        let mut stores = stores
-            .lock()
-            .expect("persistent Frontend test StateStore map");
-        let state_store = stores
-            .entry(request.cluster_id.clone())
-            .or_insert_with(|| {
-                Arc::new(InMemoryStateStore::with_limits(
-                    request.cluster_id,
-                    request.limits,
-                ))
-            })
-            .clone();
-        Box::new(PersistentInMemoryInstance {
+impl FrontendMemoryFactory {
+    fn open_instance(
+        &self,
+        request: StateStoreOpenRequest,
+    ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+        if Instant::now() >= request.deadline {
+            return Err(StateStoreError::new(
+                novarocks_state_store_api::StateStoreErrorKind::DeadlineExceeded,
+                "frontend pure memory opening deadline exceeded",
+            ));
+        }
+        let state_store = if self.persistent {
+            let stores = persistent_stores();
+            let mut stores = stores
+                .lock()
+                .expect("persistent Frontend test StateStore map");
+            stores
+                .entry(request.cluster_id.clone())
+                .or_insert_with(|| {
+                    Arc::new(InMemoryStateStore::with_limits(
+                        request.cluster_id,
+                        request.limits,
+                    ))
+                })
+                .clone()
+        } else {
+            Arc::new(InMemoryStateStore::with_limits(
+                request.cluster_id,
+                request.limits,
+            ))
+        };
+        let state_store = Arc::new(PureOriginalMemoryStore::new(state_store));
+        Ok(Box::new(FrontendMemoryInstance {
+            descriptor: self.descriptor,
+            scope: state_store.attempts().scope(),
             state_store,
-            scope: novarocks_state_store_api::InstanceScope::new(),
             closed: false,
-        })
+        }))
     }
 }
 
-struct PersistentInMemoryInstance {
+struct FrontendMemoryInstance {
+    descriptor: StateStoreProviderDescriptor,
     scope: novarocks_state_store_api::InstanceScope,
     closed: bool,
-    state_store: Arc<InMemoryStateStore>,
+    state_store: Arc<PureOriginalMemoryStore>,
 }
 
 #[async_trait::async_trait]
-impl StateStoreProviderInstance for PersistentInMemoryInstance {
+impl StateStoreProviderInstance for FrontendMemoryInstance {
     fn descriptor(&self) -> &StateStoreProviderDescriptor {
-        &PERSISTENT_TEST_STATE_STORE_DESCRIPTOR
+        &self.descriptor
     }
 
     fn blocking_dependency_facts(
@@ -185,7 +209,7 @@ impl StateStoreProviderInstance for PersistentInMemoryInstance {
     ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
         Some(
             novarocks_state_store_testkit::testing::pure_memory_original_vocabulary(
-                PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
+                self.descriptor.id,
             ),
         )
     }
@@ -224,7 +248,12 @@ pub(crate) fn persistent_registry() -> StateStoreProviderRegistry {
     registry
         .register(StateStoreProviderRegistration::new(
             PERSISTENT_TEST_STATE_STORE_DESCRIPTOR,
-            |_| Ok(Box::new(PersistentInMemoryFactory)),
+            |_| {
+                Ok(Box::new(FrontendMemoryFactory {
+                    descriptor: PERSISTENT_TEST_STATE_STORE_DESCRIPTOR,
+                    persistent: true,
+                }))
+            },
         ))
         .expect("register persistent Frontend unit-test StateStore provider");
     registry

@@ -35,7 +35,7 @@ mod provider;
 mod range;
 
 pub use attempt::{
-    AttemptId, AttemptOutcome, AttemptSupervisor, CommitObservation,
+    AttemptId, AttemptOutcome, AttemptSupervisor, CommitObservation, CommitObservationState,
     DEFAULT_MAX_OUTSTANDING_ATTEMPTS, InDoubtAdjudicator, InstanceScope, WriteAttempt,
 };
 pub use contract::{
@@ -49,6 +49,7 @@ pub use execution::{
     StateStoreBlockingRequest, StateStoreBlockingSlot, StateStoreBlockingSourceVocabulary,
     StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreExecutionPort,
     StateStoreOriginalClose, StateStoreOriginalOpen, StateStoreOriginalUnsupported,
+    StateStoreReadExecution,
 };
 pub use limits::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,

@@ -1282,40 +1282,45 @@ impl GovernedStatementAction for CtasAction {
             .as_ref()
             .and_then(|source| source.local_health())
     }
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
-        let source = self.source.as_ref()?;
-        if source.publish.started
-            && source.disposition == Some(LakePublicationDisposition::CommitUnknown)
-        {
-            if source.adjudication.started {
+    fn external_effect_disposition(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        (|| {
+            let source = self.source.as_ref()?;
+            if source.publish.started
+                && source.disposition == Some(LakePublicationDisposition::CommitUnknown)
+            {
+                if source.adjudication.started {
+                    if let Some(raw) = source
+                        .controls
+                        .adjudication
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_ref()
+                    {
+                        return Some(observed_governed_ctas_adjudication(
+                            source.publish_input.as_ref()?.action.as_ref(),
+                            &source.adjudication_input.as_ref()?.evidence,
+                            raw,
+                        ));
+                    }
+                }
                 if let Some(raw) = source
                     .controls
-                    .adjudication
+                    .publication
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .as_ref()
                 {
-                    return Some(observed_governed_ctas_adjudication(
+                    return Some(observed_governed_ctas_publication(
                         source.publish_input.as_ref()?.action.as_ref(),
-                        &source.adjudication_input.as_ref()?.evidence,
                         raw,
                     ));
                 }
             }
-            if let Some(raw) = source
-                .controls
-                .publication
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-            {
-                return Some(observed_governed_ctas_publication(
-                    source.publish_input.as_ref()?.action.as_ref(),
-                    raw,
-                ));
-            }
-        }
-        source.disposition
+            source.disposition
+        })()
+        .map(crate::query::external_effect_from_lake)
     }
     fn handoff_residual_in(
         &mut self,

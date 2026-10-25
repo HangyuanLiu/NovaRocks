@@ -26,9 +26,9 @@ pub enum StatementActionValue {
     Local(crate::api::OwnedLocalResult),
     Ok,
 }
+use crate::api::StatementExternalEffectDisposition;
 use crate::session_error::QueryServiceError;
 use futures::task::AtomicWaker;
-use novarocks_spi::connector::LakePublicationDisposition;
 use std::any::Any;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -53,7 +53,7 @@ pub trait GovernedStatementResidual: Send + 'static {
 pub trait GovernedStatementAction: Send + 'static {
     /// Read only facts already retained by the original action. This must not
     /// poll a future, perform I/O, dispatch an operation, or grant local exit.
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+    fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
         None
     }
 
@@ -87,16 +87,16 @@ enum StatementActionFailureCause {
 
 pub struct StatementActionFailure {
     primary: StatementActionFailureCause,
-    publication: AtomicU8,
+    external_effect: AtomicU8,
 }
 impl StatementActionFailure {
-    pub fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
-        match self.publication.load(Ordering::Acquire) {
+    pub fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+        match self.external_effect.load(Ordering::Acquire) {
             0 => None,
-            1 => Some(LakePublicationDisposition::KnownUncommitted),
-            2 => Some(LakePublicationDisposition::CommitUnknown),
-            3 => Some(LakePublicationDisposition::KnownCommitted),
-            _ => unreachable!("closed publication disposition"),
+            1 => Some(StatementExternalEffectDisposition::KnownUncommitted),
+            2 => Some(StatementExternalEffectDisposition::CommitUnknown),
+            3 => Some(StatementExternalEffectDisposition::KnownCommitted),
+            _ => unreachable!("closed external effect disposition"),
         }
     }
 
@@ -134,7 +134,7 @@ pub enum StatementActionWaitError {
     /// The original stopped source actually disposed its local action/result
     /// and settled its original protocol owner. This is not an absence test.
     Stopped {
-        publication: Option<LakePublicationDisposition>,
+        external_effect: Option<StatementExternalEffectDisposition>,
     },
 }
 pub struct StatementActionReady {
@@ -270,7 +270,7 @@ impl std::future::Future for StatementActionWaiter {
             }
             if state.settled {
                 return Poll::Ready(Err(StatementActionWaitError::Stopped {
-                    publication: state.publication,
+                    external_effect: state.external_effect,
                 }));
             }
             if !state.closed {
@@ -326,10 +326,10 @@ enum ActionBody {
     Background(Box<dyn super::background_source::GovernedBackgroundAction>),
 }
 impl ActionBody {
-    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+    fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
         match self {
-            Self::Sql(a) => a.publication_disposition(),
-            Self::Background(a) => a.publication_disposition(),
+            Self::Sql(a) => a.external_effect_disposition(),
+            Self::Background(a) => a.external_effect_disposition(),
         }
     }
     fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {
@@ -393,7 +393,7 @@ struct StatementActionState {
     // Retirement health retains the source without vetoing completed business.
     business_failed: bool,
     secondary: Option<Arc<StatementActionFailure>>,
-    publication: Option<LakePublicationDisposition>,
+    external_effect: Option<StatementExternalEffectDisposition>,
     settled: bool,
     polling: bool,
     closed: bool,
@@ -439,7 +439,7 @@ impl StatementActionSource {
                 failure: None,
                 business_failed: false,
                 secondary: None,
-                publication: None,
+                external_effect: None,
                 settled: false,
                 polling: false,
                 closed: false,
@@ -537,16 +537,17 @@ impl StatementActionSource {
     fn record_cause_in(&self, primary: StatementActionFailureCause, blocks_business: bool) {
         let packet = Arc::new(StatementActionFailure {
             primary,
-            publication: AtomicU8::new(0),
+            external_effect: AtomicU8::new(0),
         });
         // The actual packet's raw cause is already retained. Initialize its
         // one quoted platform backing before sharing the packet with observers.
         drop(packet.panic_payload());
         let overflow = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            packet
-                .publication
-                .store(publication_code(state.publication), Ordering::Release);
+            packet.external_effect.store(
+                external_effect_code(state.external_effect),
+                Ordering::Release,
+            );
             state.business_failed |= blocks_business;
             if state.failure.is_none() {
                 state.failure = Some(packet);
@@ -580,10 +581,10 @@ impl StatementActionSource {
             }
         }
     }
-    fn retain_publication(&self, action: &ActionBody) -> bool {
+    fn retain_external_effect(&self, action: &ActionBody) -> bool {
         // Foreign code runs outside the metadata lock, while the original
         // action/owner loan and its first raw failure remain retained.
-        let fact = match catch_unwind(AssertUnwindSafe(|| action.publication_disposition())) {
+        let fact = match catch_unwind(AssertUnwindSafe(|| action.external_effect_disposition())) {
             Ok(fact) => fact,
             Err(primary) => {
                 self.record_failure(primary);
@@ -592,11 +593,11 @@ impl StatementActionSource {
         };
         if let Some(fact) = fact {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state.publication = Some(fact);
+            state.external_effect = Some(fact);
             for packet in [&state.failure, &state.secondary].into_iter().flatten() {
                 packet
-                    .publication
-                    .store(publication_code(Some(fact)), Ordering::Release);
+                    .external_effect
+                    .store(external_effect_code(Some(fact)), Ordering::Release);
             }
         }
         true
@@ -659,7 +660,9 @@ impl StatementActionSource {
                 let healthy =
                     self.retain_local_health(loan.action.as_ref().expect("same original action"));
                 if !healthy {
-                    self.retain_publication(loan.action.as_ref().expect("same original action"));
+                    self.retain_external_effect(
+                        loan.action.as_ref().expect("same original action"),
+                    );
                 }
                 drop(loan);
                 if !healthy {
@@ -670,7 +673,7 @@ impl StatementActionSource {
                 // The same original cause becomes stable BEFORE any action/F
                 // cleanup. The poisoned action is retained and never repolled.
                 self.record_failure(primary);
-                self.retain_publication(loan.action.as_ref().expect("same original action"));
+                self.retain_external_effect(loan.action.as_ref().expect("same original action"));
                 drop(loan);
                 self.waiter.wake();
             }
@@ -682,14 +685,17 @@ impl StatementActionSource {
                 // A close failure preserves the whole action/owner even when
                 // its safe business result is Ready. It is not a fake panic.
                 if !self.retain_local_health(loan.action.as_ref().expect("same original action")) {
-                    self.retain_publication(loan.action.as_ref().expect("same original action"));
+                    self.retain_external_effect(
+                        loan.action.as_ref().expect("same original action"),
+                    );
                     drop(loan);
                     self.waiter.wake();
                     return;
                 }
                 // The value is stable before reading the original effect fact,
                 // which must survive a subsequent action destructor panic.
-                if !self.retain_publication(loan.action.as_ref().expect("same original action")) {
+                if !self.retain_external_effect(loan.action.as_ref().expect("same original action"))
+                {
                     drop(loan);
                     self.waiter.wake();
                     return;
@@ -1127,12 +1133,12 @@ impl StatementActionSource {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).settled
     }
 }
-fn publication_code(fact: Option<LakePublicationDisposition>) -> u8 {
+fn external_effect_code(fact: Option<StatementExternalEffectDisposition>) -> u8 {
     match fact {
         None => 0,
-        Some(LakePublicationDisposition::KnownUncommitted) => 1,
-        Some(LakePublicationDisposition::CommitUnknown) => 2,
-        Some(LakePublicationDisposition::KnownCommitted) => 3,
+        Some(StatementExternalEffectDisposition::KnownUncommitted) => 1,
+        Some(StatementExternalEffectDisposition::CommitUnknown) => 2,
+        Some(StatementExternalEffectDisposition::KnownCommitted) => 3,
     }
 }
 

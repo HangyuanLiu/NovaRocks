@@ -19,6 +19,7 @@
 
 use std::{borrow::Cow, fmt};
 
+use crate::api::StatementExternalEffectDisposition;
 use novarocks_spi::connector::{LakePublicationDisposition, LakePublicationTerminal};
 use novarocks_user_error::UserError;
 
@@ -69,7 +70,7 @@ pub struct QueryServiceError {
     failure_cause: Option<novarocks_failure_contract::SharedFailureCause>,
     body: QueryServiceErrorBody,
     publication_terminal: Option<LakePublicationTerminal>,
-    maintenance_publication_disposition: Option<LakePublicationDisposition>,
+    external_effect_disposition: Option<StatementExternalEffectDisposition>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     compile_provenance: Option<novarocks_type_contract::CompileControlProvenance>,
 }
@@ -92,7 +93,7 @@ impl QueryServiceError {
                 message: message.into(),
             },
             publication_terminal: None,
-            maintenance_publication_disposition: None,
+            external_effect_disposition: None,
             compile_control: None,
             compile_provenance: None,
             failure_cause: None,
@@ -105,7 +106,7 @@ impl QueryServiceError {
         Self {
             body: QueryServiceErrorBody::User { error, message },
             publication_terminal: None,
-            maintenance_publication_disposition: None,
+            external_effect_disposition: None,
             compile_control: None,
             compile_provenance: None,
             failure_cause: None,
@@ -124,7 +125,7 @@ impl QueryServiceError {
                 message,
             },
             publication_terminal: None,
-            maintenance_publication_disposition: None,
+            external_effect_disposition: None,
             compile_control: None,
             compile_provenance: None,
             failure_cause: None,
@@ -164,7 +165,7 @@ impl QueryServiceError {
                 message: message.into(),
             },
             publication_terminal: Some(terminal),
-            maintenance_publication_disposition: None,
+            external_effect_disposition: None,
             compile_control: None,
             compile_provenance: None,
             failure_cause: None,
@@ -206,16 +207,16 @@ impl QueryServiceError {
         self
     }
 
-    /// Forward only the original maintenance owner's terminal knowledge.
-    /// A disposition alone grants no publication identity or retry authority.
+    /// Forward only the original action owner's effect knowledge.
+    /// A disposition alone grants no domain identity, receipt, or exit proof.
     /// The selected input, descriptor and phase are retained without rewriting.
-    pub fn attach_maintenance_publication_disposition(
+    pub fn attach_external_effect_disposition(
         mut self,
-        disposition: LakePublicationDisposition,
+        disposition: StatementExternalEffectDisposition,
     ) -> Self {
         // This is one original owner's frozen terminal verdict, not a new
         // observation/update channel. Reapplying it cannot duplicate rendering.
-        if self.maintenance_publication_disposition.is_some() {
+        if self.external_effect_disposition.is_some() {
             return self;
         }
         let message = match &mut self.body {
@@ -224,21 +225,24 @@ impl QueryServiceError {
             | QueryServiceErrorBody::Execution { message, .. } => message,
         };
         let label = match disposition {
-            LakePublicationDisposition::KnownUncommitted => None,
-            LakePublicationDisposition::CommitUnknown => Some("CommitUnknown"),
-            LakePublicationDisposition::KnownCommitted => Some("KnownCommitted"),
+            StatementExternalEffectDisposition::KnownUncommitted => None,
+            StatementExternalEffectDisposition::CommitUnknown => Some("CommitUnknown"),
+            StatementExternalEffectDisposition::KnownCommitted => Some("KnownCommitted"),
         };
         if let Some(label) = label {
             use std::fmt::Write;
-            write!(message, " (maintenance publication disposition={label} do_not_retry=true; do not retry statement)")
-                .expect("writing to a String cannot fail");
+            write!(
+                message,
+                " (external effect disposition={label} do_not_retry=true; do not retry statement)"
+            )
+            .expect("writing to a String cannot fail");
         }
-        self.maintenance_publication_disposition = Some(disposition);
+        self.external_effect_disposition = Some(disposition);
         self
     }
 
-    pub fn maintenance_publication_disposition(&self) -> Option<LakePublicationDisposition> {
-        self.maintenance_publication_disposition
+    pub fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+        self.external_effect_disposition
     }
 
     pub fn with_compile_control(
@@ -663,37 +667,36 @@ mod publication_message_tests {
 }
 
 #[cfg(test)]
-mod maintenance_publication_companion_tests {
+mod external_effect_companion_tests {
     use super::*;
     #[test]
-    fn maintenance_disposition_neither_reauthors_cause_nor_invents_publication_identity() {
+    fn external_effect_neither_reauthors_cause_nor_invents_publication_identity() {
         let original = QueryServiceError::from_compile_control(
             novarocks_type_contract::CompileControlError::ResourceExhausted,
         );
         let input = original.execution_failure().unwrap().clone();
         for disposition in [
-            LakePublicationDisposition::KnownUncommitted,
-            LakePublicationDisposition::CommitUnknown,
-            LakePublicationDisposition::KnownCommitted,
+            StatementExternalEffectDisposition::KnownUncommitted,
+            StatementExternalEffectDisposition::CommitUnknown,
+            StatementExternalEffectDisposition::KnownCommitted,
         ] {
             let service = original
                 .clone()
-                .attach_maintenance_publication_disposition(disposition);
+                .attach_external_effect_disposition(disposition);
             assert_eq!(service.execution_failure(), Some(&input));
             assert_eq!(service.user_error(), original.user_error());
             assert_eq!(service.kind(), original.kind());
-            assert_eq!(
-                service.maintenance_publication_disposition(),
-                Some(disposition)
-            );
+            assert_eq!(service.external_effect_disposition(), Some(disposition));
             assert_eq!(service.publication_terminal(), None);
+            assert!(!service.message().contains("maintenance publication"));
+            assert!(!service.message().contains("lake publication"));
             assert_eq!(
                 service.message().contains("do not retry statement"),
                 disposition.do_not_retry()
             );
             let repeated = service
                 .clone()
-                .attach_maintenance_publication_disposition(disposition);
+                .attach_external_effect_disposition(disposition);
             assert_eq!(repeated.message(), service.message());
             assert_eq!(repeated.execution_failure(), Some(&input));
         }

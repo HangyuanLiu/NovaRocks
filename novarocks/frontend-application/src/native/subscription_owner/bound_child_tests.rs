@@ -76,10 +76,24 @@ fn drive(driver: &mut JointProgressDriver) {
 }
 
 #[derive(Debug)]
-struct Wake(std::sync::atomic::AtomicUsize);
+struct Wake(std::sync::atomic::AtomicUsize, Notify);
+impl Wake {
+    async fn wait_for_original_notification(&self) {
+        loop {
+            let notified = self.1.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 impl StatusIntakeWake for Wake {
     fn wake(&self) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.1.notify_one();
     }
 }
 struct OriginalProbe {
@@ -154,7 +168,7 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_with_other_bu
         scope.begin_control_binding().unwrap(),
     ];
     let reservation = port.prepare(&scope, None, None).unwrap();
-    let wake_impl = Arc::new(Wake(std::sync::atomic::AtomicUsize::new(0)));
+    let wake_impl = Arc::new(Wake(std::sync::atomic::AtomicUsize::new(0), Notify::new()));
     let wake: Arc<dyn StatusIntakeWake> = wake_impl.clone();
     assert!(!reservation.ready(&wake).unwrap());
     port.notify();
@@ -210,6 +224,13 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_with_other_bu
     })
     .await
     .unwrap();
+    // RecordLease publishes Reserved before releasing its locks and calling
+    // the original runner's wake. A ready level does not prove that lock-free
+    // notification tail already ran on the other worker. Observe that SAME
+    // callback independently, under the unchanged original deadline.
+    tokio::time::timeout_at(deadline, wake_impl.wait_for_original_notification())
+        .await
+        .expect("the same original readiness notification must arrive");
     // Unsubmitted builders impose no request quota and own no child. Their
     // destruction cannot revoke the child's already installed responsibility.
     drop(unsubmitted);

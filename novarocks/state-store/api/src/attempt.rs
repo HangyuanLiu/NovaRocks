@@ -763,7 +763,29 @@ pub struct CommitObservation {
     slot: Arc<Slot>,
 }
 
+/// A read-only snapshot of the issued attempt's own publication state.
+/// NotDispatched is an instantaneous fact, never a terminal absence proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitObservationState {
+    NotDispatched,
+    Dispatched,
+    Terminal(AttemptOutcome),
+}
+
 impl CommitObservation {
+    /// Reads the original slot without I/O, adjudication or settlement.
+    /// A later provider dispatch may follow NotDispatched; this grants no right
+    /// to retire the owner or declare its operation uncommitted.
+    pub fn publication_state(&self) -> Result<CommitObservationState, StateStoreError> {
+        Ok(match self.slot.read()? {
+            SlotState::Reserved => CommitObservationState::NotDispatched,
+            SlotState::Dispatched => CommitObservationState::Dispatched,
+            SlotState::CancelledBeforeDispatch => {
+                CommitObservationState::Terminal(AttemptOutcome::NotCommitted)
+            }
+            SlotState::Settled(outcome) => CommitObservationState::Terminal(outcome),
+        })
+    }
     pub fn id(&self) -> AttemptId {
         self.slot.id
     }
@@ -955,6 +977,38 @@ mod tests {
             attempt,
             revision: StoreRevision::try_from(Bytes::from_static(b"r1")).expect("revision"),
         }
+    }
+
+    #[test]
+    fn publication_snapshot_reads_only_the_actual_issued_state() {
+        let (supervisor, _) = supervisor(2);
+        let (attempt, observation) = supervisor.reserve().unwrap();
+        assert_eq!(
+            observation.publication_state().unwrap(),
+            CommitObservationState::NotDispatched
+        );
+        assert!(observation.peek().unwrap().is_none());
+        // Reading NotDispatched did not consume the owner's dispatch right.
+        attempt.mark_dispatched().unwrap();
+        assert_eq!(
+            observation.publication_state().unwrap(),
+            CommitObservationState::Dispatched
+        );
+        assert!(observation.peek().unwrap().is_none());
+        let actual = receipt(attempt.id());
+        attempt
+            .settle(AttemptOutcome::Committed(actual.clone()))
+            .unwrap();
+        assert_eq!(
+            observation.publication_state().unwrap(),
+            CommitObservationState::Terminal(AttemptOutcome::Committed(actual))
+        );
+        let (withdrawn, observed) = supervisor.reserve().unwrap();
+        withdrawn.cancel_before_dispatch().unwrap();
+        assert_eq!(
+            observed.publication_state().unwrap(),
+            CommitObservationState::Terminal(AttemptOutcome::NotCommitted)
+        );
     }
 
     #[test]
