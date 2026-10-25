@@ -96,13 +96,13 @@ pub fn try_query_materialized_views(
 pub(crate) async fn try_query_materialized_views_in(
     readiness: &MvReadinessPort,
     query: &ast::Query,
-    execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    execution: std::sync::Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
 ) -> Result<Option<StatementResult>, novarocks_query_application::session_error::QueryServiceError>
 {
     let Some(projection) = materialized_view_projection(query).map_err(local_query_error)? else {
         return Ok(None);
     };
-    let view = readiness.in_execution(execution);
+    let view = readiness.in_requests(execution);
     let mut inventory = view
         .local_projection_inventory()
         .await
@@ -639,10 +639,12 @@ mod original_read_tests {
         ))
         .await;
         let query = query("SELECT TABLE_NAME FROM information_schema.materialized_views");
-        let error = match try_query_materialized_views_in(&port, &query, &execution).await {
-            Err(error) => error,
-            Ok(_) => panic!("unsupported Original must not become a legacy empty result"),
-        };
+        let error =
+            match try_query_materialized_views_in(&port, &query, Arc::new(execution.clone())).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("unsupported Original must not become a legacy empty result"),
+            };
         let repository = error
             .failure_cause()
             .unwrap()
@@ -671,7 +673,7 @@ mod original_read_tests {
         let selected = query(
             "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'sales' ORDER BY TABLE_NAME",
         );
-        match try_query_materialized_views_in(&port, &selected, &execution)
+        match try_query_materialized_views_in(&port, &selected, Arc::new(execution.clone()))
             .await
             .unwrap()
             .unwrap()
@@ -682,14 +684,14 @@ mod original_read_tests {
         let other = query("SELECT 1");
         let expired = execution.with_deadline(Instant::now() - Duration::from_secs(1));
         assert!(
-            try_query_materialized_views_in(&port, &other, &expired)
+            try_query_materialized_views_in(&port, &other, Arc::new(expired.clone()))
                 .await
                 .unwrap()
                 .is_none()
         );
         let invalid = query("SELECT unknown_mv_column FROM information_schema.materialized_views");
         let old = try_query_materialized_views(&port, &invalid).unwrap_err();
-        let new = try_query_materialized_views_in(&port, &invalid, &expired)
+        let new = try_query_materialized_views_in(&port, &invalid, Arc::new(expired.clone()))
             .await
             .unwrap_err();
         assert_eq!(new.to_string(), old);

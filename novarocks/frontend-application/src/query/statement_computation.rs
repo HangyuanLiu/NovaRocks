@@ -287,6 +287,9 @@ impl StatementStageAdmission {
         )
         .map_err(|error| internal_error(error.to_string()))?;
         self.client_transferred = true;
+        // The exact Client computation and its window are now stable in target.
+        // This preparation-only alias must not follow unrelated residual work.
+        drop(self.client_window.take());
         Ok(())
     }
     pub(crate) fn owner_slot(&mut self) -> &mut Option<WorkOwner> {
@@ -309,6 +312,7 @@ impl StatementStageAdmission {
         if let Some(owner) = self.owner.take() {
             owner.complete();
         }
+        drop(self.client_window.take());
     }
     /// The original stream/result receiver must already own its exact aliases.
     pub(crate) fn release_capacity_alias(&mut self) {

@@ -813,7 +813,8 @@ fn build_frontend_query_session_factory_from_role_products(
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),
-    );
+    )
+    .with_state_store_original(host.state_store_original_binding());
     #[cfg(novarocks_dev_controls)]
     let query_service = query_service.with_statement_observation(
         host.test_session

@@ -21,6 +21,7 @@ use super::statement_computation::StatementStageAdmission;
 use super::*;
 use crate::query_execution::completion_facts::FrontendCompletionCustody;
 use crate::query_execution::logical_execution::OriginalComputationStart;
+use crate::state_store::execution::StateStoreOriginalOwner;
 use io_source::ReadMetadataIoSource;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
@@ -34,6 +35,7 @@ use novarocks_query_application::session_control::{
 use novarocks_spi::connector::{
     ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoProfile, SharedDependency,
 };
+use novarocks_state_store_api::StateStoreExecutionRequests;
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::task::{Context, Poll};
 
@@ -52,6 +54,7 @@ struct ReadPreparationInput {
     purpose: FrontendQueryPurpose,
     provider: Arc<FrontendCompletionCustody>,
     io: Arc<ReadMetadataIoSource>,
+    state_store: Option<Arc<dyn StateStoreExecutionRequests>>,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     #[cfg(novarocks_dev_controls)]
@@ -127,6 +130,7 @@ async fn prepare_read(
             &input.scope,
             &input.provider,
             input.io,
+            input.state_store,
             #[cfg(novarocks_dev_controls)]
             rewrite.as_ref(),
         )
@@ -166,6 +170,7 @@ type Preparation =
 /// Original statement residual: it keeps the same Root and source registered
 /// while actual lazy scan/credential streams and Native closure are pending.
 struct ReadNativeTail {
+    state_store: Option<StateStoreOriginalOwner>,
     io: Arc<ReadMetadataIoSource>,
     stage: StatementStageAdmission,
     exit: Option<LogicalExecutionExitObserver>,
@@ -174,7 +179,43 @@ struct ReadNativeTail {
     health: Option<StatementNativeHealthFailure>,
 }
 impl ReadNativeTail {
-    fn poll_exit(
+    fn retain_state_store_health(
+        &mut self,
+        cause: novarocks_state_store_api::StateStoreExecutionFailure,
+    ) {
+        if self.health.is_none() {
+            self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                "Read StateStore original custody failed",
+                Arc::new(cause),
+            ));
+        }
+    }
+    fn poll_state_store(&mut self, cx: &mut Context<'_>) {
+        if let Some(source) = self.state_store.as_ref() {
+            if let Err(cause) = source.poll_progress(cx) {
+                self.retain_state_store_health(cause);
+            }
+        }
+    }
+    fn state_store_quiescent(&mut self, cx: &mut Context<'_>) -> bool {
+        match self
+            .state_store
+            .as_ref()
+            .map(|source| source.poll_actual_quiescent(cx))
+        {
+            None | Some(Ok(true)) => true,
+            Some(Ok(false)) => false,
+            Some(Err(cause)) => {
+                self.retain_state_store_health(cause);
+                false
+            }
+        }
+    }
+
+    // Native and MIO use the same actual-exit algorithm at the business cut
+    // and during residual retirement. StateStore quiescence/close is separate:
+    // an idle Original can still retain unresolved evidence after this cut.
+    fn poll_required_exit(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), StatementNativeHealthFailure>> {
@@ -230,8 +271,53 @@ impl ReadNativeTail {
                 Poll::Ready(Ok(())) => {}
             }
         }
-        self.stage.retire_unlaunched();
         Poll::Ready(Ok(()))
+    }
+
+    fn poll_business_exit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        let state_store_quiescent = self.state_store_quiescent(cx);
+        match self.poll_required_exit(cx) {
+            Poll::Ready(Ok(())) if state_store_quiescent => {
+                self.stage.retire_unlaunched();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(())) => Poll::Pending,
+            result => result,
+        }
+    }
+
+    fn poll_exit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        if let Some(health) = &self.health {
+            return Poll::Ready(Err(health.clone()));
+        }
+        // Continue the original Source even while Native cleanup is pending.
+        // Only full retirement requests close of its retained idle obligation.
+        let state_store_closed = match self
+            .state_store
+            .as_mut()
+            .map(|source| source.poll_closed(cx))
+        {
+            None | Some(Poll::Ready(Ok(()))) => true,
+            Some(Poll::Pending) => false,
+            Some(Poll::Ready(Err(cause))) => {
+                self.retain_state_store_health(cause);
+                return Poll::Ready(Err(self.health.clone().unwrap()));
+            }
+        };
+        match self.poll_required_exit(cx) {
+            Poll::Ready(Ok(())) if state_store_closed => {
+                self.stage.retire_unlaunched();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(())) => Poll::Pending,
+            result => result,
+        }
     }
 }
 impl GovernedStatementResidual for ReadNativeTail {
@@ -273,6 +359,9 @@ impl ReadStatementAction {
             .tail
             .as_mut()
             .expect("original Read tail remains until handoff");
+        if tail.health.is_some() {
+            return Poll::Pending;
+        }
         let work = owner
             .execution_owner_slot()
             .as_ref()
@@ -342,16 +431,21 @@ impl ReadStatementAction {
             }
         }
         if self.local.is_some() {
-            match tail.poll_exit(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(_)) => return Poll::Pending,
+            match tail.poll_business_exit(cx) {
+                Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
             }
+            self.result_transferred = true;
             return Poll::Ready(Ok(StatementActionValue::Local(
                 self.local.take().expect("closed local Read result"),
             )));
         }
         if self.error.is_none() && self.read.is_some() {
+            // Actual physical footer, not an idle projection's final settlement,
+            // is the preparation-to-Native cut. Unknown remains in the tail.
+            if !tail.state_store_quiescent(cx) {
+                return Poll::Pending;
+            }
             let io = tail
                 .io
                 .original()
@@ -456,11 +550,14 @@ impl ReadStatementAction {
                 drop(self.read.take());
                 drop(self.capacity.take());
             }
-            match tail.poll_exit(cx) {
+            match tail.poll_business_exit(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(_)) => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
             }
+            // Error delivery also hands the same tail to QA. It does not
+            // retire an idle StateStore Original or discard its evidence.
+            self.result_transferred = true;
             return Poll::Ready(Err(self.error.take().unwrap()));
         }
         Poll::Pending
@@ -503,7 +600,16 @@ impl GovernedStatementAction for ReadStatementAction {
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
-        self.poll_read(owner, cx)
+        // Newly borrowed phases are dispatched in the same poll, including
+        // Pending. No borrower wake is needed to discover its own new request.
+        if let Some(tail) = self.tail.as_mut() {
+            tail.poll_state_store(cx);
+        }
+        let result = self.poll_read(owner, cx);
+        if let Some(tail) = self.tail.as_mut() {
+            tail.poll_state_store(cx);
+        }
+        result
     }
 }
 impl FrontendQuerySession {
@@ -523,8 +629,29 @@ impl FrontendQuerySession {
             .query_compiler
             .validate_original_read_runtime()
             .map_err(|error| internal_error(error.to_string()))?;
-        let local =
-            local_preparation_profile().map_err(|error| internal_error(error.to_string()))?;
+        let state_store = self
+            .service
+            .state_store
+            .as_ref()
+            .map(|binding| {
+                let owner = binding.for_root(statement.scope().clone())?;
+                let requests: Arc<dyn StateStoreExecutionRequests> =
+                    Arc::new(owner.execution_requests(binding.transaction_deadline, deadline)?);
+                Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
+            })
+            .transpose()
+            .map_err(QueryServiceError::from_failure_cause)?;
+        let dependencies = self
+            .service
+            .state_store
+            .as_ref()
+            .map_or(&[][..], |binding| binding.blocking_dependency_facts());
+        let local = local_preparation_profile_with_dependencies(dependencies)
+            .map_err(|error| internal_error(error.to_string()))?;
+        let (state_store_owner, state_store_requests) = match state_store {
+            Some((owner, requests)) => (Some(owner), Some(requests)),
+            None => (None, None),
+        };
         let io = ReadMetadataIoSource::new(statement.scope().clone(), local.clone());
         // This same host-local preparation remains a Source through encoding.
         // Exact selected Provider/service facts are added before their effects.
@@ -563,6 +690,7 @@ impl FrontendQuerySession {
             purpose,
             provider: Arc::clone(&provider),
             io: Arc::clone(&io),
+            state_store: state_store_requests,
             #[cfg(novarocks_dev_controls)]
             observation: observation.clone(),
             #[cfg(novarocks_dev_controls)]
@@ -575,6 +703,7 @@ impl FrontendQuerySession {
             provider_close_result: None,
             local: None,
             tail: Some(Box::new(ReadNativeTail {
+                state_store: state_store_owner,
                 io,
                 stage,
                 exit: None,
@@ -621,17 +750,27 @@ impl FrontendQuerySession {
         Ok(result)
     }
 }
+#[cfg(test)]
 fn local_preparation_profile() -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
+    local_preparation_profile_with_dependencies(&[])
+}
+fn local_preparation_profile_with_dependencies(
+    dependencies: &[SharedDependency],
+) -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
     use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
     // These declarations describe the actual single local preparation body;
     // they do not qualify a Provider or reserve an SDK allocation envelope.
+    let mut dependencies = dependencies.to_vec();
+    if !dependencies.contains(&SharedDependency::LocalHost) {
+        dependencies.push(SharedDependency::LocalHost);
+    }
     ConnectorMetadataMaintenanceIoProfile::try_new(
         std::num::NonZeroUsize::new(1).unwrap(),
         std::num::NonZeroU64::new(MetadataIoAdmission::request_metadata_bytes())
             .ok_or(WorkError::ArithmeticOverflow)?,
         std::num::NonZeroU64::new(std::mem::size_of::<ReadPreparationInput>() as u64)
             .ok_or(WorkError::ArithmeticOverflow)?,
-        vec![SharedDependency::LocalHost],
+        dependencies,
     )
     .map_err(|_| WorkError::InvalidConfig("local Read preparation source declaration"))
 }
@@ -651,6 +790,29 @@ mod tests {
             NonZeroU64::new(1).unwrap(),
             NonZeroU64::new(1).unwrap(),
         )
+    }
+    #[test]
+    fn read_preparation_profile_keeps_selected_store_facts_and_local_host() {
+        let selected = SharedDependency::Thrift(
+            novarocks_resource_contract::ThriftServiceOrigin::from_selected_address(
+                "catalog-host:9083",
+            )
+            .unwrap(),
+        );
+        let profile = local_preparation_profile_with_dependencies(&[
+            selected.clone(),
+            SharedDependency::LocalHost,
+        ])
+        .unwrap();
+        assert!(profile.initial_dependencies().contains(&selected));
+        assert_eq!(
+            profile
+                .initial_dependencies()
+                .iter()
+                .filter(|fact| **fact == SharedDependency::LocalHost)
+                .count(),
+            1
+        );
     }
     #[test]
     fn actual_read_source_accepts_provider_profile_without_a_geometry_quota() {
@@ -715,6 +877,7 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let mut tail = ReadNativeTail {
+            state_store: None,
             io: ReadMetadataIoSource::new(root.owner.scope(), local_preparation_profile().unwrap()),
             stage: StatementStageAdmission::new(root.owner.scope(), 1),
             exit: None,
@@ -753,3 +916,6 @@ mod provider_close_tests {
         assert!(source.local_health_failure().is_none());
     }
 }
+
+#[cfg(test)]
+mod error_residual_tests;

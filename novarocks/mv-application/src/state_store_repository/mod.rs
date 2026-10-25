@@ -699,12 +699,18 @@ use self::key::accelerator_prefix;
 /// through actual exit; this view neither mints nor owns that capability.
 pub struct StateStoreMvRepositoryExecution<'a> {
     repository: &'a StateStoreMvRepository,
-    execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    execution: &'a dyn novarocks_state_store_api::StateStoreExecutionRequests,
 }
 impl StateStoreMvRepository {
     pub fn in_execution<'a>(
         &'a self,
         execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> StateStoreMvRepositoryExecution<'a> {
+        self.in_requests(execution)
+    }
+    pub fn in_requests<'a>(
+        &'a self,
+        execution: &'a dyn novarocks_state_store_api::StateStoreExecutionRequests,
     ) -> StateStoreMvRepositoryExecution<'a> {
         StateStoreMvRepositoryExecution {
             repository: self,
@@ -800,17 +806,21 @@ impl StateStoreMvRepositoryExecution<'_> {
 }
 struct ReadRepository<'a> {
     store: &'a dyn StateStore,
-    execution: Option<&'a novarocks_state_store_api::StateStoreExecutionContext>,
+    execution: Option<&'a dyn novarocks_state_store_api::StateStoreExecutionRequests>,
 }
 impl ReadRepository<'_> {
     async fn begin_read(&self) -> Result<ReadSession, MvRepositoryError> {
         match self.execution {
-            Some(execution) => self
-                .store
-                .begin_original_read_in(execution)
-                .await
-                .map(ReadSession::Original)
-                .map_err(operation::original_failure),
+            Some(requests) => {
+                let execution = requests
+                    .read_transaction_context()
+                    .map_err(operation::original_failure)?;
+                self.store
+                    .begin_original_read_in(&execution)
+                    .await
+                    .map(ReadSession::Original)
+                    .map_err(operation::original_failure)
+            }
             None => self
                 .store
                 .begin_read()
@@ -1326,7 +1336,7 @@ impl StateStoreMvRepositoryExecution<'_> {
 }
 struct WriteRepository<'a> {
     repository: &'a StateStoreMvRepository,
-    execution: Option<&'a novarocks_state_store_api::StateStoreExecutionContext>,
+    execution: Option<&'a dyn novarocks_state_store_api::StateStoreExecutionRequests>,
 }
 impl WriteRepository<'_> {
     fn read_repository(&self) -> ReadRepository<'_> {
@@ -1384,13 +1394,16 @@ impl WriteRepository<'_> {
     async fn run<C: WriteCommand>(&self, command: C) -> Result<C::Output, MvRepositoryError> {
         let repository = self.repository;
         match self.execution {
-            Some(execution) => {
+            Some(requests) => {
+                let execution = requests
+                    .write_operation_context()
+                    .map_err(operation::original_failure)?;
                 operation::run_in(
                     repository.store.as_ref(),
                     &repository.runner_metrics,
                     repository.run_policy,
                     C::PURPOSE,
-                    execution,
+                    &execution,
                     move |transaction| {
                         let command = command.clone();
                         Box::pin(async move {

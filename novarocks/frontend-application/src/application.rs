@@ -2224,6 +2224,7 @@ impl FrontendApplicationHost {
         let (vocabulary, instance) = host.original_blocking_sources()?;
         let dependencies = host.original_blocking_dependency_facts()?.to_vec();
         Some(crate::state_store::execution::StateStoreOriginalBinding {
+            transaction_deadline: host.state_store()?.limits().transaction_deadline,
             dependencies,
             vocabulary,
             instance,

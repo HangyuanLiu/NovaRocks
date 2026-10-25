@@ -27,6 +27,7 @@ impl FrontendQueryCompiler {
         scope: &novarocks_workload_control::WorkScope,
         provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
         io: Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
+        state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
         #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
             &crate::mv::test_controls::MvRewriteStatementTarget,
         >,
@@ -37,11 +38,26 @@ impl FrontendQueryCompiler {
                 "read preparation requires a query".into(),
             ));
         };
-        if let Some(result) = information_schema::try_query_materialized_views(
-            self.system_tables.mv_readiness().as_ref(),
-            original,
-        )? {
-            return Ok(PreparedQueryOperation::immediate(result));
+        if information_schema::is_local_materialized_views_query(original) {
+            let requests = state_store.as_ref().ok_or_else(|| {
+                FrontendQueryCompilerError::Application(
+                    novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                        novarocks_failure_contract::SharedFailureCause::new(
+                            novarocks_state_store_api::StateStoreOriginalUnsupported,
+                        ),
+                    ),
+                )
+            })?;
+            if let Some(result) = information_schema::try_query_materialized_views_in(
+                self.system_tables.mv_readiness().as_ref(),
+                original,
+                Arc::clone(requests),
+            )
+            .await
+            .map_err(FrontendQueryCompilerError::Application)?
+            {
+                return Ok(PreparedQueryOperation::immediate(result));
+            }
         }
         let planning = connector_planning_context_for_query_on_runtime(
             self.connector_blocking_io.runtime(),
@@ -96,6 +112,7 @@ impl FrontendQueryCompiler {
             context.execution(),
             provider_source,
             scope,
+            state_store,
             #[cfg(novarocks_dev_controls)]
             rewrite_statement,
         )
@@ -112,6 +129,7 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
         scope: &novarocks_workload_control::WorkScope,
+        state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
         #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
             &crate::mv::test_controls::MvRewriteStatementTarget,
         >,
@@ -124,7 +142,7 @@ impl FrontendQueryCompiler {
         crate::query_execution::completion_facts::install_frontend_fact_source(
             provider_source,
             self.completion_fact_owners(),
-            crate::query_execution::completion_facts::StatementFactScope::governed_read_io(
+            crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
                 Arc::clone(&bindings),
                 connector_context.clone(),
                 current_catalog,
@@ -134,6 +152,7 @@ impl FrontendQueryCompiler {
                         "completion facts require the admitted result capacity".to_owned(),
                     )
                 })?,
+                state_store,
             )
             .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
             crate::query_execution::compiler::typed_connector_session()

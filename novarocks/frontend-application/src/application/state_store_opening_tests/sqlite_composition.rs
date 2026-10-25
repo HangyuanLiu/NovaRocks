@@ -748,6 +748,13 @@ async fn actual_sqlite_catalog_action_uses_original_qb_one_and_bootstrap_reopens
     drop(context);
     let (vocabulary, instance) = ready.as_ref().unwrap().original_blocking_sources().unwrap();
     let binding = crate::state_store::execution::StateStoreOriginalBinding {
+        transaction_deadline: ready
+            .as_ref()
+            .unwrap()
+            .state_store()
+            .unwrap()
+            .limits()
+            .transaction_deadline,
         dependencies: ready
             .as_ref()
             .unwrap()
@@ -825,6 +832,13 @@ async fn actual_sqlite_catalog_action_uses_original_qb_one_and_bootstrap_reopens
     close_catalog_reader(&mut reopened).await;
     drop(context);
     let binding = crate::state_store::execution::StateStoreOriginalBinding {
+        transaction_deadline: ready
+            .as_ref()
+            .unwrap()
+            .state_store()
+            .unwrap()
+            .limits()
+            .transaction_deadline,
         dependencies: ready
             .as_ref()
             .unwrap()
@@ -942,6 +956,13 @@ async fn actual_sqlite_catalog_commit_survives_required_materialization_failure(
     close_catalog_reader(&mut opening).await;
     let (vocabulary, instance) = ready.as_ref().unwrap().original_blocking_sources().unwrap();
     let binding = crate::state_store::execution::StateStoreOriginalBinding {
+        transaction_deadline: ready
+            .as_ref()
+            .unwrap()
+            .state_store()
+            .unwrap()
+            .limits()
+            .transaction_deadline,
         dependencies: ready
             .as_ref()
             .unwrap()

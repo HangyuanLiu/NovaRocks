@@ -33,7 +33,7 @@ use novarocks_state_store_api::{
     StateStoreBlockingRequest as Request, StateStoreBlockingSlot,
     StateStoreBlockingSourceVocabulary as Vocabulary, StateStoreError, StateStoreErrorKind,
     StateStoreExecutionContext, StateStoreExecutionFailure as Failure, StateStoreExecutionPort,
-    StateStoreReadExecution,
+    StateStoreExecutionRequests, StateStoreReadExecution,
 };
 use novarocks_workload_control::WorkScope;
 use std::{
@@ -242,6 +242,26 @@ impl StateStoreOriginalOwner {
         Ok(StateStoreOriginalReadExecution {
             progress: self.progress_handle(),
             transaction_deadline,
+            statement_deadline: None,
+        })
+    }
+    /// Root-only request factory. Host bootstrap deliberately exposes only
+    /// `read_execution`; an absent statement deadline adds no artificial cap.
+    pub(crate) fn execution_requests(
+        &self,
+        transaction_deadline: std::time::Duration,
+        statement_deadline: Option<Instant>,
+    ) -> Result<StateStoreOriginalRequests, Failure> {
+        if !matches!(&self.port.purpose, Purpose::Instance { .. }) {
+            return Err(protocol(
+                "StateStore request factory requires its original Root",
+            ));
+        }
+        let mut read = self.read_execution(transaction_deadline)?;
+        read.statement_deadline = statement_deadline;
+        Ok(StateStoreOriginalRequests {
+            read,
+            policy: self.policy,
         })
     }
     pub(crate) fn request_close(&self) {
@@ -355,20 +375,28 @@ impl StateStoreOriginalProgress {
 }
 /// Explicit per-transaction read timing for Host/Controller reads, unlike an
 /// absolute statement request. The strong owner remains in its original slot.
+#[derive(Clone)]
 pub(crate) struct StateStoreOriginalReadExecution {
     progress: StateStoreOriginalProgress,
     transaction_deadline: std::time::Duration,
+    statement_deadline: Option<Instant>,
 }
-impl StateStoreReadExecution for StateStoreOriginalReadExecution {
-    fn read_transaction_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+impl StateStoreOriginalReadExecution {
+    fn context_for(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<StateStoreExecutionContext, Failure> {
         let port = self
             .progress
             .port
             .upgrade()
             .ok_or_else(|| protocol("original StateStore read custody is unavailable"))?;
         let deadline = Instant::now()
-            .checked_add(self.transaction_deadline)
-            .ok_or_else(|| protocol("StateStore read transaction deadline is not representable"))?;
+            .checked_add(timeout)
+            .ok_or_else(|| protocol("StateStore operation deadline is not representable"))?;
+        let deadline = self
+            .statement_deadline
+            .map_or(deadline, |cap| cap.min(deadline));
         if let Some(cause) = port.business_stop(deadline) {
             return Err(cause);
         }
@@ -382,6 +410,27 @@ impl StateStoreReadExecution for StateStoreOriginalReadExecution {
         }
         let port: Arc<dyn StateStoreExecutionPort> = port;
         Ok(StateStoreExecutionContext::new(&port, deadline))
+    }
+}
+impl StateStoreReadExecution for StateStoreOriginalReadExecution {
+    fn read_transaction_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+        self.context_for(self.transaction_deadline)
+    }
+}
+/// Weak request view only; the same Read tail retains every physical source.
+#[derive(Clone)]
+pub(crate) struct StateStoreOriginalRequests {
+    read: StateStoreOriginalReadExecution,
+    policy: novarocks_state_store_runtime::StateStoreRunPolicy,
+}
+impl StateStoreReadExecution for StateStoreOriginalRequests {
+    fn read_transaction_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+        self.read.read_transaction_context()
+    }
+}
+impl StateStoreExecutionRequests for StateStoreOriginalRequests {
+    fn write_operation_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+        self.read.context_for(self.policy.operation_timeout())
     }
 }
 /// Cooperative batches bound one turn's observation cost, never admission
@@ -1114,6 +1163,7 @@ impl FailureProjection for PhysicalFailure {
 
 #[derive(Clone)]
 pub(crate) struct StateStoreOriginalBinding {
+    pub(crate) transaction_deadline: std::time::Duration,
     pub(crate) dependencies: Vec<novarocks_resource_contract::SharedDependency>,
     pub(crate) vocabulary: Vocabulary,
     pub(crate) instance: InstanceScope,

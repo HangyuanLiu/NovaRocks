@@ -226,7 +226,7 @@ pub struct MvKeyedReadinessExecution {
 #[derive(Clone)]
 enum ReadinessExecution {
     Legacy,
-    Original(novarocks_state_store_api::StateStoreExecutionContext),
+    Original(Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>),
 }
 #[derive(Clone)]
 struct ReadinessRepository {
@@ -248,7 +248,15 @@ impl MvKeyedReadinessService {
         &self,
         execution: &novarocks_state_store_api::StateStoreExecutionContext,
     ) -> MvKeyedReadinessExecution {
-        self.request(ReadinessExecution::Original(execution.clone()))
+        self.in_requests(Arc::new(execution.clone()))
+    }
+    /// Retain only the request factory's weak execution view across Provider
+    /// observations. Each independent repository operation obtains its context.
+    pub fn in_requests(
+        &self,
+        requests: Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
+    ) -> MvKeyedReadinessExecution {
+        self.request(ReadinessExecution::Original(requests))
     }
     fn legacy(&self) -> MvKeyedReadinessExecution {
         self.request(ReadinessExecution::Legacy)
@@ -1341,7 +1349,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .find_keyed_by_target(target, budget)
                     .await
             }
@@ -1358,7 +1366,7 @@ impl ReadinessRepository {
             ReadinessExecution::Legacy => self.repository.find_keyed_by_target_object(object).await,
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .find_keyed_by_target_object(object)
                     .await
             }
@@ -1380,7 +1388,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .find_keyed_by_target_bounded(target, bound)
                     .await
             }
@@ -1394,7 +1402,7 @@ impl ReadinessRepository {
             ReadinessExecution::Legacy => self.repository.list_keyed_projections().await,
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .list_keyed_projections()
                     .await
             }
@@ -1410,7 +1418,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .list_keyed_projection_inventory(bound)
                     .await
             }
@@ -1429,7 +1437,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
                     .await
             }
@@ -1447,7 +1455,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .list_keyed_dependencies_by_downstream(loaded)
                     .await
             }
@@ -1468,7 +1476,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .install_keyed_projection(operation_id, facts, expected)
                     .await
             }
@@ -1487,7 +1495,7 @@ impl ReadinessRepository {
             }
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .delete_keyed_projection(operation_id, expected)
                     .await
             }
@@ -1499,7 +1507,7 @@ impl ReadinessRepository {
             ReadinessExecution::Legacy => self.repository.wipe_accelerator(operation_id).await,
             ReadinessExecution::Original(execution) => {
                 self.repository
-                    .in_execution(execution)
+                    .in_requests(execution.as_ref())
                     .wipe_accelerator(operation_id)
                     .await
             }

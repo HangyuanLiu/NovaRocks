@@ -108,6 +108,7 @@ impl CompletionFactOwners {
 /// against whatever the catalog holds at the moment the question is asked.
 #[derive(Clone)]
 pub(crate) struct StatementFactScope {
+    state_store: StatementStateStore,
     creator_mode: ProviderCreatorMode,
     bindings: Arc<QueryTableBindingStore>,
     connector_context: ConnectorRequestContext,
@@ -117,6 +118,11 @@ pub(crate) struct StatementFactScope {
         Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
 }
 
+#[derive(Clone)]
+enum StatementStateStore {
+    Legacy,
+    Governed(Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>),
+}
 impl StatementFactScope {
     pub(crate) fn binding_only(
         bindings: Arc<QueryTableBindingStore>,
@@ -130,6 +136,7 @@ impl StatementFactScope {
         }
         Ok(Self {
             creator_mode: ProviderCreatorMode::BindingOnly,
+            state_store: StatementStateStore::Legacy,
             bindings,
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
@@ -137,14 +144,35 @@ impl StatementFactScope {
             query_local_overlays: Vec::new(),
         })
     }
-    /// Actual ordinary Read requires its original I/O source; this is not an
-    /// optional fallback selected from an absent port during Provider polling.
+    /// Retained pre-Original callers select their legacy MV adapter explicitly.
+    /// Their Provider I/O is governed, but their StateStore migration is separate.
     pub(crate) fn governed_read_io(
         bindings: Arc<QueryTableBindingStore>,
         connector_context: ConnectorRequestContext,
         current_catalog: Option<&str>,
         work_scope: &novarocks_workload_control::WorkScope,
         capacity: QueryResultCapacityBinding,
+    ) -> Result<Self, novarocks_workload_control::WorkError> {
+        let mut scope = Self::governed_read_io_in(
+            bindings,
+            connector_context,
+            current_catalog,
+            work_scope,
+            capacity,
+            None,
+        )?;
+        scope.state_store = StatementStateStore::Legacy;
+        Ok(scope)
+    }
+    /// Migrated Read explicitly supplies its request view. Missing Original
+    /// execution makes optional MV rewrite unavailable, never a legacy fallback.
+    pub(crate) fn governed_read_io_in(
+        bindings: Arc<QueryTableBindingStore>,
+        connector_context: ConnectorRequestContext,
+        current_catalog: Option<&str>,
+        work_scope: &novarocks_workload_control::WorkScope,
+        capacity: QueryResultCapacityBinding,
+        state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
     ) -> Result<Self, novarocks_workload_control::WorkError> {
         if connector_context
             .io_admission()
@@ -161,6 +189,7 @@ impl StatementFactScope {
             capacity,
         )?;
         scope.creator_mode = ProviderCreatorMode::GovernedReadIo;
+        scope.state_store = StatementStateStore::Governed(state_store);
         Ok(scope)
     }
     pub(crate) fn with_query_local_overlays(
@@ -340,12 +369,31 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
         &self,
         needs: &[MaterializedViewNeed],
     ) -> Result<Vec<MaterializedViewFact>, String> {
+        let candidate = match &self.scope.state_store {
+            StatementStateStore::Legacy => self.owners.materialized_views.clone(),
+            StatementStateStore::Governed(Some(requests)) => self
+                .owners
+                .materialized_views
+                .in_requests(Arc::clone(requests)),
+            StatementStateStore::Governed(None) => {
+                return Ok(needs
+                    .iter()
+                    .map(|need| {
+                        MaterializedViewFact::missing(
+                            need,
+                            "materialized-view original execution is unavailable",
+                        )
+                        .expect("a static MV capability diagnostic is non-empty")
+                    })
+                    .collect());
+            }
+        };
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
             facts.push(
                 freeze_materialized_view_fact_with_ports_async(
                     need,
-                    &self.owners.materialized_views,
+                    &candidate,
                     self.owners.connector_control.as_ref(),
                     self.owners.mv_storage_observation.as_ref(),
                     &self.scope.connector_context,

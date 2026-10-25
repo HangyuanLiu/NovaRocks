@@ -166,6 +166,7 @@ fn governed_compiler_failure(
         FrontendQueryCompilerError::Engine(error) => {
             GovernedPreparationError::Service(internal_error(error))
         }
+        FrontendQueryCompilerError::Application(error) => GovernedPreparationError::Service(error),
         FrontendQueryCompilerError::Control(error) => governed_compile_control_failure(error),
         FrontendQueryCompilerError::Source(source) => GovernedPreparationError::Service(
             QueryServiceError::from_compile_control(CompileControlError::Source(source)),
@@ -921,6 +922,7 @@ enum RoutedExecutionError {
 fn routed_compiler_failure(error: FrontendQueryCompilerError, sql: &str) -> RoutedExecutionError {
     match error {
         FrontendQueryCompilerError::Engine(error) => RoutedExecutionError::Engine(error),
+        FrontendQueryCompilerError::Application(error) => RoutedExecutionError::Application(error),
         FrontendQueryCompilerError::Control(error) => RoutedExecutionError::Control(error),
         FrontendQueryCompilerError::Source(source) => {
             RoutedExecutionError::Control(CompileControlError::Source(source))
@@ -1259,6 +1261,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     #[cfg(novarocks_dev_controls)]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
     #[cfg(novarocks_dev_controls)]
@@ -1291,6 +1294,14 @@ pub struct FrontendQueryService {
 }
 
 impl FrontendQueryService {
+    pub(crate) fn with_state_store_original(
+        mut self,
+        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    ) -> Self {
+        self.state_store = binding;
+        self
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_statement_observation(
         mut self,
@@ -1344,6 +1355,7 @@ impl FrontendQueryService {
         Self {
             #[cfg(novarocks_dev_controls)]
             statement_observation: None,
+            state_store: None,
             #[cfg(novarocks_dev_controls)]
             result_handoff: None,
             session_catalog_resolver,

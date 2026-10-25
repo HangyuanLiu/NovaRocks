@@ -1360,3 +1360,158 @@ async fn read_request_uses_independent_transaction_time_but_absolute_context_nev
     );
     shutdown(&mut workers).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn root_read_requests_keep_independent_limits_and_cancel_waits_for_actual_footer() {
+    let (mut workers, executor) = worker();
+    let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
+        root_limit: 4,
+        business_limit: 4,
+        scope_records_limit: 4,
+        ..WorkloadConfig::default()
+    })
+    .unwrap()
+    .owner;
+    let (_responsibility, _driver) = control
+        .configure_responsibility(
+            novarocks_workload_control::joint_admission::ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(1).unwrap(),
+            },
+        )
+        .unwrap();
+    control
+        .configure_control_storage(ControlStorageConfig::new(4, &[]))
+        .unwrap();
+    control.mark_ready().unwrap();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let instance = InstanceScope::new();
+    let policy = novarocks_state_store_runtime::StateStoreRunPolicy::default();
+    let mut owner = StateStoreOriginalOwner::for_root(
+        &executor,
+        vocabulary(),
+        instance,
+        root.owner.scope(),
+        policy,
+    )
+    .unwrap();
+    let read_limit = Duration::from_secs(31);
+    let requests = owner.execution_requests(read_limit, None).unwrap();
+    let before = Instant::now();
+    let read = requests.read_transaction_context().unwrap();
+    assert!(
+        read.deadline() >= before + read_limit,
+        "no statement cap must not borrow the shorter write-operation timeout"
+    );
+    let next = Instant::now();
+    let second = requests.clone().read_transaction_context().unwrap();
+    assert!(second.deadline() >= next + read_limit);
+    assert!(read.shares_owner(&second));
+    let before_write = Instant::now();
+    let write = requests.write_operation_context().unwrap();
+    let after_write = Instant::now();
+    assert!(write.deadline() >= before_write + policy.operation_timeout());
+    assert!(write.deadline() <= after_write + policy.operation_timeout());
+    assert!(write.shares_owner(&read));
+    assert_eq!(
+        read.read_transaction_context().unwrap().deadline(),
+        read.deadline(),
+        "pages and fixed-context operations never renew the original deadline"
+    );
+    let cap = Instant::now() + Duration::from_secs(1);
+    let capped = owner.execution_requests(read_limit, Some(cap)).unwrap();
+    assert_eq!(capped.read_transaction_context().unwrap().deadline(), cap);
+    assert_eq!(capped.write_operation_context().unwrap().deadline(), cap);
+
+    let call_gate = Gate::new();
+    let exit_gate = Gate::new();
+    let _call_rescue = Rescue(call_gate.clone());
+    let _exit_rescue = Rescue(exit_gate.clone());
+    let source = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::Get,
+        Some(call_gate.clone()),
+    );
+    let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+    let mut slot = None;
+    read.bind_original_in(&original, &mut slot).unwrap();
+    *source.slot.lock().unwrap() = slot;
+    read.request_progress();
+    let wake = Waker::from(Arc::new(PauseWake {
+        once: AtomicBool::new(false),
+        gate: exit_gate.clone(),
+    }));
+    assert!(
+        !owner
+            .poll_progress(&mut Context::from_waker(&wake))
+            .unwrap()
+    );
+    call_gate.reached().await;
+    call_gate.release();
+    exit_gate.reached().await; // The actual QB worker is paused in result notification.
+    assert!(
+        !owner
+            .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+            .unwrap()
+    );
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true)]
+    );
+    root.owner.cancel(CancellationReason::Requested);
+    assert!(requests.read_transaction_context().is_err());
+    assert!(requests.write_operation_context().is_err());
+    assert!(
+        !owner
+            .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+            .unwrap()
+    );
+    assert!(
+        owner.local_health_failure().is_none(),
+        "ordinary stop is not raw health"
+    );
+    assert!(!source.is_complete());
+    exit_gate.release();
+    closed(&mut owner).await;
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+    );
+    drop(owner);
+    assert!(
+        requests.read_transaction_context().is_err(),
+        "borrower keeps no owner alive"
+    );
+    assert!(requests.write_operation_context().is_err());
+    root.owner.complete_after_terminal_cancel_settled();
+    drop(root.business);
+    shutdown(&mut workers).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_read_owner_cannot_export_business_write_requests() {
+    let (mut workers, executor) = worker();
+    let mut owner = StateStoreOriginalOwner::bootstrap_read(
+        &executor,
+        vocabulary(),
+        InstanceScope::new(),
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .unwrap();
+    assert!(
+        owner
+            .execution_requests(Duration::from_secs(3), None)
+            .is_err()
+    );
+    assert!(
+        owner
+            .read_execution(Duration::from_secs(3))
+            .unwrap()
+            .read_transaction_context()
+            .is_ok()
+    );
+    closed(&mut owner).await;
+    drop(owner);
+    shutdown(&mut workers).await;
+}

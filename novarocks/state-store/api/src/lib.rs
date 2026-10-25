@@ -48,8 +48,8 @@ pub use execution::{
     StateStoreBlockingOrigin, StateStoreBlockingOriginal, StateStoreBlockingPhase,
     StateStoreBlockingRequest, StateStoreBlockingSlot, StateStoreBlockingSourceVocabulary,
     StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreExecutionPort,
-    StateStoreOriginalClose, StateStoreOriginalOpen, StateStoreOriginalUnsupported,
-    StateStoreReadExecution,
+    StateStoreExecutionRequests, StateStoreOriginalClose, StateStoreOriginalOpen,
+    StateStoreOriginalUnsupported, StateStoreReadExecution,
 };
 pub use limits::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,

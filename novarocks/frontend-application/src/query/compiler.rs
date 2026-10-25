@@ -98,6 +98,7 @@ impl FrontendQueryPurpose {
 /// SQL source required to render a user location.
 #[derive(Debug)]
 pub(crate) enum FrontendQueryCompilerError {
+    Application(novarocks_query_application::session_error::QueryServiceError),
     Engine(String),
     Analyze(AnalyzeError),
     Source(novarocks_failure_contract::SharedFailureCause),
@@ -613,6 +614,27 @@ mod compile_control_tests {
         match super::super::governed_compiler_failure(error, "SELECT value") {
             super::super::GovernedPreparationError::Service(error)
             | super::super::GovernedPreparationError::Cancelled(error) => error,
+        }
+    }
+
+    #[test]
+    fn original_repository_failure_keeps_its_domain_without_compile_provenance() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_query_application::session_error::QueryServiceError;
+        let original =
+            SharedFailureCause::new(novarocks_state_store_api::StateStoreOriginalUnsupported);
+        let expected = original.failure_fact();
+        let error = QueryServiceError::from_failure_cause(original.clone());
+        let governed = service(FrontendQueryCompilerError::Application(error.clone()));
+        let routed =
+            super::super::routed_execution_service_error(super::super::routed_compiler_failure(
+                FrontendQueryCompilerError::Application(error),
+                "SELECT * FROM information_schema.materialized_views",
+            ));
+        for actual in [governed, routed] {
+            assert_eq!(actual.failure_cause(), Some(&original));
+            assert_eq!(actual.execution_failure().unwrap().fact(), expected);
+            assert!(actual.compile_control_error().is_none());
         }
     }
 

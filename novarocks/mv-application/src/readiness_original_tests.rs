@@ -615,3 +615,72 @@ async fn keyed_replace_and_delete_use_root_owned_point_reads_when_ranges_require
     assert!(ranges.iter().all(|range| range.page_size == 1));
     assert!(ranges.iter().any(|range| range.continuation.is_some()));
 }
+
+struct RequestBoundaries {
+    context: StateStoreExecutionContext,
+    reads: AtomicUsize,
+    writes: AtomicUsize,
+}
+impl StateStoreReadExecution for RequestBoundaries {
+    fn read_transaction_context(
+        &self,
+    ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.context.clone())
+    }
+}
+impl StateStoreExecutionRequests for RequestBoundaries {
+    fn write_operation_context(
+        &self,
+    ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Ok(self.context.clone())
+    }
+}
+#[tokio::test]
+async fn readiness_request_factory_is_sampled_per_transaction_not_per_inventory_or_page() {
+    let (owner, context) = execution();
+    let (service, trace) = original_service(&owner, &context).await;
+    let requests = Arc::new(RequestBoundaries {
+        context,
+        reads: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
+    });
+    let view = service.in_requests(requests.clone());
+    assert!(matches!(
+        view.observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+            .await
+            .unwrap(),
+        MvKeyedProjectionInstallOutcome::Installed(_)
+    ));
+    let mut inventory = view.bounded_projection_inventory(bound()).await.unwrap();
+    let candidates = view.candidate_reader();
+    let before_next = requests.reads.load(Ordering::SeqCst);
+    assert!(inventory.next_ready().await.unwrap().is_some());
+    assert!(
+        requests.reads.load(Ordering::SeqCst) > before_next,
+        "a later independent inventory read gets its own transaction context"
+    );
+    let before_candidates = requests.reads.load(Ordering::SeqCst);
+    assert_eq!(
+        candidates.list_candidate_definitions().await.unwrap().len(),
+        1
+    );
+    assert!(requests.reads.load(Ordering::SeqCst) > before_candidates);
+    assert_eq!(trace.legacy.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        requests.reads.load(Ordering::SeqCst),
+        trace.reads.load(Ordering::SeqCst),
+        "one factory call per actual read begin; pages must not renew it"
+    );
+    assert_eq!(
+        requests.writes.load(Ordering::SeqCst),
+        trace.writes.load(Ordering::SeqCst)
+    );
+    assert_eq!(trace.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Arc::strong_count(&owner),
+        1,
+        "request views hold no physical owner"
+    );
+}

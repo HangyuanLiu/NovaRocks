@@ -175,6 +175,16 @@ pub trait StateStoreReadExecution: Send + Sync {
     ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure>;
 }
 
+/// A request-local borrower for independent read transactions and write
+/// operations. Implementations derive each context at its actual begin boundary;
+/// they neither create a physical owner nor grant a missing write capability.
+/// Host bootstrap readers implement only `StateStoreReadExecution`.
+pub trait StateStoreExecutionRequests: StateStoreReadExecution {
+    fn write_operation_context(
+        &self,
+    ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure>;
+}
+
 /// Weak borrower of an already-installed port, not a permission constructor.
 /// The real role/Action must keep the port and its strong custody alive through
 /// rollback/evidence/actual exit, including after this context or outer F drops.
@@ -238,6 +248,14 @@ impl StateStoreExecutionContext {
 
 impl StateStoreReadExecution for StateStoreExecutionContext {
     fn read_transaction_context(
+        &self,
+    ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+        Ok(self.clone())
+    }
+}
+
+impl StateStoreExecutionRequests for StateStoreExecutionContext {
+    fn write_operation_context(
         &self,
     ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
         Ok(self.clone())

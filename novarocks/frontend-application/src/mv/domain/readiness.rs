@@ -113,13 +113,13 @@ pub(crate) struct MvCandidateReader {
 #[derive(Clone)]
 enum CandidateExecution {
     Legacy,
-    Original(novarocks_state_store_api::StateStoreExecutionContext),
+    Original(std::sync::Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>),
 }
 
 /// Borrower only: the caller keeps the same Source/Root in stable custody.
 pub(crate) struct MvReadinessExecution<'a> {
     port: &'a MvReadinessPort,
-    execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    execution: std::sync::Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
     service: ProductReadinessExecution,
 }
 
@@ -166,10 +166,16 @@ impl MvReadinessPort {
         &'a self,
         execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
     ) -> MvReadinessExecution<'a> {
+        self.in_requests(std::sync::Arc::new(execution.clone()))
+    }
+    pub(crate) fn in_requests(
+        &self,
+        execution: std::sync::Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
+    ) -> MvReadinessExecution<'_> {
         MvReadinessExecution {
             port: self,
+            service: self.service.in_requests(std::sync::Arc::clone(&execution)),
             execution,
-            service: self.service.in_execution(execution),
         }
     }
 
@@ -405,7 +411,9 @@ impl MvReadinessPort {
 
 impl MvReadinessExecution<'_> {
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
-        self.port.candidate_reader().in_execution(self.execution)
+        self.port
+            .candidate_reader()
+            .in_requests(std::sync::Arc::clone(&self.execution))
     }
     pub(crate) async fn observe_current_and_install(
         &self,
@@ -553,12 +561,21 @@ impl MvCandidateReader {
         &self,
         execution: &novarocks_state_store_api::StateStoreExecutionContext,
     ) -> Self {
+        self.in_requests(std::sync::Arc::new(execution.clone()))
+    }
+    pub(crate) fn in_requests(
+        &self,
+        execution: std::sync::Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
+    ) -> Self {
         Self {
-            reader: self.service.in_execution(execution).candidate_reader(),
+            reader: self
+                .service
+                .in_requests(std::sync::Arc::clone(&execution))
+                .candidate_reader(),
             service: self.service.clone(),
             management: self.management.clone(),
             handle: self.handle.clone(),
-            execution: CandidateExecution::Original(execution.clone()),
+            execution: CandidateExecution::Original(execution),
         }
     }
     fn require_legacy_sync(&self) -> Result<(), MvRepositoryError> {
@@ -672,7 +689,7 @@ impl MvCandidateReader {
                 }
                 CandidateExecution::Original(execution) => {
                     service
-                        .in_execution(execution)
+                        .in_requests(std::sync::Arc::clone(execution))
                         .observe_current_read_only_and_install(
                             operation,
                             projection_request,
@@ -723,7 +740,7 @@ impl MvCandidateReader {
                 }
                 CandidateExecution::Original(execution) => {
                     service
-                        .in_execution(execution)
+                        .in_requests(std::sync::Arc::clone(execution))
                         .observe_and_install(operation, projection_request, &source)
                         .await
                 }
