@@ -42,87 +42,10 @@ fn reply(admission: &mut JointAdmission) -> JointGrantedBatch {
     }
 }
 fn fixture(publications: u64) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    let storage = ControlStorageConfig::new([8, 0, 0, 0, 0], 2, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 4,
-        max_registered_dependencies: 1,
-        max_claims: 32,
-        max_requests: 16,
-        max_changes_per_request: 4,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10_000_000,
-        work_per_turn: NonZeroUsize::new(7).unwrap(),
+    let storage = ControlStorageConfig::new(8, &[]);
+    let config = ResponsibilityConfig {
+        work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
-    config.max_registered_dependencies =
-        crate::joint_admission::ledger::metadata_geometry::maximum_dependency_origins(&config, 16)
-            .unwrap();
-    let base = storage.base_charge(&config).unwrap();
-    let common = JointResources::ZERO
-        .with(JointResource::ScopeRecords, 8)
-        .with(JointResource::ClaimRecords, 64)
-        .with(
-            JointResource::MetadataBytes,
-            base.get(JointResource::MetadataBytes) * 64,
-        )
-        .with(JointResource::PayloadBytes, 64);
-    let progress = base
-        .with(JointResource::Publications, 1)
-        .with(JointResource::UnreceivedProductions, 1);
-    let custody = JointResourceLimits {
-        global: common
-            .with(JointResource::Publications, publications)
-            .with(JointResource::UnreceivedProductions, publications),
-        per_dependency: common
-            .with(JointResource::Publications, publications - 1)
-            .with(JointResource::UnreceivedProductions, publications - 1),
-        protected_progress: progress,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 8)
-            .with(
-                JointResource::MetadataBytes,
-                base.get(JointResource::MetadataBytes) * 8,
-            )
-            .with(JointResource::Computations, 4),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 8)
-            .with(
-                JointResource::MetadataBytes,
-                base.get(JointResource::MetadataBytes) * 8,
-            )
-            .with(JointResource::Computations, 4),
-        protected_progress: JointResources::ZERO,
-    };
-    let global = JointResourceLimits {
-        global: custody.global.checked_add(foreground.global).unwrap(),
-        per_dependency: custody
-            .per_dependency
-            .checked_add(foreground.per_dependency)
-            .unwrap(),
-        protected_progress: progress,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
-    let mut required = RequiredJointProgress {
-        global: progress,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = progress;
-    required.lanes[0] = progress;
-    required.class_lanes[0][0] = progress;
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: 8,
         business_limit: 8,
@@ -132,10 +55,13 @@ fn fixture(publications: u64) -> (WorkloadControl, JointAdmissionHandle, JointPr
     })
     .unwrap()
     .owner;
-    let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let (handle, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
+    // The canonical production fixture creates actual RootStage computations.
+    // Install their original result owner, independently of responsibility rows.
+    control
+        .configure_result_capacity(crate::ResultCapacityConfig::V1)
+        .unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver)
 }
@@ -266,7 +192,7 @@ fn register(
     drive(driver);
     target.unwrap()
 }
-fn effective(control: &WorkloadControl, id: u64) -> Arc<ProfileFacts> {
+fn effective(control: &WorkloadControl, id: u64) -> Arc<ResponsibilityFacts> {
     let mut capture = {
         let state = control.inner.state.lock().unwrap();
         root_domains::FactCapture::capture(
@@ -319,49 +245,6 @@ fn finish(producer: Producer) {
     producer.stage.complete();
     producer.work.business.release();
     producer.work.owner.complete();
-}
-
-#[test]
-fn canonical_productions_keep_complete_catalog_routes_and_healthy_host_protection() {
-    // K=4, G=5, H=4, p=1. Each actual D is {Host, Provider, Native}.
-    // Two A rows fit; another A would consume B's protected intersection.
-    let (control, _handle, mut driver) = fixture(5);
-    let a = producer(&control, &mut driver, "provider-a");
-    let b = producer(&control, &mut driver, "provider-b");
-    let origin_a: Arc<dyn Send + Sync> = Arc::new(());
-    let origin_b: Arc<dyn Send + Sync> = Arc::new(());
-    let a1 = register(&a.stage.scope(), &origin_a, &mut driver);
-    let a2 = register(&a.stage.scope(), &origin_a, &mut driver);
-    check_full(&control, &a1, "provider-a", 3);
-    check_full(&control, &a2, "provider-a", 3);
-    let mut refused = a
-        .stage
-        .scope()
-        .begin_unreceived_productions(Arc::downgrade(&origin_a), quote())
-        .unwrap();
-    drive(&mut driver);
-    assert!(matches!(
-        Pin::new(&mut refused).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::JointCapacity(_)
-        }))
-    ));
-    drop(refused);
-    drive(&mut driver);
-    let b1 = register(&b.stage.scope(), &origin_b, &mut driver);
-    check_full(&control, &b1, "provider-b", 3);
-    assert_eq!(a1.owner().pending_records().unwrap(), 2);
-    for grant in [&a1, &a2, &b1] {
-        grant.receive_in().unwrap().notify();
-    }
-    a1.owner().settle_received_in().unwrap().notify();
-    b1.owner().settle_received_in().unwrap().notify();
-    drop((a1, a2, b1, origin_a, origin_b));
-    finish(a);
-    finish(b);
-    control.close_admission();
-    drive(&mut driver);
-    assert!(control.shutdown().is_ok());
 }
 
 #[test]
@@ -483,6 +366,35 @@ fn registration_refuses_frozen_local_s_against_canonical_control_without_taking_
     assert!(target.is_none());
     drop((bytes, ready, pending, origin));
     finish(a);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn canonical_productions_preserve_each_complete_catalog_native_and_shared_host_origin() {
+    let (control, _handle, mut driver) = fixture(5);
+    let a = producer(&control, &mut driver, "provider-a");
+    let b = producer(&control, &mut driver, "provider-b");
+    let origin_a: Arc<dyn Send + Sync> = Arc::new(());
+    let origin_b: Arc<dyn Send + Sync> = Arc::new(());
+    let a1 = register(&a.stage.scope(), &origin_a, &mut driver);
+    let a2 = register(&a.stage.scope(), &origin_a, &mut driver);
+    check_full(&control, &a1, "provider-a", 3);
+    check_full(&control, &a2, "provider-a", 3);
+    let a3 = register(&a.stage.scope(), &origin_a, &mut driver);
+    check_full(&control, &a3, "provider-a", 3);
+    let b1 = register(&b.stage.scope(), &origin_b, &mut driver);
+    check_full(&control, &b1, "provider-b", 3);
+    assert_eq!(a1.owner().pending_records().unwrap(), 3);
+    for grant in [&a1, &a2, &a3, &b1] {
+        grant.receive_in().unwrap().notify();
+    }
+    a1.owner().settle_received_in().unwrap().notify();
+    b1.owner().settle_received_in().unwrap().notify();
+    drop((a1, a2, a3, b1, origin_a, origin_b));
+    finish(a);
+    finish(b);
     control.close_admission();
     drive(&mut driver);
     assert!(control.shutdown().is_ok());

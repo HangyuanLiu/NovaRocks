@@ -55,7 +55,6 @@ pub use control_binding::ControlBindingProposal;
 use control_binding::{validate_active_control_node, validate_control_binding_shape};
 mod control_storage;
 mod dependency_storage;
-mod metadata_geometry;
 mod paid_proposal;
 pub(crate) mod retained_claim;
 pub use paid_proposal::{
@@ -80,11 +79,10 @@ pub use paid_proposal::{
     RootStageSource, SourceCohort,
 };
 pub(crate) mod proposal_storage;
-pub(crate) use control_storage::{control_storage_base, control_storage_dependency_records};
+pub(crate) use control_storage::control_storage_base;
 use dependency_storage::{DependencyRef, DependencyRegistry};
 use proposal_storage::{
     ChangeBody, ProposalConstruction, ProposalKey, ProposalReservation, queue_proposal,
-    retire_proposal,
 };
 pub use proposal_storage::{
     JointGrantedClaims, JointProposalSlotSignal, JointProposalSlotWait, JointTryBegin,
@@ -125,29 +123,22 @@ pub struct JointAdmissionHandle {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct ProfileKey {
+pub(super) struct FactKey {
     pub(super) origin: GroupOrigin,
     class: usize,
     lane: usize,
     dependencies: Vec<u64>,
-    pub(super) causal: CausalMask,
+    pub(super) source_kind: SourceKind,
 }
-pub(super) struct ProfileFacts {
-    pub(super) key: Arc<ProfileKey>,
+pub(super) struct ResponsibilityFacts {
+    pub(super) key: Arc<FactKey>,
     pub(super) class: WorkClass,
     pub(super) lane: JointLane,
     pub(super) dependencies: Arc<Vec<DependencyRef>>,
 }
 #[derive(Clone)]
-pub(super) struct ProfileRecord {
-    pub(super) facts: Arc<ProfileFacts>,
-    pub(super) amounts: JointResources,
-    pub(super) claims: usize,
-}
-
-#[derive(Clone)]
 pub(super) struct ProposedClaim {
-    pub(super) facts: Arc<ProfileFacts>,
+    pub(super) facts: Arc<ResponsibilityFacts>,
     pub(super) amounts: JointResources,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +149,8 @@ pub(crate) enum ClaimOwner {
 }
 
 pub(super) struct ClaimRecord {
+    internal_position: bool,
+    computation_window: Option<crate::result_window::ClientComputationWindow>,
     /// Only closed Root initial/Stage Ready contains these uninstalled raws.
     /// No caller can extract them before the same atomic domain install.
     domain_birth: Option<u64>,
@@ -167,9 +160,9 @@ pub(super) struct ClaimRecord {
     production: Option<typed_custody::unreceived::ProductionRecord>,
     pub(super) owner: ClaimOwner,
     /// Charged proposal, including any not-yet-installed delta and DI union.
-    pub(super) facts: Arc<ProfileFacts>,
+    pub(super) facts: Arc<ResponsibilityFacts>,
     pub(super) amounts: JointResources,
-    active_facts: Arc<ProfileFacts>,
+    active_facts: Arc<ResponsibilityFacts>,
     active_amounts: JointResources,
     pending: Option<u64>,
     structure_revision: u64,
@@ -222,7 +215,7 @@ pub struct JointClaimView {
 pub(super) struct ChangeRecord {
     pub(super) old: Option<u64>,
     pub(super) original_amounts: Option<JointResources>,
-    pub(super) original_facts: Option<Arc<ProfileFacts>>,
+    pub(super) original_facts: Option<Arc<ResponsibilityFacts>>,
     source: Option<JointClaimView>,
     pub(super) claim: ProposedClaim,
 }
@@ -245,34 +238,6 @@ pub(super) enum RequestPhase {
     Failed(WorkError),
 }
 #[derive(Clone, Copy)]
-pub(super) enum RequestBudget {
-    WaitForCapacity,
-    Finite { remaining: u64 },
-}
-impl RequestBudget {
-    pub(super) fn is_finite(self) -> bool {
-        matches!(self, Self::Finite { .. })
-    }
-    pub(super) fn limit(self, configured: u64) -> u64 {
-        match self {
-            Self::WaitForCapacity => configured,
-            Self::Finite { remaining } => remaining.min(configured),
-        }
-    }
-    pub(super) fn charge(&mut self, work: u64) -> Result<(), WorkError> {
-        if let Self::Finite { remaining } = self {
-            *remaining = remaining
-                .checked_sub(work)
-                .ok_or(WorkError::Capacity("joint finite proof work"))?;
-        }
-        Ok(())
-    }
-    pub(super) fn exhausted(self) -> bool {
-        matches!(self, Self::Finite { remaining: 0 })
-    }
-}
-
-#[derive(Clone, Copy)]
 struct RootStageFence {
     canonical: bool,
     stage: WorkId,
@@ -286,42 +251,43 @@ pub(super) struct RequestRecord {
     pub(super) root_domain: Option<RootDomainChange>,
     // Restricted by closed original sources, never caller-supplied identities.
     root_stage: Option<RootStageFence>,
+    computation_window: Option<crate::result_window::ClientComputationWindow>,
     root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
     control_action: Option<ControlActionFence>,
     native_action: Option<NativeActionFence>,
-    pub(super) budget: RequestBudget,
     pub(super) owner: WorkId,
     pub(super) changes: ChangeBody,
     source_cohort: bool,
     proposal: Option<ProposalKey>,
     pub(super) phase: RequestPhase,
-    pub(super) blocked_at: Option<u64>,
     /// Only the original service timer arms a new local observation pass.
     pub(super) local_blocked: bool,
     pub(super) waker: Option<Waker>,
 }
 pub(crate) struct JointLedger {
-    pub(super) config: Arc<ValidatedJointCapacityConfig>,
+    pub(super) config: Arc<ResponsibilityConfig>,
     dependencies: Option<DependencyRegistry>,
     pub(super) claims: BTreeMap<u64, ClaimRecord>,
-    pub(super) profiles: BTreeMap<Arc<ProfileKey>, ProfileRecord>,
     pub(super) requests: BTreeMap<u64, RequestRecord>,
-    pub(super) release_epoch: u64,
     /// A rollback can rekey a live charge behind a snapshot's ordered cursor.
     /// Such a change invalidates both positive and negative certificates.
-    pub(super) profile_layout_revision: u64,
-    pub(super) active: Option<u64>,
+    pub(super) facts_revision: u64,
     pub(super) driver_closed: bool,
     /// Count of local_blocked flags in this same original request inventory.
     pub(super) local_waiters: usize,
-    control_empty_facts: [Option<Arc<ProfileFacts>>; 5],
+    control_empty_facts: [Option<Arc<ResponsibilityFacts>>; 5],
 }
 impl JointLedger {
     pub(super) fn has_reclaimable_dependencies(&self) -> bool {
         self.dependencies
             .as_ref()
             .is_some_and(|rows| rows.has_zero())
+    }
+    pub(super) fn arm_dependency_sweep(&mut self) {
+        if let Some(rows) = &mut self.dependencies {
+            rows.arm_sweep();
+        }
     }
     pub(super) fn reap_dependency(&mut self) -> bool {
         self.dependencies
@@ -331,7 +297,6 @@ impl JointLedger {
     pub(crate) fn is_drained(&self, storage: &CancellationStorage) -> bool {
         if !self.requests.is_empty()
             || self.local_waiters != 0
-            || self.active.is_some()
             || self
                 .dependencies
                 .as_ref()
@@ -340,7 +305,7 @@ impl JointLedger {
             return false;
         }
         if !storage.fixed {
-            return self.claims.is_empty() && self.profiles.is_empty();
+            return self.claims.is_empty();
         }
         if !storage.drained() || self.claims.len() != storage.slots.len() {
             return false;
@@ -352,7 +317,7 @@ impl JointLedger {
             let Some(record) = slot.claim.and_then(|id| self.claims.get(&id)) else {
                 return false;
             };
-            let Some(empty) = &self.control_empty_facts[class_index(slot.class)] else {
+            let Some(empty) = &self.control_empty_facts[class_index(record.facts.class)] else {
                 return false;
             };
             if record.owner != ClaimOwner::ControlSlot(SlotId(index))
@@ -365,80 +330,34 @@ impl JointLedger {
                 return false;
             }
         }
-        let mut expected_profiles = 0;
-        for (class, facts) in self.control_empty_facts.iter().enumerate() {
-            let Some(facts) = facts else {
-                continue;
-            };
-            expected_profiles += 1;
-            let Some(profile) = self.profiles.get(&facts.key) else {
-                return false;
-            };
-            let mut amount = JointResources::ZERO;
-            let mut members = 0;
-            for slot in &storage.slots {
-                if class_index(slot.class) == class {
-                    let Ok(sum) = amount.checked_add(slot.base) else {
-                        return false;
-                    };
-                    amount = sum;
-                    members += 1;
-                }
-            }
-            if profile.amounts != amount || profile.claims != members {
-                return false;
-            }
-        }
-        self.profiles.len() == expected_profiles
+        true
     }
     pub(super) fn released(&mut self) {
-        match self.release_epoch.checked_add(1) {
-            Some(epoch) => self.release_epoch = epoch,
-            None => self.driver_closed = true,
-        }
+        self.layout_changed();
     }
     fn layout_changed(&mut self) {
-        match self.profile_layout_revision.checked_add(1) {
-            Some(revision) => self.profile_layout_revision = revision,
+        match self.facts_revision.checked_add(1) {
+            Some(revision) => self.facts_revision = revision,
             None => self.driver_closed = true,
         }
     }
 }
 impl WorkloadControl {
-    pub fn configure_joint_capacity(
+    pub fn configure_responsibility(
         &self,
-        config: ValidatedJointCapacityConfig,
+        config: ResponsibilityConfig,
     ) -> Result<(JointAdmissionHandle, JointProgressDriver), WorkError> {
         let config = Arc::new(config);
         self.inner.update(|state| {
             if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
                 return Err(WorkError::Conflict);
             }
-            if config
-                .source_authority
-                .as_ref()
-                .is_some_and(|authority| !Weak::ptr_eq(authority, &Arc::downgrade(&self.inner)))
-            {
-                return Err(WorkError::ForeignAuthority);
-            }
-            if let Some(source) = config.internal_cpu_factory.as_ref() {
-                let installed = state
-                    .internal_cpu_factory
-                    .as_ref()
-                    .ok_or(WorkError::NotReady)?;
-                if !installed.matches(source) || !source.is_live() {
-                    return Err(WorkError::ForeignAuthority);
-                }
-            }
             state.joint = Some(JointLedger {
                 config: Arc::clone(&config),
-                dependencies: None,
+                dependencies: Some(DependencyRegistry::new()),
                 claims: BTreeMap::new(),
-                profiles: BTreeMap::new(),
                 requests: BTreeMap::new(),
-                release_epoch: 0,
-                profile_layout_revision: 0,
-                active: None,
+                facts_revision: 0,
                 driver_closed: false,
                 local_waiters: 0,
                 control_empty_facts: std::array::from_fn(|_| None),
@@ -463,19 +382,6 @@ impl JointAdmissionHandle {
             if state.closed || ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            // Only the legacy kernel fixture can initialize an unpaid service.
-            // Production composition creates this inventory after fee validation.
-            #[cfg(test)]
-            if state.joint.as_ref().unwrap().dependencies.is_none() {
-                let count = state
-                    .joint
-                    .as_ref()
-                    .unwrap()
-                    .config
-                    .config
-                    .max_registered_dependencies;
-                state.joint.as_mut().unwrap().dependencies = Some(DependencyRegistry::new(count)?);
-            }
             let ledger = state.joint.as_mut().unwrap();
             let registry = ledger.dependencies.as_mut().ok_or(WorkError::NotReady)?;
             if let Some(record) = registry.lookup(&fact) {
@@ -484,9 +390,6 @@ impl JointAdmissionHandle {
                     record,
                     _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(&self.inner)),
                 });
-            }
-            if ledger.active.is_some() {
-                return Err(WorkError::Capacity("joint proof fence"));
             }
             let ordinal = state.next_id()?;
             let record = state
@@ -535,7 +438,7 @@ impl JointAdmissionHandle {
         if !Arc::ptr_eq(&self.inner, &scope.inner) {
             return Err(WorkError::ForeignAuthority);
         }
-        let (source, from, base, to, work_limit) = {
+        let (source, from, base, to) = {
             let mut state = self.inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             if state.closed || ledger.driver_closed {
@@ -563,13 +466,14 @@ impl JointAdmissionHandle {
             {
                 return Err(WorkError::Conflict);
             }
-            let slot = state.cancellations.free_heads[class_index(node.class)]
+            let slot = state
+                .cancellations
+                .free_head
                 .ok_or(WorkError::Capacity("fixed control slots"))?;
             let cell = &state.cancellations.slots[slot.0];
             let claim = cell.claim.ok_or(WorkError::NotReady)?;
             let old = &ledger.claims[&claim];
             if cell.phase != SlotPhase::Free
-                || cell.class != node.class
                 || cell.parent.is_some()
                 || old.owner != ClaimOwner::ControlSlot(slot)
                 || old.pending.is_some()
@@ -577,7 +481,7 @@ impl JointAdmissionHandle {
                 || old.active_amounts != cell.base
                 || !old.facts.dependencies.is_empty()
                 || !old.active_facts.dependencies.is_empty()
-                || !old.active_facts.key.causal.is_empty()
+                || !old.active_facts.key.source_kind.is_empty()
             {
                 return Err(WorkError::Conflict);
             }
@@ -617,7 +521,6 @@ impl JointAdmissionHandle {
                 Arc::clone(&old.active_facts),
                 cell.base,
                 Arc::clone(&parent.active_facts),
-                ledger.config.config.max_total_proof_work,
             );
             let custody = custody.as_mut().ok_or(WorkError::NotReady)?;
             if custody.reserved_child.is_some() {
@@ -625,7 +528,8 @@ impl JointAdmissionHandle {
             }
             let class = class_index(node.class);
             let next = state.cancellations.slots[slot.0].next_free.take();
-            state.cancellations.free_heads[class] = next;
+            state.cancellations.free_head = next;
+            state.cancellations.slots[slot.0].class = state.nodes[&scope.id].class;
             state.cancellations.slots[slot.0].phase = SlotPhase::ChildReserved { parent: scope.id };
             custody.reserved_child = Some(slot);
             result
@@ -644,13 +548,11 @@ impl JointAdmissionHandle {
         Ok(PreparedRequest {
             root_domain: None,
             root_stage: None,
+            computation_window: None,
             root_payload: None,
             cpu_action: None,
             control_action: None,
             native_action: None,
-            budget: RequestBudget::Finite {
-                remaining: work_limit,
-            },
             scope: scope.clone(),
             changes: self.store_proposal(&custody, vec![change])?,
             custody,
@@ -676,21 +578,6 @@ impl JointAdmissionHandle {
     /// This still awaits the original driver's bounded progression; it grants
     /// no capacity or metadata funding merely by constructing the request.
     #[cfg(test)]
-    pub fn request_finite(
-        &self,
-        scope: &WorkScope,
-        changes: Vec<JointClaimChange>,
-        proof_work_limit: std::num::NonZeroU64,
-    ) -> Result<JointAdmission, JointAdmissionFailure> {
-        self.prepare_request(scope, &changes)
-            .and_then(|mut prepared| {
-                prepared.budget = RequestBudget::Finite {
-                    remaining: proof_work_limit.get(),
-                };
-                self.queue_request(prepared)
-            })
-            .map_err(|error| JointAdmissionFailure { error })
-    }
 
     /// Capture only immutable headers under State. Dependency union, sorting
     /// and record allocation occur outside the original authority's mutex.
@@ -704,22 +591,18 @@ impl JointAdmissionHandle {
             return Err(WorkError::ForeignAuthority);
         }
         let custody = self.reserve_proposal(scope)?;
-        let (config, class) = {
+        let class = {
             let state = self.inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             if ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            if changes.is_empty() || changes.len() > ledger.config.config.max_changes_per_request {
+            if changes.is_empty() {
                 return Err(WorkError::Capacity("joint batch records"));
             }
-            if ledger.requests.len() >= ledger.config.config.max_requests {
-                return Err(WorkError::Capacity("joint request and reply records"));
-            }
-            (Arc::clone(&ledger.config), node.class)
+            node.class
         };
-        let config = &config.config;
         let mut records: Vec<ChangeRecord> = Vec::with_capacity(changes.len());
         for change in changes {
             let adjustment = match change {
@@ -764,9 +647,6 @@ impl JointAdmissionHandle {
                     };
                     (None, None, *lane, *amounts, Vec::new(), dependencies)
                 };
-            if additional.len() > config.max_dependencies_per_claim {
-                return Err(WorkError::Capacity("joint dependency fanout"));
-            }
             for dependency in additional {
                 if !Arc::ptr_eq(&self.inner, &dependency.inner) {
                     return Err(WorkError::ForeignAuthority);
@@ -778,16 +658,13 @@ impl JointAdmissionHandle {
                 return Err(WorkError::Conflict);
             }
             selected.dedup_by_key(|record| record.ordinal);
-            if selected.len() > config.max_dependencies_per_claim {
-                return Err(WorkError::Capacity("joint dependency union"));
-            }
-            let facts = Arc::new(ProfileFacts {
-                key: Arc::new(ProfileKey {
+            let facts = Arc::new(ResponsibilityFacts {
+                key: Arc::new(FactKey {
                     origin: GroupOrigin::Frozen,
                     class: class_index(class),
                     lane: lane as usize,
                     dependencies: selected.iter().map(|d| d.ordinal).collect(),
-                    causal: CausalMask::NONE,
+                    source_kind: SourceKind::Plain,
                 }),
                 class,
                 lane,
@@ -804,24 +681,11 @@ impl JointAdmissionHandle {
         Ok(PreparedRequest {
             root_domain: None,
             root_stage: None,
+            computation_window: None,
             root_payload: None,
             cpu_action: None,
             control_action: None,
             native_action: None,
-            // A resident control rekey uses one cumulative finite proof,
-            // including later full-domain extensions. It cannot self-park.
-            budget: if records.iter().any(|record| {
-                record
-                    .source
-                    .as_ref()
-                    .is_some_and(|source| matches!(source.source, ClaimSource::NodeControl { .. }))
-            }) {
-                RequestBudget::Finite {
-                    remaining: config.max_total_proof_work,
-                }
-            } else {
-                RequestBudget::WaitForCapacity
-            },
             scope: scope.clone(),
             changes: self.store_proposal(&custody, records)?,
             custody,
@@ -874,7 +738,7 @@ impl JointAdmissionHandle {
             if let Some(fence) = prepared.cpu_action {
                 validate_cpu_action(state, scope.id, fence, records)?;
             } else if records.iter().any(|change| {
-                !change.claim.facts.key.causal.is_empty()
+                !change.claim.facts.key.source_kind.is_empty()
                     || (state.internal_cpu_factory.is_some()
                         && change.claim.amounts.get(JointResource::InternalCpuJobs) != 0)
             }) {
@@ -897,9 +761,6 @@ impl JointAdmissionHandle {
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             if ledger.driver_closed {
                 return Err(WorkError::Closed);
-            }
-            if ledger.requests.len() >= ledger.config.config.max_requests {
-                return Err(WorkError::Capacity("joint request and reply records"));
             }
             for change in records.iter() {
                 if let GroupOrigin::Inherited(root) = change.claim.facts.key.origin {
@@ -966,16 +827,11 @@ impl JointAdmissionHandle {
                 RequestRecord {
                     root_domain: prepared.root_domain.take(),
                     root_stage: prepared.root_stage,
+                    computation_window: prepared.computation_window,
                     root_payload: prepared.root_payload,
                     cpu_action: prepared.cpu_action,
                     control_action: prepared.control_action,
                     native_action: prepared.native_action,
-                    budget: match prepared.budget {
-                        RequestBudget::Finite { remaining } => RequestBudget::Finite {
-                            remaining: remaining.min(ledger.config.config.max_total_proof_work),
-                        },
-                        RequestBudget::WaitForCapacity => RequestBudget::WaitForCapacity,
-                    },
                     owner: scope.id,
                     changes: records.clone(),
                     source_cohort: prepared
@@ -984,7 +840,6 @@ impl JointAdmissionHandle {
                         .is_some_and(|custody| !custody.reserved_cohort.is_empty()),
                     proposal,
                     phase: RequestPhase::Waiting,
-                    blocked_at: None,
                     local_blocked: false,
                     waker: None,
                 },
@@ -1022,11 +877,11 @@ impl JointAdmissionHandle {
 pub(super) struct PreparedRequest {
     root_domain: Option<RootDomainChange>,
     root_stage: Option<RootStageFence>,
+    computation_window: Option<crate::result_window::ClientComputationWindow>,
     root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
     control_action: Option<ControlActionFence>,
     native_action: Option<NativeActionFence>,
-    budget: RequestBudget,
     scope: WorkScope,
     changes: ChangeBody,
     custody: Option<ProposalConstruction>,
@@ -1106,7 +961,7 @@ fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), Wor
         _ => false,
     };
     if !custody
-        || !record.active_facts.key.causal.is_empty()
+        || !record.active_facts.key.source_kind.is_empty()
         || record.structure_revision != source.structure_revision
         || record.release_revision != source.release_revision
     {
@@ -1216,7 +1071,6 @@ fn authenticate_scope(
                 || !record.facts.dependencies.is_empty()
                 || !record.active_facts.dependencies.is_empty()
                 || cell.next_free.is_some()
-                || ledger.claims[&parent.claim].active_facts.class != cell.class
             {
                 return Err(WorkError::Conflict);
             }
@@ -1282,15 +1136,6 @@ pub(super) fn validate_waiting(
 }
 
 impl WorkScope {
-    /// Read the same original Joint configuration; this grants no admission.
-    pub fn joint_dependency_limit(&self) -> Result<usize, WorkError> {
-        let state = self.inner.state.lock().unwrap();
-        state
-            .joint
-            .as_ref()
-            .map(|joint| joint.config.declared().max_dependencies_per_claim)
-            .ok_or(WorkError::NotReady)
-    }
     /// Request one same-class child with the parent's complete admitted
     /// dependency set. This uses the original fixed proposal and proof driver;
     /// it grants neither an I/O stage nor physical execution capacity.
@@ -1394,6 +1239,14 @@ impl std::fmt::Debug for JointClaim {
     }
 }
 impl JointClaim {
+    #[cfg(test)]
+    pub(super) fn active_dependency_count(&self) -> usize {
+        let state = self.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().claims[&self.id.unwrap()]
+            .active_facts
+            .dependencies
+            .len()
+    }
     pub fn view(&self) -> Result<JointClaimView, WorkError> {
         let id = self.id.ok_or(WorkError::Released)?;
         let state = self.inner.state.lock().unwrap();
@@ -1403,7 +1256,7 @@ impl JointClaim {
             .and_then(|l| l.claims.get(&id))
             .ok_or(WorkError::Released)?;
         if !record.custody.is_raw()
-            || !record.active_facts.key.causal.is_empty()
+            || !record.active_facts.key.source_kind.is_empty()
             || !matches!(record.owner, ClaimOwner::PhysicalWork(_))
         {
             return Err(WorkError::Conflict);
@@ -1416,7 +1269,8 @@ impl JointClaim {
             release_revision: record.release_revision,
         })
     }
-    /// Only the installed amount is permission to start physical work.
+    /// Installed responsibility quantities only. Actual execution/allocation
+    /// still requires the original executor, transport or result owner permit.
     pub fn amounts(&self) -> Result<JointResources, WorkError> {
         let id = self.id.ok_or(WorkError::Released)?;
         let state = self.inner.state.lock().unwrap();
@@ -1441,18 +1295,13 @@ impl JointClaim {
             let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
             let record = ledger.claims.get_mut(&id).ok_or(WorkError::Released)?;
             if !record.custody.is_raw()
-                || !record.active_facts.key.causal.is_empty()
+                || !record.active_facts.key.source_kind.is_empty()
                 || !matches!(record.owner, ClaimOwner::PhysicalWork(_))
             {
                 return Err(WorkError::Conflict);
             }
             let active = record.active_amounts.checked_sub(released)?;
             let charged = record.amounts.checked_sub(released)?;
-            let profile = ledger
-                .profiles
-                .get_mut(&record.facts.key)
-                .expect("live claim profile");
-            profile.amounts = profile.amounts.checked_sub(released)?;
             record.active_amounts = active;
             record.amounts = charged;
             match record.release_revision.checked_add(1) {
@@ -1475,43 +1324,11 @@ impl Drop for JointClaim {
         }
     }
 }
-fn subtract_profile(ledger: &mut JointLedger, facts: &Arc<ProfileFacts>, amounts: JointResources) {
-    let profile = ledger
-        .profiles
-        .get_mut(&facts.key)
-        .expect("live charge profile");
-    profile.amounts = profile
-        .amounts
-        .checked_sub(amounts)
-        .expect("profile contains charge");
-    profile.claims -= 1;
-    if profile.claims == 0 {
-        ledger.profiles.remove(&facts.key);
-    }
-}
-fn add_profile(ledger: &mut JointLedger, facts: Arc<ProfileFacts>, amounts: JointResources) {
-    let profile = ledger
-        .profiles
-        .entry(Arc::clone(&facts.key))
-        .or_insert(ProfileRecord {
-            facts,
-            amounts: JointResources::ZERO,
-            claims: 0,
-        });
-    // Rollback is a monotone release of charged delta and dependency membership;
-    // the already-certified global u64 capacity bounds the remaining sum.
-    profile.amounts = profile
-        .amounts
-        .checked_add(amounts)
-        .expect("certified live amount");
-    profile.claims += 1;
-}
 fn remove_claim(state: &mut State, id: u64) {
     let Some(record) = state.joint.as_mut().unwrap().claims.remove(&id) else {
         return;
     };
     let ledger = state.joint.as_mut().unwrap();
-    subtract_profile(ledger, &record.facts, record.amounts);
     ledger.released();
     let owner = match record.owner {
         ClaimOwner::PhysicalWork(owner) | ClaimOwner::OwnerRetained(owner) => owner,
@@ -1519,6 +1336,14 @@ fn remove_claim(state: &mut State, id: u64) {
             unreachable!("fixed control claims are released only with their process inventory")
         }
     };
+    if record.internal_position {
+        release_internal_position(state, owner);
+    }
+    if record.amounts.get(JointResource::Computations) != 0 {
+        if let Some(window) = &record.computation_window {
+            window.release(state, id);
+        }
+    }
     state.nodes.get_mut(&owner).unwrap().resource_holders -= 1;
     state.collect(owner);
 }
@@ -1592,7 +1417,7 @@ fn remove_request(state: &mut State, id: u64) {
             }
         }
         if let Some(key) = request.proposal {
-            retire_proposal(state, key, Some(id));
+            root_domains::release_construction(state, request.owner, key);
         }
         if let Some(fence) = request.root_stage {
             state.nodes.get_mut(&fence.stage).unwrap().resource_waiters -= 1;
@@ -1715,8 +1540,6 @@ pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Opti
                 Some(revision) => record.structure_revision = revision,
                 None => ledger.driver_closed = true,
             }
-            subtract_profile(ledger, &from, amount);
-            add_profile(ledger, Arc::clone(&to), active);
             if from.key != to.key {
                 ledger.layout_changed();
             }
@@ -1750,8 +1573,54 @@ fn withdraw_request(state: &mut State, id: u64) -> Option<Waker> {
     waker
 }
 
-/// Called only by the unique driver, after proof and exact source validation.
-/// Preflight reads live affected groups; it never swaps a copied ledger.
+/// Actual result positions belong to the original ResultCapacity author.
+/// Waiting for another producer is backpressure, not a responsibility failure.
+pub(super) fn request_compute_room(state: &State, id: u64) -> Result<bool, WorkError> {
+    let request = state
+        .joint
+        .as_ref()
+        .ok_or(WorkError::NotReady)?
+        .requests
+        .get(&id)
+        .ok_or(WorkError::Released)?;
+    if !request
+        .root_stage
+        .is_some_and(|fence| fence.computation.is_none())
+    {
+        return Ok(true);
+    }
+    if let Some(window) = &request.computation_window {
+        return window.room();
+    }
+    let config = state.result_capacity.ok_or(WorkError::NotReady)?;
+    Ok(state.result_windows.held_positions[2] < config.positions[2])
+}
+fn charge_internal_position(state: &mut State, owner: WorkId) -> Result<(), WorkError> {
+    let config = state.result_capacity.ok_or(WorkError::NotReady)?;
+    if state.result_windows.held_positions[2] >= config.positions[2] {
+        return Err(WorkError::Capacity("Internal computation positions"));
+    }
+    state
+        .nodes
+        .get_mut(&owner)
+        .ok_or(WorkError::Released)?
+        .result_windows
+        .held_positions[2] += 1;
+    state.result_windows.held_positions[2] += 1;
+    Ok(())
+}
+fn release_internal_position(state: &mut State, owner: WorkId) {
+    state
+        .nodes
+        .get_mut(&owner)
+        .expect("original compute owner")
+        .result_windows
+        .held_positions[2] -= 1;
+    state.result_windows.held_positions[2] -= 1;
+}
+
+/// Called only by the unique responsibility driver after exact source validation.
+/// This transfers recorded quantities, not physical or allocation permission.
 pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError> {
     let ledger = state.joint.as_ref().unwrap();
     if ledger.driver_closed {
@@ -1762,24 +1631,20 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
         return Err(WorkError::Conflict);
     }
     validate_waiting(state, id, &request.changes)?;
+    if !request_compute_room(state, id)? {
+        return Err(WorkError::Capacity("Internal computation positions"));
+    }
+    let internal_compute = request
+        .root_stage
+        .is_some_and(|fence| fence.computation.is_none())
+        && request.computation_window.is_none();
+    let computation_window = request.computation_window.clone();
     let changes = request.changes.clone();
     let owner = request.owner;
     let root_domain = request.root_domain.clone();
     let physical_owner = request.root_stage.map_or(owner, |fence| fence.stage);
     let native_action = request.native_action.clone();
-    let dispatch_work = request
-        .budget
-        .limit(ledger.config.config.max_total_proof_work);
     let new_count = changes.iter().filter(|c| c.old.is_none()).count();
-    if ledger
-        .claims
-        .len()
-        .checked_add(new_count)
-        .ok_or(WorkError::ArithmeticOverflow)?
-        > ledger.config.config.max_claims
-    {
-        return Err(WorkError::Capacity("joint claim records"));
-    }
     for (index, change) in changes.iter().enumerate() {
         if change.old.is_none() {
             let holder = native_action
@@ -1799,7 +1664,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
         .checked_add(new_count as u64)
         .ok_or(WorkError::ArithmeticOverflow)?;
     ledger
-        .profile_layout_revision
+        .facts_revision
         .checked_add(changes.len() as u64)
         .and_then(|n| n.checked_add(u64::from(root_domain.is_some())))
         .ok_or(WorkError::ArithmeticOverflow)?;
@@ -1814,45 +1679,6 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             }
         }
     }
-    let mut profiles = BTreeMap::new();
-    for change in changes.iter() {
-        for facts in change
-            .original_facts
-            .iter()
-            .chain(std::iter::once(&change.claim.facts))
-        {
-            profiles.entry(Arc::clone(&facts.key)).or_insert_with(|| {
-                ledger
-                    .profiles
-                    .get(&facts.key)
-                    .cloned()
-                    .unwrap_or(ProfileRecord {
-                        facts: Arc::clone(facts),
-                        amounts: JointResources::ZERO,
-                        claims: 0,
-                    })
-            });
-        }
-    }
-    // All originals are removed before any candidate is added, including when
-    // original and union dependency keys differ or two sources share a group.
-    for change in changes.iter() {
-        if let Some(facts) = &change.original_facts {
-            let profile = profiles.get_mut(&facts.key).unwrap();
-            profile.amounts = profile
-                .amounts
-                .checked_sub(change.original_amounts.unwrap())?;
-            profile.claims = profile.claims.checked_sub(1).ok_or(WorkError::Conflict)?;
-        }
-    }
-    for change in changes.iter() {
-        let profile = profiles.get_mut(&change.claim.facts.key).unwrap();
-        profile.amounts = profile.amounts.checked_add(change.claim.amounts)?;
-        profile.claims = profile
-            .claims
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
     let mut new_ids = Vec::with_capacity(new_count);
     for (index, change) in changes.iter().enumerate() {
         let physical_owner = native_action
@@ -1865,7 +1691,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             let ledger = state.joint.as_mut().unwrap();
             let record = ledger.claims.get_mut(&old).unwrap();
             let rekey = record.facts.key != change.claim.facts.key;
-            record.facts = Arc::clone(&profiles[&change.claim.facts.key].facts);
+            record.facts = Arc::clone(&change.claim.facts);
             record.amounts = change.claim.amounts;
             record.structure_revision += 1; // Reserved by request preflight.
             if let Some(source) = &change.source {
@@ -1896,23 +1722,38 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             state.joint.as_mut().unwrap().claims.insert(
                 new_id,
                 ClaimRecord {
+                    internal_position: internal_compute
+                        && change.claim.amounts.get(JointResource::Computations) != 0,
+                    computation_window: (change.claim.amounts.get(JointResource::Computations)
+                        != 0)
+                        .then(|| computation_window.clone())
+                        .flatten(),
                     domain_birth: root_domain.as_ref().map(|_| id),
                     native_dispatch: native_action
                         .as_ref()
-                        .map(|fence| fence.dispatch_origin(id, index, dispatch_work)),
+                        .map(|fence| fence.dispatch_origin(id, index)),
                     dispatch_staging: None,
                     custody: ClaimCustody::Raw,
                     production: None,
                     owner: ClaimOwner::PhysicalWork(physical_owner),
-                    facts: Arc::clone(&profiles[&change.claim.facts.key].facts),
+                    facts: Arc::clone(&change.claim.facts),
                     amounts: change.claim.amounts,
-                    active_facts: Arc::clone(&profiles[&change.claim.facts.key].facts),
+                    active_facts: Arc::clone(&change.claim.facts),
                     active_amounts: change.claim.amounts,
                     pending: None,
                     structure_revision: 0,
                     release_revision: 0,
                 },
             );
+            if change.claim.amounts.get(JointResource::Computations) != 0 {
+                if internal_compute {
+                    charge_internal_position(state, physical_owner)
+                        .expect("original position and owner prechecked before mutation");
+                }
+                if let Some(window) = &computation_window {
+                    window.acquire(new_id);
+                }
+            }
             state
                 .nodes
                 .get_mut(&physical_owner)
@@ -1922,13 +1763,6 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
         }
     }
     let ledger = state.joint.as_mut().unwrap();
-    for (key, profile) in profiles {
-        if profile.claims == 0 {
-            ledger.profiles.remove(&key);
-        } else {
-            ledger.profiles.insert(key, profile);
-        }
-    }
     for change in changes.iter() {
         for dependency in change.claim.facts.dependencies.iter() {
             ledger
@@ -2259,9 +2093,7 @@ impl JointAdmission {
             let result = (|state: &mut State| {
                 let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
                 let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
-                if !request.budget.is_finite()
-                    || request.changes.iter().any(|change| change.old.is_some())
-                {
+                if request.changes.iter().any(|change| change.old.is_some()) {
                     return Err(WorkError::Conflict);
                 }
                 match &request.phase {
@@ -2402,15 +2234,8 @@ impl JointLocalOffer<'_> {
                 .requests
                 .get_mut(&self.id)
                 .unwrap();
-            let failure = failure.or_else(|| {
-                request
-                    .budget
-                    .exhausted()
-                    .then_some(WorkError::Capacity("joint finite proof work"))
-            });
             request.phase = failure.map_or(RequestPhase::Waiting, RequestPhase::Failed);
             request.local_blocked = matches!(request.phase, RequestPhase::Waiting);
-            request.blocked_at = None;
             if request.local_blocked {
                 // Bounded by max_requests; this flag was false in LocalOffered.
                 state.joint.as_mut().unwrap().local_waiters += 1;
@@ -2483,10 +2308,7 @@ impl JointLocalOffer<'_> {
             if ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            if new_ids.len() != count
-                || !request.budget.is_finite()
-                || request.changes.iter().any(|change| change.old.is_some())
-            {
+            if new_ids.len() != count || request.changes.iter().any(|change| change.old.is_some()) {
                 return Err(WorkError::Conflict);
             }
             if request.requires_business_active() {

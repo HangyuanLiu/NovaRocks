@@ -106,9 +106,7 @@ pub(super) fn production_error(message: &'static str) -> ConnectorError {
 }
 pub(super) fn production_work_error(error: WorkError) -> ConnectorError {
     let kind = match error {
-        WorkError::Capacity(_) | WorkError::JointCapacity(_) => {
-            ConnectorErrorKind::ResourceExhausted
-        }
+        WorkError::Capacity(_) => ConnectorErrorKind::ResourceExhausted,
         WorkError::Closed | WorkError::Released => ConnectorErrorKind::Cancelled,
         _ => ConnectorErrorKind::InvalidRequest,
     };
@@ -124,16 +122,8 @@ impl ConnectorWriteSession {
         let Some(quote) = WriteProductionQuote::from_manifest(manifest)? else {
             return Ok(());
         };
-        // Count the complete immutable cohort before building a paid request
-        // or allowing the first Native writer effect. Never truncate it.
-        let limit = scope
-            .unreceived_production_occurrence_limit()
-            .map_err(production_work_error)?;
-        if quote.occurrences() > limit {
-            return Err(production_work_error(WorkError::Capacity(
-                "writer cohort exceeds protected profile support",
-            )));
-        }
+        // Register the complete actual cohort before the first writer effect.
+        // No per-dependency occurrence quota truncates its responsibility.
         for cohort in manifest.writer_cohorts() {
             if !self
                 .targets()

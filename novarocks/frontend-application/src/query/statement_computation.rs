@@ -51,6 +51,7 @@ use novarocks_workload_control::{
 use std::task::{Context, Poll};
 
 pub(crate) struct StatementStageAdmission {
+    client_window: Option<novarocks_workload_control::ResultWindowAlias>,
     root: WorkScope,
     peak_bytes: u64,
     admitted: bool,
@@ -69,6 +70,7 @@ pub(crate) struct StatementStageAdmission {
 impl StatementStageAdmission {
     pub(crate) fn new(root: WorkScope, peak_bytes: u64) -> Self {
         Self {
+            client_window: None,
             root,
             peak_bytes,
             admitted: false,
@@ -84,6 +86,18 @@ impl StatementStageAdmission {
             busy: false,
             health: health(),
         }
+    }
+    pub(crate) fn with_client_window(
+        mut self,
+        window: &novarocks_workload_control::ResultWindowAlias,
+    ) -> Result<Self, WorkError> {
+        if window.class() != novarocks_workload_control::ResultWindowClass::Client
+            || !window.is_for_scope(&self.root)
+        {
+            return Err(WorkError::Conflict);
+        }
+        self.client_window = Some(window.try_clone()?);
+        Ok(self)
     }
     pub(crate) fn poll_admit(
         &mut self,
@@ -172,6 +186,12 @@ impl StatementStageAdmission {
                 let source = io
                     .root_stage_source(self.owner.as_ref().unwrap())
                     .map_err(|e| internal_error(e.to_string()))?;
+                let source = match self.client_window.as_ref() {
+                    Some(window) => source
+                        .for_client_window(window)
+                        .map_err(|error| internal_error(error.to_string()))?,
+                    None => source,
+                };
                 let mut proposal = match source
                     .try_begin(self.peak_bytes, JointLane::Foreground)
                     .map_err(|e| internal_error(e.to_string()))?
@@ -429,7 +449,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             root,
             initial,
             launcher,
-            crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES,
+            0,
             #[cfg(novarocks_dev_controls)]
             observation,
         )

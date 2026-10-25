@@ -46,53 +46,10 @@ fn receive<A: Future + Unpin>(admission: &mut A) -> A::Output {
     }
 }
 fn original_runtime() -> (WorkloadControl, JointProgressDriver) {
-    let storage = ControlStorageConfig::new([8, 0, 0, 0, 0], 1, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 2,
-        max_registered_dependencies: 266,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: 2,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10_000_000,
+    let storage = ControlStorageConfig::new(8, &[]);
+    let config = ResponsibilityConfig {
         work_per_turn: NonZeroUsize::new(7).unwrap(),
     };
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let limits = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::UnreceivedProductions, 4)
-            .with(JointResource::Publications, 4),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::UnreceivedProductions, 4)
-            .with(JointResource::Publications, 4),
-        protected_progress: base,
-    };
-    config.global = limits;
-    config.classes[0] = limits;
-    config.lanes[0] = limits;
-    config.class_lanes[0][0] = limits;
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: 8,
         business_limit: 8,
@@ -102,9 +59,7 @@ fn original_runtime() -> (WorkloadControl, JointProgressDriver) {
     })
     .unwrap()
     .owner;
-    let (_joint, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let (_joint, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
     control.mark_ready().unwrap();
     (control, driver)

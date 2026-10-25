@@ -47,143 +47,10 @@ impl GovernedWireRole {
                 .unwrap();
         let wait_backing =
             std::alloc::Layout::array::<u8>(wait_source.resident_bytes().unwrap()).unwrap();
-        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 4, 2, &[])
-            .with_process_source_backing(
-                novarocks_workload_control::PollRoleSourceBacking::from_layouts(
-                    &[],
-                    &[wait_backing],
-                )
+        let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
+            novarocks_workload_control::PollRoleSourceBacking::from_layouts(&[], &[wait_backing])
                 .unwrap(),
-            );
-        let mut config = JointCapacityConfig {
-            global: JointResourceLimits::default(),
-            classes: [JointResourceLimits::default(); 5],
-            lanes: [JointResourceLimits::default(); 3],
-            class_lanes: [[JointResourceLimits::default(); 3]; 5],
-            max_dependencies_per_claim: 2,
-            max_registered_dependencies: 1,
-            max_claims: 512,
-            max_requests: 32,
-            max_changes_per_request: FIXTURE_CHANGES_PER_REQUEST,
-            max_snapshot_bytes: 64 * 1024 * 1024,
-            max_scratch_bytes: 64 * 1024 * 1024,
-            max_residual_arcs: 100000,
-            max_total_proof_work: 10000000,
-            work_per_turn: NonZeroUsize::new(31).unwrap(),
-        };
-        config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
-        let base = storage.base_charge(&config).unwrap();
-        let metadata = base
-            .get(JointResource::MetadataBytes)
-            .checked_mul(64)
-            .unwrap();
-        let mut custody = JointResources::ZERO
-            .with(JointResource::ScopeRecords, count as u64)
-            .with(JointResource::ClaimRecords, 256)
-            .with(JointResource::ReplyRecords, 512)
-            .with(JointResource::QueueRecords, 128)
-            .with(JointResource::MetadataBytes, metadata)
-            .with(JointResource::PayloadBytes, 16 * 1024 * 1024 * 1024);
-        let execution = JointResources::ZERO
-            .with(JointResource::ClaimRecords, 128)
-            .with(JointResource::MetadataBytes, metadata)
-            .with(JointResource::PayloadBytes, 16 * 1024 * 1024 * 1024)
-            .with(JointResource::AsyncIo, 64)
-            .with(JointResource::PhysicalQueueRecords, 64)
-            .with(JointResource::PhysicalQueueBytes, 1024 * 1024 * 1024);
-        // Explicit finite support of this wire fixture, independent of the
-        // encoded-byte limit. This is not a complete production profile.
-        let native = NativeTaskOperationSink::minimum_progress_for_composition(
-            TransportBudget::DEFAULT,
-            std::num::NonZeroU64::new(128 * 1024 * 1024).unwrap(),
-        )
-        .unwrap();
-        fn sum(a: JointResources, b: JointResources) -> JointResources {
-            let mut result = JointResources::ZERO;
-            for resource in [
-                JointResource::ScopeRecords,
-                JointResource::ClaimRecords,
-                JointResource::ReplyRecords,
-                JointResource::QueueRecords,
-                JointResource::MetadataBytes,
-                JointResource::PayloadBytes,
-                JointResource::UnreceivedProductions,
-                JointResource::Publications,
-                JointResource::Residuals,
-                JointResource::Computations,
-                JointResource::AsyncIo,
-                JointResource::BlockingJobs,
-                JointResource::InternalCpuJobs,
-                JointResource::PhysicalQueueRecords,
-                JointResource::PhysicalQueueBytes,
-            ] {
-                result = result.with(
-                    resource,
-                    a.get(resource).checked_add(b.get(resource)).unwrap(),
-                );
-            }
-            result
-        }
-        let custody_progress = sum(base, native.custody());
-        let execution_progress = native.foreground();
-        assert_eq!(execution_progress, native.settlement());
-        let all_progress = sum(
-            custody_progress,
-            sum(execution_progress, execution_progress),
         );
-        let custody_limits = JointResourceLimits {
-            global: custody,
-            per_dependency: custody,
-            protected_progress: custody_progress,
-        };
-        let execution_limits = JointResourceLimits {
-            global: execution,
-            per_dependency: execution,
-            protected_progress: execution_progress,
-        };
-        config.lanes = [custody_limits, execution_limits, execution_limits];
-        config.class_lanes[0] = config.lanes;
-        for r in [
-            JointResource::ScopeRecords,
-            JointResource::ClaimRecords,
-            JointResource::ReplyRecords,
-            JointResource::QueueRecords,
-            JointResource::MetadataBytes,
-            JointResource::PayloadBytes,
-            JointResource::UnreceivedProductions,
-            JointResource::Publications,
-            JointResource::Residuals,
-            JointResource::Computations,
-            JointResource::AsyncIo,
-            JointResource::BlockingJobs,
-            JointResource::InternalCpuJobs,
-            JointResource::PhysicalQueueRecords,
-            JointResource::PhysicalQueueBytes,
-        ] {
-            custody = custody.with(
-                r,
-                custody
-                    .get(r)
-                    .checked_add(execution.get(r).checked_mul(2).unwrap())
-                    .unwrap(),
-            );
-        }
-        config.global = JointResourceLimits {
-            global: custody,
-            per_dependency: custody,
-            protected_progress: all_progress,
-        };
-        config.classes[0] = config.global;
-        let mut required = RequiredJointProgress {
-            global: all_progress,
-            classes: [JointResources::ZERO; 5],
-            lanes: [custody_progress, execution_progress, execution_progress],
-            class_lanes: [[JointResources::ZERO; 3]; 5],
-        };
-        required.classes[0] = all_progress;
-        required.class_lanes[0] = required.lanes;
-        // This is the finite original Native source for wire/lifetime tests.
-        // Other production sources and a complete Native profile are absent.
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: count,
             business_limit: count,
@@ -194,7 +61,9 @@ impl GovernedWireRole {
         .unwrap()
         .owner;
         let (_, mut driver) = control
-            .configure_joint_capacity(config.validate(&required).unwrap())
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(31).unwrap(),
+            })
             .unwrap();
         control.configure_control_storage(storage).unwrap();
         let capacity = control
@@ -245,30 +114,12 @@ impl GovernedWireRole {
         }
     }
     pub(super) fn authority(&self) -> NativeAsyncActionAuthority {
-        let authority = self
-            .window
+        self.window
             .retain_alias()
             .native_action_authority()
-            .unwrap();
-        assert_eq!(
-            authority
-                .maximum_owned_increment(
-                    std::num::NonZeroU64::new(
-                        2 * TransportBudget::DEFAULT.max_batch_encoded_bytes() as u64
-                    )
-                    .unwrap()
-                )
-                .unwrap()
-                .get(),
-            128 * 1024 * 1024
-        );
-        assert!(
-            authority
-                .maximum_owned_increment(std::num::NonZeroU64::new(u64::MAX).unwrap())
-                .is_err()
-        );
-        authority
+            .unwrap()
     }
+
     pub(super) fn drive(&self) {
         drive_original(&mut self.driver.lock().unwrap())
     }
@@ -593,10 +444,10 @@ async fn unpublished_paid_input_withdrawal_recycles_queue_but_keeps_retained_pay
     );
 }
 
-/// Multiple original inputs and the action observer share one Source wait.
-/// No request is dispatched and no cheap Full signal owns a boxed F.
+/// Each original input remains in its own stable preparation while the
+/// responsibility driver is paused; no retired quota creates a boxed wait F.
 #[tokio::test(flavor = "multi_thread")]
-async fn same_sink_q_full_preparations_share_one_original_wait_source() {
+async fn same_sink_pending_preparations_keep_original_requests_without_quota_wait_futures() {
     use crate::task_execution::intent::TaskOperationSink;
     use futures::FutureExt;
     let backend = BackendProcessId::new_v7();
@@ -622,8 +473,8 @@ async fn same_sink_q_full_preparations_share_one_original_wait_source() {
         cancel_intent(3, backend),
     ];
     let original_permit = governed.reserve(&sink, &intents[0]);
-    // Installation retires the constructor; the original driver must reap
-    // its empty reply cell before both Q2 positions can be held below.
+    // Installation retires the constructor independently of the original
+    // retained input and its actual physical queue lifetime.
     governed.drive();
     let action_input = DispatchBatch::with_queued_at(
         backend,
@@ -637,24 +488,26 @@ async fn same_sink_q_full_preparations_share_one_original_wait_source() {
     let scope = governed._root.owner.scope();
     let first = scope.begin_control_binding().unwrap();
     let second = scope.begin_control_binding().unwrap();
-    let mut blockers = [Some(first), Some(second)];
+    let unsubmitted = [first, second];
     let body = std::panic::AssertUnwindSafe(async {
         for (intent, preparation) in intents.iter().zip(&mut preparations) {
             assert!(matches!(
                 sink.try_reserve_queue(intent.queue_request(), preparation),
-                TaskOperationQueueAdmission::ProcessFull
+                TaskOperationQueueAdmission::TargetFull
             ));
             assert!(
-                preparation
+                !preparation
                     .admission
                     .as_ref()
                     .unwrap()
                     .is_waiting_for_proposal_slot()
             );
+            assert!(preparation.ready.is_none() && preparation.grant.is_none());
         }
-        assert_eq!(sink.proposal_wait.created_wait_futures(), 1);
-        assert!(sink.proposal_wait.has_wait_future());
-        // A method-run action uses the same original Source observer and wake.
+        assert_eq!(sink.proposal_wait.created_wait_futures(), 0);
+        assert!(!sink.proposal_wait.has_wait_future());
+        // The action also keeps its original request; this is not a physical
+        // dispatch or a reason to manufacture a quota-wait Source.
         let mut action = governed
             .authority()
             .action_source(JointLane::Settlement, action_quote)
@@ -672,60 +525,54 @@ async fn same_sink_q_full_preparations_share_one_original_wait_source() {
                 ))
                 .is_pending()
         );
-        assert_eq!(sink.proposal_wait.created_wait_futures(), 1);
+        assert_eq!(sink.proposal_wait.created_wait_futures(), 0);
         let before = governed.control.progress_revision();
         let wakes_before = wake.count();
-        // Repeated scanning while the original driver is stopped cannot
-        // produce its own progress notification or another boxed wait.
         for (intent, preparation) in intents.iter().zip(&mut preparations) {
             assert!(matches!(
                 sink.try_reserve_queue(intent.queue_request(), preparation),
-                TaskOperationQueueAdmission::ProcessFull
+                TaskOperationQueueAdmission::TargetFull
             ));
         }
         assert_eq!(governed.control.progress_revision(), before);
         assert_eq!(wake.count(), wakes_before);
-        assert_eq!(sink.proposal_wait.created_wait_futures(), 1);
+        assert_eq!(sink.proposal_wait.created_wait_futures(), 0);
         drop(action);
-        drop(blockers[0].take());
         governed.drive();
-        // The original driver releases a real Q cell. Each same preparation
-        // can then receive its own original finite ticket without reticketing.
+        // The same service installs these original inputs even while the
+        // unrelated unsubmitted builders above remain alive.
         for (intent, preparation) in intents.iter().zip(&mut preparations) {
-            assert!(!matches!(
-                sink.try_reserve_queue(intent.queue_request(), preparation),
-                TaskOperationQueueAdmission::Rejected(_)
-            ));
-            governed.drive();
             let permit = match sink.try_reserve_queue(intent.queue_request(), preparation) {
                 TaskOperationQueueAdmission::Admitted(permit) => permit,
-                value => panic!("same original Q source did not resume: {value:?}"),
+                value => {
+                    panic!("same original input did not receive its responsibility: {value:?}")
+                }
             };
             drop(permit);
             preparation.withdraw_unpublished();
             governed.drive();
         }
-        // Leave one real registered wait in the original Source for teardown.
-        // Withdrawing the cheap preparation does not itself destroy that F.
-        blockers[0] = Some(scope.begin_control_binding().unwrap());
+        // Teardown still withdraws a genuine original pending request; no
+        // physical operation has been submitted or implicitly completed.
         assert!(matches!(
             sink.try_reserve_queue(intents[0].queue_request(), &mut preparations[0]),
-            TaskOperationQueueAdmission::ProcessFull
+            TaskOperationQueueAdmission::TargetFull
         ));
-        assert!(sink.proposal_wait.has_wait_future());
+        assert!(preparations[0].admission.is_some());
+        assert!(!sink.proposal_wait.has_wait_future());
         assert!(peer.peer.applied().is_empty());
         assert_eq!(peer.peer.control_requests(), 0);
     })
     .catch_unwind()
     .await;
-    drop(blockers);
+    drop(unsubmitted);
     for preparation in &mut preparations {
         preparation.withdraw_unpublished();
     }
     drop(preparations);
     drop(intents);
     drop(action_input);
-    drop(sink); // wait F exits before this source's original registration lease
+    drop(sink); // Original preparations retired before the registration lease.
     drop(acks);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;

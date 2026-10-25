@@ -79,6 +79,7 @@ pub use admission::{
     QueryAdmission, ResultQueryAdmission, Stage, StageAdmission, StagePermit, StageRequest,
 };
 pub use cancellation::{CancellationReason, CancellationView};
+pub use joint_admission::ResponsibilityConfig;
 pub use observation::{
     ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationEndSnapshot, ObligationKey,
     ObligationKind, ObligationSnapshot, OwnerState, RootLifecycleSnapshot, ScopeSnapshot,
@@ -90,7 +91,7 @@ pub use resource::{
 };
 pub use result_window::{
     ResultCapacityConfig, ResultCapacityHandle, ResultCapacitySnapshot, ResultClosingCut,
-    ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
+    ResultPayloadBytes, ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
 };
 pub use role_poll::{PollRoleGeometry, PollRoleSourceBacking};
 pub use scope::{
@@ -115,7 +116,6 @@ pub enum WorkError {
     ForeignAuthority,
     Cancelled(CancellationReason),
     Capacity(&'static str),
-    JointCapacity(joint_admission::JointCapacityFailure),
     /// Only this capacity wait expired; the logical work remains active.
     CapacityWaitTimeout,
     AlreadyAdmitted,
@@ -135,11 +135,6 @@ impl std::fmt::Display for WorkError {
             Self::ForeignAuthority => f.write_str("Scope belongs to a different local authority"),
             Self::Cancelled(reason) => write!(f, "Work is cancelled: {reason:?}"),
             Self::Capacity(resource) => write!(f, "Work capacity exhausted: {resource}"),
-            Self::JointCapacity(cause) => write!(
-                f,
-                "Work capacity exhausted: joint protected intersections [resource={:?}, projection={:?}, constraint={:?}]",
-                cause.resource, cause.projection, cause.constraint,
-            ),
             Self::CapacityWaitTimeout => f.write_str("Capacity wait deadline exceeded"),
             Self::AlreadyAdmitted => f.write_str("Work already holds or awaits this stage"),
             Self::AlreadyWaitingForResource(class) => {

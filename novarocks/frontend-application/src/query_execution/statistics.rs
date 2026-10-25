@@ -678,6 +678,14 @@ impl StatisticsRootResultDecoder {
             .into());
         }
         self.body_bytes = charge_statistics_body_bytes(self.body_bytes, body.len())?;
+        if let Some(retention) = &self.retention {
+            retention.reserve_bytes(body.len()).map_err(|error| {
+                StatisticsDecodeFailure::Connector(novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                    error.to_string(),
+                ))
+            })?;
+        }
         let draft = StatisticsArtifactDraft::try_new(
             identity.input_fields().to_vec(),
             identity.blob_type(),

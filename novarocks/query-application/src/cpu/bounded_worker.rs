@@ -171,7 +171,7 @@ pub(crate) struct BoundedWorkerSnapshot {
 /// back to Shared through its reservation. The semaphore is the original one.
 pub(crate) struct BoundedWorkerReservation {
     source: Weak<dyn Send + Sync>,
-    _queue_slot: OwnedSemaphorePermit,
+    queue_slot: Option<OwnedSemaphorePermit>,
 }
 impl fmt::Debug for BoundedWorkerReservation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -718,7 +718,7 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         }
         Ok(BoundedWorkerReservation {
             source: self.source(),
-            _queue_slot: queue_slot,
+            queue_slot: Some(queue_slot),
         })
     }
 
@@ -740,7 +740,7 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         }
         Ok(BoundedWorkerReservation {
             source: self.source(),
-            _queue_slot: queue_slot,
+            queue_slot: Some(queue_slot),
         })
     }
     pub(crate) fn same_pool(&self, reservation: &BoundedWorkerReservation) -> bool {
@@ -905,7 +905,7 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
                 let mut row = ManuallyDrop::new(row);
                 // SAFETY: suppress the row destructor and move each initialized
                 // original field exactly once into this same worker's custody.
-                let (prepared, guard) = unsafe {
+                let (prepared, mut guard) = unsafe {
                     (
                         ManuallyDrop::take(&mut row.prepared),
                         ManuallyDrop::take(&mut row.physical),
@@ -917,6 +917,10 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
                     exit,
                     ..
                 } = prepared;
+                // The original FIFO no longer retains this queue position.
+                // Its separate execution/source guard remains through actual
+                // call/result teardown; a running job is bounded by workers.
+                drop(guard.physical_mut().inner.queue_slot.take());
                 (job, completion, Some(guard), Some(exit))
             }
         };

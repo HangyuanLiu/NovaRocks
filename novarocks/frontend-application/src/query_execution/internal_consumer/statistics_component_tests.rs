@@ -156,8 +156,8 @@ fn original_failure() -> TaskFailure {
     )
 }
 
-// This local fixture funds the actual closed result factory's currently
-// required byte envelope. It is not a Native action/physical profile.
+// The actual original Root/result owner and closed CPU factory. Source
+// identity grants no bytes; real collector admission uses the Result budget.
 struct TypedStatisticsCustody {
     root: novarocks_workload_control::RootWork,
     payload: joint::RetainedPayloadGrant,
@@ -218,13 +218,11 @@ fn typed_statistics_batch(
     let mut proposal = payload
         .root_stage_source(&root.owner.scope(), stage)
         .unwrap()
-        .begin(4, joint::JointLane::Foreground)
+        .begin(0, joint::JointLane::Foreground)
         .unwrap();
     proposal.end_payload().unwrap();
     proposal.end_stage().unwrap();
-    let mut admission = proposal
-        .submit_finite(NonZeroU64::new(1000000).unwrap())
-        .unwrap();
+    let mut admission = proposal.submit().unwrap();
     drive_typed(driver);
     let mut ready = match std::pin::Pin::new(&mut admission)
         .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
@@ -253,141 +251,11 @@ fn typed_statistics_custody(
         novarocks_workload_control::ResultCapacityHandle,
     ),
 ) {
-    use joint::{JointResource as R, JointResourceLimits, JointResources};
     use novarocks_workload_control::{
-        ControlStorageConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        ControlStorageConfig, ResponsibilityConfig, ResultCapacityConfig, WorkClass, WorkRequest,
+        WorkloadConfig, WorkloadControl,
     };
-    let cpu = cpu_owner.runtime();
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
-    let mut config = joint::JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        // Only LocalHost is supported by this fixture. Startup protection uses
-        // declared fanout, before any actual singleton CPU request exists.
-        max_dependencies_per_claim: 1,
-        max_registered_dependencies: 402,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: 4,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: NonZeroUsize::new(7).unwrap(),
-    };
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(R::MetadataBytes);
-    let physical = cpu.configured_capacity();
-    let cpu_jobs = u64::try_from(physical.worker_threads().get()).unwrap();
-    assert!(physical.queue_capacity().get() >= physical.worker_threads().get());
-    let action = cpu.operation_action_quote().unwrap();
-    let queue_bytes = action.physical_queue_bytes.get();
-    // This actual fixture serializes one compute, while declaring the real
-    // installed pool bound. One domain needs only its one serial CPU action.
-    let cpu_step = JointResources::ZERO
-        .with(R::ClaimRecords, 1)
-        .with(R::MetadataBytes, action.metadata_bytes.get())
-        .with(R::InternalCpuJobs, 1)
-        .with(R::PhysicalQueueRecords, 1)
-        .with(R::PhysicalQueueBytes, queue_bytes);
-    let progress = base
-        .with(
-            R::ClaimRecords,
-            base.get(R::ClaimRecords).checked_add(1).unwrap(),
-        )
-        .with(
-            R::MetadataBytes,
-            m.checked_add(action.metadata_bytes.get()).unwrap(),
-        )
-        .with(R::InternalCpuJobs, 1)
-        .with(R::PhysicalQueueRecords, 1)
-        .with(R::PhysicalQueueBytes, queue_bytes);
-    let peak = crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES;
-    let bytes = peak.checked_mul(2).unwrap();
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(R::ScopeRecords, 8)
-            .with(R::ClaimRecords, 12)
-            .with(R::MetadataBytes, m.checked_mul(16).unwrap())
-            .with(R::PayloadBytes, bytes)
-            .with(R::UnreceivedProductions, 1),
-        per_dependency: JointResources::ZERO
-            .with(R::ScopeRecords, 7)
-            .with(R::ClaimRecords, 12)
-            .with(R::MetadataBytes, m.checked_mul(8).unwrap())
-            .with(R::PayloadBytes, bytes)
-            .with(R::UnreceivedProductions, 1),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(R::ClaimRecords, 4)
-            .with(R::MetadataBytes, m.checked_mul(16).unwrap())
-            .with(R::PayloadBytes, 32)
-            .with(R::Computations, 1)
-            .with(R::InternalCpuJobs, cpu_jobs)
-            .with(R::PhysicalQueueRecords, cpu_jobs)
-            .with(
-                R::PhysicalQueueBytes,
-                queue_bytes.checked_mul(cpu_jobs).unwrap(),
-            ),
-        per_dependency: JointResources::ZERO
-            .with(R::ClaimRecords, 4)
-            .with(R::MetadataBytes, m.checked_mul(8).unwrap())
-            .with(R::PayloadBytes, 32)
-            .with(R::Computations, 1)
-            .with(R::InternalCpuJobs, 1)
-            .with(R::PhysicalQueueRecords, 1)
-            .with(R::PhysicalQueueBytes, queue_bytes),
-        protected_progress: cpu_step,
-    };
-    // Explicit sums of the two lane declarations; no private resource math API.
-    let global = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(R::ScopeRecords, 8)
-            .with(R::ClaimRecords, 16)
-            .with(R::MetadataBytes, m.checked_mul(32).unwrap())
-            .with(R::PayloadBytes, bytes.checked_add(32).unwrap())
-            .with(R::Computations, 1)
-            .with(R::UnreceivedProductions, 1)
-            .with(R::InternalCpuJobs, cpu_jobs)
-            .with(R::PhysicalQueueRecords, cpu_jobs)
-            .with(
-                R::PhysicalQueueBytes,
-                queue_bytes.checked_mul(cpu_jobs).unwrap(),
-            ),
-        per_dependency: JointResources::ZERO
-            .with(R::ScopeRecords, 7)
-            .with(R::ClaimRecords, 16)
-            .with(R::MetadataBytes, m.checked_mul(16).unwrap())
-            .with(R::PayloadBytes, bytes.checked_add(32).unwrap())
-            .with(R::Computations, 1)
-            .with(R::UnreceivedProductions, 1)
-            .with(R::InternalCpuJobs, 1)
-            .with(R::PhysicalQueueRecords, 1)
-            .with(R::PhysicalQueueBytes, queue_bytes),
-        protected_progress: progress,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
-    let mut required = joint::RequiredJointProgress {
-        global: progress,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = progress;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
-    required.lanes[1] = cpu_step;
-    required.class_lanes[0][1] = cpu_step;
     let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -397,69 +265,61 @@ fn typed_statistics_custody(
     })
     .unwrap()
     .owner;
-    let capacity = control
-        .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+    let mut result = ResultCapacityConfig::V1;
+    result.positions[2] = 1;
+    result.all_objects_bytes[2] = 1024 * 1024;
+    assert!(
+        original_statistics_body().len() < 16 * 1024,
+        "the actual component body fits its explicit small payload budget"
+    );
+    let capacity = control.configure_result_capacity(result).unwrap();
+    let (_, mut driver) = control
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: NonZeroUsize::new(7).unwrap(),
+        })
         .unwrap();
-    let (handle, mut driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
+    control
+        .configure_control_storage(ControlStorageConfig::new(count, &[]))
         .unwrap();
-    control.configure_control_storage(storage).unwrap();
     cpu_owner.bind_for_test_before_ready(&mut control).unwrap();
     control.mark_ready().unwrap();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
-    let mut binding = root.owner.scope().begin_control_binding().unwrap();
-    binding
-        .push_dependency(&novarocks_resource_contract::SharedDependency::LocalHost)
+    let scope = root.owner.scope();
+    // The real initial source installs LocalHost and the original payload pin
+    // together. No raw New claim or test-only paid-incarnation shortcut.
+    let domains = scope.prepare_root_domains().unwrap();
+    let source = domains
+        .initial_payload_source(&scope, joint::JointLane::Custody)
         .unwrap();
-    binding.end_change().unwrap();
-    let mut admission = binding.submit().unwrap();
-    drive_typed(&mut driver);
-    let mut reply = match std::pin::Pin::new(&mut admission)
-        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-    {
-        Poll::Ready(Ok(reply)) => reply,
-        _ => panic!("the original Root control must bind"),
-    };
-    reply
-        .adjustment
-        .as_mut()
-        .unwrap()
-        .install_control_scope_in(&root.owner.scope())
-        .unwrap()
-        .notify();
-    drop(reply);
-    drop(admission);
-    drive_typed(&mut driver);
-    let mut proposal = handle.begin_paid_proposal(&root.owner).unwrap();
-    proposal
-        .begin_new(
-            joint::JointLane::Custody,
-            JointResources::ZERO
-                .with(R::ClaimRecords, 1)
-                .with(R::PayloadBytes, peak),
+    let mut proposal = match source
+        .try_begin(
+            NonZeroU64::new(std::mem::size_of::<TypedStatisticsCustody>() as u64).unwrap(),
+            NonZeroU64::new(original_statistics_body().len() as u64).unwrap(),
         )
-        .unwrap();
+        .unwrap()
+    {
+        joint::JointTryBegin::Started(proposal) => proposal,
+        joint::JointTryBegin::Full(_) => {
+            panic!("fresh original Root source cannot have an outstanding constructor")
+        }
+    };
     proposal
         .push_dependency(&novarocks_resource_contract::SharedDependency::LocalHost)
         .unwrap();
-    proposal.end_change().unwrap();
-    let mut admission = proposal.submit().unwrap();
+    let mut initial = proposal.submit().unwrap();
     drive_typed(&mut driver);
-    let mut reply = match std::pin::Pin::new(&mut admission)
-        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-    {
-        Poll::Ready(Ok(reply)) => reply,
-        _ => panic!("the original Root payload must be paid"),
-    };
-    let mut raw = reply.new_claims.pop();
     let mut payload = None;
-    joint::RetainedPayloadGrant::adopt_in(&root.owner.scope(), &mut raw, &mut payload)
-        .unwrap()
-        .notify();
-    drop(reply);
-    drop(admission);
+    match initial.poll_install_in(
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        &scope,
+        &mut payload,
+    ) {
+        Poll::Ready(Ok(notice)) => notice.notify(),
+        _ => panic!("the original initial Root source must install"),
+    }
+    drop(initial);
     drive_typed(&mut driver);
     let payload = payload.unwrap();
     let stage = typed_statistics_child(&root, &mut driver);

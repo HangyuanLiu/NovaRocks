@@ -183,40 +183,68 @@ fn granted_cancellation_keeps_the_same_positive_liability_until_receipt_exit() {
 fn construction_failure_rolls_back_partial_slot_and_parent_edge_reservations() {
     let (control, mut driver, root) = fixture(2);
     let scope = root.owner.scope();
+    // Eight original scope records: Root already holds one, so the eighth
+    // child fails at the real global inventory after seven exact reservations.
     assert!(matches!(
-        scope.request_source_cohort(NonZeroUsize::new(3).unwrap()),
+        scope.request_source_cohort(NonZeroUsize::new(8).unwrap()),
         Err(JointAdmissionFailure {
-            error: WorkError::Capacity("prepaid parent child backing")
+            error: WorkError::Capacity("fixed control slots")
         })
     ));
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert!(state.cancellations.free_inventory_valid());
+        assert!(state.joint.as_ref().unwrap().requests.is_empty());
+    }
     drive(&mut driver);
-    let paid = cohort(&scope, &mut driver, 2);
+    let paid = cohort(&scope, &mut driver, 7);
+    assert_eq!(paid.remaining(), 7);
     drop(paid);
     finish(control, driver, root);
 }
 
 #[test]
-fn parent_edge_reservation_cannot_be_stolen_by_an_ordinary_child_receipt() {
+fn cohort_exact_reservations_are_not_stolen_by_an_independent_ordinary_child() {
     let (control, mut driver, root) = fixture(2);
     let scope = root.owner.scope();
     let mut paid = cohort(&scope, &mut driver, 2);
+    let reserved: Vec<_> = {
+        let state = control.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().requests[&paid.receipt.id.unwrap()]
+            .changes
+            .iter()
+            .map(|c| match c.source.as_ref().unwrap().source {
+                ClaimSource::PoolFree { slot, .. } => slot,
+                _ => panic!("exact original child"),
+            })
+            .collect()
+    };
     let mut ordinary = scope.request_joint_child().unwrap();
     drive(&mut driver);
     let mut ordinary = receipt(&mut ordinary);
     let mut destination = None;
-    assert!(matches!(
-        ordinary.install_child_in(&scope, &mut destination),
-        Err(WorkError::Capacity("prepaid parent child backing"))
-    ));
-    assert!(destination.is_none());
-    assert!(ordinary.id.is_some());
-    drop(ordinary);
-    let mut child = None;
-    paid.take_child_in(&scope, &mut child)
+    ordinary
+        .install_child_in(&scope, &mut destination)
+        .unwrap()
+        .notify();
+    let ordinary = destination.unwrap();
+    let ordinary_slot =
+        control.inner.state.lock().unwrap().nodes[&ordinary.scope().id()].cancellation;
+    assert!(!reserved.contains(&ordinary_slot));
+    assert_eq!(paid.remaining(), 2);
+    let mut first = None;
+    paid.take_child_in(&scope, &mut first)
         .unwrap()
         .unwrap()
         .notify();
-    child.unwrap().complete();
+    let first = first.unwrap();
+    assert!(
+        reserved
+            .contains(&control.inner.state.lock().unwrap().nodes[&first.scope().id()].cancellation)
+    );
+    assert_eq!(paid.remaining(), 1);
+    ordinary.complete();
+    first.complete();
     drop(paid);
     finish(control, driver, root);
 }
@@ -248,33 +276,45 @@ fn failed_install_keeps_original_slot_edge_and_receipt_armed_for_retry() {
 }
 
 #[test]
-fn oversize_count_uses_original_paid_batch_bound_without_partial_positive_rights() {
+fn complete_cohort_beyond_former_change_bound_keeps_all_original_reservations() {
     let (control, mut driver, root) = fixture(4);
     let scope = root.owner.scope();
-    assert!(matches!(
-        scope.request_source_cohort(NonZeroUsize::new(4).unwrap()),
-        Err(JointAdmissionFailure {
-            error: WorkError::Capacity("paid joint batch records")
-        })
-    ));
-    drive(&mut driver);
-    let paid = cohort(&scope, &mut driver, 3);
+    let mut paid = cohort(&scope, &mut driver, 4);
+    assert_eq!(paid.remaining(), 4);
+    let mut children = Vec::new();
+    for remaining in (0..4).rev() {
+        let mut child = None;
+        paid.take_child_in(&scope, &mut child)
+            .unwrap()
+            .unwrap()
+            .notify();
+        children.push(child.unwrap());
+        assert_eq!(paid.remaining(), remaining);
+    }
+    let ids: std::collections::BTreeSet<_> =
+        children.iter().map(|child| child.scope().id()).collect();
+    assert_eq!(ids.len(), 4);
     drop(paid);
+    for child in children {
+        child.complete();
+    }
     finish(control, driver, root);
 }
 
 #[test]
-fn unacquired_proposal_full_has_no_slot_or_edge_reservation_and_cohort_cannot_use_old_installer() {
+fn cohort_has_no_q_gate_and_cannot_use_the_ordinary_child_installer() {
     let (control, mut driver, root) = fixture(3);
     let scope = root.owner.scope();
     let first = scope.begin_control_binding().unwrap();
     let second = scope.begin_control_binding().unwrap();
-    assert!(matches!(
-        scope
-            .try_request_source_cohort(NonZeroUsize::new(3).unwrap())
-            .unwrap(),
-        JointTryBegin::Full(_)
-    ));
+    let unstarted = match scope
+        .try_request_source_cohort(NonZeroUsize::new(3).unwrap())
+        .unwrap()
+    {
+        JointTryBegin::Started(value) => value,
+        JointTryBegin::Full(_) => panic!("there is no Q inventory gate"),
+    };
+    drop(unstarted);
     drop(first);
     drop(second);
     drive(&mut driver);
@@ -336,7 +376,7 @@ fn partial_cohort_cancellation_keeps_taken_child_and_returns_only_unused_reserva
 }
 
 #[test]
-fn refused_complete_proof_releases_uncommitted_edges_before_the_failed_ticket_exits() {
+fn cancelled_cohort_returns_only_uncommitted_edges_before_failed_ticket_is_received() {
     let (control, mut driver, root) = fixture(3);
     let scope = root.owner.scope();
     let mut roots = Vec::new();
@@ -344,12 +384,10 @@ fn refused_complete_proof_releases_uncommitted_edges_before_the_failed_ticket_ex
         let extra = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let mut proposal = extra.owner.scope().begin_control_binding().unwrap();
-        proposal
-            .push_dependency(&SharedDependency::LocalHost)
-            .unwrap();
-        proposal.end_change().unwrap();
-        let mut bind = proposal.submit().unwrap();
+        let mut p = extra.owner.scope().begin_control_binding().unwrap();
+        p.push_dependency(&SharedDependency::LocalHost).unwrap();
+        p.end_change().unwrap();
+        let mut bind = p.submit().unwrap();
         drive(&mut driver);
         receipt(&mut bind)
             .install_control_scope_in(&extra.owner.scope())
@@ -357,28 +395,27 @@ fn refused_complete_proof_releases_uncommitted_edges_before_the_failed_ticket_ex
             .notify();
         roots.push(extra);
     }
-    let mut refused = scope
-        .request_source_cohort(NonZeroUsize::new(3).unwrap())
+    let mut cancelled = scope
+        .request_source_cohort(NonZeroUsize::new(2).unwrap())
         .unwrap();
+    root.owner.cancel(crate::CancellationReason::Requested);
     drive(&mut driver);
     {
         let state = control.inner.state.lock().unwrap();
         assert!(matches!(
-            state.joint.as_ref().unwrap().requests[&refused.id.unwrap()].phase,
-            RequestPhase::Failed(WorkError::JointCapacity(_))
+            state.joint.as_ref().unwrap().requests[&cancelled.id.unwrap()].phase,
+            RequestPhase::Failed(WorkError::Cancelled(crate::CancellationReason::Requested))
         ));
     }
-    // Keep the failed ticket unconsumed while an independent original Q
-    // position reserves the edges already returned by the refusal author.
-    let paid = cohort(&scope, &mut driver, 2);
-    drop(paid);
+    let same_returned_inventory = cohort(&roots[0].owner.scope(), &mut driver, 2);
+    drop(same_returned_inventory);
     assert!(matches!(
-        Pin::new(&mut refused).poll(&mut Context::from_waker(Waker::noop())),
+        Pin::new(&mut cancelled).poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::JointCapacity(_)
+            error: WorkError::Cancelled(crate::CancellationReason::Requested)
         }))
     ));
-    drop(refused);
+    drop(cancelled);
     for extra in roots {
         extra.business.release();
         extra.owner.complete();

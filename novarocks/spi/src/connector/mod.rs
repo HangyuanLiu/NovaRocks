@@ -252,7 +252,7 @@ pub use original_result_scope::{
     ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, OriginalResultCheckClass,
     OriginalResultCheckError,
 };
-pub use payload_retention::ConnectorPayloadRetentionGuard;
+pub use payload_retention::{ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard};
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
@@ -350,9 +350,8 @@ pub use statistics::{
     StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
     StatisticsNumericNature, StatisticsPublicationClose, StatisticsPublicationReady,
     StatisticsReadCpuSource, StatisticsReadOriginal, StatisticsReadRequest, StatisticsReader,
-    StatisticsReceipt, StatisticsRequiredAggregation,
-    StatisticsRowCoverage, StatisticsScanColumn, StatisticsSchemaCpuSource,
-    StatisticsSessionFuture,
+    StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
+    StatisticsSchemaCpuSource, StatisticsSessionFuture,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,

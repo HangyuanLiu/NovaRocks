@@ -189,13 +189,10 @@ mod async_read;
 pub(crate) use async_explain::{PreparedAsyncExplain, PreparedAsyncProfile};
 
 impl FrontendQueryCompiler {
-    pub(crate) fn read_io_geometry(
+    pub(crate) fn validate_original_read_runtime(
         &self,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-        novarocks_workload_control::WorkError,
-    > {
-        self.connector_blocking_io.read_io_geometry()
+    ) -> Result<(), novarocks_workload_control::WorkError> {
+        self.connector_blocking_io.validate_original_read_runtime()
     }
     pub(crate) fn connector_runtime(&self) -> &tokio::runtime::Handle {
         self.connector_blocking_io.runtime()

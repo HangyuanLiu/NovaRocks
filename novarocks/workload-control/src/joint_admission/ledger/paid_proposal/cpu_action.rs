@@ -92,6 +92,23 @@ impl Clone for InternalCpuFactoryBinding {
     }
 }
 impl InternalCpuFactoryBinding {
+    /// Check the exact registered factory and physical pool identity only.
+    /// This observation grants neither a CPU position nor allocation bytes.
+    pub fn validate_in(&self, control: &WorkloadControl) -> Result<(), WorkError> {
+        if !Weak::ptr_eq(&self.inner, &Arc::downgrade(&control.inner)) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let state = control.inner.state.lock().unwrap();
+        let installed = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if !installed.matches(&self.descriptor) || !installed.is_live() {
+            return Err(WorkError::Released);
+        }
+        Ok(())
+    }
+
     pub fn matches_descriptor(&self, descriptor: &InternalResultClosedFactoryDescriptor) -> bool {
         self.descriptor.matches(descriptor)
     }
@@ -164,55 +181,10 @@ impl WorkloadControl {
     /// Minimum global/domain limits for complete progress on this original
     /// registered source. Other sources' shared coordinates retain their
     /// original causal floor. Reading these facts grants no capacity.
-    pub fn joint_capacity_floor_for_registered_sources(
-        &mut self,
-        minimum: JointResources,
-        max_dependencies_per_claim: std::num::NonZeroUsize,
-    ) -> Result<JointResourceLimits, WorkError> {
-        let state = self.inner.state.lock().unwrap();
-        if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
-            return Err(WorkError::Conflict);
-        }
-        let descriptor = state
-            .internal_cpu_factory
-            .as_ref()
-            .ok_or(WorkError::NotReady)?;
-        if !descriptor.is_live() {
-            return Err(WorkError::Released);
-        }
-        source_progress_floor(
-            max_dependencies_per_claim.get(),
-            minimum,
-            minimum,
-            Some(descriptor.queue_bytes()),
-        )
-    }
 
     /// Validate source-aware floors from this original authority's registered
     /// closed factory. Full charged dependencies and every hard cap remain.
     /// No caller-selected causal mask or arbitrary finite contribution enters.
-    pub fn validate_joint_capacity_for_registered_sources(
-        &mut self,
-        config: JointCapacityConfig,
-        required: &RequiredJointProgress,
-    ) -> Result<ValidatedJointCapacityConfig, WorkError> {
-        let state = self.inner.state.lock().unwrap();
-        if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
-            return Err(WorkError::Conflict);
-        }
-        let descriptor = state
-            .internal_cpu_factory
-            .as_ref()
-            .ok_or(WorkError::NotReady)?;
-        if descriptor.pool.strong_count() == 0 {
-            return Err(WorkError::Released);
-        }
-        config.validate_registered_internal_cpu(
-            required,
-            descriptor.duplicate(),
-            Arc::downgrade(&self.inner),
-        )
-    }
     /// Installs the one InternalResultClosedFactory on this original authority.
     /// Only first-party role composition owns both this unique owner and the
     /// physical CPU owner. The reviewed closed implementation, not its TypeId,
@@ -288,7 +260,7 @@ fn action_source_facts(
     state: &State,
     owner: WorkId,
     fence: CpuActionFence,
-) -> Result<&Arc<ProfileFacts>, WorkError> {
+) -> Result<&Arc<ResponsibilityFacts>, WorkError> {
     if let Some(factory) = fence.factory {
         let registered = state
             .internal_cpu_factory
@@ -328,7 +300,7 @@ fn action_source_facts(
             || row.facts.key != row.active_facts.key
             || row.active_facts.class != node.class
             || !root_domains::has_effective_domains(state, &row.active_facts, true)
-            || !row.active_facts.key.causal.is_empty()
+            || !row.active_facts.key.source_kind.is_empty()
         {
             return Err(WorkError::Conflict);
         }
@@ -432,13 +404,13 @@ pub(in crate::joint_admission::ledger) fn validate_cpu_action(
                 original.key.lane
             }
         || change.claim.facts.key.dependencies != original.key.dependencies
-        || change.claim.facts.key.causal
+        || change.claim.facts.key.source_kind
             != if fence.factory.is_some() {
-                CausalMask::INTERNAL_CPU_ACTION
+                SourceKind::InternalCpu
             } else {
-                CausalMask::NONE
+                SourceKind::Plain
             }
-        || !original.key.causal.is_empty()
+        || !original.key.source_kind.is_empty()
     {
         return Err(WorkError::Conflict);
     }
@@ -545,9 +517,10 @@ impl InternalCpuActionSource {
         };
         proposal.begin_new(lane, amounts)?;
         let current = proposal.current.as_mut().expect("same closed CPU proposal");
-        if facts.dependencies.len() > current.selected.capacity() {
-            return Err(WorkError::Capacity("CPU action full dependency backing"));
-        }
+        current
+            .selected
+            .try_reserve(facts.dependencies.len())
+            .map_err(|_| WorkError::Capacity("CPU action dependency allocation"))?;
         current.origin = facts.key.origin;
         current.selected.extend(facts.dependencies.iter().cloned());
         proposal.end_change()?;

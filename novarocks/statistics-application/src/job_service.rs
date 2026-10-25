@@ -334,8 +334,8 @@ mod notification_tests {
     use novarocks_workload_control::{
         ControlStorageConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
         joint_admission::{
-            JointCapacityConfig, JointLane, JointProgress, JointProgressDriver, JointResource as R,
-            JointResourceLimits as L, JointResources as V, JointTryBegin, RequiredJointProgress,
+            JointLane, JointProgress, JointProgressDriver, JointResource as R, JointTryBegin,
+            ResponsibilityConfig,
         },
     };
     use std::{
@@ -351,53 +351,8 @@ mod notification_tests {
     // The same fixed WC substrate supplies a positive Root payload and one
     // real query permit. This is not a Native/Provider capacity certificate.
     fn original_control() -> (WorkloadControl, JointProgressDriver, u64) {
-        let storage = ControlStorageConfig::new([0, 0, 4, 0, 0], 3, 2, &[]);
-        let mut capacity = JointCapacityConfig {
-            global: L::default(),
-            classes: [L::default(); 5],
-            lanes: [L::default(); 3],
-            class_lanes: [[L::default(); 3]; 5],
-            max_dependencies_per_claim: 1,
-            max_registered_dependencies: 1,
-            max_claims: 32,
-            max_requests: 8,
-            max_changes_per_request: 4,
-            max_snapshot_bytes: 64 * 1024 * 1024,
-            max_scratch_bytes: 64 * 1024 * 1024,
-            max_residual_arcs: 100000,
-            max_total_proof_work: 10000000,
-            work_per_turn: NonZeroUsize::new(7).unwrap(),
-        };
-        capacity.max_registered_dependencies =
-            storage.minimum_dependency_records(&capacity).unwrap();
-        let base = storage.base_charge(&capacity).unwrap();
-        let metadata = base.get(R::MetadataBytes);
-        let limits = L {
-            global: V::ZERO
-                .with(R::ScopeRecords, 4)
-                .with(R::ClaimRecords, 32)
-                .with(R::MetadataBytes, metadata.checked_mul(128).unwrap())
-                .with(R::PayloadBytes, 4096),
-            per_dependency: V::ZERO
-                .with(R::ScopeRecords, 4)
-                .with(R::ClaimRecords, 32)
-                .with(R::MetadataBytes, metadata.checked_mul(128).unwrap())
-                .with(R::PayloadBytes, 4096),
-            protected_progress: base,
-        };
-        capacity.global = limits;
-        capacity.classes[2] = limits;
-        capacity.lanes[0] = limits;
-        capacity.class_lanes[2][0] = limits;
-        let mut required = RequiredJointProgress {
-            global: base,
-            classes: [V::ZERO; 5],
-            lanes: [V::ZERO; 3],
-            class_lanes: [[V::ZERO; 3]; 5],
-        };
-        required.classes[2] = base;
-        required.lanes[0] = base;
-        required.class_lanes[2][0] = base;
+        let storage = ControlStorageConfig::new(4, &[]);
+        let metadata = storage.base_charge().unwrap().get(R::MetadataBytes);
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: 4,
             business_limit: 4,
@@ -408,9 +363,14 @@ mod notification_tests {
         .unwrap()
         .owner;
         let (_, driver) = control
-            .configure_joint_capacity(capacity.validate(&required).unwrap())
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
             .unwrap();
         control.configure_control_storage(storage).unwrap();
+        let mut results = novarocks_workload_control::ResultCapacityConfig::V1;
+        results.all_objects_bytes[2] = 1024 * 1024;
+        control.configure_result_capacity(results).unwrap();
         control.mark_ready().unwrap();
         (control, driver, metadata)
     }

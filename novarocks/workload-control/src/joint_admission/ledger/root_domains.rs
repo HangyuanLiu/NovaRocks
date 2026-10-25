@@ -112,13 +112,13 @@ impl WorkScope {
         };
         // Dormant has no D. This is exactly the existing positive local S, not
         // a retroactive binding of any previously dispatched external action.
-        let facts = Arc::new(ProfileFacts {
-            key: Arc::new(ProfileKey {
+        let facts = Arc::new(ResponsibilityFacts {
+            key: Arc::new(FactKey {
                 origin: GroupOrigin::Inherited(binding),
                 class: class_index(class),
                 lane: source.lane as usize,
                 dependencies: source.key.dependencies.clone(),
-                causal: source.key.causal,
+                source_kind: source.key.source_kind,
             }),
             class,
             lane: source.lane,
@@ -154,11 +154,9 @@ impl WorkScope {
                 return Err(WorkError::Conflict);
             }
             ledger
-                .profile_layout_revision
+                .facts_revision
                 .checked_add(1)
                 .ok_or(WorkError::ArithmeticOverflow)?;
-            subtract_profile(ledger, &source, amount);
-            add_profile(ledger, Arc::clone(&facts), amount);
             let row = ledger.claims.get_mut(&id).unwrap();
             let retired = (
                 std::mem::replace(&mut row.facts, Arc::clone(&facts)),
@@ -252,7 +250,7 @@ pub struct RootDomainInitialSource {
 }
 pub struct RootDomainInitialProposal {
     proposal: JointProposal,
-    local: Arc<ProfileFacts>,
+    local: Arc<ResponsibilityFacts>,
 }
 pub struct RootDomainInitialAdmission {
     admission: JointAdmission,
@@ -403,7 +401,6 @@ pub(super) fn validate_change(
     if domains.epoch != change.epoch
         || domains.pending != ticket
         || change.candidate.is_empty()
-        || change.candidate.len() > ledger.config.config.max_dependencies_per_claim
         || !domains.active.iter().all(|old| {
             change
                 .candidate
@@ -601,7 +598,7 @@ pub(super) fn validate_install(state: &State, ticket: u64, root: WorkId) -> Resu
         .joint
         .as_ref()
         .unwrap()
-        .profile_layout_revision
+        .facts_revision
         .checked_add(1)
         .ok_or(WorkError::ArithmeticOverflow)?;
     let change = request.root_domain.as_ref().ok_or(WorkError::Conflict)?;
@@ -633,19 +630,19 @@ pub(super) fn install(state: &mut State, ticket: u64) -> Option<Arc<Vec<Dependen
 /// At most one such header exists in the driver's record-at-a-time cursor.
 /// Its old Root alias is dropped outside State before the next record capture.
 pub(in crate::joint_admission) struct FactCapture {
-    facts: Arc<ProfileFacts>,
+    facts: Arc<ResponsibilityFacts>,
     root: Option<Arc<Vec<DependencyRef>>>,
     selected: Vec<DependencyRef>,
     ordinals: Vec<u64>,
     local_cursor: usize,
     root_cursor: usize,
-    maximum: usize,
+    merge_capacity: usize,
     allocated: bool,
 }
 impl FactCapture {
     pub(in crate::joint_admission) fn capture(
         state: &State,
-        facts: Arc<ProfileFacts>,
+        facts: Arc<ResponsibilityFacts>,
         candidate: Option<&RootDomainChange>,
     ) -> Result<Self, WorkError> {
         let root = match facts.key.origin {
@@ -658,6 +655,11 @@ impl FactCapture {
                 },
             ),
         };
+        let merge_capacity = facts
+            .dependencies
+            .len()
+            .checked_add(root.as_ref().map_or(0, |d| d.len()))
+            .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(Self {
             facts,
             root,
@@ -665,45 +667,43 @@ impl FactCapture {
             ordinals: Vec::new(),
             local_cursor: 0,
             root_cursor: 0,
-            maximum: state
-                .joint
-                .as_ref()
-                .unwrap()
-                .config
-                .config
-                .max_dependencies_per_claim,
+            merge_capacity,
             allocated: false,
         })
     }
     pub(super) fn active(
-        facts: Arc<ProfileFacts>,
+        facts: Arc<ResponsibilityFacts>,
         root: Option<Arc<Vec<DependencyRef>>>,
-        maximum: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, WorkError> {
+        let merge_capacity = facts
+            .dependencies
+            .len()
+            .checked_add(root.as_ref().map_or(0, |d| d.len()))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(Self {
             facts,
             root,
             selected: Vec::new(),
             ordinals: Vec::new(),
             local_cursor: 0,
             root_cursor: 0,
-            maximum,
+            merge_capacity,
             allocated: false,
-        }
+        })
     }
     /// One bounded merge step; allocation and membership clone occur lock-free.
     pub(in crate::joint_admission) fn step(
         &mut self,
-    ) -> Result<Poll<Arc<ProfileFacts>>, WorkError> {
+    ) -> Result<Poll<Arc<ResponsibilityFacts>>, WorkError> {
         let Some(root) = &self.root else {
             return Ok(Poll::Ready(Arc::clone(&self.facts)));
         };
         if !self.allocated {
             self.selected
-                .try_reserve_exact(self.maximum)
+                .try_reserve_exact(self.merge_capacity)
                 .map_err(|_| WorkError::Capacity("canonical effective D backing"))?;
             self.ordinals
-                .try_reserve_exact(self.maximum)
+                .try_reserve_exact(self.merge_capacity)
                 .map_err(|_| WorkError::Capacity("canonical effective D key backing"))?;
             self.allocated = true;
             return Ok(Poll::Pending);
@@ -735,20 +735,20 @@ impl FactCapture {
             (None, None) => None,
         };
         if let Some(next) = next {
-            if self.selected.len() == self.maximum {
-                return Err(WorkError::Capacity("canonical effective D union"));
+            if self.selected.len() == self.merge_capacity {
+                return Err(WorkError::Conflict);
             }
             self.ordinals.push(next.ordinal);
             self.selected.push(next.clone());
             return Ok(Poll::Pending);
         }
         let selected = std::mem::take(&mut self.selected);
-        Ok(Poll::Ready(Arc::new(ProfileFacts {
-            key: Arc::new(ProfileKey {
+        Ok(Poll::Ready(Arc::new(ResponsibilityFacts {
+            key: Arc::new(FactKey {
                 origin: GroupOrigin::Frozen,
                 class: self.facts.key.class,
                 lane: self.facts.key.lane,
-                causal: self.facts.key.causal,
+                source_kind: self.facts.key.source_kind,
                 dependencies: std::mem::take(&mut self.ordinals),
             }),
             class: self.facts.class,
@@ -759,7 +759,11 @@ impl FactCapture {
 }
 
 /// Domain existence is read from the original Node; local S may be empty.
-pub(super) fn has_effective_domains(state: &State, facts: &ProfileFacts, active: bool) -> bool {
+pub(super) fn has_effective_domains(
+    state: &State,
+    facts: &ResponsibilityFacts,
+    active: bool,
+) -> bool {
     if !facts.dependencies.is_empty() {
         return true;
     }
@@ -776,8 +780,8 @@ pub(super) fn has_effective_domains(state: &State, facts: &ProfileFacts, active:
 }
 /// Explicit source propagation combines only compatible original relationships.
 pub(super) fn combined_origin(
-    left: &ProfileFacts,
-    right: &ProfileFacts,
+    left: &ResponsibilityFacts,
+    right: &ResponsibilityFacts,
 ) -> Result<GroupOrigin, WorkError> {
     match (left.key.origin, right.key.origin) {
         (GroupOrigin::Frozen, GroupOrigin::Frozen) => Ok(GroupOrigin::Frozen),

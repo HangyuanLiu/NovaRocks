@@ -21,58 +21,20 @@ use super::*;
 use crate::scope::ReclaimWakeOnExit;
 use std::ops::Deref;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProposalPhase {
-    Free,
-    Building,
-    Queued(u64),
-    Retired,
-    Resetting,
-}
-
-pub(crate) struct ProposalCell {
-    pub(crate) body: Arc<ProposalBody>,
-    pub(crate) phase: ProposalPhase,
-    pub(crate) generation: u64,
-}
-
-#[derive(Default)]
-pub(crate) struct ProposalBody {
-    changes: Vec<ChangeRecord>,
-}
-
-impl ProposalCell {
-    pub(crate) fn new() -> Self {
-        Self {
-            body: Arc::new(ProposalBody::default()),
-            phase: ProposalPhase::Free,
-            generation: 0,
-        }
-    }
-}
-
-/// Internal raw aliases never run callbacks on Drop, including under State.
+/// Immutable request-local facts. Installed claims never retain this body.
 #[derive(Clone)]
-pub(in crate::joint_admission) enum ChangeBody {
-    #[cfg(test)]
-    Migration(Arc<Vec<ChangeRecord>>),
-    Fixed(Arc<ProposalBody>),
-}
+pub(in crate::joint_admission) struct ChangeBody(Arc<Vec<ChangeRecord>>);
 impl Deref for ChangeBody {
     type Target = [ChangeRecord];
     fn deref(&self) -> &Self::Target {
-        match self {
-            #[cfg(test)]
-            Self::Migration(records) => records,
-            Self::Fixed(body) => &body.changes,
-        }
+        &self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProposalKey {
     slot: SlotId,
-    index: usize,
+    serial: u64,
     generation: u64,
 }
 
@@ -91,7 +53,6 @@ impl Drop for ProposalConstruction {
         if let Some(inner) = self.inner.upgrade() {
             inner.update(|state| {
                 root_domains::release_construction(state, self.owner, key);
-                retire_proposal(state, key, None);
                 if let Some(slot) = self.reserved_child.take() {
                     state.cancellations.withdraw_child_reservation(slot);
                 }
@@ -121,7 +82,6 @@ pub enum JointTryBegin<T, W = JointProposalSlotWait> {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ProposalWaitReason {
-    Slot,
     RootWriter(JointLane),
 }
 
@@ -228,12 +188,6 @@ async fn wait_proposal_slot(
                 return Err(WorkError::Released);
             }
             match target.reason {
-                ProposalWaitReason::Slot => {
-                    slot.proposals
-                        .iter()
-                        .any(|cell| cell.phase == ProposalPhase::Free)
-                        || inner.capture_progress(&state) != target.marker
-                }
                 ProposalWaitReason::RootWriter(lane) => {
                     if lane != JointLane::Settlement {
                         node.check(&state.cancellations)?;
@@ -261,9 +215,7 @@ impl JointAdmissionHandle {
     ) -> Result<Option<ProposalConstruction>, WorkError> {
         match self.try_reserve_proposal(scope)? {
             ProposalReservation::Reserved(custody) => Ok(custody),
-            ProposalReservation::Full(_) => {
-                Err(WorkError::Capacity("fixed proposal and reply cells"))
-            }
+            ProposalReservation::Full(_) => Err(WorkError::Capacity("Root writer is busy")),
         }
     }
 
@@ -331,40 +283,15 @@ impl JointAdmissionHandle {
                         .checked_add(1)
                         .ok_or(WorkError::ArithmeticOverflow)?;
                 }
-                if state.cancellations.slots[slot.0].proposals.is_empty() {
-                    return Err(WorkError::Capacity("fixed proposal cell geometry"));
-                }
-                let Some(index) = state.cancellations.slots[slot.0]
-                    .proposals
-                    .iter()
-                    .position(|cell| cell.phase == ProposalPhase::Free)
-                else {
-                    // A failed reservation is read-only. Advancing/notifying
-                    // here would wake this constructor on its own Full result.
-                    return Ok(ProposalReservation::Full(ProposalSlotWaitTarget {
-                        reason: ProposalWaitReason::Slot,
-                        owner: scope.id,
-                        slot,
-                        generation: state.cancellations.slots[slot.0].generation,
-                        marker: self.inner.capture_progress(&state),
-                    }));
-                };
                 let waiters = node
                     .resource_waiters
                     .checked_add(1)
                     .ok_or(WorkError::ArithmeticOverflow)?;
-                let cell = &mut state.cancellations.slots[slot.0].proposals[index];
-                assert!(Arc::get_mut(&mut cell.body).is_some());
-                let generation = cell
-                    .generation
-                    .checked_add(1)
-                    .ok_or(WorkError::ArithmeticOverflow)?;
-                cell.generation = generation;
-                cell.phase = ProposalPhase::Building;
+                let generation = state.cancellations.slots[slot.0].generation;
                 let key = ProposalKey {
                     slot,
-                    index,
                     generation,
+                    serial: state.next_id()?,
                 };
                 let node = state.nodes.get_mut(&scope.id).unwrap();
                 node.resource_waiters = waiters;
@@ -376,11 +303,7 @@ impl JointAdmissionHandle {
                     owner: scope.id,
                     reserved_child: None,
                     reserved_cohort: Vec::new(),
-                    key: Some(ProposalKey {
-                        slot,
-                        index,
-                        generation,
-                    }),
+                    key: Some(key),
                 })))
             })();
             let changed = matches!(&result, Ok(ProposalReservation::Reserved(Some(_))));
@@ -403,81 +326,35 @@ impl JointAdmissionHandle {
         custody: &Option<ProposalConstruction>,
         records: Vec<ChangeRecord>,
     ) -> Result<ChangeBody, WorkError> {
-        let Some(key) = custody.as_ref().and_then(|c| c.key) else {
-            #[cfg(test)]
-            return Ok(ChangeBody::Migration(Arc::new(records)));
-            #[cfg(not(test))]
-            return Err(WorkError::NotReady);
-        };
-        // A failed construction keeps its original pin until all local values
-        // exit. The original anchor remains unavailable during that exit.
-        self.inner.update(|state| {
-            let cell = &mut state.cancellations.slots[key.slot.0].proposals[key.index];
-            if cell.generation != key.generation || cell.phase != ProposalPhase::Building {
+        if let Some(custody) = custody {
+            let key = custody.key.ok_or(WorkError::Released)?;
+            let state = self.inner.state.lock().unwrap();
+            let node = state.nodes.get(&custody.owner).ok_or(WorkError::Released)?;
+            let slot = &state.cancellations.slots[key.slot.0];
+            if node.cancellation != key.slot || slot.generation != key.generation {
                 return Err(WorkError::Conflict);
             }
-            let body = Arc::get_mut(&mut cell.body).ok_or(WorkError::Conflict)?;
-            assert!(body.changes.is_empty());
-            body.changes = records;
-            Ok(ChangeBody::Fixed(Arc::clone(&cell.body)))
-        })
+        }
+        Ok(ChangeBody(Arc::new(records)))
     }
 }
 
 pub(super) fn queue_proposal(
     state: &mut State,
     custody: &Option<ProposalConstruction>,
-    id: u64,
+    _id: u64,
 ) -> Result<Option<ProposalKey>, WorkError> {
-    let Some(key) = custody.as_ref().and_then(|c| c.key) else {
+    let Some(custody) = custody else {
         return Ok(None);
     };
-    let cell = &mut state.cancellations.slots[key.slot.0].proposals[key.index];
-    if cell.generation != key.generation || cell.phase != ProposalPhase::Building {
+    let key = custody.key.ok_or(WorkError::Released)?;
+    let node = state.nodes.get(&custody.owner).ok_or(WorkError::Released)?;
+    if node.cancellation != key.slot
+        || state.cancellations.slots[key.slot.0].generation != key.generation
+    {
         return Err(WorkError::Conflict);
     }
-    cell.phase = ProposalPhase::Queued(id);
     Ok(Some(key))
-}
-
-pub(super) fn retire_proposal(state: &mut State, key: ProposalKey, ticket: Option<u64>) {
-    let cell = &mut state.cancellations.slots[key.slot.0].proposals[key.index];
-    assert_eq!(cell.generation, key.generation);
-    assert_eq!(
-        cell.phase,
-        ticket.map_or(ProposalPhase::Building, ProposalPhase::Queued)
-    );
-    cell.phase = ProposalPhase::Retired;
-    state.cancellations.retired_proposals += 1;
-}
-
-pub(in crate::joint_admission) fn prepare_reap_proposal(
-    storage: &mut CancellationStorage,
-    slot: SlotId,
-    index: usize,
-) -> Option<(Vec<ChangeRecord>, u64)> {
-    let cell = storage.slots.get_mut(slot.0)?.proposals.get_mut(index)?;
-    if cell.phase != ProposalPhase::Retired {
-        return None;
-    }
-    let body = Arc::get_mut(&mut cell.body)?;
-    let old = std::mem::take(&mut body.changes);
-    cell.phase = ProposalPhase::Resetting;
-    Some((old, cell.generation))
-}
-
-pub(crate) fn finish_reap_proposal(
-    storage: &mut CancellationStorage,
-    slot: SlotId,
-    index: usize,
-    generation: u64,
-) {
-    let cell = &mut storage.slots[slot.0].proposals[index];
-    assert_eq!(cell.phase, ProposalPhase::Resetting);
-    assert_eq!(cell.generation, generation);
-    assert!(Arc::get_mut(&mut cell.body).is_some());
-    cell.phase = ProposalPhase::Free;
-    storage.retired_proposals -= 1;
 }
 
 /// Owned installed claims, independent of temporary proposal construction.
@@ -611,7 +488,14 @@ mod child_reservation_tests {
                 .install_control(&parent.owner, &[])
                 .unwrap();
             drain(&mut driver);
-            let head = control.inner.state.lock().unwrap().cancellations.free_heads[0].unwrap();
+            let head = control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .cancellations
+                .free_head
+                .unwrap();
             let before = control
                 .inner
                 .state
@@ -636,7 +520,7 @@ mod child_reservation_tests {
             }
             drop(prepared);
             assert_eq!(
-                control.inner.state.lock().unwrap().cancellations.free_heads[0],
+                control.inner.state.lock().unwrap().cancellations.free_head,
                 Some(head)
             );
             drain(&mut driver);
@@ -650,7 +534,7 @@ mod child_reservation_tests {
             }
             drop(queued);
             assert_eq!(
-                control.inner.state.lock().unwrap().cancellations.free_heads[0],
+                control.inner.state.lock().unwrap().cancellations.free_head,
                 Some(head)
             );
             drain(&mut driver);
@@ -661,7 +545,7 @@ mod child_reservation_tests {
             drain(&mut driver);
             // A refused proof has no real child payload or observer to retain.
             assert_eq!(
-                control.inner.state.lock().unwrap().cancellations.free_heads[0],
+                control.inner.state.lock().unwrap().cancellations.free_head,
                 Some(head)
             );
             assert!(matches!(

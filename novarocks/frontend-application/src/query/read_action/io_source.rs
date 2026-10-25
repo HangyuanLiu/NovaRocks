@@ -24,20 +24,17 @@ use std::task::{Context, Poll};
 
 pub(crate) struct ReadMetadataIoSource {
     root: WorkScope,
-    geometry: ConnectorMetadataMaintenanceIoGeometry,
-    source_bytes: u64,
+    local_preparation: ConnectorMetadataMaintenanceIoProfile,
     original: Mutex<Option<Arc<MetadataIoAdmission>>>,
 }
 impl ReadMetadataIoSource {
     pub(crate) fn new(
         root: WorkScope,
-        geometry: ConnectorMetadataMaintenanceIoGeometry,
-        source_bytes: u64,
+        local_preparation: ConnectorMetadataMaintenanceIoProfile,
     ) -> Arc<Self> {
         Arc::new(Self {
             root,
-            geometry,
-            source_bytes,
+            local_preparation,
             original: Mutex::new(None),
         })
     }
@@ -47,29 +44,18 @@ impl ReadMetadataIoSource {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
-    fn install(
-        &self,
-        profile: &ConnectorMetadataMaintenanceIoProfile,
-    ) -> Result<Arc<MetadataIoAdmission>, ConnectorError> {
-        let actual = profile.geometry();
-        if actual.max_concurrent_io() > self.geometry.max_concurrent_io()
-            || actual.metadata_bytes() > self.geometry.metadata_bytes()
-            || actual.initial_owned_bytes() > self.geometry.initial_owned_bytes()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "read factory exceeds the sealed original source geometry",
-            ));
-        }
+    fn install(&self) -> Result<Arc<MetadataIoAdmission>, ConnectorError> {
         let mut original = self.original.lock().unwrap_or_else(|p| p.into_inner());
         if original.is_none() {
-            let profile = ConnectorMetadataMaintenanceIoProfile::from_geometry(
-                self.geometry,
-                profile.initial_dependencies().to_vec(),
-            )?;
+            // The actual local preparation source is the initial author. A
+            // Provider adds its exact selected route before its own request.
             *original = Some(
-                MetadataIoAdmission::new(self.root.clone(), profile, self.source_bytes)
-                    .map_err(work_error)?,
+                MetadataIoAdmission::new(
+                    self.root.clone(),
+                    self.local_preparation.clone(),
+                    self.local_preparation.metadata_bytes().get(),
+                )
+                .map_err(work_error)?,
             );
         }
         Ok(Arc::clone(
@@ -100,7 +86,7 @@ impl ConnectorIoAdmissionPort for ReadMetadataIoSource {
         &self,
         profile: &ConnectorMetadataMaintenanceIoProfile,
     ) -> Result<(), ConnectorError> {
-        self.install(profile)?.configure_read_source(profile)
+        self.install()?.configure_read_source(profile)
     }
     fn poll_read_source_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
         match self.original() {
@@ -112,12 +98,9 @@ impl ConnectorIoAdmissionPort for ReadMetadataIoSource {
         }
     }
     fn request(&self, dependency: SharedDependency) -> Result<ConnectorIoRequest, ConnectorError> {
-        let profile = ConnectorMetadataMaintenanceIoProfile::from_geometry(
-            self.geometry,
-            vec![dependency.clone()],
-        )?;
-        self.install(&profile)?.request(dependency)
+        self.install()?.request(dependency)
     }
+
     fn request_owned(
         &self,
         additional: std::num::NonZeroU64,

@@ -30,87 +30,10 @@ use std::{
 };
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 2,
-        max_registered_dependencies: 266,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: 2,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
+    let storage = ControlStorageConfig::new(count, &[]);
+    let config = ResponsibilityConfig {
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
-        protected_progress: JointResources::ZERO,
-    };
-    let global = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, m * 32)
-            .with(JointResource::PayloadBytes, 96)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Computations, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 96)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Computations, 1),
-        protected_progress: base,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
-    // Only the original fixed substrate requires progress in this fixture.
-    // CPU/complete Native action protection is deliberately not asserted.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -120,9 +43,13 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     })
     .unwrap()
     .owner;
-    let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
+    control
+        .configure_result_capacity(ResultCapacityConfig {
+            all_objects_bytes: [8 * 1024 * 1024, 96 * 1024 * 1024, 64, 8 * 1024 * 1024],
+            ..ResultCapacityConfig::V1
+        })
         .unwrap();
+    let (handle, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver)
@@ -324,4 +251,70 @@ fn joint_child(scope: &WorkScope, driver: &mut JointProgressDriver) -> WorkOwner
     drop(pending);
     drive(driver);
     target.unwrap()
+}
+
+#[test]
+fn actual_root_buffer_receipts_share_the_original_budget_independently_of_recorded_quantities() {
+    let (control, handle, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("local")], &mut driver);
+    let mut raw = Some(claim(
+        &handle,
+        &work.owner,
+        &[fact("local")],
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 8),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    let first = ResultWindowAlias::from_internal_payload(&scope, &scope, payload.as_ref().unwrap())
+        .unwrap();
+    let second =
+        ResultWindowAlias::from_internal_payload(&scope, &scope, payload.as_ref().unwrap())
+            .unwrap();
+    struct ActualBuffer {
+        _data: Vec<u8>,
+        _receipt: ResultPayloadBytes,
+    }
+    let receipt = first.reserve_payload_bytes(40).unwrap();
+    let original = Arc::new(ActualBuffer {
+        _data: vec![0; 40],
+        _receipt: receipt,
+    });
+    let retained = Arc::clone(&original);
+    assert_eq!(second.retained_payload_bytes(), 40);
+    assert!(matches!(
+        second.reserve_payload_bytes(25),
+        Err(WorkError::Capacity(_))
+    ));
+    let transient = second.reserve_payload_bytes(24).unwrap();
+    assert_eq!(first.retained_payload_bytes(), 64);
+    drop(transient);
+    drop(original);
+    assert_eq!(
+        second.retained_payload_bytes(),
+        40,
+        "a handoff is not actual backing exit"
+    );
+    drop(retained);
+    assert_eq!(first.retained_payload_bytes(), 0);
+    // Neither the old responsibility quantity eight nor a fresh alias mints a
+    // new budget. Both views share the original configured sixty-four bytes.
+    let mut full = first.reserve_payload_bytes(64).unwrap();
+    assert!(matches!(full.try_grow(1), Err(WorkError::Capacity(_))));
+    assert_eq!(full.bytes(), 64);
+    assert!(second.reserve_payload_bytes(1).is_err());
+    drop(full);
+    assert_eq!(second.retained_payload_bytes(), 0);
+    drop(second);
+    drop(first);
+    drop(payload);
+    finish(work, &mut driver);
+    drop(driver);
+    control.close_admission();
+    assert!(control.shutdown().is_ok());
 }

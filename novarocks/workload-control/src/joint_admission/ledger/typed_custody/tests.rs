@@ -77,96 +77,10 @@ fn fixture_with_optional_closed_factory(
     Option<InternalCpuFactoryBinding>,
 ) {
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 2,
-        max_registered_dependencies: 266,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: changes,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
+    let storage = ControlStorageConfig::new(count, &[]);
+    let config = ResponsibilityConfig {
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
-    config.max_registered_dependencies =
-        crate::joint_admission::ledger::metadata_geometry::maximum_fact_roots(&config, count * 2)
-            .unwrap()
-            .checked_mul(config.max_dependencies_per_claim)
-            .unwrap();
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, production_records)
-            .with(JointResource::Publications, publications),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, production_records)
-            .with(JointResource::Publications, publications),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1)
-            .with(JointResource::InternalCpuJobs, cpu_jobs)
-            .with(JointResource::PhysicalQueueRecords, cpu_jobs)
-            .with(JointResource::PhysicalQueueBytes, cpu_jobs * 64),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1)
-            .with(JointResource::InternalCpuJobs, cpu_jobs)
-            .with(JointResource::PhysicalQueueRecords, cpu_jobs)
-            .with(JointResource::PhysicalQueueBytes, cpu_jobs * 64),
-        protected_progress: JointResources::ZERO,
-    };
-    let global = JointResourceLimits {
-        global: custody.global.checked_add(foreground.global).unwrap(),
-        per_dependency: custody
-            .per_dependency
-            .checked_add(foreground.per_dependency)
-            .unwrap(),
-        protected_progress: base,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    let lane_index = match lane {
-        JointLane::Foreground => 1,
-        JointLane::Settlement => 2,
-        JointLane::Custody => panic!("CPU fixture requires an execution lane"),
-    };
-    config.lanes[lane_index] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][lane_index] = foreground;
-    // Only the original fixed substrate requires progress in this fixture.
-    // CPU/complete Native action protection is deliberately not asserted.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
     let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -181,10 +95,11 @@ fn fixture_with_optional_closed_factory(
             .bind_internal_result_closed_factory_for_composition(d)
             .unwrap()
     });
-    let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let (handle, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
+    control
+        .configure_result_capacity(crate::ResultCapacityConfig::V1)
+        .unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver, binding)
 }
@@ -287,103 +202,6 @@ fn finish(work: crate::RootWork, driver: &mut JointProgressDriver) {
 }
 
 #[test]
-fn one_computation_position_reuses_after_actual_compute_alias_exit_with_payload_alive() {
-    let (control, handle, mut driver) = fixture();
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let facts = [fact("union")];
-    bind(&scope, &facts, &mut driver);
-    let mut payload_source = Some(claim(
-        &handle,
-        &work.owner,
-        &facts,
-        JointLane::Custody,
-        amounts(JointResource::PayloadBytes, 8),
-        &mut driver,
-    ));
-    let mut payload = None;
-    RetainedPayloadGrant::adopt_in(&scope, &mut payload_source, &mut payload)
-        .unwrap()
-        .notify();
-    struct ActualPayload {
-        bytes: Vec<u8>,
-        _paid: RetainedPayloadAlias,
-    }
-    let output = ActualPayload {
-        bytes: vec![7; 8],
-        _paid: payload.as_ref().unwrap().retain_alias().unwrap(),
-    };
-    let same_union = output._paid.try_clone().unwrap();
-    assert!(same_union.shares_payload_with(&output._paid));
-    assert_eq!(same_union.capacity_bytes().unwrap(), 8);
-    assert!(same_union.check_backing_total(9).is_err());
-    let mut compute_source = Some(claim(
-        &handle,
-        &work.owner,
-        &facts,
-        JointLane::Foreground,
-        amounts(JointResource::Computations, 1),
-        &mut driver,
-    ));
-    let mut computation = None;
-    InternalComputationGrant::adopt_in(&scope, &mut compute_source, &mut computation)
-        .unwrap()
-        .notify();
-    let producer = computation.as_ref().unwrap().retain_alias().unwrap();
-    for positive_grant_exits in [false, true] {
-        if positive_grant_exits {
-            drop(computation.take());
-        }
-        let mut next = request(
-            &handle,
-            &work.owner,
-            &facts,
-            JointLane::Foreground,
-            amounts(JointResource::Computations, 1),
-        );
-        drive(&mut driver);
-        // Self-held capacity is a finite refusal, including when only the
-        // original producer alias remains. It cannot wait for its own exit.
-        assert!(matches!(
-            Pin::new(&mut next).poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(JointAdmissionFailure {
-                error: WorkError::JointCapacity(_)
-            }))
-        ));
-        assert_eq!(held(&control, JointResource::Computations), 1);
-        assert_eq!(held(&control, JointResource::PayloadBytes), 8);
-    }
-    drop(producer);
-    drive(&mut driver);
-    assert_eq!(held(&control, JointResource::Computations), 0);
-    let mut next = request(
-        &handle,
-        &work.owner,
-        &facts,
-        JointLane::Foreground,
-        amounts(JointResource::Computations, 1),
-    );
-    drive(&mut driver);
-    let next = receive(&mut next);
-    assert_eq!(held(&control, JointResource::Computations), 1);
-    assert_eq!(output.bytes, vec![7; 8]);
-    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
-    drop(next);
-    drop(payload.take());
-    finish(work, &mut driver);
-    assert_eq!(held(&control, JointResource::Computations), 0);
-    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
-    drop(output);
-    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
-    let spi_holder = same_union.into_retention();
-    drive(&mut driver);
-    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
-    drop(spi_holder);
-    drive(&mut driver);
-    assert_eq!(held(&control, JointResource::PayloadBytes), 0);
-}
-
-#[test]
 fn adoption_seals_old_public_view_without_changing_the_original_paid_charge() {
     let (control, handle, mut driver) = fixture();
     let work = root(&control);
@@ -414,49 +232,6 @@ fn adoption_seals_old_public_view_without_changing_the_original_paid_charge() {
     drop(notification);
     drop(target);
     finish(work, &mut driver);
-}
-
-#[test]
-fn wrong_shape_full_domain_and_record_refusals_keep_the_original_move_only_claim() {
-    for case in 0..4 {
-        let (control, handle, mut driver) = fixture();
-        let work = root(&control);
-        let scope = work.owner.scope();
-        let facts = [fact("full-a"), fact("full-b")];
-        bind(&scope, &facts, &mut driver);
-        let mut amount = amounts(JointResource::PayloadBytes, 8);
-        if case == 0 {
-            amount = amount.with(JointResource::UnreceivedProductions, 1);
-        }
-        if case == 1 {
-            amount = amount.with(JointResource::ClaimRecords, 2);
-        }
-        if case == 2 {
-            amount = amount.with(JointResource::ClaimRecords, 0);
-        }
-        let selected = if case == 3 { &facts[..1] } else { &facts[..] };
-        let mut source = Some(claim(
-            &handle,
-            &work.owner,
-            selected,
-            JointLane::Custody,
-            amount,
-            &mut driver,
-        ));
-        let original = source.as_ref().unwrap().view().unwrap();
-        let mut target = None;
-        let before = control.progress_revision();
-        assert!(matches!(
-            RetainedPayloadGrant::adopt_in(&scope, &mut source, &mut target),
-            Err(WorkError::Conflict)
-        ));
-        assert!(target.is_none());
-        assert_eq!(source.as_ref().unwrap().id, Some(original.id));
-        assert_eq!(source.as_ref().unwrap().amounts().unwrap(), amount);
-        assert_eq!(control.progress_revision(), before);
-        drop(source);
-        finish(work, &mut driver);
-    }
 }
 
 #[test]
@@ -944,7 +719,6 @@ fn cpu_action_inherits_every_stage_domain_and_retires_after_original_physical_dr
             change.claim.amounts.get(JointResource::PhysicalQueueBytes),
             23
         );
-        assert!(request.budget.is_finite());
     }
     assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
     drive(&mut driver);
@@ -1122,106 +896,6 @@ fn foreground_cpu_source_keeps_the_original_cancellation_refusal() {
     work.owner.complete_after_terminal_cancel_settled();
     work.business.release();
     drive(&mut driver);
-}
-
-#[test]
-fn failed_cpu_action_keeps_original_refusal_after_the_producer_source_exits() {
-    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let computation = cpu_stage(
-        &handle,
-        &work.owner,
-        &[fact("original-refusal")],
-        &mut driver,
-    );
-    let mut action = computation
-        .cpu_action_source(&scope)
-        .unwrap()
-        .begin(
-            std::num::NonZeroU64::new(1).unwrap(),
-            std::num::NonZeroU64::new(65).unwrap(),
-        )
-        .unwrap();
-    drive(&mut driver);
-    drop(computation);
-    assert!(matches!(
-        action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::JointCapacity(_)
-        }))
-    ));
-    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
-    drop(action);
-    finish(work, &mut driver);
-}
-
-#[test]
-fn ordinary_positive_grant_does_not_certify_a_closed_cpu_factory() {
-    let (control, handle, mut driver) = fixture_with_cpu_jobs(2);
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let facts = [fact("shape-a"), fact("shape-b")];
-    let computation = cpu_stage(&handle, &work.owner, &facts, &mut driver);
-    let external = claim(
-        &handle,
-        &work.owner,
-        &facts,
-        JointLane::Foreground,
-        amounts(JointResource::PhysicalQueueRecords, 1).with(JointResource::PhysicalQueueBytes, 23),
-        &mut driver,
-    );
-    let mut forged = handle.begin_paid_proposal(&work.owner).unwrap();
-    assert!(matches!(
-        forged.begin_new(
-            JointLane::Foreground,
-            amounts(JointResource::InternalCpuJobs, 1)
-        ),
-        Err(WorkError::Conflict)
-    ));
-    drop(forged);
-    // The original progress service retires the rejected constructor's cell
-    // before this same work constructs another independently rejected action.
-    drive(&mut driver);
-    let mut growth = handle.begin_paid_proposal(&work.owner).unwrap();
-    assert!(matches!(
-        growth.begin_grow(
-            external.view().unwrap(),
-            JointResources::ZERO.with(JointResource::InternalCpuJobs, 1)
-        ),
-        Err(WorkError::Conflict)
-    ));
-    drop(growth);
-    drive(&mut driver);
-    let mut action = computation
-        .cpu_action_source(&scope)
-        .unwrap()
-        .begin(
-            std::num::NonZeroU64::new(17).unwrap(),
-            std::num::NonZeroU64::new(23).unwrap(),
-        )
-        .unwrap();
-    drive(&mut driver);
-    assert!(matches!(
-        action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Ok(_))
-    ));
-    {
-        let state = control.inner.state.lock().unwrap();
-        assert!(
-            state
-                .joint
-                .as_ref()
-                .unwrap()
-                .profiles
-                .values()
-                .all(|profile| profile.facts.key.causal.is_empty())
-        );
-    }
-    // No invented physical value is accepted. The actual queue/factory
-    // integration regression lives with the original QA worker author.
-    drop((action, external, computation));
-    finish(work, &mut driver);
 }
 
 #[test]
@@ -1457,37 +1131,6 @@ fn pending_received_production_refuses_settlement_and_drop_rolls_back_all_domain
     drop(grant);
     finish(work, &mut driver);
 }
-#[test]
-fn exact_original_production_count_rejects_insufficient_paid_batch_backing() {
-    let (control, _, mut driver) =
-        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 2);
-    let work = root(&control);
-    let scope = work.owner.scope();
-    bind(&scope, &[fact("original")], &mut driver);
-    let origin: Arc<dyn Send + Sync> = Arc::new(());
-    let first = registered_production(&scope, &origin, &mut driver);
-    first.receive_in().unwrap().notify();
-    let second = registered_production(&scope, &origin, &mut driver);
-    assert_eq!(scope.control_binding_change_records().unwrap(), 3);
-    let before = production_rows(&scope);
-    let mut growth = scope.begin_control_binding().unwrap();
-    growth.push_dependency(&fact("additional")).unwrap();
-    growth.end_change().unwrap();
-    let failure = match growth.submit() {
-        Err(failure) => failure,
-        Ok(_) => panic!("two paid rows cannot hold three actual changes"),
-    };
-    assert!(matches!(
-        failure.error,
-        WorkError::Capacity("control and production joint batch records")
-    ));
-    assert_eq!(production_rows(&scope), before);
-    assert_eq!(held(&control, JointResource::UnreceivedProductions), 1);
-    second.receive_in().unwrap().notify();
-    second.owner().settle_received_in().unwrap().notify();
-    drop((first, second));
-    finish(work, &mut driver);
-}
 
 #[test]
 fn an_already_granted_new_record_cannot_register_across_pending_control_growth() {
@@ -1543,100 +1186,6 @@ fn an_already_granted_new_record_cannot_register_across_pending_control_growth()
     grant.owner().settle_received_in().unwrap().notify();
     drop((grant, reply, admission));
     finish(work, &mut driver);
-}
-
-#[test]
-fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody() {
-    // This neutral identity fixture proves fences/accounting, not a Provider
-    // callback's finiteness or the physical QA factory. FA's actual fixed-pool
-    // consumer exercises the same real production factory separately.
-    let pool: Arc<dyn Send + Sync> = Arc::new(());
-    let descriptor = InternalResultClosedFactoryDescriptor::for_composition(
-        Arc::downgrade(&pool),
-        std::any::TypeId::of::<fn()>(),
-        std::num::NonZeroU64::new(23).unwrap(),
-    );
-    let (control, _handle, mut driver, binding) =
-        fixture_with_optional_closed_factory(1, JointLane::Foreground, 1, 0, 2, Some(descriptor));
-    let binding = binding.unwrap();
-    let work = root(&control);
-    let scope = work.owner.scope();
-    assert!(binding.provider_creator_source(&scope).is_err()); // unbound D
-    let facts = [fact("creator-original-a"), fact("creator-original-b")];
-    bind(&scope, &facts, &mut driver);
-    let source = binding.provider_creator_source(&scope).unwrap();
-    let mut action = source
-        .begin(
-            std::num::NonZeroU64::new(17).unwrap(),
-            std::num::NonZeroU64::new(23).unwrap(),
-        )
-        .unwrap();
-    {
-        let state = control.inner.state.lock().unwrap();
-        let request = state
-            .joint
-            .as_ref()
-            .unwrap()
-            .requests
-            .values()
-            .next()
-            .unwrap();
-        let claim = &request.changes[0].claim;
-        assert_eq!(claim.facts.dependencies.len(), 2);
-        assert_eq!(claim.facts.lane, JointLane::Foreground);
-        assert_eq!(claim.amounts.get(JointResource::Computations), 0);
-        assert_eq!(claim.amounts.get(JointResource::InternalCpuJobs), 1);
-        assert_eq!(claim.amounts.get(JointResource::PhysicalQueueRecords), 1);
-    }
-    drive(&mut driver);
-    let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(Ok(offer)) => offer,
-        _ => panic!("expected exact original CPU offer"),
-    };
-    let mut physical = Some(());
-    let mut installed = None;
-    offer
-        .accept_in(&mut physical, &mut installed)
-        .unwrap()
-        .notify();
-    assert!(physical.is_none());
-    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
-    assert_eq!(held(&control, JointResource::Computations), 0);
-    // The registered finite source still occupies its exact hard CPU/queue
-    // capacity until the original physical holder exits. Qualification does
-    // not let a second real source borrow or refund that occupied position.
-    let mut second = binding
-        .provider_creator_source(&scope)
-        .unwrap()
-        .begin(
-            std::num::NonZeroU64::new(17).unwrap(),
-            std::num::NonZeroU64::new(23).unwrap(),
-        )
-        .unwrap();
-    drive(&mut driver);
-    assert!(matches!(
-        second.poll_local_offer(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::JointCapacity(_),
-        }))
-    ));
-    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
-    assert_eq!(held(&control, JointResource::PhysicalQueueRecords), 1);
-    drop(second);
-    drop(installed);
-    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
-    let stale = binding.provider_creator_source(&scope).unwrap();
-    work.owner.complete();
-    assert!(
-        stale
-            .begin(
-                std::num::NonZeroU64::new(17).unwrap(),
-                std::num::NonZeroU64::new(23).unwrap()
-            )
-            .is_err()
-    );
-    work.business.release();
-    drive(&mut driver);
 }
 
 #[test]
@@ -1703,5 +1252,335 @@ fn original_payload_disposal_preserves_live_alias_metadata_domains_and_next_capa
     assert_eq!(held(&control, JointResource::PayloadBytes), 40);
     drop((next, kept, payload));
     finish(work, &mut driver);
+    assert_eq!(held(&control, JointResource::PayloadBytes), 0);
+}
+
+#[test]
+fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody() {
+    // This neutral identity fixture proves fences/accounting, not a Provider
+    // callback's finiteness or the physical QA factory. FA's actual fixed-pool
+    // consumer exercises the same real production factory separately.
+    let pool: Arc<dyn Send + Sync> = Arc::new(());
+    let descriptor = InternalResultClosedFactoryDescriptor::for_composition(
+        Arc::downgrade(&pool),
+        std::any::TypeId::of::<fn()>(),
+        std::num::NonZeroU64::new(23).unwrap(),
+    );
+    let (control, _handle, mut driver, binding) =
+        fixture_with_optional_closed_factory(1, JointLane::Foreground, 1, 0, 2, Some(descriptor));
+    let binding = binding.unwrap();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    assert!(binding.provider_creator_source(&scope).is_err()); // unbound D
+    let facts = [fact("creator-original-a"), fact("creator-original-b")];
+    bind(&scope, &facts, &mut driver);
+    let source = binding.provider_creator_source(&scope).unwrap();
+    let mut action = source
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    {
+        let state = control.inner.state.lock().unwrap();
+        let request = state
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap();
+        let claim = &request.changes[0].claim;
+        assert_eq!(claim.facts.dependencies.len(), 2);
+        assert_eq!(claim.facts.lane, JointLane::Foreground);
+        assert_eq!(claim.amounts.get(JointResource::Computations), 0);
+        assert_eq!(claim.amounts.get(JointResource::InternalCpuJobs), 1);
+        assert_eq!(claim.amounts.get(JointResource::PhysicalQueueRecords), 1);
+    }
+    drive(&mut driver);
+    let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("expected exact original CPU offer"),
+    };
+    let mut physical = Some(());
+    let mut installed = None;
+    offer
+        .accept_in(&mut physical, &mut installed)
+        .unwrap()
+        .notify();
+    assert!(physical.is_none());
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+    assert_eq!(held(&control, JointResource::Computations), 0);
+    // Occupied original receiving slots cannot be overwritten, even by a
+    // second independently valid source. This is not a physical-pool test.
+    let mut second = binding
+        .provider_creator_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    let mut second_offer = match second.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("same original source offer"),
+    };
+    let mut second_physical = Some(());
+    assert!(matches!(
+        second_offer.accept_in(&mut second_physical, &mut installed),
+        Err(WorkError::Conflict)
+    ));
+    assert!(second_physical.is_some());
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 2);
+    second_offer
+        .reobserve_after_drop(&mut second_physical)
+        .unwrap()
+        .notify();
+    drop(second_offer);
+    drop(second);
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+    drop(installed);
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+    let stale = binding.provider_creator_source(&scope).unwrap();
+    work.owner.complete();
+    assert!(
+        stale
+            .begin(
+                std::num::NonZeroU64::new(17).unwrap(),
+                std::num::NonZeroU64::new(23).unwrap()
+            )
+            .is_err()
+    );
+    work.business.release();
+    drive(&mut driver);
+}
+
+#[test]
+fn ordinary_positive_grant_does_not_certify_a_closed_cpu_factory() {
+    let (control, handle, mut driver) = fixture_with_cpu_jobs(2);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let facts = [fact("shape-a"), fact("shape-b")];
+    let computation = cpu_stage(&handle, &work.owner, &facts, &mut driver);
+    let external = claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Foreground,
+        amounts(JointResource::PhysicalQueueRecords, 1).with(JointResource::PhysicalQueueBytes, 23),
+        &mut driver,
+    );
+    let mut forged = handle.begin_paid_proposal(&work.owner).unwrap();
+    assert!(matches!(
+        forged.begin_new(
+            JointLane::Foreground,
+            amounts(JointResource::InternalCpuJobs, 1)
+        ),
+        Err(WorkError::Conflict)
+    ));
+    drop(forged);
+    // The original progress service retires the rejected constructor's cell
+    // before this same work constructs another independently rejected action.
+    drive(&mut driver);
+    let mut growth = handle.begin_paid_proposal(&work.owner).unwrap();
+    assert!(matches!(
+        growth.begin_grow(
+            external.view().unwrap(),
+            JointResources::ZERO.with(JointResource::InternalCpuJobs, 1)
+        ),
+        Err(WorkError::Conflict)
+    ));
+    drop(growth);
+    drive(&mut driver);
+    let mut action = computation
+        .cpu_action_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original unregistered source"),
+    };
+    offer
+        .reobserve_after_drop(&mut None::<()>)
+        .unwrap()
+        .notify();
+    drop(offer);
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert!(
+            state.joint.as_ref().unwrap().claims.values().all(|row| row
+                .facts
+                .key
+                .source_kind
+                .is_empty())
+        );
+    }
+    // No invented physical value is accepted. The actual queue/factory
+    // integration regression lives with the original QA worker author.
+    drop((action, external, computation));
+    finish(work, &mut driver);
+}
+
+#[test]
+fn cancelled_cpu_action_keeps_original_refusal_after_the_producer_source_exits() {
+    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let computation = cpu_stage(
+        &handle,
+        &work.owner,
+        &[fact("original-refusal")],
+        &mut driver,
+    );
+    let mut action = computation
+        .cpu_action_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroU64::new(65).unwrap(),
+        )
+        .unwrap();
+    work.owner.cancel(crate::CancellationReason::Requested);
+    drive(&mut driver);
+    drop(computation);
+    assert!(matches!(
+        action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Cancelled(crate::CancellationReason::Requested)
+        }))
+    ));
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+    drop(action);
+    finish(work, &mut driver);
+}
+
+#[test]
+fn wrong_shape_full_domain_and_record_refusals_keep_the_original_move_only_claim() {
+    for case in 0..4 {
+        let (control, handle, mut driver) = fixture();
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let facts = [fact("full-a"), fact("full-b")];
+        bind(&scope, &facts, &mut driver);
+        let mut amount = amounts(JointResource::PayloadBytes, 8);
+        if case == 0 {
+            amount = amount.with(JointResource::UnreceivedProductions, 1);
+        }
+        if case == 1 {
+            amount = amount.with(JointResource::ClaimRecords, 2);
+        }
+        if case == 2 {
+            amount = amount.with(JointResource::ClaimRecords, 0);
+        }
+        let selected = if case == 3 { &facts[..1] } else { &facts[..] };
+        let mut source = Some(claim(
+            &handle,
+            &work.owner,
+            selected,
+            JointLane::Custody,
+            amount,
+            &mut driver,
+        ));
+        let original = source.as_ref().unwrap().view().unwrap();
+        let mut target = None;
+        let before = control.progress_revision();
+        assert!(matches!(
+            RetainedPayloadGrant::adopt_in(&scope, &mut source, &mut target),
+            Err(WorkError::Conflict)
+        ));
+        assert!(target.is_none());
+        assert_eq!(source.as_ref().unwrap().id, Some(original.id));
+        assert_eq!(source.as_ref().unwrap().amounts().unwrap(), amount);
+        assert_eq!(control.progress_revision(), before);
+        drop(source);
+        finish(work, &mut driver);
+    }
+}
+
+#[test]
+fn computation_and_payload_pins_retire_independently_at_their_actual_last_alias() {
+    let (control, handle, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let facts = [fact("union")];
+    bind(&scope, &facts, &mut driver);
+    let mut payload_source = Some(claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 8),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut payload_source, &mut payload)
+        .unwrap()
+        .notify();
+    struct ActualPayload {
+        bytes: Vec<u8>,
+        _paid: RetainedPayloadAlias,
+    }
+    let output = ActualPayload {
+        bytes: vec![7; 8],
+        _paid: payload.as_ref().unwrap().retain_alias().unwrap(),
+    };
+    let same_union = output._paid.try_clone().unwrap();
+    assert!(same_union.shares_payload_with(&output._paid));
+    assert_eq!(same_union.capacity_bytes().unwrap(), 8);
+    assert!(same_union.check_backing_total(9).is_err());
+    let mut compute_source = Some(claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Foreground,
+        amounts(JointResource::Computations, 1),
+        &mut driver,
+    ));
+    let mut computation = None;
+    InternalComputationGrant::adopt_in(&scope, &mut compute_source, &mut computation)
+        .unwrap()
+        .notify();
+    let producer = computation.as_ref().unwrap().retain_alias().unwrap();
+    drop(computation.take());
+    assert_eq!(
+        held(&control, JointResource::Computations),
+        1,
+        "the original producer alias still retains computation responsibility"
+    );
+    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
+    drop(producer);
+    drive(&mut driver);
+    assert_eq!(held(&control, JointResource::Computations), 0);
+    let mut next = request(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Foreground,
+        amounts(JointResource::Computations, 1),
+    );
+    drive(&mut driver);
+    let next = receive(&mut next);
+    assert_eq!(held(&control, JointResource::Computations), 1);
+    assert_eq!(output.bytes, vec![7; 8]);
+    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
+    drop(next);
+    drop(payload.take());
+    finish(work, &mut driver);
+    assert_eq!(held(&control, JointResource::Computations), 0);
+    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
+    drop(output);
+    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
+    let spi_holder = same_union.into_retention();
+    drive(&mut driver);
+    assert_eq!(held(&control, JointResource::PayloadBytes), 8);
+    drop(spi_holder);
+    drive(&mut driver);
     assert_eq!(held(&control, JointResource::PayloadBytes), 0);
 }

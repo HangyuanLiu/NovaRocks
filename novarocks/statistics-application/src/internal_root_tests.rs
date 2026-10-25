@@ -30,87 +30,7 @@ use std::{
 };
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
-    let storage = ControlStorageConfig::new([0, 0, count, 0, 0], 1, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 2,
-        max_registered_dependencies: 402,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: 4,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
-    };
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
-        protected_progress: JointResources::ZERO,
-    };
-    let global = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, m * 32)
-            .with(JointResource::PayloadBytes, 96)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Computations, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 96)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Computations, 1),
-        protected_progress: base,
-    };
-    config.global = global;
-    config.classes[2] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[2][0] = custody;
-    config.class_lanes[2][1] = foreground;
-    // Only the original fixed substrate requires progress in this fixture.
-    // CPU/complete Native action protection is deliberately not asserted.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[2] = base;
-    required.lanes[0] = base;
-    required.class_lanes[2][0] = base;
+    let storage = ControlStorageConfig::new(count, &[]);
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -121,9 +41,14 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     .unwrap()
     .owner;
     let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+        })
         .unwrap();
     control.configure_control_storage(storage).unwrap();
+    let mut results = novarocks_workload_control::ResultCapacityConfig::V1;
+    results.all_objects_bytes[2] = 1024 * 1024;
+    control.configure_result_capacity(results).unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver)
 }

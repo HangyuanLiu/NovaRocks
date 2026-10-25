@@ -149,14 +149,6 @@ impl RetainedPayloadGrant {
         };
         let control = control(&state, root, lane)?;
         let ledger = state.joint.as_ref().unwrap();
-        if active
-            .len()
-            .checked_add(2)
-            .ok_or(WorkError::ArithmeticOverflow)?
-            > ledger.config.config.max_changes_per_request
-        {
-            return Err(WorkError::Capacity("Root payload paid batch backing"));
-        }
         for grant in active {
             if grant.claims.len() != 1 {
                 return Err(WorkError::Conflict);
@@ -174,7 +166,7 @@ impl RetainedPayloadGrant {
                 || row.amounts != row.active_amounts
                 || row.facts.key != row.active_facts.key
                 || row.amounts.get(JointResource::AsyncIo) == 0
-                || !row.active_facts.key.causal.is_empty()
+                || !row.active_facts.key.source_kind.is_empty()
             {
                 return Err(WorkError::Conflict);
             }
@@ -222,9 +214,6 @@ impl RootPayloadSource<'_> {
                     self.writer_revision,
                 )?;
             }
-            if delta_bytes > super::root_stage::maximum_payload_increment(&state, self.root)? {
-                return Err(WorkError::Capacity("Root protected payload increment"));
-            }
         }
         let handle = JointAdmissionHandle { inner };
         let proposal = if self.fence.canonical {
@@ -269,9 +258,6 @@ impl RootPayloadSource<'_> {
                     self.root,
                     self.writer_revision,
                 )?;
-            }
-            if delta_bytes > super::root_stage::maximum_payload_increment(&state, self.root)? {
-                return Err(WorkError::Capacity("Root protected payload increment"));
             }
         }
         let handle = JointAdmissionHandle { inner };
@@ -430,19 +416,6 @@ impl RootPayloadProposal {
             .submit()
             .map(|admission| RootPayloadAdmission { admission })
     }
-    pub fn submit_finite(
-        self,
-        limit: NonZeroU64,
-    ) -> Result<RootPayloadAdmission, JointAdmissionFailure> {
-        if self.phase != 1 {
-            return Err(JointAdmissionFailure {
-                error: WorkError::Conflict,
-            });
-        }
-        self.proposal
-            .submit_finite(limit)
-            .map(|admission| RootPayloadAdmission { admission })
-    }
 }
 fn includes(full: &[DependencyRef], old: &[DependencyRef]) -> bool {
     old.iter()
@@ -491,10 +464,8 @@ pub(in crate::joint_admission::ledger) fn validate_root_payload(
                 JointResource::PayloadBytes,
                 delta.get(JointResource::PayloadBytes),
             )
-            || delta.get(JointResource::PayloadBytes)
-                > super::root_stage::maximum_payload_increment(state, root)?
         {
-            return Err(WorkError::Capacity("Root protected payload increment"));
+            return Err(WorkError::Conflict);
         }
         return Ok(());
     }
@@ -537,10 +508,8 @@ pub(in crate::joint_admission::ledger) fn validate_root_payload(
             JointResource::PayloadBytes,
             delta.get(JointResource::PayloadBytes),
         )
-        || delta.get(JointResource::PayloadBytes)
-            > super::root_stage::maximum_payload_increment(state, root)?
     {
-        return Err(WorkError::Capacity("Root protected payload increment"));
+        return Err(WorkError::Conflict);
     }
     let full = &changes[1].claim.facts.dependencies;
     if full.is_empty() || !includes(full, &payload.claim.facts.dependencies) {
@@ -588,7 +557,7 @@ pub(in crate::joint_admission::ledger) fn validate_root_payload(
                 || row.owner != ClaimOwner::PhysicalWork(root)
                 || !row.custody.is_raw()
                 || change.claim.amounts.get(JointResource::AsyncIo) == 0
-                || !change.claim.facts.key.causal.is_empty()
+                || !change.claim.facts.key.source_kind.is_empty()
             {
                 return Err(WorkError::Conflict);
             }

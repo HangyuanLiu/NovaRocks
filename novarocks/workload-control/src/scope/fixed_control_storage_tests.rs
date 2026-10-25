@@ -20,8 +20,7 @@
 use super::*;
 use crate::control_storage::{ControlStorageConfig, SlotPhase};
 use crate::joint_admission::{
-    JointCapacityConfig, JointProgress, JointProgressDriver, JointResource, JointResourceLimits,
-    JointResources, RequiredJointProgress,
+    JointProgress, JointProgressDriver, JointResource, JointResources, ResponsibilityConfig,
 };
 use std::{
     future::Future,
@@ -76,59 +75,13 @@ pub(crate) fn prototype_profile_with_roles(
     crate::joint_admission::JointAdmissionHandle,
     JointProgressDriver,
 ) {
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], children_per_slot, 2, poll_roles);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: max_dependencies,
-        max_registered_dependencies: count,
-        max_claims: count * 2,
-        max_requests: count * 2,
-        max_changes_per_request: max_changes,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
+    // The former K/C parameters remain only to keep existing lifecycle fixture
+    // callers readable; no production configuration or capacity uses them.
+    let _ = (children_per_slot, max_dependencies, max_changes);
+    let storage = ControlStorageConfig::new(count, poll_roles);
+    let config = ResponsibilityConfig {
         work_per_turn: NonZeroUsize::new(7).unwrap(),
     };
-    config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
-    let base = storage.base_charge(&config).unwrap();
-    let metadata = base.get(JointResource::MetadataBytes);
-    let global = JointResources::ZERO
-        .with(JointResource::ScopeRecords, count as u64)
-        .with(JointResource::ClaimRecords, (count * 2) as u64)
-        .with(JointResource::MetadataBytes, metadata * count as u64 * 4);
-    let domain = JointResources::ZERO
-        .with(JointResource::ScopeRecords, (count - 1) as u64)
-        .with(JointResource::ClaimRecords, count as u64)
-        .with(JointResource::MetadataBytes, metadata * count as u64 * 2);
-    let limit = JointResourceLimits {
-        global,
-        per_dependency: domain,
-        protected_progress: base,
-    };
-    let mut classes = [JointResourceLimits::default(); 5];
-    classes[0] = limit;
-    let mut lanes = [JointResourceLimits::default(); 3];
-    lanes[0] = limit;
-    let mut class_lanes = [[JointResourceLimits::default(); 3]; 5];
-    class_lanes[0][0] = limit;
-    config.global = limit;
-    config.classes = classes;
-    config.lanes = lanes;
-    config.class_lanes = class_lanes;
-    // This minimum is only the storage substrate, never a complete role.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -138,9 +91,7 @@ pub(crate) fn prototype_profile_with_roles(
     })
     .unwrap()
     .owner;
-    let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let (handle, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
     if poll_roles.is_empty() {
         control.mark_ready().unwrap();
@@ -483,44 +434,6 @@ fn first_bind_preserves_base_and_requires_the_exact_original_owner_at_install() 
 }
 
 #[test]
-fn first_bind_is_finite_under_one_bad_domain_and_preserves_healthy_progress() {
-    let (control, handle, mut driver) = prototype_full(3, 1);
-    let bad = selected_dependency(&handle, "bad");
-    let healthy = selected_dependency(&handle, "healthy");
-    let a = root(&control);
-    let b = root(&control);
-    let c = root(&control);
-    for owner in [&a.owner, &b.owner] {
-        let mut request = first_bind(&handle, owner, &bad);
-        drain(&mut driver);
-        binding_receipt(&mut request)
-            .install_control(owner, &[])
-            .unwrap();
-    }
-    let before = snapshot(&control);
-    let mut rejected = first_bind(&handle, &c.owner, &bad);
-    drain(&mut driver);
-    let Poll::Ready(Err(failure)) =
-        std::pin::Pin::new(&mut rejected).poll(&mut Context::from_waker(Waker::noop()))
-    else {
-        panic!("a self-held first binding must fail rather than park");
-    };
-    assert!(matches!(failure.error, WorkError::JointCapacity(_)));
-    assert_eq!(snapshot(&control), before);
-    let mut request = first_bind(&handle, &c.owner, &healthy);
-    drain(&mut driver);
-    binding_receipt(&mut request)
-        .install_control(&c.owner, &[])
-        .unwrap();
-    for work in [a, b, c] {
-        work.business.release();
-        work.owner.complete();
-    }
-    drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
-}
-
-#[test]
 fn first_bind_and_physical_growth_install_atomically_with_both_original_owners() {
     use crate::joint_admission::{JointClaimChange, JointLane};
     let (control, handle, mut driver) = prototype_profile(4, 1, 2, 2);
@@ -807,100 +720,6 @@ fn control_domain_extension_preserves_the_union_and_invalidates_an_old_child_rec
 }
 
 #[test]
-fn control_union_refusal_is_finite_and_never_discards_its_old_domain() {
-    use crate::joint_admission::JointClaimChange;
-    let (control, handle, mut driver) = prototype_profile(4, 1, 2, 1);
-    let a = selected_dependency(&handle, "a");
-    let b = selected_dependency(&handle, "b");
-    let parent = root(&control);
-    let mut binding = first_bind(&handle, &parent.owner, &a);
-    drain(&mut driver);
-    binding_receipt(&mut binding)
-        .install_control(&parent.owner, &[])
-        .unwrap();
-    let scope = parent.owner.scope();
-    let parent_slot = slot(&control, scope.id);
-    let claim = control.inner.state.lock().unwrap().cancellations.slots[parent_slot.0]
-        .claim
-        .unwrap();
-    let mut others = Vec::new();
-    for _ in 0..3 {
-        let work = root(&control);
-        let mut binding = first_bind(&handle, &work.owner, &b);
-        drain(&mut driver);
-        binding_receipt(&mut binding)
-            .install_control(&work.owner, &[])
-            .unwrap();
-        others.push(work);
-    }
-    let before = snapshot(&control);
-    let mut extension = handle
-        .request(
-            &scope,
-            vec![JointClaimChange::grow_by(
-                parent.owner.control_claim_view().unwrap(),
-                JointResources::ZERO,
-                vec![b.clone()],
-            )],
-        )
-        .unwrap();
-    drain(&mut driver);
-    assert!(matches!(
-        std::pin::Pin::new(&mut extension).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-            error: WorkError::JointCapacity(_)
-        }))
-    ));
-    assert_eq!(snapshot(&control), before);
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .control_has_domains_for_test(claim, &[a.fact().clone()])
-    );
-    let exited = others.pop().unwrap();
-    exited.business.release();
-    exited.owner.complete();
-    drain(&mut driver);
-    let mut extension = handle
-        .request(
-            &scope,
-            vec![JointClaimChange::grow_by(
-                parent.owner.control_claim_view().unwrap(),
-                JointResources::ZERO,
-                vec![b.clone()],
-            )],
-        )
-        .unwrap();
-    drain(&mut driver);
-    binding_receipt(&mut extension)
-        .install_control(&parent.owner, &[])
-        .unwrap();
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .control_has_domains_for_test(claim, &[a.fact().clone(), b.fact().clone()])
-    );
-    for work in others.into_iter().chain(std::iter::once(parent)) {
-        work.business.release();
-        work.owner.complete();
-    }
-    drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
-}
-
-#[test]
 fn concurrent_paid_child_proposals_reserve_distinct_backing_without_granting_work() {
     let (control, handle, mut driver) = prototype_profile(5, 2, 2, 2);
     let prepaid = snapshot(&control);
@@ -1106,7 +925,14 @@ fn pool_grant_publishes_one_child_with_the_full_parent_domain_and_same_claim() {
         .unwrap();
     drain(&mut driver);
     let before = snapshot(&control);
-    let candidate = control.inner.state.lock().unwrap().cancellations.free_heads[0].unwrap();
+    let candidate = control
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .cancellations
+        .free_head
+        .unwrap();
     let claim = control.inner.state.lock().unwrap().cancellations.slots[candidate.0].claim;
     let mut first = handle
         .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
@@ -1240,61 +1066,6 @@ fn granted_and_delivered_child_replies_keep_domain_fees_until_their_actual_exit(
         );
         assert_eq!(reset.3, 0);
     }
-}
-
-#[test]
-fn refused_pool_proof_preserves_the_real_free_head_for_a_healthy_root() {
-    let (control, handle, mut driver) = prototype_full(4, 2);
-    let a = selected_dependency(&handle, "bad");
-    let b = selected_dependency(&handle, "healthy");
-    let parent = root(&control);
-    let mut binding = first_bind(&handle, &parent.owner, &a);
-    drain(&mut driver);
-    binding_receipt(&mut binding)
-        .install_control(&parent.owner, &[])
-        .unwrap();
-    let mut children = Vec::new();
-    for _ in 0..2 {
-        let mut request = handle
-            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        drain(&mut driver);
-        children.push(
-            binding_receipt(&mut request)
-                .install_child(&parent.owner)
-                .unwrap(),
-        );
-    }
-    let free = control.inner.state.lock().unwrap().cancellations.free_heads[0];
-    let mut rejected = handle
-        .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    drain(&mut driver);
-    assert_eq!(
-        control.inner.state.lock().unwrap().cancellations.free_heads[0],
-        free
-    );
-    let healthy = root(&control);
-    let mut binding = first_bind(&handle, &healthy.owner, &b);
-    drain(&mut driver);
-    binding_receipt(&mut binding)
-        .install_control(&healthy.owner, &[])
-        .unwrap();
-    assert!(matches!(
-        std::pin::Pin::new(&mut rejected).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-            error: WorkError::JointCapacity(_)
-        }))
-    ));
-    for child in children {
-        child.complete();
-    }
-    for work in [parent, healthy] {
-        work.business.release();
-        work.owner.complete();
-    }
-    drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
 }
 
 #[test]
@@ -1718,7 +1489,7 @@ fn leaf_parent_hint_reclaims_a_retired_chain_in_linear_cell_checks() {
                 .fixed_child_facts_for_test(),
         )
     };
-    assert_eq!(limit, 1);
+    assert_eq!(limit, count - 1);
     assert_eq!(edges, count - 1);
     work.business.release();
     for owner in owners {
@@ -1865,27 +1636,28 @@ fn shutdown_requires_exact_free_inventory_but_keeps_its_prepaid_profiles() {
 }
 
 #[test]
-fn bounded_fanout_failure_preserves_the_free_head_and_later_reuses_returned_storage() {
-    let (control, mut driver) = prototype_with_fanout(4, 1);
+fn global_scope_exhaustion_preserves_free_head_and_later_reuses_only_exited_storage() {
+    let (control, mut driver) = prototype_with_fanout(3, 1);
     let work = root(&control);
     let scope = work.owner.scope();
     let first = scope.child(WorkRequest::new(WorkClass::Query)).unwrap();
     let first_slot = slot(&control, first.scope().id);
+    let independent_root = root(&control);
     let (heads, prepaid) = {
         let state = control.inner.state.lock().unwrap();
         assert!(state.cancellations.free_inventory_valid());
         (
-            state.cancellations.free_heads,
+            state.cancellations.free_head,
             state.joint.as_ref().unwrap().control_snapshot_for_test(),
         )
     };
     assert!(matches!(
         scope.child(WorkRequest::new(WorkClass::Query)),
-        Err(WorkError::Capacity("prepaid parent child backing"))
+        Err(WorkError::Capacity("scope records"))
     ));
     {
         let state = control.inner.state.lock().unwrap();
-        assert_eq!(state.cancellations.free_heads, heads);
+        assert_eq!(state.cancellations.free_head, heads);
         assert!(state.cancellations.free_inventory_valid());
         assert_eq!(state.nodes[&scope.id].children, 1);
     }
@@ -1898,19 +1670,21 @@ fn bounded_fanout_failure_preserves_the_free_head_and_later_reuses_returned_stor
             SlotPhase::Retired
         );
         assert_eq!(
-            state.cancellations.free_heads, heads,
+            state.cancellations.free_head, heads,
             "Retired is never free inventory"
         );
         assert!(state.cancellations.free_inventory_valid());
     }
     drain(&mut driver);
     assert_eq!(
-        control.inner.state.lock().unwrap().cancellations.free_heads[0],
+        control.inner.state.lock().unwrap().cancellations.free_head,
         Some(first_slot)
     );
     let second = scope.child(WorkRequest::new(WorkClass::Query)).unwrap();
     assert_eq!(slot(&control, second.scope().id), first_slot);
     second.complete();
+    independent_root.business.release();
+    independent_root.owner.complete();
     work.business.release();
     work.owner.complete();
     drain(&mut driver);
@@ -1920,7 +1694,7 @@ fn bounded_fanout_failure_preserves_the_free_head_and_later_reuses_returned_stor
 #[test]
 fn rejected_fixed_root_deadline_leaves_its_head_and_original_claim_untouched() {
     let (control, mut driver) = prototype(2);
-    let heads = control.inner.state.lock().unwrap().cancellations.free_heads;
+    let heads = control.inner.state.lock().unwrap().cancellations.free_head;
     let prepaid = snapshot(&control);
     assert!(matches!(
         control.try_begin_root(WorkRequest {
@@ -1931,34 +1705,34 @@ fn rejected_fixed_root_deadline_leaves_its_head_and_original_claim_untouched() {
     ));
     {
         let state = control.inner.state.lock().unwrap();
-        assert_eq!(state.cancellations.free_heads, heads);
+        assert_eq!(state.cancellations.free_head, heads);
         assert!(state.cancellations.drained());
         assert!(state.nodes.is_empty());
     }
     assert_eq!(snapshot(&control), prepaid);
     let work = root(&control);
-    assert_eq!(slot(&control, work.owner.scope().id), heads[0].unwrap());
+    assert_eq!(slot(&control, work.owner.scope().id), heads.unwrap());
     work.business.release();
     work.owner.complete();
     drain(&mut driver);
 }
 
 #[test]
-fn drained_requires_complete_acyclic_class_correct_free_chains() {
+fn drained_requires_complete_acyclic_global_free_chain() {
     let (control, _driver) = prototype(4);
     control.close_admission();
     {
         let mut state = control.inner.state.lock().unwrap();
         assert!(state.is_drained());
-        let heads = state.cancellations.free_heads;
-        let head = heads[0].unwrap();
+        let heads = state.cancellations.free_head;
+        let head = heads.unwrap();
         let next = state.cancellations.slots[head.0].next_free;
-        state.cancellations.free_heads[0] = None;
+        state.cancellations.free_head = None;
         assert!(
             !state.is_drained(),
             "unreachable Free entries cannot certify drain"
         );
-        state.cancellations.free_heads = heads;
+        state.cancellations.free_head = heads;
         state.cancellations.slots[head.0].next_free = Some(head);
         assert!(
             !state.is_drained(),
@@ -1970,18 +1744,13 @@ fn drained_requires_complete_acyclic_class_correct_free_chains() {
             "a disconnected suffix cannot certify drain"
         );
         state.cancellations.slots[head.0].next_free = next;
-        state.cancellations.free_heads[1] = Some(head);
-        assert!(
-            !state.is_drained(),
-            "one slot cannot appear in a foreign class chain"
-        );
-        state.cancellations.free_heads = heads;
-        state.cancellations.free_heads[0] = Some(SlotId(state.cancellations.slots.len()));
+        state.cancellations.free_head = heads;
+        state.cancellations.free_head = Some(SlotId(state.cancellations.slots.len()));
         assert!(
             !state.is_drained(),
             "out-of-inventory links are not followed"
         );
-        state.cancellations.free_heads = heads;
+        state.cancellations.free_head = heads;
         state.cancellations.slots[head.0].phase = SlotPhase::Retired;
         assert!(!state.is_drained(), "a linked Retired entry is never Free");
         state.cancellations.slots[head.0].phase = SlotPhase::Free;
@@ -2078,77 +1847,6 @@ fn legacy_generation_exhaustion_does_not_pop_or_lose_the_vacant_head() {
 }
 
 #[test]
-fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
-    let narrow = ControlStorageConfig {
-        slots_per_class: [4, 0, 0, 0, 0],
-        children_per_slot: 1,
-        proposals_per_slot: 2,
-        poll_roles: &[],
-        process_sources: crate::PollRoleSourceBacking::default(),
-    };
-    let wider = ControlStorageConfig {
-        children_per_slot: 2,
-        ..narrow
-    };
-    let impossible = ControlStorageConfig {
-        children_per_slot: 4,
-        ..narrow
-    };
-    let (control, _, _driver) = prototype_profile(4, 1, 1, 1);
-    let geometry = {
-        let state = control.inner.state.lock().unwrap();
-        state.joint.as_ref().unwrap().config_for_test()
-    };
-    let narrow = crate::joint_admission::ledger::control_storage_base(narrow, &geometry).unwrap();
-    let wider = crate::joint_admission::ledger::control_storage_base(wider, &geometry).unwrap();
-    assert_eq!(
-        wider, narrow,
-        "fanout uses the same original N-slot edge inventory"
-    );
-    assert!(matches!(
-        crate::joint_admission::ledger::control_storage_base(impossible, &geometry),
-        Err(WorkError::InvalidConfig("fixed control storage geometry"))
-    ));
-}
-
-#[test]
-fn constructor_cells_are_reserved_before_build_and_reaped_while_the_work_is_live() {
-    let (control, handle, mut driver) = prototype_full(3, 1);
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let first = handle.reserve_proposal(&scope).unwrap();
-    let second = handle.reserve_proposal(&scope).unwrap();
-    assert!(matches!(
-        handle.reserve_proposal(&scope),
-        Err(WorkError::Capacity("fixed proposal and reply cells"))
-    ));
-    let own_slot = slot(&control, scope.id());
-    drop(first);
-    drain(&mut driver);
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .nodes
-            .contains_key(&scope.id())
-    );
-    let reused = handle.reserve_proposal(&scope).unwrap();
-    {
-        let state = control.inner.state.lock().unwrap();
-        let cells = &state.cancellations.slots[own_slot.0].proposals;
-        assert_eq!(cells[0].generation, 2);
-        assert_eq!(cells[1].generation, 1);
-    }
-    drop((second, reused));
-    work.business.release();
-    work.owner.complete();
-    drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
-}
-
-#[test]
 fn aborted_constructor_keeps_the_original_node_until_its_actual_exit() {
     let (control, handle, mut driver) = prototype_full(3, 1);
     let work = root(&control);
@@ -2160,167 +1858,6 @@ fn aborted_constructor_keeps_the_original_node_until_its_actual_exit() {
     assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
     drop(building);
     drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
-}
-
-#[test]
-fn withdrawn_request_cannot_reuse_a_body_still_held_by_the_original_driver() {
-    use crate::joint_admission::{JointClaimChange, JointLane};
-    let (control, handle, mut driver) = prototype_full(3, 1);
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let request = || {
-        handle.request(
-            &scope,
-            vec![JointClaimChange::New {
-                dependencies: Vec::new(),
-                lane: JointLane::Custody,
-                amounts: JointResources::ZERO,
-            }],
-        )
-    };
-    let first = request().unwrap();
-    assert_eq!(driver.step(), JointProgress::More); // Original Turn takes the body.
-    drop(first);
-    let second = request().unwrap();
-    assert!(matches!(
-        request(),
-        Err(crate::joint_admission::JointAdmissionFailure {
-            error: WorkError::Capacity("fixed proposal and reply cells")
-        })
-    ));
-    drain(&mut driver);
-    let third = request().unwrap();
-    drop((second, third));
-    work.business.release();
-    work.owner.complete();
-    drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
-}
-
-#[test]
-fn empty_delivered_container_and_its_iterator_do_not_retain_proposal_backing() {
-    use crate::joint_admission::{JointClaimChange, JointLane};
-    let (control, handle, mut driver) = prototype_full(3, 1);
-    let dependency = selected_dependency(&handle, "reply");
-    let work = root(&control);
-    let mut binding = first_bind(&handle, &work.owner, &dependency);
-    drain(&mut driver);
-    binding_receipt(&mut binding)
-        .install_control(&work.owner, &[])
-        .unwrap();
-    drain(&mut driver);
-    let mut request = handle
-        .request(
-            &work.owner.scope(),
-            vec![JointClaimChange::New {
-                dependencies: vec![dependency.clone()],
-                lane: JointLane::Custody,
-                amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
-            }],
-        )
-        .unwrap();
-    drain(&mut driver);
-    let Poll::Ready(Ok(mut batch)) =
-        std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
-    else {
-        panic!("original reply")
-    };
-    assert!(batch.adjustment.is_none());
-    let physical = batch.new_claims.pop().unwrap();
-    let scope_id = work.owner.scope().id;
-    drain(&mut driver);
-    {
-        let state = control.inner.state.lock().unwrap();
-        let node = &state.nodes[&scope_id];
-        assert!(
-            state.cancellations.slots[node.cancellation.0]
-                .proposals
-                .iter()
-                .all(|cell| {
-                    cell.phase
-                        == crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
-                }),
-            "consumed reply is not an active proposal borrow"
-        );
-    }
-    work.business.release();
-    work.owner.complete();
-    drain(&mut driver);
-    assert_eq!(
-        control.inner.state.lock().unwrap().nodes.len(),
-        1,
-        "the original physical claim still retains its Work"
-    );
-    let mut iter = batch.new_claims.into_iter();
-    assert!(iter.next().is_none());
-    drop(physical);
-    drain(&mut driver);
-    assert!(
-        control.inner.state.lock().unwrap().nodes.is_empty(),
-        "only actual claim exit permits Work retirement"
-    );
-    assert_eq!(
-        snapshot(&control).3,
-        0,
-        "empty owning iterator cannot pin a retired proposal/control cell"
-    );
-    drop(iter);
-    drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
-}
-
-#[test]
-fn nonempty_owning_iterator_keeps_claims_without_pinning_constructor_cells() {
-    use crate::joint_admission::{JointClaimChange, JointLane};
-    let (control, handle, mut driver) = prototype_profile(6, 1, 1, 2);
-    let dependency = selected_dependency(&handle, "iterator");
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let mut binding = first_bind(&handle, &work.owner, &dependency);
-    drain(&mut driver);
-    binding_receipt(&mut binding)
-        .install_control(&work.owner, &[])
-        .unwrap();
-    drain(&mut driver);
-    let change = || JointClaimChange::New {
-        dependencies: vec![dependency.clone()],
-        lane: JointLane::Custody,
-        amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
-    };
-    let mut request = handle.request(&scope, vec![change(), change()]).unwrap();
-    drain(&mut driver);
-    let Poll::Ready(Ok(batch)) =
-        std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
-    else {
-        panic!("original two-claim reply");
-    };
-    assert!(batch.adjustment.is_none());
-    let mut original = batch.new_claims.into_iter();
-    let first = original.next().unwrap();
-    assert_eq!(original.size_hint(), (1, Some(1)));
-    drain(&mut driver);
-    // Both original cells can build new requests while the owning iterator and
-    // its yielded physical claim remain alive.
-    let a = handle.reserve_proposal(&scope).unwrap();
-    let b = handle.reserve_proposal(&scope).unwrap();
-    drop((a, b));
-    drain(&mut driver);
-    work.business.release();
-    work.owner.complete();
-    drain(&mut driver);
-    assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
-    assert_eq!(first.amounts().unwrap().get(JointResource::ClaimRecords), 1);
-    drop(first);
-    drain(&mut driver);
-    assert_eq!(
-        control.inner.state.lock().unwrap().nodes.len(),
-        1,
-        "the unconsumed iterator still owns its remaining physical claim"
-    );
-    drop(original);
-    drain(&mut driver);
-    assert!(control.inner.state.lock().unwrap().nodes.is_empty());
     assert_eq!(snapshot(&control).3, 0);
 }
 
@@ -2340,71 +1877,6 @@ impl std::task::Wake for WithdrawAndPanicReplyWake {
             .unwrap();
         panic!("intentional reply callback unwind after actual withdrawal");
     }
-}
-
-#[test]
-fn driver_turn_exit_notifies_after_a_reply_callback_withdraws_and_panics() {
-    use crate::joint_admission::{JointClaimChange, JointLane};
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    let (control, handle, mut driver) = prototype_full(3, 1);
-    let work = root(&control);
-    let own_slot = slot(&control, work.owner.scope().id());
-    let mut request = handle
-        .request(
-            &work.owner.scope(),
-            vec![JointClaimChange::New {
-                dependencies: Vec::new(),
-                lane: JointLane::Custody,
-                amounts: JointResources::ZERO,
-            }],
-        )
-        .unwrap();
-    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
-    let wake = Arc::new(WithdrawAndPanicReplyWake {
-        request: Mutex::new(None),
-        entered: entered_tx,
-        resume: Mutex::new(resume_rx),
-    });
-    let waker = Waker::from(Arc::clone(&wake));
-    assert!(
-        std::pin::Pin::new(&mut request)
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending()
-    );
-    *wake.request.lock().unwrap() = Some(request);
-    let worker = std::thread::spawn(move || {
-        let panic = catch_unwind(AssertUnwindSafe(|| drain(&mut driver)));
-        assert!(panic.is_err(), "the real reply callback must unwind");
-        driver
-    });
-    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    work.business.release();
-    work.owner.complete();
-    {
-        let state = control.inner.state.lock().unwrap();
-        assert!(state.nodes.is_empty());
-        assert_eq!(state.cancellations.retired_proposals, 1);
-        assert_eq!(
-            state.cancellations.slots[own_slot.0].phase,
-            SlotPhase::Retired
-        );
-        assert_eq!(
-            Arc::strong_count(&state.cancellations.slots[own_slot.0].proposals[0].body),
-            2,
-            "only the fixed anchor and paused original Turn remain"
-        );
-    }
-    let before_exit = control.progress_revision();
-    resume_tx.send(()).unwrap();
-    let mut driver = worker.join().unwrap();
-    assert_ne!(
-        before_exit,
-        control.progress_revision(),
-        "actual Turn exit must publish a later generation"
-    );
-    drain(&mut driver);
-    assert!(control.inner.state.lock().unwrap().cancellations.drained());
 }
 
 struct PanicOnceProgressWake(std::sync::atomic::AtomicBool);
@@ -2476,87 +1948,16 @@ fn reply_handoff_panic_releases_undelivered_claims_for_new_and_mixed_batches() {
 }
 
 #[test]
-fn metadata_reservation_tracks_actual_service_geometry_and_rejects_overflow_before_build() {
-    let (control, _, _driver) = prototype_profile(4, 1, 1, 1);
-    let geometry = {
-        let state = control.inner.state.lock().unwrap();
-        state.joint.as_ref().unwrap().config_for_test()
-    };
-    let storage = ControlStorageConfig {
-        slots_per_class: [4, 0, 0, 0, 0],
-        children_per_slot: 1,
-        proposals_per_slot: 2,
-        poll_roles: &[],
-        process_sources: crate::PollRoleSourceBacking::default(),
-    };
-    let quote = |geometry: &JointCapacityConfig| {
-        crate::joint_admission::ledger::control_storage_base(storage, geometry)
-    };
-    let baseline = quote(&geometry).unwrap().get(JointResource::MetadataBytes);
-    for larger in [
-        JointCapacityConfig {
-            max_registered_dependencies: geometry.max_registered_dependencies * 2,
-            ..geometry.clone()
-        },
-        JointCapacityConfig {
-            max_dependencies_per_claim: 2,
-            ..geometry.clone()
-        },
-        JointCapacityConfig {
-            max_changes_per_request: 2,
-            ..geometry.clone()
-        },
-        JointCapacityConfig {
-            max_claims: 16,
-            ..geometry.clone()
-        },
-    ] {
-        assert!(
-            quote(&larger).unwrap().get(JointResource::MetadataBytes) > baseline,
-            "fixed cells cannot reuse a smaller metadata fee for a larger service"
-        );
-    }
-    for overflow in [
-        JointCapacityConfig {
-            max_dependencies_per_claim: usize::MAX,
-            ..geometry.clone()
-        },
-        JointCapacityConfig {
-            max_registered_dependencies: usize::MAX,
-            ..geometry.clone()
-        },
-        JointCapacityConfig {
-            max_changes_per_request: usize::MAX,
-            ..geometry.clone()
-        },
-        JointCapacityConfig {
-            max_claims: usize::MAX,
-            ..geometry.clone()
-        },
-    ] {
-        assert!(matches!(
-            quote(&overflow),
-            Err(WorkError::ArithmeticOverflow)
-        ));
-    }
-}
-
-#[test]
 fn independent_process_source_layout_is_prepaid_once_by_the_original_base() {
-    let (control, _, _driver) = prototype_profile(4, 1, 1, 1);
-    let geometry = {
-        let state = control.inner.state.lock().unwrap();
-        state.joint.as_ref().unwrap().config_for_test()
-    };
-    let plain = ControlStorageConfig::new([4, 0, 0, 0, 0], 1, 2, &[]);
+    let plain = ControlStorageConfig::new(4, &[]);
     let source = crate::PollRoleSourceBacking::from_layouts(
         &[std::alloc::Layout::new::<[u64; 4]>()],
         &[std::alloc::Layout::new::<[u64; 2]>()],
     )
     .unwrap();
     let with = plain.with_process_source_backing(source);
-    let old = plain.base_charge(&geometry).unwrap();
-    let new = with.base_charge(&geometry).unwrap();
+    let old = plain.base_charge().unwrap();
+    let new = with.base_charge().unwrap();
     // (4 * 32 + 16) / 4 is exact, including the one shared header.
     assert_eq!(
         new.get(JointResource::MetadataBytes) - old.get(JointResource::MetadataBytes),
@@ -2573,84 +1974,294 @@ fn independent_process_source_layout_is_prepaid_once_by_the_original_base() {
 }
 
 #[test]
-fn one_slot_progress_invoice_cannot_protect_a_healthy_root_and_its_child_on_shared_origin() {
-    // This diagnoses a supported-progress invoice that counts one control
-    // slot while its real consumer needs two simultaneously. The local
-    // proof must refuse the underfunded second slot, never relax full D.
-    let (control, handle, mut driver) = prototype_profile(4, 1, 2, 2);
+fn driver_turn_exit_notifies_after_a_reply_callback_withdraws_and_panics() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let own_slot = slot(&control, work.owner.scope().id());
+    let mut request = handle
+        .request(
+            &work.owner.scope(),
+            vec![JointClaimChange::New {
+                dependencies: Vec::new(),
+                lane: JointLane::Custody,
+                amounts: JointResources::ZERO,
+            }],
+        )
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let wake = Arc::new(WithdrawAndPanicReplyWake {
+        request: Mutex::new(None),
+        entered: entered_tx,
+        resume: Mutex::new(resume_rx),
+    });
+    let waker = Waker::from(Arc::clone(&wake));
+    assert!(
+        std::pin::Pin::new(&mut request)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    *wake.request.lock().unwrap() = Some(request);
+    let worker = std::thread::spawn(move || {
+        let panic = catch_unwind(AssertUnwindSafe(|| drain(&mut driver)));
+        assert!(panic.is_err(), "the real reply callback must unwind");
+        driver
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    work.business.release();
+    work.owner.complete();
     {
-        let a = selected_dependency(&handle, "catalog-a");
-        let b = selected_dependency(&handle, "catalog-b");
-        let x = selected_dependency(&handle, "shared-healthy-native");
-        let roots = [root(&control), root(&control), root(&control)];
-        for (owner, catalog) in [
-            (&roots[0].owner, &a),
-            (&roots[1].owner, &a),
-            (&roots[2].owner, &b),
-        ] {
-            let mut bind = handle
-                .request(
-                    &owner.scope(),
-                    vec![crate::joint_admission::JointClaimChange::FirstBind {
-                        source: owner.control_claim_view().unwrap(),
-                        dependencies: vec![catalog.clone(), x.clone()],
-                    }],
-                )
-                .unwrap();
-            drain(&mut driver);
-            binding_receipt(&mut bind)
-                .install_control(owner, &[])
-                .unwrap();
-        }
-        drain(&mut driver);
-        let before = snapshot(&control);
-        let free = control.inner.state.lock().unwrap().cancellations.free_heads[0];
-        assert!(
-            free.is_some(),
-            "a real original fixed slot is physically free"
-        );
-        let scope = roots[2].owner.scope();
-        let mut child = match scope.try_request_joint_child().unwrap() {
-            crate::joint_admission::JointTryBegin::Started(child) => child,
-            crate::joint_admission::JointTryBegin::Full(_) => {
-                panic!("this source has real paid Q backing")
-            }
-        };
-        drain(&mut driver);
-        assert!(matches!(
-            std::pin::Pin::new(&mut child).poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-                error: WorkError::JointCapacity(_)
-            }))
-        ));
+        let state = control.inner.state.lock().unwrap();
+        assert!(state.nodes.is_empty());
         assert_eq!(
-            snapshot(&control),
-            before,
-            "the refused child cannot wash the old charges"
+            state.cancellations.slots[own_slot.0].phase,
+            SlotPhase::Retired
         );
-        assert_eq!(
-            control.inner.state.lock().unwrap().cancellations.free_heads[0],
-            free
-        );
-        {
-            let state = control.inner.state.lock().unwrap();
-            let joint = state.joint.as_ref().unwrap();
-            for (index, catalog) in [&a, &a, &b].into_iter().enumerate() {
-                let slot = state.nodes[&roots[index].owner.scope().id()].cancellation;
-                let claim = state.cancellations.slots[slot.0].claim.unwrap();
-                assert!(joint.control_has_domains_for_test(
-                    claim,
-                    &[catalog.fact().clone(), x.fact().clone()]
-                ));
+    }
+    let before_exit = control.progress_revision();
+    resume_tx.send(()).unwrap();
+    let mut driver = worker.join().unwrap();
+    assert_ne!(
+        before_exit,
+        control.progress_revision(),
+        "actual Turn exit must publish a later generation"
+    );
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().cancellations.drained());
+}
+
+#[test]
+fn nonempty_owning_iterator_keeps_claims_without_pinning_constructor_cells() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    let (control, handle, mut driver) = prototype_profile(6, 1, 1, 2);
+    let dependency = selected_dependency(&handle, "iterator");
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let mut binding = first_bind(&handle, &work.owner, &dependency);
+    drain(&mut driver);
+    binding_receipt(&mut binding)
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drain(&mut driver);
+    let change = || JointClaimChange::New {
+        dependencies: vec![dependency.clone()],
+        lane: JointLane::Custody,
+        amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+    };
+    let mut request = handle.request(&scope, vec![change(), change()]).unwrap();
+    drain(&mut driver);
+    let Poll::Ready(Ok(batch)) =
+        std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("original two-claim reply");
+    };
+    assert!(batch.adjustment.is_none());
+    let mut original = batch.new_claims.into_iter();
+    let first = original.next().unwrap();
+    assert_eq!(original.size_hint(), (1, Some(1)));
+    drain(&mut driver);
+    // Both original cells can build new requests while the owning iterator and
+    // its yielded physical claim remain alive.
+    let a = handle.reserve_proposal(&scope).unwrap();
+    let b = handle.reserve_proposal(&scope).unwrap();
+    drop((a, b));
+    drain(&mut driver);
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
+    assert_eq!(first.amounts().unwrap().get(JointResource::ClaimRecords), 1);
+    drop(first);
+    drain(&mut driver);
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes.len(),
+        1,
+        "the unconsumed iterator still owns its remaining physical claim"
+    );
+    drop(original);
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().nodes.is_empty());
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn empty_delivered_container_and_its_iterator_do_not_retain_proposal_backing() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let dependency = selected_dependency(&handle, "reply");
+    let work = root(&control);
+    let mut binding = first_bind(&handle, &work.owner, &dependency);
+    drain(&mut driver);
+    binding_receipt(&mut binding)
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drain(&mut driver);
+    let mut request = handle
+        .request(
+            &work.owner.scope(),
+            vec![JointClaimChange::New {
+                dependencies: vec![dependency.clone()],
+                lane: JointLane::Custody,
+                amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+            }],
+        )
+        .unwrap();
+    drain(&mut driver);
+    let Poll::Ready(Ok(mut batch)) =
+        std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("original reply")
+    };
+    assert!(batch.adjustment.is_none());
+    let physical = batch.new_claims.pop().unwrap();
+    drain(&mut driver);
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes.len(),
+        1,
+        "the original physical claim still retains its Work"
+    );
+    let mut iter = batch.new_claims.into_iter();
+    assert!(iter.next().is_none());
+    drop(physical);
+    drain(&mut driver);
+    assert!(
+        control.inner.state.lock().unwrap().nodes.is_empty(),
+        "only actual claim exit permits Work retirement"
+    );
+    assert_eq!(
+        snapshot(&control).3,
+        0,
+        "empty owning iterator cannot pin a retired proposal/control cell"
+    );
+    drop(iter);
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn original_fixed_storage_quote_checks_actual_scope_layout_overflow_before_allocation() {
+    assert!(matches!(
+        ControlStorageConfig::new(usize::MAX, &[]).base_charge(),
+        Err(WorkError::ArithmeticOverflow)
+    ));
+}
+
+#[test]
+fn withdrawing_one_request_does_not_reuse_or_mutate_another_original_body() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let issue = |amount| {
+        handle
+            .request(
+                &scope,
+                vec![JointClaimChange::New {
+                    dependencies: Vec::new(),
+                    lane: JointLane::Custody,
+                    amounts: JointResources::ZERO.with(JointResource::PayloadBytes, amount),
+                }],
+            )
+            .unwrap()
+    };
+    let first = issue(3);
+    let mut second = issue(7);
+    drop(first);
+    drain(&mut driver);
+    let Poll::Ready(Ok(mut batch)) =
+        std::pin::Pin::new(&mut second).poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("same surviving body")
+    };
+    let original = batch.new_claims.pop().unwrap();
+    assert_eq!(
+        original.amounts().unwrap().get(JointResource::PayloadBytes),
+        7
+    );
+    drop((original, batch, second));
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn simultaneous_construction_tokens_retain_the_original_work_until_actual_exit() {
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let id = scope.id();
+    let first = handle.reserve_proposal(&scope).unwrap();
+    let second = handle.reserve_proposal(&scope).unwrap();
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().nodes.contains_key(&id));
+    drop(first);
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().nodes.contains_key(&id));
+    drop(second);
+    drain(&mut driver);
+    assert!(!control.inner.state.lock().unwrap().nodes.contains_key(&id));
+}
+
+#[test]
+fn independent_roots_bind_complete_shared_domains_without_a_cancelled_domain_quota() {
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let bad = selected_dependency(&handle, "bad");
+    let healthy = selected_dependency(&handle, "healthy");
+    let a = root(&control);
+    let b = root(&control);
+    let c = root(&control);
+    for owner in [&a.owner, &b.owner] {
+        let mut request = first_bind(&handle, owner, &bad);
+        drain(&mut driver);
+        binding_receipt(&mut request)
+            .install_control(owner, &[])
+            .unwrap();
+    }
+    let mut request = first_bind(&handle, &c.owner, &bad);
+    drain(&mut driver);
+    binding_receipt(&mut request)
+        .install_control(&c.owner, &[])
+        .unwrap();
+    let mut grow = handle
+        .request(
+            &c.owner.scope(),
+            vec![crate::joint_admission::JointClaimChange::grow_by(
+                c.owner.control_claim_view().unwrap(),
+                JointResources::ZERO,
+                vec![healthy.clone()],
+            )],
+        )
+        .unwrap();
+    drain(&mut driver);
+    binding_receipt(&mut grow)
+        .install_control(&c.owner, &[])
+        .unwrap();
+    assert_eq!(snapshot(&control).1, 3);
+    {
+        let state = control.inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().unwrap();
+        for owner in [&a.owner, &b.owner, &c.owner] {
+            let slot = state.nodes[&owner.scope().id].cancellation;
+            let claim = state.cancellations.slots[slot.0].claim.unwrap();
+            let mut expected = vec![bad.fact().clone()];
+            if owner.scope().id == c.owner.scope().id {
+                expected.push(healthy.fact().clone());
             }
-            assert_eq!(state.nodes[&scope.id].children, 0);
-        }
-        for root in roots {
-            root.business.release();
-            root.owner.complete();
+            assert!(ledger.control_has_domains_for_test(claim, &expected));
         }
     }
-    control.close_admission();
+    for work in [a, b, c] {
+        work.business.release();
+        work.owner.complete();
+    }
     drain(&mut driver);
-    assert!(control.shutdown().is_ok());
+    assert_eq!(snapshot(&control).3, 0);
 }

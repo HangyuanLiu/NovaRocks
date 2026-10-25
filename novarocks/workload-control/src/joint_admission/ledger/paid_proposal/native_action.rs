@@ -131,54 +131,6 @@ impl NativeAsyncActionAuthority {
     /// is a fact from the actual Native builder, not a delegated capacity.
     /// The production profile keeps FG/Settlement payload support equal to
     /// this source's encoding backing plus its next owned increment.
-    pub fn maximum_owned_increment(
-        &self,
-        encoding_coexistence_bytes: NonZeroU64,
-    ) -> Result<NonZeroU64, WorkError> {
-        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
-        let root = WorkScope {
-            inner: Arc::clone(&inner),
-            id: self.owner,
-        };
-        let execution = WorkScope {
-            inner: Arc::clone(&inner),
-            id: self.execution,
-        };
-        // Capture the actual original control slots, not an ID-only route.
-        let root_fence = capture_node(&root)?;
-        let execution_fence = capture_node(&execution)?;
-        let state = inner.state.lock().unwrap();
-        validate_execution(&state, self.owner, self.execution)?;
-        // Observing the original installed support does not authorize a new
-        // action or retain a result position. The actual source below checks
-        // whether this is foreground production or original settlement.
-        node_facts(&state, &root_fence, false)?;
-        node_facts(&state, &execution_fence, false)?;
-        let node = state.nodes.get(&self.owner).ok_or(WorkError::Released)?;
-        let class = crate::joint_admission::class_index(node.class);
-        let config = &state
-            .joint
-            .as_ref()
-            .ok_or(WorkError::NotReady)?
-            .config
-            .config;
-        let mut support = u64::MAX;
-        for lane in [JointLane::Foreground, JointLane::Settlement] {
-            let lane = lane as usize;
-            for limits in [
-                config.global,
-                config.classes[class],
-                config.lanes[lane],
-                config.class_lanes[class][lane],
-            ] {
-                support = support.min(limits.protected_progress.get(JointResource::PayloadBytes));
-            }
-        }
-        support
-            .checked_sub(encoding_coexistence_bytes.get())
-            .and_then(NonZeroU64::new)
-            .ok_or(WorkError::Capacity("Native next owned increment support"))
-    }
 
     pub fn action_source(
         &self,
@@ -378,7 +330,7 @@ fn node_facts<'a>(
     state: &'a State,
     node_fence: &NativeNodeFence,
     foreground: bool,
-) -> Result<&'a Arc<ProfileFacts>, WorkError> {
+) -> Result<&'a Arc<ResponsibilityFacts>, WorkError> {
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     if ledger.driver_closed {
         return Err(WorkError::Closed);
@@ -409,7 +361,7 @@ fn node_facts<'a>(
         || claim.facts.key != claim.active_facts.key
         || claim.active_facts.class != node.class
         || !root_domains::has_effective_domains(state, &claim.active_facts, true)
-        || !claim.active_facts.key.causal.is_empty()
+        || !claim.active_facts.key.source_kind.is_empty()
     {
         return Err(WorkError::Conflict);
     }
@@ -425,7 +377,7 @@ fn source_facts<'a>(
     state: &'a State,
     owner: WorkId,
     fence: &NativeActionFence,
-) -> Result<(&'a Arc<ProfileFacts>, &'a Arc<ProfileFacts>), WorkError> {
+) -> Result<(&'a Arc<ResponsibilityFacts>, &'a Arc<ResponsibilityFacts>), WorkError> {
     if owner != fence.root.work {
         return Err(WorkError::Conflict);
     }
@@ -442,7 +394,11 @@ fn source_facts<'a>(
         node_facts(state, &fence.execution, fence.lane == JointLane::Foreground)?,
     ))
 }
-fn exact_union(facts: &ProfileFacts, root: &ProfileFacts, execution: &ProfileFacts) -> bool {
+fn exact_union(
+    facts: &ResponsibilityFacts,
+    root: &ResponsibilityFacts,
+    execution: &ResponsibilityFacts,
+) -> bool {
     if root_domains::combined_origin(root, execution).ok() != Some(facts.key.origin) {
         return false;
     }
@@ -481,7 +437,7 @@ pub(in crate::joint_admission::ledger) fn validate_native_action(
             || change.claim.facts.class != facts.class
             || change.claim.facts.lane != lane
             || !exact_union(&change.claim.facts, facts, execution)
-            || !change.claim.facts.key.causal.is_empty()
+            || !change.claim.facts.key.source_kind.is_empty()
         {
             return Err(WorkError::Conflict);
         }
@@ -625,9 +581,10 @@ impl NativeAsyncActionSource {
                     .selected
                     .binary_search_by_key(&record.ordinal, |record| record.ordinal)
                 {
-                    if current.selected.len() == current.selected.capacity() {
-                        return Err(WorkError::Capacity("Native action full dependency backing"));
-                    }
+                    current
+                        .selected
+                        .try_reserve(1)
+                        .map_err(|_| WorkError::Capacity("Native action dependency allocation"))?;
                     current.selected.insert(position, record.clone());
                 }
             }
@@ -815,7 +772,6 @@ impl NativeActionFence {
         &self,
         ticket: u64,
         index: usize,
-        remaining: u64,
     ) -> typed_custody::NativeDispatchOrigin {
         let kind = match (self.quote, index) {
             (NativeSourceQuote::Action(_), 0) => typed_custody::NativeDispatchKind::Action,
@@ -828,7 +784,6 @@ impl NativeActionFence {
             execution: self.execution.work,
             ticket,
             kind,
-            remaining,
             frozen: false,
             lane: self.lane,
         }

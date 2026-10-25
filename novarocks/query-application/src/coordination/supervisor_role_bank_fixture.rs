@@ -19,8 +19,7 @@
 // explicit neutral test policy, never a complete Native production profile.
 use novarocks_resource_contract::SharedDependency;
 use novarocks_workload_control::joint_admission::{
-    JointAdmissionHandle, JointCapacityConfig, JointProgress, JointProgressDriver, JointResource,
-    JointResourceLimits, JointResources, RequiredJointProgress,
+    JointAdmissionHandle, JointProgress, JointProgressDriver, ResponsibilityConfig,
 };
 use novarocks_workload_control::{ControlStorageConfig, PollRoleGeometry};
 
@@ -156,151 +155,20 @@ fn governance_with_query_limit(
         PollRoleGeometry::for_factory_with_context::<_, _, _, Arc<OriginalLogicalExit>>(&factory)
             .unwrap(),
     ];
-    // Query covers the original three-owner handoff fixture. Every other
-    // class has one fake role plus its declared progress/storage margin.
-    let slots = [8usize, 3, 3, 3, 3];
-    let count = slots.iter().sum::<usize>();
-    let proposals_per_slot = 2;
-    let max_changes = if client { 4 } else { 1 };
-    let max_dependencies = 1;
-    let storage = ControlStorageConfig::new(slots, count - 1, proposals_per_slot, &roles);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: max_dependencies,
-        max_registered_dependencies: 1,
-        max_claims: count * 2,
-        max_requests: count * 2,
-        max_changes_per_request: max_changes,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
+    // The same original global scope inventory and actual role factory.
+    // Work classes identify owners; they do not partition these records.
+    let count = 20;
+    let storage = ControlStorageConfig::new(count, &roles);
+    let config = ResponsibilityConfig {
         work_per_turn: NonZeroUsize::new(7).unwrap(),
     };
-    // The original registered-row floor, using this fixture's actual creators.
-    config.max_registered_dependencies = (4 * config.max_claims
-        + 2 * count * proposals_per_slot * max_changes
-        + 2 * max_changes
-        + 1)
-        * max_dependencies;
-    let base = storage.base_charge(&config).unwrap();
-    let limit = |n: usize| JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, n as u64)
-            .with(JointResource::ClaimRecords, (n * 2) as u64)
-            .with(
-                JointResource::MetadataBytes,
-                base.get(JointResource::MetadataBytes) * n as u64 * 4,
-            ),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, (n - 1) as u64)
-            .with(JointResource::ClaimRecords, n as u64)
-            .with(
-                JointResource::MetadataBytes,
-                base.get(JointResource::MetadataBytes) * n as u64 * 2,
-            ),
-        protected_progress: base,
-    };
-    config.global = limit(count);
-    for (class, n) in slots.into_iter().enumerate() {
-        config.classes[class] = limit(n);
-        config.class_lanes[class][0] = limit(n);
-    }
-    config.lanes[0] = limit(count);
-    if client {
-        // Real Root payload plus one P=1 stage; no Native network protection
-        // is asserted by this deliberately in-process finite fixture.
-        for limits in [
-            &mut config.global,
-            &mut config.classes[0],
-            &mut config.lanes[0],
-            &mut config.class_lanes[0][0],
-        ] {
-            limits.global = limits
-                .global
-                .with(JointResource::PayloadBytes, 64 * 1024 * 1024);
-            limits.per_dependency = limits
-                .per_dependency
-                .with(JointResource::PayloadBytes, 64 * 1024 * 1024);
-        }
-        let foreground = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ClaimRecords, 4)
-                .with(JointResource::Computations, 1),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ClaimRecords, 4)
-                .with(JointResource::Computations, 1),
-            protected_progress: JointResources::ZERO,
-        };
-        config.lanes[1] = foreground;
-        config.class_lanes[0][1] = foreground;
-        for limits in [&mut config.global, &mut config.classes[0]] {
-            limits.global = limits
-                .global
-                .with(
-                    JointResource::ClaimRecords,
-                    limits.global.get(JointResource::ClaimRecords) + 4,
-                )
-                .with(JointResource::Computations, 1);
-            limits.per_dependency = limits
-                .per_dependency
-                .with(
-                    JointResource::ClaimRecords,
-                    limits.per_dependency.get(JointResource::ClaimRecords) + 4,
-                )
-                .with(JointResource::Computations, 1);
-        }
-    }
-    // Every class may need its original base progress at the same time.
-    // Keep the actual fixture inventories; only sum their real reservations.
-    let simultaneous_progress = [
-        JointResource::ScopeRecords,
-        JointResource::ClaimRecords,
-        JointResource::ReplyRecords,
-        JointResource::QueueRecords,
-        JointResource::MetadataBytes,
-        JointResource::PayloadBytes,
-        JointResource::UnreceivedProductions,
-        JointResource::Publications,
-        JointResource::Residuals,
-        JointResource::Computations,
-        JointResource::AsyncIo,
-        JointResource::BlockingJobs,
-        JointResource::InternalCpuJobs,
-        JointResource::PhysicalQueueRecords,
-        JointResource::PhysicalQueueBytes,
-    ]
-    .into_iter()
-    .fold(JointResources::ZERO, |total, resource| {
-        let amount = config
-            .classes
-            .iter()
-            .try_fold(0u64, |sum, class| {
-                sum.checked_add(class.protected_progress.get(resource))
-            })
-            .expect("finite fixture simultaneous progress");
-        total.with(resource, amount)
-    });
-    config.global.protected_progress = simultaneous_progress;
-    config.lanes[0].protected_progress = simultaneous_progress;
-    let mut required = RequiredJointProgress {
-        global: simultaneous_progress,
-        classes: [base; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.lanes[0] = simultaneous_progress;
-    for class in &mut required.class_lanes {
-        class[0] = base;
-    }
+    // Client cut tests deliberately have one real computation position.
+    let query_concurrency_limit = query_limit.unwrap_or(if client { 1 } else { 8 });
     let mut control = WorkloadControl::try_new(
         WorkloadConfig {
             root_limit: count,
             business_limit: count,
-            query_concurrency_limit: query_limit.unwrap_or(slots[0]),
+            query_concurrency_limit,
             scope_records_limit: count,
             ..WorkloadConfig::default()
         },
@@ -311,12 +179,12 @@ fn governance_with_query_limit(
         },
     )
     .unwrap();
-    control
-        .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
-        .unwrap();
-    let (admission, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let mut result = novarocks_workload_control::ResultCapacityConfig::V1;
+    if client {
+        result.client_compute_positions = 1;
+    }
+    control.configure_result_capacity(result).unwrap();
+    let (admission, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
     let bank = RolePollBank::<_, _, _, Arc<OriginalLogicalExit>>::install_with_context(
         &mut control,

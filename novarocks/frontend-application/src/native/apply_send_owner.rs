@@ -544,6 +544,16 @@ impl Drop for ApplySendOwner {
     }
 }
 impl ApplySendPort {
+    /// Observe this original process owner's installed records. Readiness is
+    /// opened only after the composition starts its original reaper.
+    pub(crate) fn installed_records(&self) -> Result<usize, novarocks_workload_control::WorkError> {
+        let state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(novarocks_workload_control::WorkError::Closed);
+        }
+        Ok(state.records.len())
+    }
+
     /// Original fixed record/Core/owner payloads only, not independent input,
     /// task, reservation or arbitrary failure pointees.
     pub(crate) fn capacity_sources(

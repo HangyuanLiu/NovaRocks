@@ -633,6 +633,12 @@ impl RootWriteResultDecoder {
                     .map_err(|error| {
                         RootWriteDecodeFailure::source(error).context("prepared write set budget")
                     })?;
+                if let Some(retention) = &self.retention {
+                    retention.reserve_bytes(fragment.len()).map_err(|error| {
+                        RootWriteDecodeFailure::source(error)
+                            .context("prepared write retained bytes")
+                    })?;
+                }
                 self.fragments.push((target, fragment.to_vec()));
             }
             RootRowKind::ArtifactDraft => {
@@ -710,6 +716,17 @@ impl RootWriteResultDecoder {
                                 ),
                             )
                         })?;
+                    if let Some(retention) = &self.retention {
+                        let bytes = key.len().checked_add(value.len()).ok_or_else(|| {
+                            RootWriteDecodeFailure::source(
+                                novarocks_workload_control::WorkError::ArithmeticOverflow,
+                            )
+                        })?;
+                        retention.reserve_bytes(bytes).map_err(|error| {
+                            RootWriteDecodeFailure::source(error)
+                                .context("write artifact property retained bytes")
+                        })?;
+                    }
                     property_map.insert(key.to_string(), value.to_string());
                 }
                 self.property_bytes = charge_total(
@@ -718,6 +735,12 @@ impl RootWriteResultDecoder {
                     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
                     "write Root artifact properties",
                 )?;
+                if let Some(retention) = &self.retention {
+                    retention.reserve_bytes(body.len()).map_err(|error| {
+                        RootWriteDecodeFailure::source(error)
+                            .context("write artifact retained bytes")
+                    })?;
+                }
                 let draft = StatisticsArtifactDraft::try_new(
                     field_ids,
                     identity.blob_type(),

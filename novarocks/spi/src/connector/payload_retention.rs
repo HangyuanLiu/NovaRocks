@@ -15,22 +15,51 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Opaque caller-owned lifetime retention. This module acquires no capacity
-//! and grants no authority; the caller supplies its already-admitted holder.
+//! Caller-owned retention and an explicit port to its original byte budget.
+//! Plain retention cannot authorize new allocation or mint a byte receipt.
 
+use super::{ConnectorError, ConnectorErrorKind};
 use novarocks_resource_contract::{ExistingOwnerRetentionLease, RetentionPinError};
 use std::fmt;
 use std::sync::Arc;
 
+/// The original allocation author reserves before creating new backing. The
+/// returned guard must keep that SAME receipt until its backing really exits.
+/// It is not a new quota, a source-identity test, or a Provider authority.
+pub trait ConnectorPayloadByteBudget: Send + Sync {
+    fn reserve_bytes(&self, bytes: usize)
+    -> Result<ConnectorPayloadRetentionGuard, ConnectorError>;
+}
+
 enum Retention {
     Shared(Arc<dyn Send + Sync>),
     Existing(ExistingOwnerRetentionLease),
+    Budgeted(Arc<dyn ConnectorPayloadByteBudget>),
 }
 
 pub struct ConnectorPayloadRetentionGuard {
     holder: Retention,
 }
 impl ConnectorPayloadRetentionGuard {
+    /// Bind only the caller's original byte author. Cloning this capability
+    /// reserves no bytes; each allocation must request its own real receipt.
+    pub fn from_byte_budget<T: ConnectorPayloadByteBudget + 'static>(budget: Arc<T>) -> Self {
+        Self {
+            holder: Retention::Budgeted(budget),
+        }
+    }
+    pub(crate) fn is_byte_budget(&self) -> bool {
+        matches!(&self.holder, Retention::Budgeted(_))
+    }
+    pub fn reserve_owned_bytes(&self, bytes: usize) -> Result<Self, ConnectorError> {
+        match &self.holder {
+            Retention::Budgeted(budget) => budget.reserve_bytes(bytes),
+            Retention::Shared(_) | Retention::Existing(_) => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "payload retention has no byte-budget authority",
+            )),
+        }
+    }
     /// Retain an existing shared holder with its original owner semantics.
     pub fn from_shared<T: Send + Sync + 'static>(holder: Arc<T>) -> Self {
         Self {
@@ -52,6 +81,7 @@ impl ConnectorPayloadRetentionGuard {
         let holder = match &self.holder {
             Retention::Shared(holder) => Retention::Shared(Arc::clone(holder)),
             Retention::Existing(lease) => Retention::Existing(lease.try_clone()?),
+            Retention::Budgeted(budget) => Retention::Budgeted(Arc::clone(budget)),
         };
         Ok(Self { holder })
     }

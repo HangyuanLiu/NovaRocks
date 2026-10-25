@@ -118,6 +118,7 @@ impl InternalManifestBinding {
         }
         Ok((
             RootStageSource {
+                computation_window: None,
                 writer_revision: state.nodes[&self.root]
                     .root_domains
                     .as_ref()

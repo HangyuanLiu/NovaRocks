@@ -670,7 +670,7 @@ mod tests {
         let mut releases = Vec::new();
         let mut entered = Vec::new();
         // Occupy the actual finite worker set so EOF is genuinely queued.
-        let workers = novarocks_workload_control::ResultCapacityConfig::V1.positions[2];
+        let workers = owner.runtime().configured_capacity().worker_threads().get();
         for _ in 0..workers {
             let (release, gate) = std::sync::mpsc::channel();
             let (started, start) = tokio::sync::oneshot::channel();
@@ -932,7 +932,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod root_action_tests {
+pub(crate) mod root_action_tests {
     use super::*;
     use crate::query_execution::internal_result_cpu::{
         INTERNAL_PEAK_BYTES, InternalResultCpuOwner,
@@ -954,151 +954,11 @@ mod root_action_tests {
         task::Waker,
         time::{Duration, Instant},
     };
-    fn root_control(
+    pub(crate) fn root_control(
         cpu_owner: &mut InternalResultCpuOwner,
     ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-        let cpu = cpu_owner.runtime();
-        let lane = JointLane::Foreground;
-        let cpu_jobs = cpu.configured_capacity().worker_threads().get() as u64;
-        assert!(cpu.configured_capacity().queue_capacity().get() >= cpu_jobs as usize);
-        let quote = cpu.operation_action_quote().unwrap();
         let count = 8;
-        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
-        let mut config = JointCapacityConfig {
-            global: JointResourceLimits::default(),
-            classes: [JointResourceLimits::default(); 5],
-            lanes: [JointResourceLimits::default(); 3],
-            class_lanes: [[JointResourceLimits::default(); 3]; 5],
-            max_dependencies_per_claim: 2,
-            max_registered_dependencies: 266,
-            max_claims: 16,
-            max_requests: 16,
-            max_changes_per_request: 2,
-            max_snapshot_bytes: 16 * 1024 * 1024,
-            max_scratch_bytes: 16 * 1024 * 1024,
-            max_residual_arcs: 10000,
-            max_total_proof_work: 10000000,
-            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
-        };
-        let base = storage.base_charge(&config).unwrap();
-        let m = base.get(JointResource::MetadataBytes);
-        let custody = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 8)
-                .with(JointResource::ClaimRecords, 12)
-                .with(JointResource::MetadataBytes, m * 16)
-                .with(
-                    JointResource::PayloadBytes,
-                    crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES * 2,
-                )
-                .with(JointResource::UnreceivedProductions, 1),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 7)
-                .with(JointResource::ClaimRecords, 12)
-                .with(JointResource::MetadataBytes, m * 8)
-                .with(
-                    JointResource::PayloadBytes,
-                    crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES * 2,
-                )
-                .with(JointResource::UnreceivedProductions, 1),
-            protected_progress: base,
-        };
-        let foreground = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ClaimRecords, 4)
-                .with(JointResource::MetadataBytes, m * 16)
-                .with(JointResource::PayloadBytes, 32)
-                .with(JointResource::Computations, 1)
-                .with(JointResource::InternalCpuJobs, cpu_jobs)
-                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
-                .with(
-                    JointResource::PhysicalQueueBytes,
-                    cpu_jobs * quote.physical_queue_bytes.get(),
-                ),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ClaimRecords, 4)
-                .with(JointResource::MetadataBytes, m * 8)
-                .with(JointResource::PayloadBytes, 32)
-                .with(JointResource::Computations, 1)
-                .with(JointResource::InternalCpuJobs, cpu_jobs)
-                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
-                .with(
-                    JointResource::PhysicalQueueBytes,
-                    cpu_jobs * quote.physical_queue_bytes.get(),
-                ),
-            protected_progress: JointResources::ZERO,
-        };
-        let global = JointResourceLimits {
-            // Explicit sums preserve these two real fixture lane vectors;
-            // JointResources arithmetic is intentionally private to WC.
-            global: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 8)
-                .with(JointResource::ClaimRecords, 16)
-                .with(JointResource::MetadataBytes, m.checked_mul(32).unwrap())
-                .with(
-                    JointResource::PayloadBytes,
-                    INTERNAL_PEAK_BYTES
-                        .checked_mul(2)
-                        .unwrap()
-                        .checked_add(32)
-                        .unwrap(),
-                )
-                .with(JointResource::Computations, 1)
-                .with(JointResource::UnreceivedProductions, 1)
-                .with(JointResource::InternalCpuJobs, cpu_jobs)
-                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
-                .with(
-                    JointResource::PhysicalQueueBytes,
-                    cpu_jobs
-                        .checked_mul(quote.physical_queue_bytes.get())
-                        .unwrap(),
-                ),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 7)
-                .with(JointResource::ClaimRecords, 16)
-                .with(JointResource::MetadataBytes, m.checked_mul(16).unwrap())
-                .with(
-                    JointResource::PayloadBytes,
-                    INTERNAL_PEAK_BYTES
-                        .checked_mul(2)
-                        .unwrap()
-                        .checked_add(32)
-                        .unwrap(),
-                )
-                .with(JointResource::Computations, 1)
-                .with(JointResource::UnreceivedProductions, 1)
-                .with(JointResource::InternalCpuJobs, cpu_jobs)
-                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
-                .with(
-                    JointResource::PhysicalQueueBytes,
-                    cpu_jobs
-                        .checked_mul(quote.physical_queue_bytes.get())
-                        .unwrap(),
-                ),
-            protected_progress: base,
-        };
-        config.global = global;
-        config.classes[0] = global;
-        config.lanes[0] = custody;
-        let lane_index = match lane {
-            JointLane::Foreground => 1,
-            JointLane::Settlement => 2,
-            JointLane::Custody => panic!("CPU fixture requires an execution lane"),
-        };
-        config.lanes[lane_index] = foreground;
-        config.class_lanes[0][0] = custody;
-        config.class_lanes[0][lane_index] = foreground;
-        // Only the original fixed substrate requires progress in this fixture.
-        // CPU/complete Native action protection is deliberately not asserted.
-        let mut required = RequiredJointProgress {
-            global: base,
-            classes: [JointResources::ZERO; 5],
-            lanes: [JointResources::ZERO; 3],
-            class_lanes: [[JointResources::ZERO; 3]; 5],
-        };
-        required.classes[0] = base;
-        required.lanes[0] = base;
-        required.class_lanes[0][0] = base;
+        let storage = ControlStorageConfig::new(count, &[]);
         let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: count,
             business_limit: count,
@@ -1109,14 +969,19 @@ mod root_action_tests {
         .unwrap()
         .owner;
         let (handle, driver) = control
-            .configure_joint_capacity(config.validate(&required).unwrap())
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+            })
             .unwrap();
         control.configure_control_storage(storage).unwrap();
+        control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
         cpu_owner.bind_for_test_before_ready(&mut control).unwrap();
         control.mark_ready().unwrap();
         (control, handle, driver)
     }
-    fn drive(driver: &mut JointProgressDriver) {
+    pub(crate) fn drive(driver: &mut JointProgressDriver) {
         for _ in 0..10000 {
             if matches!(driver.step(), JointProgress::Idle(_)) {
                 return;
@@ -1130,7 +995,7 @@ mod root_action_tests {
             _ => panic!("expected the original paid reply"),
         }
     }
-    fn bind(scope: &WorkScope, driver: &mut JointProgressDriver) {
+    pub(crate) fn bind(scope: &WorkScope, driver: &mut JointProgressDriver) {
         let mut proposal = scope.begin_control_binding().unwrap();
         proposal
             .push_dependency(&SharedDependency::LocalHost)
@@ -1149,7 +1014,7 @@ mod root_action_tests {
         drop(reply);
         drive(driver);
     }
-    fn paid_claim(
+    pub(crate) fn paid_claim(
         handle: &JointAdmissionHandle,
         owner: &WorkOwner,
         lane: JointLane,
@@ -1552,13 +1417,15 @@ mod root_action_tests {
             // the old Root payload remain live. No Native receipt is forged.
             stage_scope.check().unwrap();
             root_scope.check().unwrap();
-            payload
-                .as_ref()
-                .unwrap()
-                .retain_alias()
-                .unwrap()
+            let original_payload = payload.as_ref().unwrap().retain_alias().unwrap();
+            assert!(original_payload.is_for_scope(&root_scope));
+            // The same configured result owner supplies bytes; the retained
+            // responsibility quantity is not a new resource authorization.
+            binding
+                .window_alias()
                 .check_backing_total(INTERNAL_PEAK_BYTES)
                 .unwrap();
+            drop(original_payload);
             let next = paid_claim(
                 &handle,
                 &stage,

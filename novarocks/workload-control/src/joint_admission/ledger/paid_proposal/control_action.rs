@@ -49,7 +49,7 @@ fn source_facts(
     state: &State,
     owner: WorkId,
     fence: ControlActionFence,
-) -> Result<&Arc<ProfileFacts>, WorkError> {
+) -> Result<&Arc<ResponsibilityFacts>, WorkError> {
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     if ledger.driver_closed {
         return Err(WorkError::Closed);
@@ -81,7 +81,7 @@ fn source_facts(
         || claim.facts.key != claim.active_facts.key
         || claim.active_facts.class != node.class
         || !root_domains::has_effective_domains(state, &claim.active_facts, true)
-        || !claim.active_facts.key.causal.is_empty()
+        || !claim.active_facts.key.source_kind.is_empty()
         || (matches!(fence.kind, ControlActionKind::Payload)
             && (node.parent.is_some() || fence.lane != JointLane::Foreground))
         || (!matches!(fence.kind, ControlActionKind::Payload)
@@ -221,7 +221,7 @@ pub(in crate::joint_admission::ledger) fn validate_control_action(
                 _ => fence.lane,
             }
         || change.claim.facts.key.dependencies != facts.key.dependencies
-        || !change.claim.facts.key.causal.is_empty()
+        || !change.claim.facts.key.source_kind.is_empty()
     {
         return Err(WorkError::Conflict);
     }
@@ -323,11 +323,10 @@ impl ControlActionSource {
             .current
             .as_mut()
             .expect("one original blocking action");
-        if facts.dependencies.len() > current.selected.capacity() {
-            return Err(WorkError::Capacity(
-                "blocking action full dependency backing",
-            ));
-        }
+        current
+            .selected
+            .try_reserve(facts.dependencies.len())
+            .map_err(|_| WorkError::Capacity("blocking action dependency allocation"))?;
         current.origin = facts.key.origin;
         current.selected.extend(facts.dependencies.iter().cloned());
         proposal.end_change()?;

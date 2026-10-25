@@ -207,9 +207,18 @@ impl CowSignedLayoutPlan {
             planning_requested_bytes: requested,
         })
     }
+    #[cfg(test)]
     pub fn execute(
         &self,
         context: &mut ValueConversionContext,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<RecordBatch, ConnectorError> {
+        self.execute_with_growth(context, &mut |_| Ok(()), work)
+    }
+    pub(super) fn execute_with_growth(
+        &self,
+        context: &mut ValueConversionContext,
+        growth: &mut dyn FnMut(std::alloc::Layout) -> Result<(), ConnectorError>,
         work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
     ) -> Result<RecordBatch, ConnectorError> {
         let mut columns = Vec::new();
@@ -218,7 +227,7 @@ impl CowSignedLayoutPlan {
             .map_err(allocation)?;
         for (plan, field) in self.columns.iter().zip(self.schema.fields()) {
             let output = plan
-                .execute_observed(context, &mut |_| Ok(()), work, &mut |_| Ok(()))
+                .execute_observed(context, growth, work, &mut |_| Ok(()))
                 .map_err(failure)?;
             columns.push(attach_signed_type(&output, field.data_type(), work)?);
         }

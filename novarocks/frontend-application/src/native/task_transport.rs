@@ -125,10 +125,8 @@ fn covered_reconnect_backoff(failures: u32, jitter_sample: u64) -> Duration {
 
 mod joint_action;
 use joint_action::NativeCallSource;
+pub(crate) use joint_action::NativeMethodRunProgress;
 pub(crate) use joint_action::{NativeBatchAdmission, NativePhysicalOffer};
-pub(crate) use joint_action::{
-    NativeMethodRunProgress, NativeTaskActionMinimum, original_operation_clone_bytes,
-};
 mod queue_input;
 pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
 
@@ -2694,9 +2692,7 @@ impl CoveredTaskStatusSubscriber {
                         #[cfg(not(test))]
                         let original = port.prepare(&self.work_scope, None, None);
                         #[cfg(test)]
-                        let original = if self.work_scope.joint_dependency_limit()
-                            == Err(novarocks_workload_control::WorkError::NotReady)
-                        {
+                        let original = if !self.work_scope.has_responsibility_service() {
                             port.reserve(&self.work_scope, None, None)
                         } else {
                             port.prepare(&self.work_scope, None, None)
@@ -3677,7 +3673,7 @@ mod tests {
     }
 
     #[test]
-    fn original_small_method_runs_invoice_the_actual_codec_and_keep_the_support_envelope() {
+    fn original_small_method_runs_invoice_the_actual_codec_without_a_composition_envelope() {
         use novarocks_workload_control::joint_admission::JointResource;
         let budget = TransportBudget::DEFAULT;
         let backend = BackendProcessId::new_v7();
@@ -3739,73 +3735,6 @@ mod tests {
             );
             assert_eq!(plan.retained_bytes(), plan.protobuf_bytes() + 5);
         }
-    }
-
-    #[test]
-    fn composition_run_envelope_charges_queued_input_and_reply_independently() {
-        use novarocks_workload_control::joint_admission::JointResource;
-        let budget = TransportBudget::DEFAULT;
-        let owned = NativeTaskOperationSink::minimum_owned_support_for_composition(budget).unwrap();
-        let quote =
-            NativeTaskOperationSink::minimum_progress_for_composition(budget, owned).unwrap();
-        assert_eq!(quote.foreground(), quote.settlement());
-        assert_eq!(
-            quote.foreground().get(JointResource::PayloadBytes),
-            owned.get() + 2 * budget.max_batch_encoded_bytes() as u64
-        );
-        assert_eq!(
-            quote.custody().get(JointResource::QueueRecords),
-            budget.max_batch_items() as u64
-        );
-        assert_eq!(
-            quote.custody().get(JointResource::ReplyRecords),
-            budget.max_batch_items() as u64
-        );
-        assert_eq!(
-            quote.custody().get(JointResource::ClaimRecords),
-            budget.max_batch_items() as u64 + 1
-        );
-        assert_eq!(
-            quote.custody().get(JointResource::PayloadBytes),
-            owned.get()
-                + novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64
-                + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
-                    budget
-                )
-                .peak_bytes() as u64
-        );
-        let too_small = std::num::NonZeroU64::new(owned.get() - 1).unwrap();
-        assert!(
-            NativeTaskOperationSink::minimum_progress_for_composition(budget, too_small).is_err()
-        );
-        assert!(
-            NativeTaskOperationSink::minimum_progress_for_composition(
-                budget,
-                std::num::NonZeroU64::new(u64::MAX).unwrap()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn original_apply_source_geometry_keeps_last_alias_headers_separate_from_reply_cells() {
-        let geometry =
-            NativeTaskOperationSink::source_geometry_for_composition(TransportBudget::DEFAULT)
-                .unwrap();
-        assert_eq!(
-            geometry.records,
-            TransportBudget::DEFAULT.max_backend_queued_operations()
-        );
-        assert_eq!(geometry.canonical_headers, geometry.records + 1);
-        assert_eq!(
-            geometry.resident_bytes().unwrap(),
-            geometry.record_array.size()
-                + geometry.core.size()
-                + geometry.owner.size()
-                + geometry.canonical_headers * geometry.canonical_header.size()
-        );
-        assert!(super::super::apply_send_owner::apply_source_geometry(0).is_err());
-        assert!(super::super::apply_send_owner::apply_source_geometry(usize::MAX).is_err());
     }
 
     #[test]
@@ -4693,7 +4622,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn missing_one_input_capability_rejects_the_original_before_any_rpc() {
-        use crate::task_execution::intent::{OriginalOperationPacking, TaskOperationQueuePermit};
+        use crate::task_execution::intent::TaskOperationQueuePermit;
         use novarocks_workload_control::WorkError;
 
         #[derive(Debug)]
@@ -4701,12 +4630,6 @@ mod tests {
         impl TaskOperationQueuePermit for HiddenInput {
             fn mark_in_flight(&mut self) {
                 self.0.mark_in_flight()
-            }
-            fn packing_support(
-                &self,
-                input: &OperationIntent,
-            ) -> Result<OriginalOperationPacking, WorkError> {
-                self.0.packing_support(input)
             }
             // Deliberately no typed capability. The actual paid original
             // remains owned by this wrapper through physical retirement.

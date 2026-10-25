@@ -58,13 +58,7 @@ impl ControlBindingProposal {
         self.proposal.end_change()
     }
     pub fn submit(self) -> Result<JointAdmission, JointAdmissionFailure> {
-        self.proposal.submit_control_binding(None)
-    }
-    pub fn submit_finite(
-        self,
-        limit: std::num::NonZeroU64,
-    ) -> Result<JointAdmission, JointAdmissionFailure> {
-        self.proposal.submit_control_binding(Some(limit))
+        self.proposal.submit_control_binding()
     }
 }
 

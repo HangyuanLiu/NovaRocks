@@ -545,7 +545,6 @@ impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
             Ok(root) => root,
             Err(WorkError::NotReady)
             | Err(WorkError::Capacity(_))
-            | Err(WorkError::JointCapacity(_))
             | Err(WorkError::CapacityWaitTimeout) => return Ok(OptimizeJobAdmission::RetryLater),
             Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
             Err(error) => return Err(format!("admit governed optimize root failed: {error}")),
@@ -559,7 +558,6 @@ impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
                 Ok(permit) => permit,
                 Err(WorkError::Cancelled(_))
                 | Err(WorkError::Capacity(_))
-                | Err(WorkError::JointCapacity(_))
                 | Err(WorkError::CapacityWaitTimeout) => {
                     return Ok(OptimizeJobAdmission::RetryLater);
                 }

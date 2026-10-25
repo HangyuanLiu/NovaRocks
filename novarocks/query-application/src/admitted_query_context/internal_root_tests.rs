@@ -28,6 +28,8 @@ use std::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+const INTERNAL_RESULT_BYTES: u64 = 16;
+
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     fixture_with_client(false)
 }
@@ -35,90 +37,7 @@ fn fixture_with_client(
     client: bool,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
-    // The Client fixture retains two sibling stages and one descendant.
-    // This pays their child headers; the computation limit remains P=1.
-    let children_per_parent = if client { 2 } else { 1 };
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], children_per_parent, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 2,
-        max_registered_dependencies: 402,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: 4,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
-    };
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
-        protected_progress: JointResources::ZERO,
-    };
-    let global = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, m * 32)
-            .with(JointResource::PayloadBytes, 96)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Computations, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 96)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Computations, 1),
-        protected_progress: base,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
-    // Only the original fixed substrate requires progress in this fixture.
-    // CPU/complete Native action protection is deliberately not asserted.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
+    let storage = ControlStorageConfig::new(count, &[]);
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -129,14 +48,17 @@ fn fixture_with_client(
     .unwrap()
     .owner;
     let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+        })
         .unwrap();
     control.configure_control_storage(storage).unwrap();
+    let mut results = novarocks_workload_control::ResultCapacityConfig::V1;
+    results.all_objects_bytes[2] = INTERNAL_RESULT_BYTES;
     if client {
-        let mut config = novarocks_workload_control::ResultCapacityConfig::V1;
-        config.all_objects_bytes[0] = 8;
-        control.configure_result_capacity(config).unwrap();
+        results.all_objects_bytes[0] = 8;
     }
+    control.configure_result_capacity(results).unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver)
 }
@@ -403,9 +325,11 @@ fn successive_real_closed_batches_reuse_the_root_payload_after_each_actual_activ
         );
         let view = binding.try_window_alias().unwrap();
         assert!(old.shares_capacity_with(&view));
-        old.check_backing_total(expected_bytes).unwrap();
+        // Responsibility growth does not mint bytes. Both stages share the
+        // same independently installed result owner's retained-data budget.
+        old.check_backing_total(INTERNAL_RESULT_BYTES).unwrap();
         assert!(matches!(
-            old.check_backing_total(expected_bytes + 1),
+            old.check_backing_total(INTERNAL_RESULT_BYTES + 1),
             Err(WorkError::Capacity(_))
         ));
         let activity = binding

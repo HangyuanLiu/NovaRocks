@@ -101,8 +101,8 @@ impl JointProposal {
                     || original.class != full.class
                     || original.lane != JointLane::Custody
                     || full.lane != JointLane::Custody
-                    || !original.key.causal.is_empty()
-                    || !full.key.causal.is_empty()
+                    || !original.key.source_kind.is_empty()
+                    || !full.key.source_kind.is_empty()
                     || original.dependencies.iter().any(|old| {
                         full.dependencies
                             .binary_search_by_key(&old.ordinal, |d| d.ordinal)
@@ -115,11 +115,6 @@ impl JointProposal {
                 structure
                     .checked_add(2)
                     .ok_or(WorkError::ArithmeticOverflow)?;
-                if self.records.len() >= self.config.config.max_changes_per_request {
-                    return Err(WorkError::Capacity(
-                        "control and production joint batch records",
-                    ));
-                }
                 let source = JointClaimView {
                     inner: Arc::downgrade(&self.scope.inner),
                     id,
@@ -190,7 +185,7 @@ pub(in crate::joint_admission::ledger) fn validate_control_productions(
                     .as_ref()
                     .is_none_or(|old| old.key != row.active_facts.key)
                 || change.claim.facts.key != control.claim.facts.key
-                || !change.claim.facts.key.causal.is_empty()
+                || !change.claim.facts.key.source_kind.is_empty()
             {
                 return Err(WorkError::Conflict);
             }

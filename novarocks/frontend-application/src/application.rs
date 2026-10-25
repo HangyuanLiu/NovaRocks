@@ -419,18 +419,8 @@ impl FrontendExecutionRuntimeOwner {
                     format!("install original connector executors: {error}"),
                 )
             })?;
-        if let Some(geometry) = native_capacity_profile.statement_io_geometry() {
-            connector_blocking_io
-                .install_read_io_geometry(geometry)
-                .map_err(|error| {
-                    FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::WorkloadControlOpen,
-                        format!("install original statement I/O geometry: {error}"),
-                    )
-                })?;
-        }
         let internal_result_cpu =
-            InternalResultCpuOwner::try_new(result_profile, &mut workload.owner).map_err(
+            InternalResultCpuOwner::try_new(query_blocking_config, &mut workload.owner).map_err(
                 |error| {
                     FrontendApplicationError::new(
                         FrontendApplicationErrorKind::InternalResultCpuOpen,
@@ -1136,58 +1126,22 @@ impl FrontendExecutionConfig {
         ingress: crate::native_workload::FrontendStatementIngress,
     ) -> Result<Self, novarocks_workload_control::WorkError> {
         use crate::native_workload::{
-            FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs,
-            FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
+            FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig,
+            FrontendWorkloadCapacityProfile,
         };
-        // Fund the complete minimum Root/stage plus every allowed attempt's
-        // original Sources under K=1 protection. This one domain is the actual
-        // LocalHost preparation body, never a guessed BE or Provider domain.
-        let sources = crate::query_execution::native_execution_adapter::native_source_count(1, 1)?;
-        let attempts = self
-            .workload
-            .restarts_per_work
-            .checked_add(1)
-            .ok_or(novarocks_workload_control::WorkError::ArithmeticOverflow)?;
-        let controls =
-            novarocks_workload_control::joint_admission::RootStageSource::minimum_control_records()
-                .checked_add(
-                    sources
-                        .get()
-                        .checked_mul(attempts)
-                        .ok_or(novarocks_workload_control::WorkError::ArithmeticOverflow)?,
-                )
-                .ok_or(novarocks_workload_control::WorkError::ArithmeticOverflow)?;
-        let per_class = controls
-            .checked_mul(2)
-            .ok_or(novarocks_workload_control::WorkError::ArithmeticOverflow)?;
-        // Root/business/concurrency and all original timeout policies stay
-        // those of new_for_test; this is the finite Source inventory only.
-        let slots_per_class = [per_class; 5];
         let policy = FrontendWorkloadCapacityConfig::try_new(
-            slots_per_class,
-            FrontendDependencyCustodyLimits {
-                unreceived_productions: 256,
-                publications: 256,
-                residuals: 256,
-                retained_payload_bytes: 4 << 30,
-            },
+            self.workload.scope_records_limit,
             NonZeroUsize::new(7).unwrap(),
             Duration::from_millis(25),
         )?;
-        self.workload.scope_records_limit = policy.scope_limit();
         let inputs =
             FrontendNativeCapacityInputs::try_new(policy, self.query_blocking_executor_config)?;
-        let geometry = crate::query::read_action::empty_provider_preparation_geometry_for_test()?;
         self.native_capacity_profile = FrontendWorkloadCapacityProfile::try_for_native(
             inputs,
             &self.workload,
             self.result_profile,
             self.transport_budget,
             ingress,
-            geometry,
-            // This host installs Vec::new() Provider factories, so it owns no
-            // Provider staged-create Source and promises no Provider geometry.
-            0,
         )?;
         Ok(self)
     }
@@ -2613,7 +2567,7 @@ mod tests {
         )
         .unwrap();
         let mut cpu = crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new(
-            FrontendResultCapacityProfile::for_test(),
+            profile.inputs().query_blocking_capacity(),
             &mut workload.owner,
         )
         .unwrap();

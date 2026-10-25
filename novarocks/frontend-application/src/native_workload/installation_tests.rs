@@ -16,91 +16,90 @@
 // under the License.
 
 use super::*;
+use crate::query_execution::internal_result_cpu::InternalResultCpuOwner;
+use novarocks_query_application::cpu::QueryBlockingExecutorOwner;
 
-fn fixture() -> FrontendWorkloadCapacityProfile {
-    original_owner_test_profile(QueryBlockingExecutorConfig::new(
+#[tokio::test]
+async fn one_worker_installs_original_cpu_factory_without_a_topology_formula() {
+    let blocking_config = QueryBlockingExecutorConfig::new(
         NonZeroUsize::new(1).unwrap(),
         NonZeroUsize::new(1).unwrap(),
-    ))
+    );
+    let workload = original_owner_test_workload();
+    let profile = original_owner_test_profile(blocking_config);
+    let result = FrontendResultCapacityProfile::for_test();
+    let mut control = WorkloadControl::try_new_counted(workload.clone()).unwrap();
+    let mut blocking = QueryBlockingExecutorOwner::try_new(blocking_config).unwrap();
+    let mut cpu = InternalResultCpuOwner::try_new(blocking_config, &mut control.owner).unwrap();
+    let installed = profile
+        .capture_sources(&workload, result, &blocking.executor(), &cpu.runtime())
+        .and_then(|sources| profile.install(&mut control.owner, &sources));
+    let installation_ok = installed.is_ok();
+    drop(installed);
+    control.owner.close_admission();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let cpu_exit = cpu.shutdown_until(deadline).await;
+    let blocking_exit = blocking.shutdown_until(deadline).await;
+    let control_exit = control.owner.shutdown();
+    assert!(installation_ok);
+    assert!(cpu_exit.is_ok());
+    assert!(blocking_exit.is_ok());
+    assert!(control_exit.is_ok());
+}
+
+#[tokio::test]
+async fn foreign_original_cpu_factory_is_refused_without_a_layout_quote() {
+    let config = QueryBlockingExecutorConfig::new(
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    let workload = original_owner_test_workload();
+    let profile = original_owner_test_profile(config);
+    let result = FrontendResultCapacityProfile::for_test();
+    let mut original = WorkloadControl::try_new_counted(workload.clone()).unwrap();
+    let mut foreign = WorkloadControl::try_new_counted(workload.clone()).unwrap();
+    let mut blocking = QueryBlockingExecutorOwner::try_new(config).unwrap();
+    let mut cpu = InternalResultCpuOwner::try_new(config, &mut original.owner).unwrap();
+    let sources = profile
+        .capture_sources(&workload, result, &blocking.executor(), &cpu.runtime())
+        .unwrap();
+    let refused = profile.install(&mut foreign.owner, &sources);
+    let refusal = matches!(refused, Err(WorkError::ForeignAuthority));
+    drop(sources);
+    original.owner.close_admission();
+    foreign.owner.close_admission();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let cpu_exit = cpu.shutdown_until(deadline).await;
+    let blocking_exit = blocking.shutdown_until(deadline).await;
+    let original_exit = original.owner.shutdown();
+    let foreign_exit = foreign.owner.shutdown();
+    assert!(refusal);
+    assert!(cpu_exit.is_ok());
+    assert!(blocking_exit.is_ok());
+    assert!(original_exit.is_ok());
+    assert!(foreign_exit.is_ok());
 }
 
 #[test]
-fn received_production_rows_require_real_batch_capacity() {
-    let profile = fixture();
-    let mut declared = profile.capacity.clone();
-    // Three canonical records can contain any supported occurrence count.
-    // They remain Publication responsibilities after complete receiving.
-    declared.global.global = declared.global.global.with(JointResource::Publications, 3);
-    assert_eq!(production_batch_records(&declared).unwrap(), 7);
-    let error = FrontendWorkloadCapacityProfile::from_complete_actions(
-        profile.inputs.clone(),
-        &profile.workload,
-        declared,
-        profile.required.clone(),
-        profile.children_per_slot,
-        profile.proposals_per_slot,
-    )
-    .unwrap_err();
-    assert_eq!(
-        error,
-        WorkError::InvalidConfig("frontend production growth records")
+fn changed_actual_workload_or_pool_configuration_is_refused() {
+    let config = QueryBlockingExecutorConfig::new(
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
     );
-}
-
-#[test]
-fn additional_production_changes_increase_the_original_paid_metadata_envelope() {
-    let profile = fixture();
-    let mut next = profile.capacity.clone();
-    let storage = ControlStorageConfig::new(
-        profile.policy().slots_per_class(),
-        profile.children_per_slot,
-        profile.proposals_per_slot.get(),
-        &profile.poll_roles,
-    );
-    let old_m = storage.minimum_dependency_records(&next).unwrap();
-    let old_base = storage.base_charge(&next).unwrap();
-    next.global.global = next.global.global.with(JointResource::Publications, 3);
-    next.max_changes_per_request = production_batch_records(&next).unwrap();
-    let next_m = storage.minimum_dependency_records(&next).unwrap();
-    // One paid request retains its complete distinct union once, irrespective
-    // of the number of changes; additional C still enlarges the paid body.
-    assert_eq!(next_m, old_m);
-    next.max_registered_dependencies = next_m;
-    let next_base = storage.base_charge(&next).unwrap();
-    assert!(
-        next_base.get(JointResource::MetadataBytes) > old_base.get(JointResource::MetadataBytes)
-    );
-    // C/M are actual retained backing, so merely increasing the configured C
-    // cannot reuse the previous cheaper global/class inventory declaration.
+    let profile = original_owner_test_profile(config);
+    let mut changed = original_owner_test_workload();
+    changed.scope_records_limit += 1;
     assert!(matches!(
-        FrontendWorkloadCapacityProfile::from_complete_actions(
-            profile.inputs.clone(),
-            &profile.workload,
-            next,
-            profile.required.clone(),
-            profile.children_per_slot,
-            profile.proposals_per_slot,
-        ),
-        Err(WorkError::InvalidConfig("frontend fixed global inventory"))
+        profile.validate_pool_declarations(&changed, config),
+        Err(WorkError::Conflict)
     ));
-}
-
-#[test]
-fn original_dependency_author_refuses_an_underfunded_membership_inventory() {
-    let profile = fixture();
-    let mut next = profile.capacity.clone();
-    next.max_registered_dependencies -= 1;
-    let error = FrontendWorkloadCapacityProfile::from_complete_actions(
-        profile.inputs.clone(),
-        &profile.workload,
-        next,
-        profile.required.clone(),
-        profile.children_per_slot,
-        profile.proposals_per_slot,
-    )
-    .unwrap_err();
-    assert_eq!(
-        error,
-        WorkError::InvalidConfig("frontend fixed dependency inventory")
+    let other = QueryBlockingExecutorConfig::new(
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    assert!(
+        profile
+            .validate_pool_declarations(&profile.workload, other)
+            .is_err()
     );
 }

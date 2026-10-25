@@ -48,8 +48,8 @@ pub mod task_protocol_config;
 
 mod native_workload;
 pub use native_workload::{
-    FrontendCompositionFacts, FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs,
-    FrontendStatementIngress, FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
+    FrontendNativeCapacityInputs, FrontendStatementIngress, FrontendWorkloadCapacityConfig,
+    FrontendWorkloadCapacityProfile,
 };
 
 pub(crate) mod application;

@@ -398,7 +398,7 @@ fn validate_adoption(
     {
         return Err(WorkError::Conflict);
     }
-    if !record.active_facts.key.causal.is_empty() {
+    if !record.active_facts.key.source_kind.is_empty() {
         return Err(WorkError::Conflict);
     }
     let capacity = record.active_amounts.get(kind.resource());
@@ -503,6 +503,23 @@ fn adopt_in(
             .structure_revision
             .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
+        if matches!(kind, Kind::Computation)
+            && !state.joint.as_ref().unwrap().claims[&id].internal_position
+            && state.joint.as_ref().unwrap().claims[&id]
+                .computation_window
+                .is_none()
+        {
+            charge_internal_position(&mut state, scope.id)?;
+            state
+                .joint
+                .as_mut()
+                .unwrap()
+                .claims
+                .get_mut(&id)
+                .unwrap()
+                .internal_position = true;
+        }
+        let row = state.joint.as_mut().unwrap().claims.get_mut(&id).unwrap();
         row.structure_revision = epoch;
         row.custody = kind.new_custody(epoch);
         original.id = None;
@@ -631,9 +648,7 @@ impl NativeQueuedInputGrant {
             let released=JointResources::ZERO.with(JointResource::QueueRecords,1);
             let charged=row.amounts.checked_sub(released)?;
             let active=row.active_amounts.checked_sub(released)?;
-            let profile=ledger.profiles.get_mut(&row.facts.key).ok_or(WorkError::Released)?;
-            let total=profile.amounts.checked_sub(released)?;
-            profile.amounts=total;row.amounts=charged;row.active_amounts=active;row.release_revision=revision;
+row.amounts=charged;row.active_amounts=active;row.release_revision=revision;
             let ClaimCustody::NativeInput{queued,..}=&mut row.custody else{unreachable!()};*queued=false;
             ledger.released();Ok(())
         })?;
@@ -695,17 +710,10 @@ impl RetainedPayloadGrant {
             let delta = JointResources::ZERO.with(JointResource::PayloadBytes, released);
             let active = row.active_amounts.checked_sub(delta)?;
             let charged = row.amounts.checked_sub(delta)?;
-            let profile = ledger
-                .profiles
-                .get(&row.facts.key)
-                .ok_or(WorkError::Conflict)?
-                .amounts
-                .checked_sub(delta)?;
             if released == 0 {
                 return Ok(());
             }
             let row = ledger.claims.get_mut(&key[0]).unwrap();
-            ledger.profiles.get_mut(&row.facts.key).unwrap().amounts = profile;
             row.active_amounts = active;
             row.amounts = charged;
             row.release_revision = revision;
@@ -793,6 +801,41 @@ pub struct InternalComputationGrant {
     pin: OriginalPin,
 }
 impl InternalComputationGrant {
+    pub(crate) fn validate_client_position(
+        &self,
+        original: &crate::result_window::ClientComputationWindow,
+    ) -> Result<(), WorkError> {
+        let state = self.pin.inner.state.lock().unwrap();
+        let key = self.pin.key.ok_or(WorkError::Released)?;
+        let row = state
+            .joint
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .claims
+            .get(&key[0])
+            .ok_or(WorkError::Released)?;
+        let window = row.computation_window.as_ref().ok_or(WorkError::Conflict)?;
+        if row.internal_position || !window.same_original(original) {
+            return Err(WorkError::Conflict);
+        }
+        window.validate_claim(key[0])
+    }
+    pub(crate) fn validate_internal_position(&self) -> Result<(), WorkError> {
+        let state = self.pin.inner.state.lock().unwrap();
+        let key = self.pin.key.ok_or(WorkError::Released)?;
+        let row = state
+            .joint
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .claims
+            .get(&key[0])
+            .ok_or(WorkError::Released)?;
+        if !row.internal_position {
+            return Err(WorkError::Conflict);
+        }
+        Ok(())
+    }
+
     /// Observe the actual original stage; no pin or callback.
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
         self.pin.is_for_scope(scope)
@@ -947,6 +990,14 @@ fn typed_binding_view_mode(
         .claims
         .get(&key[0])
         .ok_or(WorkError::Released)?;
+    if computation && !row.internal_position && row.computation_window.is_none() {
+        return Err(WorkError::Conflict);
+    }
+    if computation {
+        if let Some(window) = &row.computation_window {
+            window.validate_claim(key[0])?;
+        }
+    }
     let custody = match row.custody {
         ClaimCustody::Computation { epoch, pins } if computation => epoch == key[1] && pins != 0,
         ClaimCustody::Payload { epoch, pins } if !computation => epoch == key[1] && pins != 0,
@@ -957,7 +1008,7 @@ fn typed_binding_view_mode(
         || (!capture && row.pending.is_some())
         || (row.pending.is_none()
             && (row.amounts != row.active_amounts || row.facts.key != row.active_facts.key))
-        || !row.active_facts.key.causal.is_empty()
+        || !row.active_facts.key.source_kind.is_empty()
     {
         return Err(WorkError::Conflict);
     }
@@ -1064,7 +1115,7 @@ pub(crate) fn validate_native_computation_fence(
         || row.amounts != row.active_amounts
         || row.facts.key != row.active_facts.key
         || row.active_amounts.get(JointResource::Computations) != 1
-        || !row.active_facts.key.causal.is_empty()
+        || !row.active_facts.key.source_kind.is_empty()
     {
         return Err(WorkError::Conflict);
     }

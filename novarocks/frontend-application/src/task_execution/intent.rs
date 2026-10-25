@@ -873,43 +873,6 @@ pub enum TaskOperationSubmit {
     },
 }
 
-/// Pure packing facts carried by the same original input permit. Neither
-/// the numbers nor this Copy value grant execution or retained capacity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OriginalOperationPacking {
-    owned_bytes: u64,
-    maximum_owned_increment: std::num::NonZeroU64,
-}
-impl OriginalOperationPacking {
-    pub(crate) fn new(
-        owned_bytes: u64,
-        maximum_owned_increment: std::num::NonZeroU64,
-    ) -> Result<Self, novarocks_workload_control::WorkError> {
-        if owned_bytes > maximum_owned_increment.get() {
-            return Err(novarocks_workload_control::WorkError::Capacity(
-                "Native operation owned backing",
-            ));
-        }
-        Ok(Self {
-            owned_bytes,
-            maximum_owned_increment,
-        })
-    }
-    pub(crate) fn owned_bytes(self) -> u64 {
-        self.owned_bytes
-    }
-    pub(crate) fn maximum_owned_increment(self) -> u64 {
-        self.maximum_owned_increment.get()
-    }
-}
-
-/// Non-Native dispatcher fixtures explicitly model one cost unit per input.
-/// This is a finite queue oracle, not a Native profile or source certificate.
-#[cfg(test)]
-pub(crate) fn test_operation_packing() -> OriginalOperationPacking {
-    OriginalOperationPacking::new(1, std::num::NonZeroU64::new(32).unwrap()).unwrap()
-}
-
 /// One process-level reservation attached to an operation while it is queued.
 ///
 /// The reservation moves with the exact operation through dequeue, transport
@@ -917,12 +880,6 @@ pub(crate) fn test_operation_packing() -> OriginalOperationPacking {
 /// in-flight reservation and remains held until that send settles or drops.
 pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     fn mark_in_flight(&mut self);
-    /// Borrow only the exact immutable input associated with this permit.
-    /// The first-party Native implementation performs no DTO construction.
-    fn packing_support(
-        &self,
-        input: &OperationIntent,
-    ) -> Result<OriginalOperationPacking, novarocks_workload_control::WorkError>;
     /// Borrow the original Native queue capability for the same batch's
     /// actual dispatch cut. Absence is not permission to omit governance.
     /// Call outside WC State while the original queue holder stays stable.
@@ -967,12 +924,6 @@ struct TestQueuePermit;
 #[cfg(test)]
 impl TaskOperationQueuePermit for TestQueuePermit {
     fn mark_in_flight(&mut self) {}
-    fn packing_support(
-        &self,
-        _: &OperationIntent,
-    ) -> Result<OriginalOperationPacking, novarocks_workload_control::WorkError> {
-        Ok(test_operation_packing())
-    }
 }
 
 #[cfg(test)]

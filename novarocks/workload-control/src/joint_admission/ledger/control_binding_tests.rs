@@ -165,120 +165,6 @@ fn delegated_scope_install_is_borrowed_exact_and_preserves_foreign_refusal() {
 }
 
 #[test]
-fn delegated_builders_use_original_q_and_poison_partial_or_ended_changes() {
-    let (control, _, mut driver) = fixture();
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let first = scope.begin_control_binding().unwrap();
-    let second = scope.begin_control_binding().unwrap();
-    assert!(matches!(
-        scope.begin_control_binding(),
-        Err(WorkError::Capacity("fixed proposal and reply cells"))
-    ));
-    drop(first);
-    drop(second);
-    assert!(matches!(
-        scope.begin_control_binding(),
-        Err(WorkError::Capacity("fixed proposal and reply cells"))
-    ));
-    drive(&mut driver);
-    let mut empty = scope.begin_control_binding().unwrap();
-    assert_eq!(empty.end_change(), Err(WorkError::Conflict));
-    assert!(matches!(
-        empty.submit(),
-        Err(JointAdmissionFailure {
-            error: WorkError::Conflict
-        })
-    ));
-    drive(&mut driver);
-    let unfinished = scope.begin_control_binding().unwrap();
-    assert!(matches!(
-        unfinished.submit(),
-        Err(JointAdmissionFailure {
-            error: WorkError::Conflict
-        })
-    ));
-    drive(&mut driver);
-    let mut ended = scope.begin_control_binding().unwrap();
-    ended.push_dependency(&network("one")).unwrap();
-    ended.end_change().unwrap();
-    assert_eq!(ended.end_change(), Err(WorkError::Conflict));
-    assert!(matches!(
-        ended.submit(),
-        Err(JointAdmissionFailure {
-            error: WorkError::Conflict
-        })
-    ));
-    drive(&mut driver);
-    let mut after_end = scope.begin_control_binding().unwrap();
-    after_end.push_dependency(&network("one")).unwrap();
-    after_end.end_change().unwrap();
-    assert_eq!(
-        after_end.push_dependency(&network("two")),
-        Err(WorkError::Conflict)
-    );
-    assert!(matches!(
-        after_end.submit(),
-        Err(JointAdmissionFailure {
-            error: WorkError::Conflict
-        })
-    ));
-    finish(work, &mut driver);
-}
-
-#[test]
-fn delegated_original_revision_and_full_union_limits_are_not_reset() {
-    let (control, handle, mut driver) = fixture();
-    let work = root(&control);
-    let scope = work.owner.scope();
-    let mut stale = scope.begin_control_binding().unwrap();
-    stale.push_dependency(&network("stale")).unwrap();
-    stale.end_change().unwrap();
-    let mut current = binding(&scope, &network("current"));
-    install(&scope, &mut current, &mut driver);
-    assert!(matches!(
-        stale.submit(),
-        Err(JointAdmissionFailure {
-            error: WorkError::Conflict
-        })
-    ));
-    drive(&mut driver);
-    let mut grow = binding(&scope, &network("second"));
-    install(&scope, &mut grow, &mut driver);
-    let mut overflow = scope.begin_control_binding().unwrap();
-    assert_eq!(
-        overflow.push_dependency(&network("third")),
-        Err(WorkError::Capacity("joint dependency union"))
-    );
-    assert!(matches!(
-        overflow.submit(),
-        Err(JointAdmissionFailure {
-            error: WorkError::Capacity("joint dependency union")
-        })
-    ));
-    assert!(domains(
-        &handle,
-        &scope,
-        &[network("current"), network("second")]
-    ));
-    drive(&mut driver);
-    let mut finite = scope.begin_control_binding().unwrap();
-    finite.end_change().unwrap();
-    let mut finite = finite
-        .submit_finite(std::num::NonZeroU64::new(1).unwrap())
-        .unwrap();
-    drive(&mut driver);
-    assert!(matches!(
-        Pin::new(&mut finite).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::Capacity(_)
-        }))
-    ));
-    drop(finite);
-    finish(work, &mut driver);
-}
-
-#[test]
 fn delegated_cancel_and_success_sealed_orphan_cannot_install_or_mint() {
     let (control, _, mut driver) = fixture();
     let cancelled = root(&control);
@@ -528,5 +414,83 @@ fn delegated_closed_install_keeps_receipt_and_original_fixed_base() {
         assert_eq!(claim.active_amounts, base);
     }
     drop(reply);
+    finish(work, &mut driver);
+}
+
+#[test]
+fn delegated_original_revision_and_complete_monotone_union_are_preserved() {
+    let (control, handle, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let mut stale = scope.begin_control_binding().unwrap();
+    stale.push_dependency(&network("stale")).unwrap();
+    stale.end_change().unwrap();
+    let mut current = binding(&scope, &network("current"));
+    install(&scope, &mut current, &mut driver);
+    assert!(matches!(
+        stale.submit(),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    drive(&mut driver);
+    let mut grow = binding(&scope, &network("second"));
+    install(&scope, &mut grow, &mut driver);
+    let mut third = binding(&scope, &network("third"));
+    install(&scope, &mut third, &mut driver);
+    assert!(domains(
+        &handle,
+        &scope,
+        &[network("current"), network("second"), network("third")]
+    ));
+    finish(work, &mut driver);
+}
+
+#[test]
+fn delegated_builders_poison_partial_repeated_end_and_push_after_end() {
+    let (control, _, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let mut empty = scope.begin_control_binding().unwrap();
+    assert_eq!(empty.end_change(), Err(WorkError::Conflict));
+    assert!(matches!(
+        empty.submit(),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    drive(&mut driver);
+    let unfinished = scope.begin_control_binding().unwrap();
+    assert!(matches!(
+        unfinished.submit(),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    drive(&mut driver);
+    let mut ended = scope.begin_control_binding().unwrap();
+    ended.push_dependency(&network("one")).unwrap();
+    ended.end_change().unwrap();
+    assert_eq!(ended.end_change(), Err(WorkError::Conflict));
+    assert!(matches!(
+        ended.submit(),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    drive(&mut driver);
+    let mut after_end = scope.begin_control_binding().unwrap();
+    after_end.push_dependency(&network("one")).unwrap();
+    after_end.end_change().unwrap();
+    assert_eq!(
+        after_end.push_dependency(&network("two")),
+        Err(WorkError::Conflict)
+    );
+    assert!(matches!(
+        after_end.submit(),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
     finish(work, &mut driver);
 }

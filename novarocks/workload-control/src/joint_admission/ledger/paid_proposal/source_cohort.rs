@@ -73,9 +73,6 @@ fn prepare(
 ) -> Result<JointProposal, JointAdmissionFailure> {
     let result = (|| {
         let count = count.get();
-        if count > proposal.config.config.max_changes_per_request {
-            return Err(WorkError::Capacity("paid joint batch records"));
-        }
         // The same original fixed-service author charges this bounded array.
         // Reserve it only after acquiring the original construction position.
         proposal
@@ -102,20 +99,16 @@ fn prepare(
         };
         authenticate_parent(&state, fence, proposal.scope.id)?;
         let facts = Arc::clone(&parent.active_facts);
-        track_dependency_union(
-            &mut proposal.dependency_union,
-            &facts.dependencies,
-            proposal.config.config.max_dependencies_per_claim,
-        )?;
         let class = class_index(node.class);
         for _ in 0..count {
-            let slot = state.cancellations.free_heads[class]
+            let slot = state
+                .cancellations
+                .free_head
                 .ok_or(WorkError::Capacity("fixed control slots"))?;
             let cell = &state.cancellations.slots[slot.0];
             let claim = cell.claim.ok_or(WorkError::NotReady)?;
             let old = &state.joint.as_ref().unwrap().claims[&claim];
             if cell.phase != SlotPhase::Free
-                || cell.class != facts.class
                 || cell.parent.is_some()
                 || old.owner != ClaimOwner::ControlSlot(slot)
                 || old.pending.is_some()
@@ -123,7 +116,7 @@ fn prepare(
                 || old.active_amounts != cell.base
                 || !old.facts.dependencies.is_empty()
                 || !old.active_facts.dependencies.is_empty()
-                || !old.active_facts.key.causal.is_empty()
+                || !old.active_facts.key.source_kind.is_empty()
             {
                 return Err(WorkError::Conflict);
             }
@@ -169,7 +162,8 @@ fn prepare(
                 .reserved_cohort
                 .push(slot);
             let next = state.cancellations.slots[slot.0].next_free.take();
-            state.cancellations.free_heads[class] = next;
+            state.cancellations.free_head = next;
+            state.cancellations.slots[slot.0].class = facts.class;
             state.cancellations.slots[slot.0].phase = SlotPhase::ChildReserved {
                 parent: proposal.scope.id,
             };

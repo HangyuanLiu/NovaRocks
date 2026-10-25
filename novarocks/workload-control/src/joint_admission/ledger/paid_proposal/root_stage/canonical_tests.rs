@@ -17,7 +17,6 @@
 
 //! Real paid builders, original driver and typed grants; no invented grant.
 use super::*;
-use crate::joint_admission::ledger::proposal_storage::ProposalPhase;
 use crate::joint_admission::{
     NativeAsyncActionAdmission, NativeAsyncActionGrant, NativeAsyncActionQuote,
     NativeDispatchSource, NativeQueuedInputGrant, NativeQueuedInputQuote, NativeReplyGrant,
@@ -183,17 +182,16 @@ fn positive_native(
         .begin()
         .unwrap();
     drive(driver);
-    let original_remaining = {
+    let original_ticket = {
         let state = control.inner.state.lock().unwrap();
-        let ledger = state.joint.as_ref().unwrap();
-        let request = ledger
+        *state
+            .joint
+            .as_ref()
+            .unwrap()
             .requests
-            .values()
-            .find(|r| r.native_action.is_some())
-            .unwrap();
-        request
-            .budget
-            .limit(ledger.config.config.max_total_proof_work)
+            .keys()
+            .next_back()
+            .unwrap()
     };
     let mut offer = match pending
         .poll_local_offer(&mut Context::from_waker(Waker::noop()), &mut |_, _| {
@@ -240,7 +238,7 @@ fn positive_native(
         reply.unwrap(),
         input.unwrap(),
         action_id,
-        original_remaining,
+        original_ticket,
     )
 }
 fn remaining(control: &WorkloadControl, action: u64) -> u64 {
@@ -255,7 +253,7 @@ fn remaining(control: &WorkloadControl, action: u64) -> u64 {
         .claims[&action]
         .native_dispatch
         .unwrap()
-        .remaining
+        .ticket
 }
 
 #[test]
@@ -361,50 +359,7 @@ fn canonical_pending_root_does_not_authorize_new_inherited_birth_before_rollback
 }
 
 #[test]
-fn native_dispatch_inherits_actual_remaining_proof_budget_and_drop_retains_originals() {
-    let (control, mut driver, work, stage, _domains, payload) = canonical_setup();
-    let (_admission, _body, action, reply, input, id, original) =
-        positive_native(&control, &mut driver, &work, &stage, &payload);
-    let configured = control
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .joint
-        .as_ref()
-        .unwrap()
-        .config
-        .config
-        .max_total_proof_work;
-    assert!(
-        original < configured,
-        "the original builder/proof already spent work"
-    );
-    assert_eq!(remaining(&control, id), original);
-    let mut source =
-        NativeDispatchSource::capture(&action, &reply, [Some(&input)].into_iter()).unwrap();
-    let after_capture = remaining(&control, id);
-    assert!(after_capture < original);
-    assert!(
-        Pin::new(&mut source)
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-    );
-    assert!(remaining(&control, id) < after_capture);
-    drop(source);
-    let state = control.inner.state.lock().unwrap();
-    let row = &state.joint.as_ref().unwrap().claims[&id];
-    assert_eq!(row.dispatch_staging, None);
-    assert!(!row.native_dispatch.unwrap().frozen);
-    assert_eq!(
-        row.active_amounts.get(JointResource::AsyncIo),
-        1,
-        "preparer exit cannot refund the real action"
-    );
-}
-
-#[test]
-fn native_dispatch_official_epoch_reobserve_never_resets_remaining_work() {
+fn native_dispatch_official_epoch_reobserve_keeps_original_ticket() {
     let (control, mut driver, work, stage, _domains, payload) = canonical_setup();
     let (_admission, _body, action, reply, input, id, original) =
         positive_native(&control, &mut driver, &work, &stage, &payload);
@@ -416,7 +371,7 @@ fn native_dispatch_official_epoch_reobserve_never_resets_remaining_work() {
             .is_pending()
     );
     let before_epoch = remaining(&control, id);
-    assert!(before_epoch < original);
+    assert_eq!(before_epoch, original);
     let mut pending = growth(&payload, &work.owner.scope(), "b");
     drive(&mut driver);
     let mut proof = growth_ready(&mut pending);
@@ -428,7 +383,7 @@ fn native_dispatch_official_epoch_reobserve_never_resets_remaining_work() {
     assert_eq!(
         remaining(&control, id),
         before_epoch,
-        "original event wait does not remint or spin the budget"
+        "original event wait does not remint the request"
     );
     proof
         .install_domains_in(&work.owner.scope(), &payload)
@@ -439,11 +394,11 @@ fn native_dispatch_official_epoch_reobserve_never_resets_remaining_work() {
         match Pin::new(&mut source).poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Ok(frozen)) => break frozen,
             Poll::Ready(Err(error)) => panic!("official epoch reobserve: {error:?}"),
-            Poll::Pending => assert!(remaining(&control, id) <= before_epoch),
+            Poll::Pending => assert_eq!(remaining(&control, id), before_epoch),
         }
     };
     assert_eq!(frozen.epoch(), domain_epoch(&control, &work.owner.scope()));
-    assert!(remaining(&control, id) < before_epoch);
+    assert_eq!(remaining(&control, id), before_epoch);
     assert_eq!(
         effective(&control, id).len(),
         3,
@@ -641,73 +596,6 @@ impl std::task::Wake for RootWriterWake {
 }
 
 #[test]
-fn canonical_manifest_building_and_pending_make_mio_wait_without_free_q_spin() {
-    let (control, mut driver, work, stage, _domains, payload) = canonical_setup();
-    let root = work.owner.scope();
-    let (_compute, binding) = original_manifest_binding(&mut driver, &root, &stage, &payload);
-    let mut manifest = match binding.try_begin().unwrap() {
-        JointTryBegin::Started(p) => p,
-        _ => panic!("original manifest constructor is available"),
-    };
-    let mut wait = match payload
-        .root_domain_source(&root, JointLane::Foreground)
-        .unwrap()
-        .try_begin(0)
-        .unwrap()
-    {
-        JointTryBegin::Full(wait) => wait,
-        _ => panic!("the same Root writer is still Building"),
-    };
-    let wakes = Arc::new(RootWriterWake::default());
-    let waker = Waker::from(Arc::clone(&wakes));
-    let mut cx = Context::from_waker(&waker);
-    {
-        let state = control.inner.state.lock().unwrap();
-        let slot = state.nodes[&root.id].cancellation;
-        assert!(
-            state.cancellations.slots[slot.0]
-                .proposals
-                .iter()
-                .any(|p| p.phase == ProposalPhase::Free)
-        );
-        assert!(state.joint.as_ref().unwrap().requests.is_empty());
-    }
-    for _ in 0..4 {
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
-    }
-    assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-    manifest
-        .push_payload_dependency(&fact("backend-b"))
-        .unwrap();
-    manifest.end_payload().unwrap();
-    manifest.end_stage().unwrap();
-    let mut admission = manifest.submit().unwrap();
-    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
-    drive(&mut driver);
-    let proof = ready(&mut admission);
-    assert!(
-        Pin::new(&mut wait).poll(&mut cx).is_pending(),
-        "Ready is not installed Root D"
-    );
-    let before_drop = wakes.0.load(std::sync::atomic::Ordering::SeqCst);
-    drop((proof, admission));
-    assert!(
-        wakes.0.load(std::sync::atomic::Ordering::SeqCst) > before_drop,
-        "original rollback notifies its parked source"
-    );
-    assert!(matches!(
-        Pin::new(&mut wait).poll(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
-    drop(wait);
-    drive(&mut driver);
-    let mut mio = growth(&payload, &root, "fs-c");
-    drive(&mut driver);
-    let mut ready = growth_ready(&mut mio);
-    ready.install_domains_in(&root, &payload).unwrap().notify();
-}
-
-#[test]
 fn canonical_mio_charged_payload_parks_same_manifest_binding_until_install() {
     let (_control, mut driver, work, stage, _domains, payload) = canonical_setup();
     let root = work.owner.scope();
@@ -823,7 +711,7 @@ fn canonical_root_writer_drop_and_completed_capture_reobserve_keep_original_fenc
 }
 
 #[test]
-fn canonical_root_writer_wait_reason_is_not_vacant_q_and_cancellation_wins() {
+fn canonical_root_writer_wait_is_independent_of_generic_constructors_and_cancellation_wins() {
     let (control, mut driver, work, stage, _domains, payload) = canonical_setup();
     let root = work.owner.scope();
     let (_compute, binding) = original_manifest_binding(&mut driver, &root, &stage, &payload);
@@ -835,30 +723,23 @@ fn canonical_root_writer_wait_reason_is_not_vacant_q_and_cancellation_wins() {
         inner: Arc::clone(&control.inner),
     };
     let ordinary = handle.begin_paid_proposal(&work.owner).unwrap();
-    let mut slot_wait = match handle
+    let independent = match handle
         .try_begin_paid_proposal_for_scope_signal(root.clone())
         .unwrap()
     {
-        JointTryBegin::Full(signal) => signal.into_wait(),
-        _ => panic!("both original Q cells occupied"),
+        JointTryBegin::Started(value) => value,
+        JointTryBegin::Full(_) => panic!("generic construction has no Q gate"),
     };
+    drop(independent);
     let writer_signal = match binding.try_begin().unwrap() {
         JointTryBegin::Full(signal) => signal,
         _ => panic!("same original writer still Building"),
     };
-    assert!(
-        !slot_wait.is_for_signal(&writer_signal),
-        "a vacant-Q predicate cannot be reused for Root writer contention"
-    );
     let mut writer_wait = writer_signal.into_wait();
     let mut cx = Context::from_waker(Waker::noop());
     assert!(Pin::new(&mut writer_wait).poll(&mut cx).is_pending());
     drop(ordinary);
     drive(&mut driver);
-    assert!(matches!(
-        Pin::new(&mut slot_wait).poll(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
     assert!(
         Pin::new(&mut writer_wait).poll(&mut cx).is_pending(),
         "free Q does not grant the occupied Root writer"
@@ -871,4 +752,92 @@ fn canonical_root_writer_wait_reason_is_not_vacant_q_and_cancellation_wins() {
         )))
     ));
     drop(building);
+}
+
+#[test]
+fn canonical_manifest_building_and_pending_serialize_same_mio_root_without_selfwake() {
+    let (control, mut driver, work, stage, _domains, payload) = canonical_setup();
+    let root = work.owner.scope();
+    let (_compute, binding) = original_manifest_binding(&mut driver, &root, &stage, &payload);
+    let mut manifest = match binding.try_begin().unwrap() {
+        JointTryBegin::Started(p) => p,
+        _ => panic!("original manifest constructor is available"),
+    };
+    let mut wait = match payload
+        .root_domain_source(&root, JointLane::Foreground)
+        .unwrap()
+        .try_begin(0)
+        .unwrap()
+    {
+        JointTryBegin::Full(wait) => wait,
+        _ => panic!("the same Root writer is still Building"),
+    };
+    let wakes = Arc::new(RootWriterWake::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert!(state.joint.as_ref().unwrap().requests.is_empty());
+    }
+    for _ in 0..4 {
+        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    }
+    assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    manifest
+        .push_payload_dependency(&fact("backend-b"))
+        .unwrap();
+    manifest.end_payload().unwrap();
+    manifest.end_stage().unwrap();
+    let mut admission = manifest.submit().unwrap();
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    drive(&mut driver);
+    let proof = ready(&mut admission);
+    assert!(
+        Pin::new(&mut wait).poll(&mut cx).is_pending(),
+        "Ready is not installed Root D"
+    );
+    let before_drop = wakes.0.load(std::sync::atomic::Ordering::SeqCst);
+    drop((proof, admission));
+    assert!(
+        wakes.0.load(std::sync::atomic::Ordering::SeqCst) > before_drop,
+        "original rollback notifies its parked source"
+    );
+    assert!(matches!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    drop(wait);
+    drive(&mut driver);
+    let mut mio = growth(&payload, &root, "fs-c");
+    drive(&mut driver);
+    let mut ready = growth_ready(&mut mio);
+    ready.install_domains_in(&root, &payload).unwrap().notify();
+}
+
+#[test]
+fn native_dispatch_preserves_original_ticket_and_drop_retains_original_action() {
+    let (control, mut driver, work, stage, _domains, payload) = canonical_setup();
+    let (_admission, _body, action, reply, input, id, original) =
+        positive_native(&control, &mut driver, &work, &stage, &payload);
+    assert_eq!(remaining(&control, id), original);
+    let mut source =
+        NativeDispatchSource::capture(&action, &reply, [Some(&input)].into_iter()).unwrap();
+    let after_capture = remaining(&control, id);
+    assert_eq!(after_capture, original);
+    assert!(
+        Pin::new(&mut source)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert_eq!(remaining(&control, id), after_capture);
+    drop(source);
+    let state = control.inner.state.lock().unwrap();
+    let row = &state.joint.as_ref().unwrap().claims[&id];
+    assert_eq!(row.dispatch_staging, None);
+    assert!(!row.native_dispatch.unwrap().frozen);
+    assert_eq!(
+        row.active_amounts.get(JointResource::AsyncIo),
+        1,
+        "preparer exit cannot refund the real action"
+    );
 }

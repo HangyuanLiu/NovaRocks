@@ -35,107 +35,10 @@ fn fixture_with_native_resources(
     native: bool,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 4,
-        max_registered_dependencies: (4 * 16 + 2 * 8 * 2 * 4 + 2 * 4 + 1) * 4,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: changes,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
+    let storage = ControlStorageConfig::new(count, &[]);
+    let config = ResponsibilityConfig {
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
-    config.max_registered_dependencies =
-        crate::joint_admission::ledger::metadata_geometry::maximum_fact_roots(&config, count * 2)
-            .unwrap()
-            .checked_mul(config.max_dependencies_per_claim)
-            .unwrap();
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Publications, u64::from(production))
-            .with(JointResource::ReplyRecords, if native { 2 } else { 0 })
-            .with(JointResource::QueueRecords, if native { 2 } else { 0 }),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Publications, u64::from(production))
-            .with(JointResource::ReplyRecords, if native { 2 } else { 0 })
-            .with(JointResource::QueueRecords, if native { 2 } else { 0 }),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1)
-            .with(JointResource::AsyncIo, if native { 3 } else { 0 })
-            .with(
-                JointResource::PhysicalQueueRecords,
-                if native { 2 } else { 0 },
-            )
-            .with(
-                JointResource::PhysicalQueueBytes,
-                if native { 8 } else { 0 },
-            ),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1)
-            .with(JointResource::AsyncIo, if native { 3 } else { 0 })
-            .with(
-                JointResource::PhysicalQueueRecords,
-                if native { 2 } else { 0 },
-            )
-            .with(
-                JointResource::PhysicalQueueBytes,
-                if native { 8 } else { 0 },
-            ),
-        protected_progress: JointResources::ZERO,
-    };
-    let global = JointResourceLimits {
-        global: custody.global.checked_add(foreground.global).unwrap(),
-        per_dependency: custody
-            .per_dependency
-            .checked_add(foreground.per_dependency)
-            .unwrap(),
-        protected_progress: base,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
-    // Only the original fixed substrate requires progress in this fixture.
-    // CPU/complete Native action protection is deliberately not asserted.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -145,9 +48,7 @@ fn fixture_with_native_resources(
     })
     .unwrap()
     .owner;
-    let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let (handle, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
     let mut result = crate::ResultCapacityConfig::V1;
     result.all_objects_bytes[0] = 8;
@@ -583,75 +484,6 @@ fn stale_capture_stage_cancel_and_driver_close_cannot_publish_a_new_stage() {
 }
 
 #[test]
-fn complete_finite_refusal_keeps_root_payload_and_existing_compute_without_partial_growth() {
-    let (control, _, mut driver, work, stage, payload) = setup(false);
-    let payload = payload.unwrap();
-    let mut first = batch(&payload, &work, &stage, 4);
-    drive(&mut driver);
-    let mut first = ready(&mut first);
-    let mut compute = None;
-    first
-        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
-        .unwrap()
-        .notify();
-    drop(first);
-    drive(&mut driver);
-    let other = child(&work.owner.scope(), &mut driver);
-    let mut refused = batch(&payload, &work, &other, 4);
-    drive(&mut driver);
-    assert!(matches!(
-        Pin::new(&mut refused).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::JointCapacity(_),
-            ..
-        }))
-    ));
-    assert_eq!(capacity(&control, JointResource::PayloadBytes), 12);
-    assert_eq!(capacity(&control, JointResource::Computations), 1);
-    assert_eq!(
-        payload.retain_alias().unwrap().capacity_bytes().unwrap(),
-        12
-    );
-    // The original epoch survives both a successful growth and withdrawal.
-    // Release the old actual position, then reuse the same Root and child.
-    let alias = payload.retain_alias().unwrap();
-    let original = payload
-        .root_stage_source(&work.owner.scope(), &other)
-        .unwrap();
-    let id = original.fence.payload;
-    let before_reuse = payload_state(&control, id).unwrap();
-    drop(original);
-    drop(compute);
-    assert_eq!(capacity(&control, JointResource::Computations), 0);
-    let mut next = batch(&payload, &work, &other, 4);
-    drive(&mut driver);
-    let mut next = ready(&mut next);
-    let mut next_compute = None;
-    next.install_in(&work.owner.scope(), &payload, &other, &mut next_compute)
-        .unwrap()
-        .notify();
-    let after_reuse = payload_state(&control, id).unwrap();
-    assert_eq!(
-        (after_reuse.0, after_reuse.1),
-        (before_reuse.0, before_reuse.1)
-    );
-    assert_eq!(alias.capacity_bytes().unwrap(), 16);
-    assert_eq!(capacity(&control, JointResource::Computations), 1);
-    drop(next);
-    drop(next_compute);
-    assert_eq!(capacity(&control, JointResource::Computations), 0);
-    drop(payload);
-    assert_eq!(capacity(&control, JointResource::PayloadBytes), 16);
-    drop(alias);
-    assert_eq!(capacity(&control, JointResource::PayloadBytes), 0);
-    other.complete();
-    stage.complete();
-    work.business.release();
-    work.owner.complete();
-    drive(&mut driver);
-}
-
-#[test]
 fn root_stage_original_batch_also_installs_its_roots_unknown_production_domains() {
     let (control, _, mut driver, work, stage, payload) = setup_with_production(false, 5, true);
     let payload = payload.unwrap();
@@ -728,58 +560,6 @@ fn root_stage_original_batch_also_installs_its_roots_unknown_production_domains(
     work.owner.complete();
     drive(&mut driver);
     assert_eq!(capacity(&control, JointResource::Computations), 0);
-}
-
-#[test]
-fn complete_payload_increment_refuses_before_paid_body_and_preserves_same_source_for_retry() {
-    let (control, _, mut driver, work, stage, payload) = setup(false);
-    let payload = payload.unwrap();
-    let alias = payload.retain_alias().unwrap();
-    let source = payload
-        .root_stage_source(&work.owner.scope(), &stage)
-        .unwrap();
-    let id = source.fence.payload;
-    let bound = source.maximum_protected_payload_increment().unwrap();
-    assert_eq!(bound, 16);
-    let before = payload_state(&control, id).unwrap();
-    let before_claims = {
-        let state = control.inner.state.lock().unwrap();
-        state.joint.as_ref().unwrap().claims.len()
-    };
-    assert!(matches!(
-        source.begin(bound + 1, JointLane::Foreground),
-        Err(WorkError::Capacity(
-            "Root/stage protected payload increment"
-        ))
-    ));
-    assert_eq!(payload_state(&control, id).unwrap(), before);
-    assert_eq!(capacity(&control, JointResource::Computations), 0);
-    {
-        let state = control.inner.state.lock().unwrap();
-        assert_eq!(state.joint.as_ref().unwrap().claims.len(), before_claims);
-        assert_eq!(state.nodes[&work.owner.scope().id].resource_waiters, 0);
-    }
-    let mut admission = batch(&payload, &work, &stage, 4);
-    drive(&mut driver);
-    let mut reply = ready(&mut admission);
-    let mut compute = None;
-    let notification = reply
-        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
-        .unwrap();
-    let after = payload_state(&control, id).unwrap();
-    assert_eq!((after.0, after.1), (before.0, before.1));
-    assert_eq!(alias.capacity_bytes().unwrap(), 12);
-    notification.notify();
-    drop(reply);
-    drop(compute);
-    assert_eq!(capacity(&control, JointResource::Computations), 0);
-    drop(alias);
-    drop(payload);
-    stage.complete();
-    work.business.release();
-    work.owner.complete();
-    drive(&mut driver);
-    assert_eq!(capacity(&control, JointResource::PayloadBytes), 0);
 }
 
 fn installed_binding_computation(
@@ -887,14 +667,13 @@ fn internal_manifest_binding_reuses_all_four_originals_and_productions_without_n
             JointTryBegin::Full(_) => panic!("the actual Q has been reaped"),
         };
         refused.push_payload_dependency(&fact("d")).unwrap();
-        assert!(
-            matches!(
-                refused.push_payload_dependency(&fact("e")),
-                Err(WorkError::Capacity(_))
-            ),
-            "full old/new union rejects the fifth actual origin before formation"
+        refused.push_payload_dependency(&fact("e")).unwrap();
+        refused.end_payload().unwrap();
+        assert_eq!(
+            refused.push_payload_dependency(&fact("f")),
+            Err(WorkError::Conflict)
         );
-        drop(refused);
+        assert!(refused.submit().is_err());
         drive(&mut driver);
         assert_eq!(typed_rows(&control), before);
         let before_ids: Vec<_> = control
@@ -927,21 +706,24 @@ fn internal_manifest_binding_reuses_all_four_originals_and_productions_without_n
             .unwrap()
             .requests
             .len();
-        assert!(matches!(
-            binding.try_begin().unwrap(),
-            JointTryBegin::Full(_)
-        ));
-        assert!(
-            matches!(
-                payload
-                    .root_stage_source(&scope, &stage)
-                    .unwrap()
-                    .try_begin(0, JointLane::Foreground)
-                    .unwrap(),
-                JointTryBegin::Full(_)
-            ),
-            "the unchanged New mode also defers only its original unacquired Q"
-        );
+        // Unrelated unfinished constructors no longer reserve a Q cell.
+        // Merely capturing/dropping either closed mode still changes no row,
+        // creates no ticket, and must not add any typed pin.
+        let existing = match binding.try_begin().unwrap() {
+            JointTryBegin::Started(value) => value,
+            JointTryBegin::Full(_) => panic!("no fixed Q inventory for an existing binding"),
+        };
+        drop(existing);
+        let new_compute = match payload
+            .root_stage_source(&scope, &stage)
+            .unwrap()
+            .try_begin(0, JointLane::Foreground)
+            .unwrap()
+        {
+            JointTryBegin::Started(value) => value,
+            JointTryBegin::Full(_) => panic!("no fixed Q inventory for a New computation"),
+        };
+        drop(new_compute);
         assert_eq!(
             control
                 .inner
@@ -954,12 +736,12 @@ fn internal_manifest_binding_reuses_all_four_originals_and_productions_without_n
                 .requests
                 .len(),
             pending_before,
-            "Full has no new ticket"
+            "unsubmitted original constructors have no new ticket"
         );
         assert_eq!(
             typed_rows(&control),
             before,
-            "pure capability/Q Full adds no typed pins"
+            "unsubmitted original constructors add no typed pins"
         );
         drop(blockers);
         drive(&mut driver);
@@ -1292,7 +1074,7 @@ fn client_stage_window_manifest_retains_bytes_without_pinning_or_reminting_compu
     let original = window.retain_alias();
     assert_eq!(original.client_all_objects_bytes().unwrap(), 8);
     assert!(original.internal_manifest_binding().unwrap().is_none());
-    let mut admission = batch(&payload, &work, &stage, 4);
+    let mut admission = client_stage_request(&payload, &work.owner.scope(), &stage, &original, 4);
     drive(&mut driver);
     let mut proof = ready(&mut admission);
     let mut compute = None;
@@ -1436,3 +1218,386 @@ fn metadata_continuation_requires_same_original_positive_root_payload() {
 
 #[path = "canonical_tests.rs"]
 mod canonical_tests;
+
+#[test]
+fn overflowing_payload_growth_preserves_original_pins_and_source_for_a_valid_followup() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let alias = payload.retain_alias().unwrap();
+    let source = payload
+        .root_stage_source(&work.owner.scope(), &stage)
+        .unwrap();
+    let id = source.fence.payload;
+    let before = payload_state(&control, id).unwrap();
+    let before_claims = {
+        let state = control.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().claims.len()
+    };
+    assert!(matches!(
+        source.begin(u64::MAX, JointLane::Foreground),
+        Err(WorkError::ArithmeticOverflow)
+    ));
+    assert_eq!(payload_state(&control, id).unwrap(), before);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert_eq!(state.joint.as_ref().unwrap().claims.len(), before_claims);
+        assert_eq!(state.nodes[&work.owner.scope().id].resource_waiters, 0);
+    }
+    let mut admission = batch(&payload, &work, &stage, 4);
+    drive(&mut driver);
+    let mut reply = ready(&mut admission);
+    let mut compute = None;
+    let notification = reply
+        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
+        .unwrap();
+    let after = payload_state(&control, id).unwrap();
+    assert_eq!((after.0, after.1), (before.0, before.1));
+    assert_eq!(alias.capacity_bytes().unwrap(), 12);
+    notification.notify();
+    drop(reply);
+    drop(compute);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    drop(alias);
+    drop(payload);
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(capacity(&control, JointResource::PayloadBytes), 0);
+}
+
+#[test]
+fn cancelled_stage_growth_preserves_original_payload_and_existing_computation_without_partial_install()
+ {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let mut first = batch(&payload, &work, &stage, 4);
+    drive(&mut driver);
+    let mut first = ready(&mut first);
+    let mut compute = None;
+    first
+        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
+        .unwrap()
+        .notify();
+    drop(first);
+    drive(&mut driver);
+    let other = child(&work.owner.scope(), &mut driver);
+    let mut refused = batch(&payload, &work, &other, 4);
+    other.cancel(crate::CancellationReason::Requested);
+    drive(&mut driver);
+    assert!(matches!(
+        Pin::new(&mut refused).poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Cancelled(crate::CancellationReason::Requested),
+            ..
+        }))
+    ));
+    assert_eq!(capacity(&control, JointResource::PayloadBytes), 12);
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    assert_eq!(
+        payload.retain_alias().unwrap().capacity_bytes().unwrap(),
+        12
+    );
+    // The original epoch survives both a successful growth and withdrawal.
+    // Release the old actual position, then reuse the same Root and child.
+    let alias = payload.retain_alias().unwrap();
+    let next_stage = child(&work.owner.scope(), &mut driver);
+    let original = payload
+        .root_stage_source(&work.owner.scope(), &next_stage)
+        .unwrap();
+    let id = original.fence.payload;
+    let before_reuse = payload_state(&control, id).unwrap();
+    drop(original);
+    drop(compute);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    let mut next = batch(&payload, &work, &next_stage, 4);
+    drive(&mut driver);
+    let mut next = ready(&mut next);
+    let mut next_compute = None;
+    next.install_in(
+        &work.owner.scope(),
+        &payload,
+        &next_stage,
+        &mut next_compute,
+    )
+    .unwrap()
+    .notify();
+    let after_reuse = payload_state(&control, id).unwrap();
+    assert_eq!(
+        (after_reuse.0, after_reuse.1),
+        (before_reuse.0, before_reuse.1)
+    );
+    assert_eq!(alias.capacity_bytes().unwrap(), 16);
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop(next);
+    drop(next_compute);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    drop(payload);
+    assert_eq!(capacity(&control, JointResource::PayloadBytes), 16);
+    drop(alias);
+    assert_eq!(capacity(&control, JointResource::PayloadBytes), 0);
+    next_stage.complete();
+    other.complete_after_terminal_cancel_settled();
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+}
+
+// The original Client result owner grants one computation at a time. These
+// tests use the actual closed RootStage request, receipt and typed pins.
+fn client_stage_request(
+    payload: &RetainedPayloadGrant,
+    root: &WorkScope,
+    stage: &WorkOwner,
+    window: &crate::ResultWindowAlias,
+    delta: u64,
+) -> RootStageAdmission {
+    let mut proposal = payload
+        .root_stage_source(root, stage)
+        .unwrap()
+        .for_client_window(window)
+        .unwrap()
+        .begin(delta, JointLane::Foreground)
+        .unwrap();
+    proposal.end_payload().unwrap();
+    proposal.end_stage().unwrap();
+    proposal.submit().unwrap()
+}
+
+#[test]
+fn one_original_client_window_waits_for_the_first_computations_last_actual_alias() {
+    let (control, _, mut driver, work, first_stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let scope = work.owner.scope();
+    let second_stage = child(&scope, &mut driver);
+    let result_capacity = scope.result_capacity().unwrap();
+    let window = result_capacity
+        .try_acquire(&scope, crate::ResultWindowClass::Client)
+        .unwrap();
+    let original = window.retain_alias();
+    let mut first = client_stage_request(&payload, &scope, &first_stage, &original, 0);
+    drive(&mut driver);
+    let mut first_ready = ready(&mut first);
+    let mut first_compute = None;
+    first_ready
+        .install_in(&scope, &payload, &first_stage, &mut first_compute)
+        .unwrap()
+        .notify();
+    drop((first_ready, first));
+    let other_window = result_capacity
+        .try_acquire(&scope, crate::ResultWindowClass::Client)
+        .unwrap();
+    assert!(matches!(
+        crate::ResultWindowAlias::from_client_computation(
+            &scope,
+            &first_stage,
+            &other_window.retain_alias(),
+            &payload,
+            first_compute.as_ref().unwrap()
+        ),
+        Err(WorkError::Conflict)
+    ));
+    assert!(matches!(
+        crate::ResultWindowAlias::from_internal_computation(
+            &scope,
+            &first_stage,
+            &payload,
+            first_compute.as_ref().unwrap()
+        ),
+        Err(WorkError::Conflict)
+    ));
+    drop(other_window);
+    let actual_producer = first_compute.as_ref().unwrap().retain_alias().unwrap();
+    let mut second = client_stage_request(&payload, &scope, &second_stage, &original, 0);
+    drive(&mut driver);
+    assert!(
+        Pin::new(&mut second)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    assert_eq!(payload.capacity_bytes().unwrap(), 8);
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop(first_compute.take());
+    drive(&mut driver);
+    assert!(
+        Pin::new(&mut second)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop(actual_producer);
+    drive(&mut driver);
+    let mut second_ready = ready(&mut second);
+    let mut second_compute = None;
+    second_ready
+        .install_in(&scope, &payload, &second_stage, &mut second_compute)
+        .unwrap()
+        .notify();
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    assert!(
+        second_compute
+            .as_ref()
+            .unwrap()
+            .is_for_scope(&second_stage.scope())
+    );
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop((
+        second_ready,
+        second,
+        second_compute,
+        original,
+        window,
+        payload,
+    ));
+    first_stage.complete();
+    second_stage.complete();
+    work.business.release();
+    work.owner.complete();
+    control.close_admission();
+    drive(&mut driver);
+    assert_eq!(result_capacity.snapshot().held_positions, [0; 4]);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn client_window_exit_after_ready_refuses_install_without_mutating_original_claims() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let scope = work.owner.scope();
+    let payload_id = payload
+        .root_stage_source(&scope, &stage)
+        .unwrap()
+        .fence
+        .payload;
+    let retained = payload.retain_alias().unwrap();
+    let original_payload = payload_state(&control, payload_id).unwrap();
+    let result_capacity = scope.result_capacity().unwrap();
+    let window = result_capacity
+        .try_acquire(&scope, crate::ResultWindowClass::Client)
+        .unwrap();
+    let original = window.retain_alias();
+    let mut admission = client_stage_request(&payload, &scope, &stage, &original, 4);
+    drive(&mut driver);
+    let mut output = ready(&mut admission);
+    drop((original, window));
+    // Ready still owns its exact uninstalled raw computation claim. Its real
+    // exit, rather than the last WindowHolder alone, returns this position.
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    let claims = || {
+        let state = control.inner.state.lock().unwrap();
+        state
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .iter()
+            .map(|(&id, row)| {
+                (
+                    id,
+                    row.owner,
+                    row.structure_revision,
+                    row.release_revision,
+                    row.amounts,
+                    row.active_amounts,
+                    Arc::clone(&row.facts.key),
+                    Arc::clone(&row.active_facts.key),
+                    row.pending,
+                    row.custody.is_raw(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = claims();
+    let mut target = None;
+    assert!(matches!(
+        output.install_in(&scope, &payload, &stage, &mut target),
+        Err(WorkError::Released)
+    ));
+    assert!(target.is_none());
+    assert_eq!(claims(), before);
+    assert_eq!(
+        payload_state(&control, payload_id).unwrap(),
+        original_payload
+    );
+    assert!(retained.shares_payload_with(&payload.retain_alias().unwrap()));
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    drop((output, admission));
+    drive(&mut driver);
+    assert_eq!(result_capacity.snapshot().held_positions, [0; 4]);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    assert_eq!(payload.capacity_bytes().unwrap(), 8);
+    assert_eq!(
+        payload_state(&control, payload_id).unwrap(),
+        original_payload
+    );
+    drop((retained, payload));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn last_client_window_exit_defers_original_position_until_actual_computation_exit() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let scope = work.owner.scope();
+    let result_capacity = scope.result_capacity().unwrap();
+    let window = result_capacity
+        .try_acquire(&scope, crate::ResultWindowClass::Client)
+        .unwrap();
+    let original = window.retain_alias();
+    let mut admission = client_stage_request(&payload, &scope, &stage, &original, 0);
+    drive(&mut driver);
+    let mut output = ready(&mut admission);
+    let mut computation = None;
+    output
+        .install_in(&scope, &payload, &stage, &mut computation)
+        .unwrap()
+        .notify();
+    drop((output, admission));
+    let actual_producer = computation.as_ref().unwrap().retain_alias().unwrap();
+    drop((original, window));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop(computation.take());
+    drive(&mut driver);
+    assert_eq!(result_capacity.snapshot().held_positions, [1, 0, 0, 0]);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&scope.id)
+    );
+    drop(actual_producer);
+    drive(&mut driver);
+    assert_eq!(result_capacity.snapshot().held_positions, [0; 4]);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    assert_eq!(payload.capacity_bytes().unwrap(), 8);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&scope.id)
+    );
+    drop(payload);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}

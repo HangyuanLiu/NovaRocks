@@ -56,18 +56,11 @@ impl ConnectorOriginalResultScopeCheck for ReadOriginalCheck {
             .check()
             .map_err(|e| ScopeFailure::new(Class::Admission, e))
     }
-    fn check_before_growth(&self, upper: u64) -> Result<(), ScopeFailure> {
-        self.check_active()?;
-        self.capacity
-            .window_alias()
-            .check_backing_total(upper)
-            .map_err(|e| {
-                tracing::debug!(
-                    requested_upper = upper,
-                    "Statistics original payload invoice refused"
-                );
-                ScopeFailure::new(Class::Coverage, e)
-            })
+    fn check_before_growth(&self, _upper: u64) -> Result<(), ScopeFailure> {
+        // This Provider callback carries SDK/schema construction declarations,
+        // not actual retained Result bytes. Preserve the exact original scope,
+        // deadline and cancellation; actual collectors own payload admission.
+        self.check_active()
     }
 }
 struct StatisticsReadAction {
@@ -159,14 +152,10 @@ impl FrontendStatisticsApplicationPort {
         let profile = lease
             .collection_io_profile()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
-        let bytes = submission_fixed_source_bytes(
-            &profile.geometry(),
-            capacity.scope().joint_dependency_limit().map_err(fail)?,
-        )
-        .map_err(fail)?;
-        origin.check_backing_total(bytes).map_err(fail)?;
+        // The same action's inline declaration is responsibility only.
+        let metadata = std::mem::size_of::<StatisticsReadAction>() as u64;
         let io =
-            MetadataIoAdmission::new(capacity.scope().clone(), profile, bytes).map_err(fail)?;
+            MetadataIoAdmission::new(capacity.scope().clone(), profile, metadata).map_err(fail)?;
         let context = context.clone().with_io_admission(io.clone());
         Ok(Box::new(StatisticsReadAction {
             io,
@@ -466,41 +455,4 @@ impl GovernedStatementResidual for StatisticsReadResidual {
         original.closed = true;
         Poll::Ready(Ok(()))
     }
-}
-pub(super) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use std::alloc::Layout;
-    let mut bytes =
-        MetadataIoAdmission::fixed_backing_bytes(geometry.max_concurrent_io().get(), k)?;
-    for layout in [
-        Layout::new::<StatisticsReadAction>(),
-        Layout::new::<StatisticsReadResidual>(),
-        arc_layout(Layout::new::<StatisticsSubmitWake>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<ReadOriginalCheck>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        // OriginalResultCheckError boxes exactly one error from this checker.
-        // The Provider's actual Arc carrier is quoted by its own source author.
-        if Layout::new::<WorkError>().size()
-            >= Layout::new::<novarocks_spi::connector::ConnectorError>().size()
-        {
-            Layout::new::<WorkError>()
-        } else {
-            Layout::new::<novarocks_spi::connector::ConnectorError>()
-        },
-    ] {
-        bytes = bytes
-            .checked_add(layout.size() as u64)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    // The boxed control refusal above also owns its original fixed diagnostic.
-    // WorkError refusals have no separate String backing.
-    bytes = bytes
-        .checked_add(ConnectorOperationControlView::failure_backing_bytes() as u64)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    bytes.checked_add(crate::query_execution::internal_result_cpu::InternalResultCpu::statistics_port_metadata_bytes_for_composition()?.get())
-        .ok_or(WorkError::ArithmeticOverflow)
 }

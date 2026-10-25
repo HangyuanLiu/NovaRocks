@@ -262,10 +262,11 @@ impl FrontendStatisticsAttemptExecutor {
         let profile = lease
             .collection_io_profile()
             .map_err(|e| Self::failure(e.to_string()))?;
-        let k = scope.joint_dependency_limit().map_err(Self::scope_error)?;
-        let bytes = source_bytes(*profile.geometry(), k, job).map_err(Self::scope_error)?;
-        let io =
-            MetadataIoAdmission::new(scope.clone(), profile, bytes).map_err(Self::scope_error)?;
+        // The original action header remains a responsibility fact. Provider
+        // profile/SDK layout declarations do not authorize actual Result bytes.
+        let metadata = std::mem::size_of::<StatisticsAction>() as u64;
+        let io = MetadataIoAdmission::new(scope.clone(), profile, metadata)
+            .map_err(Self::scope_error)?;
         io.adopt_original_payload_in(&mut originals.root_payload)
             .map_err(Self::scope_error)?;
         // The former repository view was only a retention alias of this same
@@ -339,7 +340,7 @@ impl FrontendStatisticsAttemptExecutor {
                 execution.test_statement_nomination(),
             )
             .map_err(|e| Self::failure(e.to_string()))?;
-        let request = Self::request(job)?; // source_bytes covered actual variable backing before these copies.
+        let request = Self::request(job)?;
         let mut action: Option<Box<dyn GovernedBackgroundAction>> =
             Some(Box::new(StatisticsAction {
                 state: Some(StatisticsState {
@@ -1345,174 +1346,6 @@ async fn close_session(
     }
     provider.close().await?;
     Ok(())
-}
-
-pub(crate) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use std::alloc::Layout;
-    fn f7<A, B, C, D, E, F, G, H: Future>(_: fn(A, B, C, D, E, F, G) -> H) -> Layout {
-        Layout::new::<H>()
-    }
-    fn f10<A, B, C, D, E, F, G, H, I, J, K: Future>(
-        _: fn(A, B, C, D, E, F, G, H, I, J) -> K,
-    ) -> Layout {
-        Layout::new::<K>()
-    }
-    fn f4<A, B, C, D, F: Future>(_: fn(A, B, C, D) -> F) -> Layout {
-        Layout::new::<F>()
-    }
-    fn f1<A, F: Future>(_: fn(A) -> F) -> Layout {
-        Layout::new::<F>()
-    }
-    fn f5<A, B, C, D, E, F: Future>(_: fn(A, B, C, D, E) -> F) -> Layout {
-        Layout::new::<F>()
-    }
-    let mut total =
-        MetadataIoAdmission::fixed_backing_bytes(geometry.max_concurrent_io().get(), k)?;
-    let layouts = [
-        Layout::new::<StatisticsAction>(),
-        Layout::new::<StatisticsResidual>(),
-        arc_layout(Layout::new::<tokio::sync::Mutex<SessionSlot>>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<tokio::sync::Mutex<PlanSlot>>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<StatisticsWake>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        f4(execute_statistics_original),
-        f7(begin_session),
-        f10(prepare_plan),
-        f1(publish_session),
-        f5(close_session),
-        QueryResultCapacityBinding::fixed_backing_layout()?,
-        QueryResultCapacityBinding::fixed_backing_layout()?,
-    ];
-    for layout in layouts.into_iter().chain(
-        FrontendCompletionCustody::known_layouts().map_err(|_| WorkError::ArithmeticOverflow)?,
-    ) {
-        total = total
-            .checked_add(layout.size() as u64)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for bytes in [novarocks_query_application::coordination::LogicalExecutionSupervisor::background_action_source_geometry().fixed_source_bytes()? as u64,
-        crate::query_execution::internal_result_cpu::InternalResultCpu::statistics_port_metadata_bytes_for_composition()?.get(),
-        crate::query_execution::statistics::preparation::statistics_preparation_custody_metadata_bytes()?.get(),
-        crate::query::statement_computation::stage_heap_source_bytes()? as u64,
-        StatementNativeTail::retained_heap_bytes()? as u64,InitialComputationReservation::fixed_backing_bytes()? as u64,
-        ConnectorStatisticsLease::session_backing_bytes() as u64] {
-        total=total.checked_add(bytes).ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    Ok(total)
-}
-fn source_bytes(
-    geometry: novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-    job: &StatisticsJob,
-) -> Result<u64, WorkError> {
-    let columns: &[Arc<str>] = match &job.columns {
-        StatisticsColumns::All => &[],
-        StatisticsColumns::Explicit(columns) => columns,
-    };
-    source_bytes_parts(
-        &geometry,
-        k,
-        [
-            job.target.catalog.len(),
-            job.target.namespace.len(),
-            job.target.table.len(),
-        ],
-        job.target.object_id.len(),
-        matches!(&job.columns, StatisticsColumns::Explicit(_)),
-        columns.iter().map(|name| name.len()),
-    )
-}
-/// The submission author borrows the original SQL/capture fields. It can pay
-/// their queued Arc backing before constructing any of those new allocations.
-pub(crate) fn queued_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-    target: &super::application::StatisticsTableTarget,
-    columns: &super::application::StatisticsColumnIntent,
-    object_id: &[u8],
-) -> Result<u64, WorkError> {
-    let explicit = matches!(
-        columns,
-        super::application::StatisticsColumnIntent::Explicit(_)
-    );
-    let columns: &[String] = match columns {
-        super::application::StatisticsColumnIntent::AllColumns => &[],
-        super::application::StatisticsColumnIntent::Explicit(columns) => columns,
-    };
-    source_bytes_parts(
-        geometry,
-        k,
-        [
-            target.catalog.len(),
-            target.namespace.len(),
-            target.table.len(),
-        ],
-        object_id.len(),
-        explicit,
-        columns.iter().map(|name| name.len()),
-    )
-}
-fn source_bytes_parts(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-    names: [usize; 3],
-    object_len: usize,
-    explicit: bool,
-    columns: impl ExactSizeIterator<Item = usize>,
-) -> Result<u64, WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use std::alloc::Layout;
-    let mut total = fixed_source_bytes(geometry, k)?;
-    let mut add = |bytes: usize| -> Result<(), WorkError> {
-        total = total
-            .checked_add(u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(())
-    };
-    // Same queued definition graph plus the actual request/relation copies.
-    // This metadata stays in the original Root payload; Arc clones are free.
-    for len in names {
-        add(
-            arc_layout(Layout::array::<u8>(len).map_err(|_| WorkError::ArithmeticOverflow)?)
-                .map_err(|_| WorkError::ArithmeticOverflow)?
-                .size(),
-        )?;
-        add(len.checked_mul(3).ok_or(WorkError::ArithmeticOverflow)?)?;
-    }
-    add(
-        arc_layout(Layout::array::<u8>(object_len).map_err(|_| WorkError::ArithmeticOverflow)?)
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .size(),
-    )?;
-    add(object_len)?;
-    if explicit {
-        add(arc_layout(
-            Layout::array::<Arc<str>>(columns.len()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        )
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .size())?;
-        // Submission materializes this exact Vec before moving it into Arc.
-        add(Layout::array::<Arc<str>>(columns.len())
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .size())?;
-        add(Layout::array::<String>(columns.len())
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .size())?;
-        for len in columns {
-            add(
-                arc_layout(Layout::array::<u8>(len).map_err(|_| WorkError::ArithmeticOverflow)?)
-                    .map_err(|_| WorkError::ArithmeticOverflow)?
-                    .size(),
-            )?;
-            add(len)?;
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]

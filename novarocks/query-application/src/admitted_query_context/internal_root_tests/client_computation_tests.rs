@@ -15,47 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual P=1 original claims, weak manifests and the original activity cell.
+//! Original computation custody, weak manifests and the actual activity cell.
 use super::*;
 
-fn assert_finite_stage_refused(
-    payload: &RetainedPayloadGrant,
-    root: &WorkScope,
+fn assert_original_compute_held(
+    binding: &QueryResultCapacityBinding,
     stage: &WorkOwner,
-    driver: &mut JointProgressDriver,
+    activities: usize,
+    sealed: bool,
     phase: &str,
 ) {
-    let mut batch = payload
-        .root_stage_source(root, stage)
-        .unwrap()
-        .begin(4, JointLane::Foreground)
-        .unwrap();
-    batch.end_payload().unwrap();
-    batch.end_stage().unwrap();
-    let mut probe = batch.submit().unwrap();
-    drive(driver);
-    match Pin::new(&mut probe).poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(Err(failure)) => {
-            eprintln!("Client finite P=1 probe {phase}: {failure:?}");
-            assert_eq!(
-                failure.error,
-                WorkError::JointCapacity(novarocks_workload_control::joint_admission::JointCapacityFailure {
-                    resource: JointResource::Computations,
-                    projection: novarocks_workload_control::joint_admission::JointCapacityProjection::Global,
-                    constraint: novarocks_workload_control::joint_admission::JointCapacityConstraint::Global,
-                }),
-                "only the actual saturated resource proof is the expected refusal",
-            );
-        }
-        Poll::Ready(Ok(_)) => panic!("Client finite P=1 probe {phase} acquired P too early"),
-        Poll::Pending => panic!("Client finite P=1 probe {phase} did not finish its finite proof"),
-    }
-    drop(probe);
-    drive(driver);
+    let state = binding.activity.state.lock().unwrap();
+    assert_eq!(state.count, activities, "{phase}");
+    let client = state.client.as_ref().unwrap();
+    assert_eq!(client.sealed, sealed, "{phase}");
+    assert!(
+        !client.producer_exited && !client.retiring && !client.retired,
+        "{phase}"
+    );
+    assert!(
+        client.grant.as_ref().unwrap().is_for_scope(&stage.scope()),
+        "{phase}"
+    );
 }
 
 #[test]
-fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot_reopen_p() {
+fn client_seal_with_zero_activity_requires_actual_producer_exit_and_cannot_reopen_original_compute()
+{
     let (control, handle, mut driver) = fixture_with_client(true);
     let root = root(&control);
     let root_scope = root.owner.scope();
@@ -74,9 +60,20 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
         .unwrap()
         .notify();
     let payload = payload.unwrap();
+    let window = root_scope
+        .result_capacity()
+        .unwrap()
+        .try_acquire(
+            &root_scope,
+            novarocks_workload_control::ResultWindowClass::Client,
+        )
+        .unwrap();
+    let original_window = window.retain_alias();
     let stage = joint_child(&root_scope, &mut driver);
     let mut batch = payload
         .root_stage_source(&root_scope, &stage)
+        .unwrap()
+        .for_client_window(&original_window)
         .unwrap()
         .begin(4, JointLane::Foreground)
         .unwrap();
@@ -86,7 +83,7 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
     drive(&mut driver);
     let mut ready = match Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(Ok(value)) => value,
-        _ => panic!("actual first P=1 stage"),
+        _ => panic!("actual original first stage"),
     };
     let mut compute = None;
     ready
@@ -96,19 +93,11 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
     drop(ready);
     drop(pending);
     drive(&mut driver);
-    let window = root_scope
-        .result_capacity()
-        .unwrap()
-        .try_acquire(
-            &root_scope,
-            novarocks_workload_control::ResultWindowClass::Client,
-        )
-        .unwrap();
     let mut binding = None;
     QueryResultCapacityBinding::from_owned_client_computation_in(
         &root_scope,
         &stage,
-        &window.retain_alias(),
+        &original_window,
         &payload,
         &mut compute,
         &mut binding,
@@ -135,35 +124,12 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
     let cut = binding.client_computation_cut_handle().unwrap();
     let activity = binding.begin_result_activity().unwrap();
     let next = joint_child(&root_scope, &mut driver);
-    assert_finite_stage_refused(&payload, &root_scope, &next, &mut driver, "producer active");
-    cut.seal_producer().unwrap();
-    drive(&mut driver);
-    assert_finite_stage_refused(
-        &payload,
-        &root_scope,
-        &next,
-        &mut driver,
-        "sealed producer with live activity and local body",
-    );
-    assert!(
-        binding.begin_result_activity().is_err(),
-        "closed producer cannot start more activity"
-    );
-    drop(activity);
-    drive(&mut driver);
-    assert_finite_stage_refused(
-        &payload,
-        &root_scope,
-        &next,
-        &mut driver,
-        "sealed producer with zero activity but live local body",
-    );
-    producer.native_body_exited().unwrap();
-    drive(&mut driver);
-    // A completed finite refusal cannot later become a grant. Submit one
-    // fresh original request after the actual producer exit returned P.
+    // Both requests borrow the original Client window's one computation
+    // position. This same pending request must observe its actual last exit.
     let mut batch = payload
         .root_stage_source(&root_scope, &next)
+        .unwrap()
+        .for_client_window(&original_window)
         .unwrap()
         .begin(4, JointLane::Foreground)
         .unwrap();
@@ -171,13 +137,63 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
     batch.end_stage().unwrap();
     let mut second = batch.submit().unwrap();
     drive(&mut driver);
+    assert!(
+        Pin::new(&mut second)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "the same Client window retains its active original computation"
+    );
+    assert_original_compute_held(&binding, &stage, 1, false, "producer active");
+    cut.seal_producer().unwrap();
+    drive(&mut driver);
+    assert_original_compute_held(
+        &binding,
+        &stage,
+        1,
+        true,
+        "sealed producer with live activity and local body",
+    );
+    assert!(
+        Pin::new(&mut second)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "producer seal and activity zero do not substitute for actual body exit"
+    );
+    assert!(
+        binding.begin_result_activity().is_err(),
+        "closed producer cannot start more activity"
+    );
+    drop(activity);
+    drive(&mut driver);
+    assert_original_compute_held(
+        &binding,
+        &stage,
+        0,
+        true,
+        "sealed producer with zero activity but live local body",
+    );
+    assert!(
+        Pin::new(&mut second)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "producer seal and activity zero do not substitute for actual body exit"
+    );
+    producer.native_body_exited().unwrap();
+    drive(&mut driver);
+    {
+        let state = binding.activity.state.lock().unwrap();
+        let client = state.client.as_ref().unwrap();
+        assert!(client.producer_exited && client.retired && client.grant.is_none());
+    }
+    // The original request now progresses on the same window after its
+    // previous computation's true exit; no replacement request is minted.
     let mut second_ready = match Pin::new(&mut second).poll(&mut Context::from_waker(Waker::noop()))
     {
         Poll::Ready(Ok(value)) => value,
         Poll::Ready(Err(failure)) => {
-            panic!("actual second P=1 stage refused after producer exit: {failure:?}")
+            panic!("actual second stage refused after producer exit: {failure:?}")
         }
-        Poll::Pending => panic!("actual second P=1 stage must finish its finite proof"),
+        Poll::Pending => panic!("actual second stage must finish its responsibility transaction"),
     };
     let mut second_compute = None;
     second_ready
@@ -188,15 +204,20 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
     drop(second);
     drive(&mut driver);
     assert!(old_manifest.try_begin().is_err());
-    assert!(authority
-        .action_source(JointLane::Foreground, quote)
-        .is_err());
-    assert!(old
-        .native_action_source(JointLane::Foreground, quote)
-        .is_err());
-    assert!(authority
-        .action_source(JointLane::Settlement, quote)
-        .is_ok());
+    assert!(
+        authority
+            .action_source(JointLane::Foreground, quote)
+            .is_err()
+    );
+    assert!(
+        old.native_action_source(JointLane::Foreground, quote)
+            .is_err()
+    );
+    assert!(
+        authority
+            .action_source(JointLane::Settlement, quote)
+            .is_ok()
+    );
     assert!(QueryResultCapacityBinding::try_new(&stage.scope(), old.try_clone().unwrap()).is_err());
     let descendant = joint_child(&stage.scope(), &mut driver);
     let projected = old.for_child(&descendant.scope()).unwrap();
@@ -232,6 +253,7 @@ fn client_seal_with_zero_activity_still_requires_actual_producer_exit_and_cannot
         old,
         binding,
         tail,
+        original_window,
         window,
         payload,
     ));

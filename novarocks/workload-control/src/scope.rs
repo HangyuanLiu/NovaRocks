@@ -192,6 +192,8 @@ impl WorkloadConfig {
 }
 
 pub(crate) struct Node {
+    pub(crate) internal_result_bytes:
+        std::sync::Weak<crate::result_window::retained_bytes::RetainedBytes>,
     pub(crate) root_domains: Option<crate::joint_admission::ledger::root_domains::RootDomains>,
     pub parent: Option<WorkId>,
     pub root: WorkId,
@@ -230,6 +232,7 @@ pub(crate) struct Node {
 impl Node {
     fn new(parent: Option<WorkId>, root: WorkId, class: WorkClass, cancellation: SlotId) -> Self {
         Self {
+            internal_result_bytes: std::sync::Weak::new(),
             root_domains: None,
             parent,
             root,
@@ -329,7 +332,7 @@ impl State {
                 .joint
                 .as_mut()
                 .unwrap()
-                .activate_control_slot(slot, claim)
+                .activate_control_slot(slot, claim, class)
             {
                 self.cancellations.retire(slot);
                 return Err(error);
@@ -366,7 +369,7 @@ impl State {
                 .joint
                 .as_mut()
                 .unwrap()
-                .activate_control_slot(slot, claim)
+                .activate_control_slot(slot, claim, class)
             {
                 self.cancellations.retire(slot);
                 return Err(error);
@@ -1256,6 +1259,12 @@ pub struct WorkScope {
 }
 
 impl WorkScope {
+    /// Observe only whether this original owner installed its responsibility
+    /// service. This grants no source, resource or permission to start work.
+    pub fn has_responsibility_service(&self) -> bool {
+        self.inner.state.lock().unwrap().joint.is_some()
+    }
+
     pub fn id(&self) -> WorkId {
         self.id
     }

@@ -25,43 +25,35 @@ use crate::control_storage::{ControlSlot, ControlStorageConfig};
 /// Provider URL input parsing or complete roles. No production activation.
 pub(crate) fn control_storage_base(
     config: ControlStorageConfig<'_>,
-    joint: &JointCapacityConfig,
 ) -> Result<JointResources, WorkError> {
-    use crate::control_storage::{
-        arc_bytes, btree_peak_bytes, resources_for_bytes, storage_cell_bytes,
-    };
+    use crate::control_storage::{btree_peak_bytes, resources_for_bytes, storage_cell_bytes};
     let count = config.count()?;
-    if count == 0
-        || config.proposals_per_slot == 0
-        || config.children_per_slot > count.saturating_sub(1)
-    {
+    if count == 0 {
         return Err(WorkError::InvalidConfig("fixed control storage geometry"));
     }
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return Err(WorkError::InvalidConfig("fixed control storage platform"));
-    }
-    let proposal_bytes = std::mem::size_of::<proposal_storage::ProposalCell>()
-        .checked_add(arc_bytes::<proposal_storage::ProposalBody>()?)
-        .and_then(|n| n.checked_mul(config.proposals_per_slot))
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    let cell = storage_cell_bytes()?
-        .checked_add(proposal_bytes)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    let proposals = count
-        .checked_mul(config.proposals_per_slot)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    let shared_children = crate::cancellation::shared_child_index_backing_bytes(count)?;
-    let mut bytes = cell
+    let mut bytes = storage_cell_bytes()?
         .checked_mul(count)
         .and_then(|n| n.checked_add(std::mem::size_of::<CancellationStorage>()))
-        .and_then(|n| n.checked_add(shared_children))
         .ok_or(WorkError::ArithmeticOverflow)?;
     bytes = bytes
-        .checked_add(metadata_geometry::backing_bytes(
-            joint,
-            proposals,
-            config.slots_per_class.iter().filter(|n| **n != 0).count(),
+        .checked_add(crate::cancellation::shared_child_index_backing_bytes(
+            count,
         )?)
+        .and_then(|n| n.checked_add(std::mem::size_of::<JointLedger>()))
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    // Five immutable identity labels, not five resource reservations.
+    let empty_facts = crate::control_storage::arc_bytes::<ResponsibilityFacts>()?
+        .checked_add(crate::control_storage::arc_bytes::<FactKey>()?)
+        .and_then(|n| {
+            n.checked_add(crate::control_storage::arc_bytes::<Vec<DependencyRef>>().ok()?)
+        })
+        .and_then(|n| n.checked_mul(5))
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    bytes = bytes
+        .checked_add(empty_facts)
+        .and_then(|n| {
+            n.checked_add(crate::control_storage::arc_bytes::<ResponsibilityConfig>().ok()?)
+        })
         .ok_or(WorkError::ArithmeticOverflow)?;
     for role in config.poll_roles {
         bytes = bytes
@@ -71,46 +63,19 @@ pub(crate) fn control_storage_base(
     bytes = bytes
         .checked_add(config.process_sources.bytes(count)?)
         .ok_or(WorkError::ArithmeticOverflow)?;
-    // Fixed inventory reserves the original maps' retained roots and one
-    // insertion path peak. These are whole-map amounts, counted exactly once.
-    for map in [
+    for backing in [
         btree_peak_bytes::<WorkId, crate::scope::Node>(count)?,
-        btree_peak_bytes::<u64, ClaimRecord>(joint.max_claims)?,
-        // Sorted commit may install a new key before retiring a zero old key.
-        btree_peak_bytes::<Arc<ProfileKey>, ProfileRecord>(
-            joint
-                .max_claims
-                .checked_add(joint.max_changes_per_request)
-                .ok_or(WorkError::ArithmeticOverflow)?,
-        )?,
-        btree_peak_bytes::<u64, RequestRecord>(
-            count
-                .checked_mul(config.proposals_per_slot)
-                .ok_or(WorkError::ArithmeticOverflow)?,
-        )?,
+        btree_peak_bytes::<u64, ClaimRecord>(count)?,
     ] {
         bytes = bytes
-            .checked_add(map)
+            .checked_add(backing)
             .ok_or(WorkError::ArithmeticOverflow)?;
     }
-    // Evenly reserve this one physical envelope across its original members.
-    // Rounding reserves at most count-1 extra bytes; it is not an RSS multiplier.
     let per_slot = bytes
         .checked_add(count - 1)
         .ok_or(WorkError::ArithmeticOverflow)?
         / count;
     resources_for_bytes(per_slot)
-}
-
-pub(crate) fn control_storage_dependency_records(
-    config: ControlStorageConfig<'_>,
-    joint: &JointCapacityConfig,
-) -> Result<usize, WorkError> {
-    let proposals = config
-        .count()?
-        .checked_mul(config.proposals_per_slot)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    metadata_geometry::maximum_dependency_origins(joint, proposals)
 }
 
 impl WorkloadControl {
@@ -122,11 +87,7 @@ impl WorkloadControl {
         config: ControlStorageConfig<'_>,
     ) -> Result<(), WorkError> {
         let count = config.count()?;
-        let geometry = {
-            let state = self.inner.state.lock().unwrap();
-            Arc::clone(&state.joint.as_ref().ok_or(WorkError::NotReady)?.config)
-        };
-        let base = control_storage_base(config, &geometry.config)?;
+        let base = control_storage_base(config)?;
         if count != self.inner.config.scope_records_limit {
             return Err(WorkError::InvalidConfig("fixed control scope inventory"));
         }
@@ -139,82 +100,21 @@ impl WorkloadControl {
                 return Err(WorkError::Conflict);
             }
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-            if ledger.driver_closed
-                || ledger.active.is_some()
-                || !ledger.claims.is_empty()
-                || !ledger.requests.is_empty()
-            {
+            if ledger.driver_closed || !ledger.claims.is_empty() || !ledger.requests.is_empty() {
                 return Err(WorkError::Conflict);
-            }
-            let declared = &ledger.config.config;
-            if declared.max_claims < count
-                || declared.max_requests
-                    < count
-                        .checked_mul(config.proposals_per_slot)
-                        .ok_or(WorkError::ArithmeticOverflow)?
-            {
-                return Err(WorkError::InvalidConfig("fixed control claim inventory"));
-            }
-            let total_scopes = u64::try_from(count).map_err(|_| WorkError::ArithmeticOverflow)?;
-            let totals = |n: usize| -> Result<JointResources, WorkError> {
-                let mut result = JointResources::ZERO;
-                for index in 0..RESOURCE_COUNT {
-                    result.0[index] = base.0[index]
-                        .checked_mul(u64::try_from(n).map_err(|_| WorkError::ArithmeticOverflow)?)
-                        .ok_or(WorkError::ArithmeticOverflow)?;
-                }
-                Ok(result)
-            };
-            if declared.global.global.get(JointResource::ScopeRecords) != total_scopes
-                || declared.lanes[JointLane::Custody as usize]
-                    .global
-                    .get(JointResource::ScopeRecords)
-                    != total_scopes
-                || !declared.global.global.covers(totals(count)?)
-                || !declared.lanes[JointLane::Custody as usize]
-                    .global
-                    .covers(totals(count)?)
-            {
-                return Err(WorkError::InvalidConfig("fixed global custody inventory"));
-            }
-            for (class, n) in config.slots_per_class.into_iter().enumerate() {
-                let n64 = u64::try_from(n).map_err(|_| WorkError::ArithmeticOverflow)?;
-                if declared.classes[class]
-                    .global
-                    .get(JointResource::ScopeRecords)
-                    != n64
-                    || declared.class_lanes[class][JointLane::Custody as usize]
-                        .global
-                        .get(JointResource::ScopeRecords)
-                        != n64
-                    || !declared.classes[class].global.covers(totals(n)?)
-                    || !declared.class_lanes[class][JointLane::Custody as usize]
-                        .global
-                        .covers(totals(n)?)
-                {
-                    return Err(WorkError::InvalidConfig("fixed class custody inventory"));
-                }
             }
             state
                 .next_id
-                .checked_add(total_scopes)
+                .checked_add(u64::try_from(count).map_err(|_| WorkError::ArithmeticOverflow)?)
                 .ok_or(WorkError::ArithmeticOverflow)?;
-            let rows = control_storage_dependency_records(config, declared)?;
-            if declared.max_registered_dependencies < rows {
-                return Err(WorkError::InvalidConfig(
-                    "fixed dependency membership inventory",
-                ));
-            }
-            let dependencies = DependencyRegistry::new(declared.max_registered_dependencies)?;
+            let dependencies = DependencyRegistry::new();
             let shared_children = crate::cancellation::new_shared_child_index();
             let mut slots = Vec::new();
             slots
                 .try_reserve_exact(count)
                 .map_err(|_| WorkError::Capacity("fixed control inventory"))?;
             let mut claims = BTreeMap::new();
-            let mut profiles: BTreeMap<Arc<ProfileKey>, ProfileRecord> = BTreeMap::new();
             let mut empty_facts = std::array::from_fn(|_| None);
-            let mut free_heads = [None; 5];
             let classes = [
                 WorkClass::Query,
                 WorkClass::MaterializedView,
@@ -222,103 +122,83 @@ impl WorkloadControl {
                 WorkClass::TableMaintenance,
                 WorkClass::Management,
             ];
-            for (class, n) in config.slots_per_class.into_iter().enumerate() {
-                if n == 0 {
-                    continue;
-                }
-                let facts = Arc::new(ProfileFacts {
-                    key: Arc::new(ProfileKey {
+            for (class, _) in classes.iter().enumerate() {
+                let facts = Arc::new(ResponsibilityFacts {
+                    key: Arc::new(FactKey {
                         origin: GroupOrigin::Frozen,
                         class,
                         lane: JointLane::Custody as usize,
                         dependencies: Vec::new(),
-                        causal: CausalMask::NONE,
+                        source_kind: SourceKind::Plain,
                     }),
                     class: classes[class],
                     lane: JointLane::Custody,
                     dependencies: Arc::new(Vec::<DependencyRef>::new()),
                 });
                 empty_facts[class] = Some(Arc::clone(&facts));
-                free_heads[class] = Some(SlotId(slots.len()));
-                for offset in 0..n {
-                    let cell = crate::cancellation::Cancellation::preallocated_fixed(
-                        Arc::clone(&shared_children),
-                        slots.len(),
-                        config.children_per_slot,
-                    );
-                    let claim = state.next_id()?;
-                    let id = SlotId(slots.len());
-                    let mut proposals = Vec::new();
-                    proposals
-                        .try_reserve_exact(config.proposals_per_slot)
-                        .map_err(|_| WorkError::Capacity("fixed proposal inventory"))?;
-                    for _ in 0..config.proposals_per_slot {
-                        proposals.push(proposal_storage::ProposalCell::new());
-                    }
-                    let mut polls = Vec::new();
-                    polls
-                        .try_reserve_exact(config.poll_roles.len())
-                        .map_err(|_| WorkError::Capacity("fixed poll backing inventory"))?;
-                    for &role in config.poll_roles {
-                        polls.push(crate::role_poll::PollBacking::new(
-                            role,
-                            SlotId(slots.len()),
-                        ));
-                    }
-                    slots.push(ControlSlot {
-                        retired_root_domains: None,
-                        cell: Some(cell),
-                        proposals,
-                        polls,
-                        class: classes[class],
-                        phase: SlotPhase::Free,
-                        generation: 0,
-                        claim: Some(claim),
-                        base,
-                        parent: None,
-                        next_free: (offset + 1 < n).then_some(SlotId(id.0 + 1)),
-                    });
-                    claims.insert(
-                        claim,
-                        ClaimRecord {
-                            domain_birth: None,
-                            native_dispatch: None,
-                            dispatch_staging: None,
-                            custody: ClaimCustody::Raw,
-                            production: None,
-                            owner: ClaimOwner::ControlSlot(id),
-                            facts: Arc::clone(&facts),
-                            amounts: base,
-                            active_facts: Arc::clone(&facts),
-                            active_amounts: base,
-                            pending: None,
-                            structure_revision: 0,
-                            release_revision: 0,
-                        },
-                    );
-                    let profile = profiles
-                        .entry(Arc::clone(&facts.key))
-                        .or_insert(ProfileRecord {
-                            facts: Arc::clone(&facts),
-                            amounts: JointResources::ZERO,
-                            claims: 0,
-                        });
-                    profile.amounts = profile.amounts.checked_add(base)?;
-                    profile.claims += 1;
+            }
+            let facts = Arc::clone(empty_facts[0].as_ref().unwrap());
+            for offset in 0..count {
+                let cell = crate::cancellation::Cancellation::preallocated_fixed(
+                    Arc::clone(&shared_children),
+                    slots.len(),
+                    count - 1,
+                );
+                let claim = state.next_id()?;
+                let id = SlotId(slots.len());
+                let mut polls = Vec::new();
+                polls
+                    .try_reserve_exact(config.poll_roles.len())
+                    .map_err(|_| WorkError::Capacity("fixed poll backing inventory"))?;
+                for &role in config.poll_roles {
+                    polls.push(crate::role_poll::PollBacking::new(
+                        role,
+                        SlotId(slots.len()),
+                    ));
                 }
+                slots.push(ControlSlot {
+                    retired_root_domains: None,
+                    cell: Some(cell),
+                    polls,
+                    class: WorkClass::Query,
+                    phase: SlotPhase::Free,
+                    generation: 0,
+                    claim: Some(claim),
+                    base,
+                    parent: None,
+                    next_free: (offset + 1 < count).then_some(SlotId(id.0 + 1)),
+                });
+                claims.insert(
+                    claim,
+                    ClaimRecord {
+                        internal_position: false,
+                        computation_window: None,
+                        domain_birth: None,
+                        native_dispatch: None,
+                        dispatch_staging: None,
+                        custody: ClaimCustody::Raw,
+                        production: None,
+                        owner: ClaimOwner::ControlSlot(id),
+                        facts: Arc::clone(&facts),
+                        amounts: base,
+                        active_facts: Arc::clone(&facts),
+                        active_amounts: base,
+                        pending: None,
+                        structure_revision: 0,
+                        release_revision: 0,
+                    },
+                );
             }
             let ledger = state.joint.as_mut().unwrap();
             ledger.dependencies = Some(dependencies);
             ledger.claims = claims;
-            ledger.profiles = profiles;
             ledger.control_empty_facts = empty_facts;
             state.cancellations = CancellationStorage {
                 slots,
                 fixed: true,
                 retired: 0,
-                retired_proposals: 0,
                 retired_polls: 0,
-                free_heads,
+                free_head: (count != 0).then_some(SlotId(0)),
                 legacy_vacant: None,
             };
             Ok(())
@@ -341,6 +221,7 @@ impl JointLedger {
         &mut self,
         slot: SlotId,
         claim: u64,
+        class: WorkClass,
     ) -> Result<(), WorkError> {
         let record = self.claims.get_mut(&claim).ok_or(WorkError::Released)?;
         if self.driver_closed
@@ -349,10 +230,18 @@ impl JointLedger {
         {
             return Err(WorkError::Conflict);
         }
-        record.structure_revision = record
+        let facts = Arc::clone(
+            self.control_empty_facts[class_index(class)]
+                .as_ref()
+                .unwrap(),
+        );
+        let revision = record
             .structure_revision
             .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
+        record.facts = Arc::clone(&facts);
+        record.active_facts = facts;
+        record.structure_revision = revision;
         Ok(())
     }
 
@@ -378,8 +267,6 @@ impl JointLedger {
             Some(revision) => record.structure_revision = revision,
             None => self.driver_closed = true,
         }
-        subtract_profile(self, &from, amount);
-        add_profile(self, Arc::clone(&to), base);
         if from.key != to.key {
             self.layout_changed();
         }
@@ -389,8 +276,8 @@ impl JointLedger {
 
 #[cfg(test)]
 impl JointLedger {
-    pub(crate) fn config_for_test(&self) -> JointCapacityConfig {
-        self.config.config.clone()
+    pub(crate) fn config_for_test(&self) -> ResponsibilityConfig {
+        *self.config
     }
 
     pub(crate) fn control_snapshot_for_test(&self) -> (usize, usize, JointResources, usize) {
@@ -404,12 +291,7 @@ impl JointLedger {
                 bound += usize::from(!record.facts.dependencies.is_empty());
             }
         }
-        (
-            records,
-            self.profiles.values().map(|profile| profile.claims).sum(),
-            amount,
-            bound,
-        )
+        (records, self.claims.len(), amount, bound)
     }
 
     pub(crate) fn control_has_domains_for_test(
@@ -452,20 +334,18 @@ impl JointLedger {
                     .unwrap()
             });
         let ordinal = dependency.ordinal;
-        let to = Arc::new(ProfileFacts {
-            key: Arc::new(ProfileKey {
+        let to = Arc::new(ResponsibilityFacts {
+            key: Arc::new(FactKey {
                 origin: GroupOrigin::Frozen,
                 class: class_index(from.class),
                 lane: from.lane as usize,
                 dependencies: vec![ordinal],
-                causal: CausalMask::NONE,
+                source_kind: SourceKind::Plain,
             }),
             class: from.class,
             lane: from.lane,
             dependencies: Arc::new(vec![dependency]),
         });
-        subtract_profile(self, &from, amount);
-        add_profile(self, Arc::clone(&to), amount);
         let record = self.claims.get_mut(&claim).unwrap();
         record.facts = Arc::clone(&to);
         record.active_facts = to;

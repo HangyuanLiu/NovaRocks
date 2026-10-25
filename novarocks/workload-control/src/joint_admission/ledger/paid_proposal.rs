@@ -92,28 +92,12 @@ impl DependencyInput<'_> {
 pub(super) struct PendingChange {
     pub(super) origin: GroupOrigin,
     source: Option<JointClaimView>,
-    original: Option<(Arc<ProfileFacts>, JointResources)>,
+    original: Option<(Arc<ResponsibilityFacts>, JointResources)>,
     selected: Vec<DependencyRef>,
     lane: JointLane,
     amounts: JointResources,
     additional: usize,
     first_bind: bool,
-}
-
-fn track_dependency_union(
-    union: &mut Vec<u64>,
-    dependencies: &[DependencyRef],
-    maximum: usize,
-) -> Result<(), WorkError> {
-    for record in dependencies {
-        if let Err(position) = union.binary_search(&record.ordinal) {
-            if union.len() >= maximum {
-                return Err(WorkError::Capacity("joint request dependency union"));
-            }
-            union.insert(position, record.ordinal);
-        }
-    }
-    Ok(())
 }
 
 /// One original prepaid proposal position, including its construction phase.
@@ -135,18 +119,15 @@ fn track_dependency_union(
 pub struct JointProposal {
     pub(super) root_domain: Option<RootDomainChange>,
     root_stage: Option<RootStageFence>,
+    computation_window: Option<crate::result_window::ClientComputationWindow>,
     root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
     control_action: Option<ControlActionFence>,
     native_action: Option<NativeActionFence>,
     pub(super) records: Vec<ChangeRecord>,
-    // The complete source union, shared by every change in this one paid
-    // request. Ordinals grant no access and retain no canonical fact alias.
-    dependency_union: Vec<u64>,
     pub(super) current: Option<PendingChange>,
     custody: Option<ProposalConstruction>,
     pub(super) scope: WorkScope,
-    config: Arc<ValidatedJointCapacityConfig>,
     class: WorkClass,
     started: usize,
     failed: Option<WorkError>,
@@ -236,41 +217,32 @@ impl JointAdmissionHandle {
         scope: WorkScope,
         custody: ProposalConstruction,
     ) -> Result<JointProposal, WorkError> {
-        let (config, class) = {
+        let class = {
             let state = self.inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             if !state.cancellations.fixed || ledger.dependencies.is_none() {
                 return Err(WorkError::NotReady);
             }
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            (Arc::clone(&ledger.config), node.class)
+            node.class
         };
         let mut proposal = JointProposal {
             root_domain: None,
             root_stage: None,
+            computation_window: None,
             root_payload: None,
             cpu_action: None,
             control_action: None,
             native_action: None,
             records: Vec::new(),
-            dependency_union: Vec::new(),
             current: None,
             custody: Some(custody),
             scope,
-            config,
             class,
             started: 0,
             failed: None,
             _exit: ReclaimWakeOnExit::observe(&Arc::downgrade(&self.inner)),
         };
-        proposal
-            .records
-            .try_reserve_exact(proposal.config.config.max_changes_per_request)
-            .map_err(|_| WorkError::Capacity("paid joint change backing"))?;
-        proposal
-            .dependency_union
-            .try_reserve_exact(proposal.config.config.max_dependencies_per_claim)
-            .map_err(|_| WorkError::Capacity("paid joint request union backing"))?;
         Ok(proposal)
     }
 
@@ -280,7 +252,7 @@ impl JointAdmissionHandle {
         source: &JointClaimView,
         delta: JointResources,
         first_bind: bool,
-    ) -> Result<(Arc<ProfileFacts>, JointResources), WorkError> {
+    ) -> Result<(Arc<ResponsibilityFacts>, JointResources), WorkError> {
         if !Weak::ptr_eq(&source.inner, &Arc::downgrade(&self.inner)) {
             return Err(WorkError::ForeignAuthority);
         }
@@ -288,7 +260,7 @@ impl JointAdmissionHandle {
         let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
         let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
         authenticate_scope(&state, old, source, scope.id)?;
-        if old.pending.is_some() || !old.active_facts.key.causal.is_empty() {
+        if old.pending.is_some() || !old.active_facts.key.source_kind.is_empty() {
             return Err(WorkError::Conflict);
         }
         match (source.source, first_bind) {
@@ -341,10 +313,10 @@ impl JointProposal {
         if self.current.is_some() {
             return Err(WorkError::Conflict);
         }
-        if self.started >= self.config.config.max_changes_per_request {
-            return Err(WorkError::Capacity("paid joint batch records"));
-        }
-        self.started += 1;
+        self.started = self
+            .started
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
         let original = if let Some(source) = &source {
             if self
                 .records
@@ -370,22 +342,9 @@ impl JointProposal {
         } else {
             None
         };
-        if let Some((facts, _)) = &original {
-            // Adjustment retains its complete old union. Check it before
-            // allocating another selected set or creating any new facts.
-            track_dependency_union(
-                &mut self.dependency_union,
-                &facts.dependencies,
-                self.config.config.max_dependencies_per_claim,
-            )?;
-        }
         let mut selected = Vec::new();
-        selected
-            .try_reserve_exact(self.config.config.max_dependencies_per_claim)
-            .map_err(|_| WorkError::Capacity("paid joint dependency backing"))?;
         let (lane, amounts) = if let Some((facts, old_amounts)) = &original {
             // This is the complete old set, not only newly selected domains.
-            assert!(facts.dependencies.len() <= self.config.config.max_dependencies_per_claim);
             selected.extend(facts.dependencies.iter().cloned());
             (facts.lane, old_amounts.checked_add(amounts)?)
         } else {
@@ -467,11 +426,6 @@ impl JointProposal {
     }
     fn push(&mut self, input: DependencyInput<'_>) -> Result<(), WorkError> {
         let change = self.current.as_mut().ok_or(WorkError::Conflict)?;
-        let k = self.config.config.max_dependencies_per_claim;
-        if change.additional >= k {
-            return Err(WorkError::Capacity("paid joint dependency calls"));
-        }
-        change.additional += 1;
         if change
             .selected
             .iter()
@@ -482,24 +436,6 @@ impl JointProposal {
             } else {
                 Err(WorkError::Conflict)
             };
-        }
-        if change.selected.len() >= k {
-            return Err(WorkError::Capacity("joint dependency union"));
-        }
-        if self.dependency_union.len() >= k
-            && !self.records.iter().any(|record| {
-                record
-                    .claim
-                    .facts
-                    .dependencies
-                    .iter()
-                    .any(|record| input.matches(&record.fact))
-            })
-        {
-            // All earlier members remain in records/current. A new domain
-            // cannot consume canonical inventory merely by starting another
-            // change of the same logical source. Never truncate its full D.
-            return Err(WorkError::Capacity("joint request dependency union"));
         }
         let fact = input.into_owned();
         let record = self.scope.inner.update(|state| {
@@ -536,15 +472,10 @@ impl JointProposal {
                 .unwrap()
                 .insert(fact.clone(), ordinal)
         })?;
-        if let Err(position) = self.dependency_union.binary_search(&record.ordinal) {
-            assert!(self.dependency_union.len() < self.dependency_union.capacity());
-            self.dependency_union.insert(position, record.ordinal);
-        }
         let position = change
             .selected
             .binary_search_by_key(&record.ordinal, |record| record.ordinal)
             .expect_err("distinct canonical facts have distinct ordinals");
-        assert!(change.selected.len() < change.selected.capacity());
         change.selected.insert(position, record);
         Ok(())
     }
@@ -555,31 +486,23 @@ impl JointProposal {
         self.remember(result)
     }
     fn end(&mut self) -> Result<(), WorkError> {
-        // Closed action authors can copy an already-paid original set without
-        // minting origins through push. They obey this SAME request bound
-        // before a new immutable graph is formed or any body can be queued.
-        track_dependency_union(
-            &mut self.dependency_union,
-            &self.current.as_ref().ok_or(WorkError::Conflict)?.selected,
-            self.config.config.max_dependencies_per_claim,
-        )?;
         let change = self.current.take().ok_or(WorkError::Conflict)?;
         if change.first_bind && change.selected.is_empty() {
             return Err(WorkError::Conflict);
         }
-        let facts = Arc::new(ProfileFacts {
-            key: Arc::new(ProfileKey {
+        let facts = Arc::new(ResponsibilityFacts {
+            key: Arc::new(FactKey {
                 origin: change.origin,
                 class: class_index(self.class),
                 lane: change.lane as usize,
                 dependencies: change.selected.iter().map(|d| d.ordinal).collect(),
-                causal: if self
+                source_kind: if self
                     .cpu_action
                     .is_some_and(CpuActionFence::has_closed_factory)
                 {
-                    CausalMask::INTERNAL_CPU_ACTION
+                    SourceKind::InternalCpu
                 } else {
-                    CausalMask::NONE
+                    SourceKind::Plain
                 },
             }),
             class: self.class,
@@ -588,7 +511,6 @@ impl JointProposal {
             // creates no overlapping second element array during capture.
             dependencies: Arc::new(change.selected),
         });
-        assert!(self.records.len() < self.records.capacity());
         self.records.push(ChangeRecord {
             old: change.source.as_ref().map(|source| source.id),
             original_amounts: change.original.as_ref().map(|(_, amounts)| *amounts),
@@ -602,34 +524,15 @@ impl JointProposal {
         Ok(())
     }
 
-    /// One cumulative finite proof, including all layout reobservations. A
-    /// starting/self-held owner never anonymously parks on its own resources.
+    /// Queue one original atomic responsibility transaction. Its receiving
+    /// ticket is retained until install, withdrawal or actual physical handoff.
     pub fn submit(self) -> Result<JointAdmission, JointAdmissionFailure> {
-        let limit = self.config.config.max_total_proof_work;
-        self.submit_with_budget(limit)
+        self.submit_mode(false)
     }
-    pub fn submit_finite(
-        self,
-        limit: std::num::NonZeroU64,
-    ) -> Result<JointAdmission, JointAdmissionFailure> {
-        self.submit_with_budget(limit.get())
+    pub(super) fn submit_control_binding(self) -> Result<JointAdmission, JointAdmissionFailure> {
+        self.submit_mode(true)
     }
-    fn submit_with_budget(self, limit: u64) -> Result<JointAdmission, JointAdmissionFailure> {
-        self.submit_with_budget_mode(limit, false)
-    }
-    pub(super) fn submit_control_binding(
-        self,
-        limit: Option<std::num::NonZeroU64>,
-    ) -> Result<JointAdmission, JointAdmissionFailure> {
-        let limit = limit.map_or(self.config.config.max_total_proof_work, |n| n.get());
-        self.submit_with_budget_mode(limit, true)
-    }
-    fn submit_with_budget_mode(
-        mut self,
-        limit: u64,
-        control_only: bool,
-    ) -> Result<JointAdmission, JointAdmissionFailure> {
-        let limit = limit.min(self.config.config.max_total_proof_work);
+    fn submit_mode(mut self, control_only: bool) -> Result<JointAdmission, JointAdmissionFailure> {
         let result = (|| {
             self.healthy()?;
             if self.current.is_some() || self.records.is_empty() {
@@ -647,11 +550,11 @@ impl JointProposal {
                 PreparedRequest {
                     root_domain: self.root_domain.take(),
                     root_stage: self.root_stage,
+                    computation_window: self.computation_window,
                     root_payload: self.root_payload,
                     cpu_action: self.cpu_action,
                     control_action: self.control_action,
                     native_action: self.native_action.take(),
-                    budget: RequestBudget::Finite { remaining: limit },
                     changes,
                     custody: self.custody.take(),
                     scope: self.scope.clone(),

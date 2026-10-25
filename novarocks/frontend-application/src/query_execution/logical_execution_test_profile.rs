@@ -28,8 +28,7 @@ use novarocks_query_application::{
 };
 use novarocks_types::identity::{FrontendProcessId, QueryProcessNamespace};
 use novarocks_workload_control::joint_admission::{
-    JointAdmissionHandle, JointCapacityConfig, JointProgress, JointProgressDriver, JointResource,
-    JointResourceLimits, JointResources, RequiredJointProgress,
+    JointAdmissionHandle, JointProgress, JointProgressDriver, ResponsibilityConfig,
 };
 use novarocks_workload_control::{ControlStorageConfig, WorkloadConfig, WorkloadControl};
 use std::{num::NonZeroUsize, sync::Arc, time::Instant};
@@ -73,9 +72,7 @@ fn process_inner(
 ) -> (IdentityTestOwner, QueryExecutionClient) {
     let roles = [LogicalExecutionSupervisor::logical_role_poll_geometry().unwrap()];
     let count = 4;
-    let proposals_per_slot = 2;
-    let mut storage =
-        ControlStorageConfig::new([count, 0, 0, 0, 0], count - 1, proposals_per_slot, &roles);
+    let mut storage = ControlStorageConfig::new(count, &roles);
     if statements.is_some() {
         let source = novarocks_query_application::session_control::QueryControlService::statement_action_geometry();
         storage = storage.with_process_source_backing(
@@ -94,51 +91,8 @@ fn process_inner(
             .unwrap(),
         );
     }
-    let mut joint = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 1,
-        max_registered_dependencies: 1,
-        max_claims: count * 2,
-        max_requests: count * 2,
-        max_changes_per_request: 1,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: NonZeroUsize::new(7).unwrap(),
-    };
-    joint.max_registered_dependencies = 4 * joint.max_claims + 2 * count * proposals_per_slot + 3;
-    let base = storage.base_charge(&joint).unwrap();
-    let metadata = base.get(JointResource::MetadataBytes);
-    let limits = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, count as u64)
-            .with(JointResource::ClaimRecords, (count * 2) as u64)
-            .with(JointResource::MetadataBytes, metadata * count as u64 * 4),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, (count - 1) as u64)
-            .with(JointResource::ClaimRecords, count as u64)
-            .with(JointResource::MetadataBytes, metadata * count as u64 * 2),
-        protected_progress: base,
-    };
-    joint.global = limits;
-    joint.classes[0] = limits;
-    joint.lanes[0] = limits;
-    joint.class_lanes[0][0] = limits;
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
-    // Counted is only the existing initializing constructor. The actual same
-    // owner immediately installs joint+fixed+bank, with no counted fallback.
+    // The same original owner installs the responsibility service and roles;
+    // responsibility quantities do not create a second resource budget.
     let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -149,7 +103,9 @@ fn process_inner(
     .unwrap()
     .owner;
     let (admission, driver) = control
-        .configure_joint_capacity(joint.validate(&required).unwrap())
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: NonZeroUsize::new(7).unwrap(),
+        })
         .unwrap();
     control.configure_control_storage(storage).unwrap();
     if statements.is_some() {

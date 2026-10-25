@@ -32,8 +32,7 @@ use novarocks_query_application::session_control::{
     GovernedStatementResidual, StatementActionValue,
 };
 use novarocks_spi::connector::{
-    ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoGeometry,
-    ConnectorMetadataMaintenanceIoProfile, SharedDependency,
+    ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoProfile, SharedDependency,
 };
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::task::{Context, Poll};
@@ -520,37 +519,24 @@ impl FrontendQuerySession {
         let window = statement
             .result_window_alias()
             .ok_or_else(|| internal_error("Read has no original result window"))?;
-        let geometry = self
-            .service
+        self.service
             .query_compiler
-            .read_io_geometry()
-            .map_err(|e| internal_error(e.to_string()))?;
-        let source_bytes = fixed_source_bytes(
-            &geometry,
-            statement
-                .scope()
-                .joint_dependency_limit()
-                .map_err(|e| internal_error(e.to_string()))?,
-        )
-        .map_err(|e| internal_error(e.to_string()))?;
-        let io = ReadMetadataIoSource::new(statement.scope().clone(), geometry, source_bytes);
-        // This is the actual host-local SQL preparation body above. It remains
-        // a real Source through view rewrite, pure completion and encoding;
-        // Provider/service facts are independently added before their effects.
-        io.configure_read_source(
-            &ConnectorMetadataMaintenanceIoProfile::from_geometry(
-                geometry,
-                vec![SharedDependency::LocalHost],
-            )
-            .map_err(|e| internal_error(e.to_string()))?,
-        )
-        .map_err(|e| internal_error(e.to_string()))?;
-        let peak = if purpose == FrontendQueryPurpose::ClientRows {
-            window
-                .client_all_objects_bytes()
-                .map_err(|e| internal_error(e.to_string()))?
+            .validate_original_read_runtime()
+            .map_err(|error| internal_error(error.to_string()))?;
+        let local =
+            local_preparation_profile().map_err(|error| internal_error(error.to_string()))?;
+        let io = ReadMetadataIoSource::new(statement.scope().clone(), local.clone());
+        // This same host-local preparation remains a Source through encoding.
+        // Exact selected Provider/service facts are added before their effects.
+        io.configure_read_source(&local)
+            .map_err(|error| internal_error(error.to_string()))?;
+        let stage = StatementStageAdmission::new(statement.scope().clone(), 0);
+        let stage = if window.class() == novarocks_workload_control::ResultWindowClass::Client {
+            stage
+                .with_client_window(&window)
+                .map_err(|error| internal_error(error.to_string()))?
         } else {
-            1
+            stage
         };
         let provider = FrontendCompletionCustody::new();
         #[cfg(novarocks_dev_controls)]
@@ -590,7 +576,7 @@ impl FrontendQuerySession {
             local: None,
             tail: Some(Box::new(ReadNativeTail {
                 io,
-                stage: StatementStageAdmission::new(statement.scope().clone(), peak),
+                stage,
                 exit: None,
                 receipt: None,
                 launched: false,
@@ -635,68 +621,19 @@ impl FrontendQuerySession {
         Ok(result)
     }
 }
-pub(crate) fn fixed_source_bytes(
-    metadata: &ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
+fn local_preparation_profile() -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
     use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    fn future_layout<I, F: Future>(_: impl Fn(I) -> F) -> std::alloc::Layout {
-        std::alloc::Layout::new::<F>()
-    }
-    let source_mutex = if cfg!(all(target_os = "macos", target_pointer_width = "64")) {
-        std::alloc::Layout::new::<(isize, [u8; 56])>()
-    } else if cfg!(target_os = "linux") {
-        std::alloc::Layout::new::<()>()
-    } else {
-        return Err(WorkError::InvalidConfig(
-            "unsupported Read source mutex backing model",
-        ));
-    };
-    let layouts = [
-        std::alloc::Layout::new::<ReadStatementAction>(),
-        std::alloc::Layout::new::<ReadNativeTail>(),
-        future_layout(prepare_read),
-        future_layout(close_provider),
-        arc_layout(std::alloc::Layout::new::<ReadMetadataIoSource>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        source_mutex,
-        arc_layout(std::alloc::Layout::new::<WorkError>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        // The original preparation and Client stage constructors each create
-        // one activity Arc; both coexist before the original action exits.
-        QueryResultCapacityBinding::fixed_backing_layout()?,
-        QueryResultCapacityBinding::fixed_backing_layout()
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-    ];
-    let mut total =
-        MetadataIoAdmission::fixed_backing_bytes(metadata.max_concurrent_io().get(), k)?;
-    for layout in layouts.into_iter().chain(
-        FrontendCompletionCustody::known_layouts().map_err(|_| WorkError::ArithmeticOverflow)?,
-    ) {
-        total = total
-            .checked_add(layout.size() as u64)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    total
-        .checked_add(super::statement_computation::stage_heap_source_bytes()? as u64)
-        .ok_or(WorkError::ArithmeticOverflow)
-}
-
-/// Pure geometry of the original local preparation used by the empty-Provider
-/// real-entry fixture. It supports no external Provider factory or data read.
-#[cfg(test)]
-pub(crate) fn empty_provider_preparation_geometry_for_test()
--> Result<ConnectorMetadataMaintenanceIoGeometry, WorkError> {
-    use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
-    let header = u64::try_from(std::mem::size_of::<ReadPreparationInput>())
-        .map_err(|_| WorkError::ArithmeticOverflow)?;
-    Ok(ConnectorMetadataMaintenanceIoGeometry::new(
+    // These declarations describe the actual single local preparation body;
+    // they do not qualify a Provider or reserve an SDK allocation envelope.
+    ConnectorMetadataMaintenanceIoProfile::try_new(
         std::num::NonZeroUsize::new(1).unwrap(),
         std::num::NonZeroU64::new(MetadataIoAdmission::request_metadata_bytes())
             .ok_or(WorkError::ArithmeticOverflow)?,
-        std::num::NonZeroU64::new(header).ok_or(WorkError::ArithmeticOverflow)?,
-    ))
+        std::num::NonZeroU64::new(std::mem::size_of::<ReadPreparationInput>() as u64)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        vec![SharedDependency::LocalHost],
+    )
+    .map_err(|_| WorkError::InvalidConfig("local Read preparation source declaration"))
 }
 
 #[cfg(test)]
@@ -708,27 +645,36 @@ mod tests {
         num::{NonZeroU64, NonZeroUsize},
         task::Waker,
     };
-    fn geometry(io: usize) -> ConnectorMetadataMaintenanceIoGeometry {
-        ConnectorMetadataMaintenanceIoGeometry::new(
+    fn geometry(io: usize) -> novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry {
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(
             NonZeroUsize::new(io).unwrap(),
             NonZeroU64::new(1).unwrap(),
             NonZeroU64::new(1).unwrap(),
         )
     }
     #[test]
-    fn actual_read_source_rejects_factory_over_geometry_before_install_or_dispatch() {
+    fn actual_read_source_accepts_provider_profile_without_a_geometry_quota() {
         let (control, driver, _) = fixture();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let source = ReadMetadataIoSource::new(root.owner.scope(), geometry(1), 1);
+        let source =
+            ReadMetadataIoSource::new(root.owner.scope(), local_preparation_profile().unwrap());
         let actual = ConnectorMetadataMaintenanceIoProfile::from_geometry(
             geometry(2),
             vec![SharedDependency::LocalHost],
         )
         .unwrap();
-        assert!(source.configure_read_source(&actual).is_err());
-        assert!(source.original().is_none());
+        source.configure_read_source(&actual).unwrap();
+        let original = source.original().expect("same actual local source");
+        source.configure_read_source(&actual).unwrap();
+        assert!(Arc::ptr_eq(&original, &source.original().unwrap()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            source.poll_read_source_ready(&mut cx).is_pending(),
+            "profile acceptance is not Root/source readiness"
+        );
+        drop(original);
         drop(source);
         finish(control, root, driver);
     }
@@ -738,7 +684,8 @@ mod tests {
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let source = ReadMetadataIoSource::new(root.owner.scope(), geometry(1), 1);
+        let source =
+            ReadMetadataIoSource::new(root.owner.scope(), local_preparation_profile().unwrap());
         let profile = ConnectorMetadataMaintenanceIoProfile::from_geometry(
             geometry(1),
             vec![SharedDependency::LocalHost],
@@ -768,7 +715,7 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let mut tail = ReadNativeTail {
-            io: ReadMetadataIoSource::new(root.owner.scope(), geometry(1), 1),
+            io: ReadMetadataIoSource::new(root.owner.scope(), local_preparation_profile().unwrap()),
             stage: StatementStageAdmission::new(root.owner.scope(), 1),
             exit: None,
             receipt: None,

@@ -221,24 +221,10 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         let profile = lease
             .collection_io_profile()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
-        let bytes = submission_fixed_source_bytes(
-            &profile.geometry(),
-            scope.joint_dependency_limit().map_err(fail)?,
-        )
-        .map_err(fail)?;
-        let target_bytes = [&target.catalog, &target.namespace, &target.table]
-            .into_iter()
-            .try_fold(0usize, |n, name| n.checked_add(name.len()))
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| fail(novarocks_workload_control::WorkError::ArithmeticOverflow))?;
-        let bytes = bytes
-            .checked_add(
-                u64::try_from(target_bytes)
-                    .map_err(|_| fail(novarocks_workload_control::WorkError::ArithmeticOverflow))?,
-            )
-            .ok_or_else(|| fail(novarocks_workload_control::WorkError::ArithmeticOverflow))?;
-        origin.check_backing_total(bytes).map_err(fail)?;
-        let io = MetadataIoAdmission::new(scope, profile, bytes).map_err(fail)?;
+        // Original inline Source declaration only; it is neither an SDK
+        // envelope nor a reservation of the statement's result payload bytes.
+        let metadata = std::mem::size_of::<StatisticsSubmitAction>() as u64;
+        let io = MetadataIoAdmission::new(scope, profile, metadata).map_err(fail)?;
         let context = context.clone().with_io_admission(io.clone());
         Ok(Box::new(StatisticsSubmitAction {
             io,
@@ -829,50 +815,6 @@ struct StatisticsSubmitResidual {
     original: StatisticsSubmitAction,
 }
 
-fn submit_only_fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, novarocks_workload_control::WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use novarocks_workload_control::WorkError;
-    use std::alloc::Layout;
-    fn future_layout<A, B, F: std::future::Future>(_: fn(A, B) -> F) -> Layout {
-        Layout::new::<F>()
-    }
-    let prepare = future_layout(prepare_statistics_submission);
-    let observe = future_layout(wait_statistics_submission);
-    // Preparation is dropped after actual capture exit before an Attached
-    // observer is constructed. Both headers are inline; only one Box is live.
-    let active_future = if prepare.size() >= observe.size() {
-        prepare
-    } else {
-        observe
-    };
-    let mut bytes = crate::query_execution::maintenance::io_admission::MetadataIoAdmission::fixed_backing_bytes(geometry.max_concurrent_io().get(),k)?;
-    for layout in [
-        Layout::new::<StatisticsSubmitAction>(),
-        Layout::new::<StatisticsSubmitResidual>(),
-        arc_layout(Layout::new::<StatisticsSubmitWake>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        active_future,
-        // The queued Root proof owns a distinct external wait future while
-        // the original statement MIO still retains its own request cells.
-        novarocks_workload_control::joint_admission::JointProposalSlotWait::metadata_layouts().1,
-    ] {
-        bytes = bytes
-            .checked_add(layout.size() as u64)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    let detail =
-        novarocks_statistics_application::StatisticsPublicationFailure::PUBLIC_MESSAGE_BYTES;
-    let projection = novarocks_query_application::session_error::QueryServiceError::bounded_publication_projection_backing_bytes(novarocks_spi::connector::LakePublicationFamily::Statistics, detail)?
-        .checked_add(detail).ok_or(WorkError::ArithmeticOverflow)?;
-    let cpu_port = crate::query_execution::internal_result_cpu::InternalResultCpu::statistics_port_metadata_bytes_for_composition()?;
-    bytes
-        .checked_add(u64::try_from(projection).map_err(|_| WorkError::ArithmeticOverflow)?)
-        .and_then(|n| n.checked_add(cpu_port.get()))
-        .ok_or(WorkError::ArithmeticOverflow)
-}
 impl novarocks_query_application::session_control::GovernedStatementAction
     for StatisticsSubmitAction
 {
@@ -1125,25 +1067,10 @@ async fn prepare_statistics_submission(
     let root = roots
         .begin_statistics_job()
         .map_err(application::StatisticsApplicationError::new)?;
-    let metadata = (|| {
-        let k = root.owner.scope().joint_dependency_limit()?;
-        super::attempt_executor::queued_source_bytes(
-            &profile.geometry(),
-            k,
-            &target,
-            &columns,
-            &capture.object_id,
-        )
-    })();
-    let metadata = match metadata {
-        Ok(value) => value,
-        Err(error) => {
-            root.owner.complete_after_terminal_cancel_settled();
-            return Err(application::StatisticsApplicationError::new(
-                error.to_string(),
-            ));
-        }
-    };
+    // The same queued originals cross the stable receiving cut. This is a
+    // structural responsibility fact, not a prediction of all future SDK work.
+    let metadata =
+        std::mem::size_of::<novarocks_statistics_application::StatisticsJobOriginals>() as u64;
     let originals = novarocks_statistics_application::StatisticsJobOriginals {
         owner: Some(root.owner),
         query_concurrency: None,
@@ -1390,82 +1317,9 @@ mod admission_and_conclusion_tests {
         u64,
     ) {
         use novarocks_workload_control::{
-            ControlStorageConfig,
-            joint_admission::{
-                JointCapacityConfig, JointResource as R, JointResourceLimits as L,
-                JointResources as V, RequiredJointProgress,
-            },
+            ControlStorageConfig, ResponsibilityConfig, ResultCapacityConfig,
         };
         use std::num::NonZeroUsize;
-        // A finite two-class LocalHost component. It makes no Native or
-        // external-fault progress claim and never changes product limits.
-        let storage = ControlStorageConfig::new([4, 0, 4, 0, 0], 7, 2, &[]);
-        let mut config = JointCapacityConfig {
-            global: L::default(),
-            classes: [L::default(); 5],
-            lanes: [L::default(); 3],
-            class_lanes: [[L::default(); 3]; 5],
-            max_dependencies_per_claim: 1,
-            max_registered_dependencies: 1,
-            max_claims: 64,
-            max_requests: 32,
-            max_changes_per_request: 10,
-            max_snapshot_bytes: 64 * 1024 * 1024,
-            max_scratch_bytes: 64 * 1024 * 1024,
-            max_residual_arcs: 100000,
-            max_total_proof_work: 10000000,
-            work_per_turn: NonZeroUsize::new(7).unwrap(),
-        };
-        config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
-        let base = storage.base_charge(&config).unwrap();
-        let m = base.get(R::MetadataBytes);
-        let one = L {
-            global: V::ZERO
-                .with(R::ScopeRecords, 4)
-                .with(R::ClaimRecords, 32)
-                .with(R::MetadataBytes, m.checked_mul(128).unwrap())
-                .with(R::PayloadBytes, 4096),
-            per_dependency: V::ZERO
-                .with(R::ScopeRecords, 4)
-                .with(R::ClaimRecords, 32)
-                .with(R::MetadataBytes, m.checked_mul(128).unwrap())
-                .with(R::PayloadBytes, 4096),
-            protected_progress: base,
-        };
-        let two_progress = V::ZERO
-            .with(R::ScopeRecords, base.get(R::ScopeRecords) * 2)
-            .with(R::ClaimRecords, base.get(R::ClaimRecords) * 2)
-            .with(R::MetadataBytes, m * 2);
-        let two = L {
-            global: V::ZERO
-                .with(R::ScopeRecords, 8)
-                .with(R::ClaimRecords, 64)
-                .with(R::MetadataBytes, m.checked_mul(256).unwrap())
-                .with(R::PayloadBytes, 8192),
-            per_dependency: V::ZERO
-                .with(R::ScopeRecords, 8)
-                .with(R::ClaimRecords, 64)
-                .with(R::MetadataBytes, m.checked_mul(256).unwrap())
-                .with(R::PayloadBytes, 8192),
-            protected_progress: two_progress,
-        };
-        config.global = two;
-        config.classes[0] = one;
-        config.classes[2] = one;
-        config.lanes[0] = two;
-        config.class_lanes[0][0] = one;
-        config.class_lanes[2][0] = one;
-        let mut required = RequiredJointProgress {
-            global: two_progress,
-            classes: [V::ZERO; 5],
-            lanes: [V::ZERO; 3],
-            class_lanes: [[V::ZERO; 3]; 5],
-        };
-        required.classes[0] = base;
-        required.classes[2] = base;
-        required.lanes[0] = two_progress;
-        required.class_lanes[0][0] = base;
-        required.class_lanes[2][0] = base;
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: 8,
             business_limit: 8,
@@ -1475,12 +1329,23 @@ mod admission_and_conclusion_tests {
         })
         .unwrap()
         .owner;
-        let (_, driver) = control
-            .configure_joint_capacity(config.validate(&required).unwrap())
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
-        control.configure_control_storage(storage).unwrap();
+        let (_, driver) = control
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
+            .unwrap();
+        control
+            .configure_control_storage(ControlStorageConfig::new(8, &[]))
+            .unwrap();
         control.mark_ready().unwrap();
-        (control, driver, m)
+        (
+            control,
+            driver,
+            std::mem::size_of::<novarocks_statistics_application::StatisticsJobOriginals>() as u64,
+        )
     }
 
     fn drive_handoff_control(
@@ -1552,7 +1417,7 @@ mod admission_and_conclusion_tests {
         let pay = pay_queued_statistics_original(
             originals,
             &context,
-            m * 4,
+            m,
             std::num::NonZeroU64::new(128).unwrap(),
         );
         tokio::pin!(pay);
@@ -2404,18 +2269,3 @@ mod admission_and_conclusion_tests {
 
 #[path = "statistics_read.rs"]
 mod statistics_read;
-pub(crate) fn submission_fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, novarocks_workload_control::WorkError> {
-    fn future_bytes<A, B, F>(_: fn(A, B) -> F) -> u64 {
-        std::mem::size_of::<F>() as u64
-    }
-    // Repository SHOW/CANCEL borrow this named Box F in the same Root. They
-    // are exclusive with an ANALYZE or SHOW TABLE STATS statement source.
-    Ok(submit_only_fixed_source_bytes(geometry, k)?
-        .max(statistics_read::fixed_source_bytes(geometry, k)?)
-        .max(future_bytes(
-            FrontendStatisticsApplicationPort::execute_local_command,
-        )))
-}

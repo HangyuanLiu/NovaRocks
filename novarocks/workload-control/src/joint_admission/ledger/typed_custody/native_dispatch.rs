@@ -31,14 +31,13 @@ pub(in crate::joint_admission::ledger) struct NativeDispatchOrigin {
     pub(in crate::joint_admission::ledger) execution: WorkId,
     pub(in crate::joint_admission::ledger) ticket: u64,
     pub(in crate::joint_admission::ledger) kind: NativeDispatchKind,
-    pub(in crate::joint_admission::ledger) remaining: u64,
     pub(in crate::joint_admission::ledger) frozen: bool,
     pub(in crate::joint_admission::ledger) lane: JointLane,
 }
 struct Member {
     pin: OriginalPin,
-    facts: Option<Arc<ProfileFacts>>,
-    flat: Option<Arc<ProfileFacts>>,
+    facts: Option<Arc<ResponsibilityFacts>>,
+    flat: Option<Arc<ResponsibilityFacts>>,
     structure: u64,
     release: u64,
 }
@@ -68,7 +67,6 @@ pub struct NativeDispatchSource {
     wait: Option<Pin<Box<dyn Future<Output = Result<(), WorkError>> + Send>>>,
     complete: bool,
     per_turn: usize,
-    maximum: usize,
     _exit: crate::scope::ReclaimWakeOnExit,
 }
 fn pin_error(error: RetentionPinError) -> WorkError {
@@ -165,7 +163,7 @@ impl NativeDispatchSource {
         let action_id = action.pin.key.ok_or(WorkError::Released)?[0];
         // One exact original Action reserves construction before any member
         // allocation. Concurrent capture cannot allocate against the same fee.
-        let (origin, token, maximum, per_turn) = {
+        let (origin, token, per_turn) = {
             let mut state = inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             if ledger.driver_closed {
@@ -191,22 +189,7 @@ impl NativeDispatchSource {
             {
                 return Err(WorkError::Conflict);
             }
-            if origin.remaining == 0 {
-                return Err(WorkError::Capacity("Native dispatch finite work"));
-            }
-            let maximum = ledger.config.config.max_dependencies_per_claim;
-            let per_turn = ledger.config.config.work_per_turn.get();
-            let header_work =
-                u64::try_from(count.checked_add(2).ok_or(WorkError::ArithmeticOverflow)?)
-                    .map_err(|_| WorkError::ArithmeticOverflow)?;
-            let sort_levels = 64 - header_work.leading_zeros() as u64;
-            let construction_work = header_work
-                .checked_mul(sort_levels + 3)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            let remaining = origin
-                .remaining
-                .checked_sub(construction_work)
-                .ok_or(WorkError::Capacity("Native dispatch construction work"))?;
+            let per_turn = ledger.config.work_per_turn.get();
             let token = state.next_id()?;
             state
                 .joint
@@ -215,19 +198,8 @@ impl NativeDispatchSource {
                 .claims
                 .get_mut(&action_id)
                 .unwrap()
-                .native_dispatch
-                .as_mut()
-                .unwrap()
-                .remaining = remaining;
-            state
-                .joint
-                .as_mut()
-                .unwrap()
-                .claims
-                .get_mut(&action_id)
-                .unwrap()
                 .dispatch_staging = Some(token);
-            (origin, token, maximum, per_turn)
+            (origin, token, per_turn)
         };
         let mut construction = Construction {
             inner: Arc::clone(&inner),
@@ -322,7 +294,6 @@ impl NativeDispatchSource {
             wait: None,
             complete: false,
             per_turn,
-            maximum,
             _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(&inner)),
         })
     }
@@ -368,10 +339,6 @@ impl NativeDispatchSource {
             return Err(WorkError::Conflict);
         }
         let original = row.native_dispatch.as_mut().ok_or(WorkError::Conflict)?;
-        original.remaining = original
-            .remaining
-            .checked_sub(work)
-            .ok_or(WorkError::Capacity("Native dispatch finite work"))?;
         Ok((epoch, graph))
     }
     fn commit(&mut self) -> Result<bool, WorkError> {
@@ -403,7 +370,7 @@ impl NativeDispatchSource {
             return Err(WorkError::Closed);
         }
         ledger
-            .profile_layout_revision
+            .facts_revision
             .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
         for member in &self.members {
@@ -421,18 +388,8 @@ impl NativeDispatchSource {
             }
         }
         let ledger = state.joint.as_mut().unwrap();
-        // Remove ALL old groups first. No transient L+b aggregate inventory.
         for member in &self.members {
-            let row = &ledger.claims[&member.pin.key.unwrap()[0]];
-            let amount = row.amounts;
-            subtract_profile(ledger, member.facts.as_ref().unwrap(), amount);
-        }
-        for member in &self.members {
-            let amount = ledger.claims[&member.pin.key.unwrap()[0]].amounts;
-            add_profile(ledger, Arc::clone(member.flat.as_ref().unwrap()), amount);
-        }
-        for member in &self.members {
-            let target = Arc::clone(&ledger.profiles[&member.flat.as_ref().unwrap().key].facts);
+            let target = Arc::clone(member.flat.as_ref().unwrap());
             let row = ledger.claims.get_mut(&member.pin.key.unwrap()[0]).unwrap();
             // Source retains old S and any unused dedup candidate in its two
             // paid slots until the lock exits. Neither graph can final-Drop here.
@@ -511,8 +468,7 @@ impl Future for NativeDispatchSource {
                     self.capture = Some(FactCapture::active(
                         Arc::clone(self.members[self.cursor].facts.as_ref().unwrap()),
                         self.root_graph.as_ref().map(Arc::clone),
-                        self.maximum,
-                    ));
+                    )?);
                 }
                 match self.capture.as_mut().unwrap().step() {
                     Err(error) => {

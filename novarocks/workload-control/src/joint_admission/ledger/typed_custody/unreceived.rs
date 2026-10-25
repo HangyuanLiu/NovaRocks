@@ -83,37 +83,6 @@ impl WorkScope {
     /// Pure configured support fact. It neither binds D nor grants a record.
     /// The same original configuration protects a complete indivisible cohort
     /// under its cumulative per-dependency responsibility limit.
-    pub fn unreceived_production_occurrence_limit(&self) -> Result<u64, WorkError> {
-        let state = self.inner.state.lock().unwrap();
-        control_facts(&state, self)?;
-        let config = &state
-            .joint
-            .as_ref()
-            .ok_or(WorkError::NotReady)?
-            .config
-            .config;
-        let k = u64::try_from(config.max_dependencies_per_claim)
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
-        let class = crate::joint_admission::class_index(state.nodes[&self.id].class);
-        let custody = JointLane::Custody as usize;
-        [
-            config.global,
-            config.classes[class],
-            config.lanes[custody],
-            config.class_lanes[class][custody],
-        ]
-        .into_iter()
-        .map(|limits| {
-            limits
-                .per_dependency
-                .get(JointResource::UnreceivedProductions)
-        })
-        .min()
-        .ok_or(WorkError::Conflict)?
-        .checked_div(k)
-        .filter(|n| *n != 0)
-        .ok_or(WorkError::Capacity("protected writer cohort support"))
-    }
 
     /// A closed delegated constructor: only these responsibility coordinates,
     /// the original active Node's complete class/D, and original paid Q.
@@ -155,7 +124,7 @@ impl WorkScope {
 fn control_facts<'a>(
     state: &'a State,
     scope: &WorkScope,
-) -> Result<&'a Arc<ProfileFacts>, WorkError> {
+) -> Result<&'a Arc<ResponsibilityFacts>, WorkError> {
     validate_active_control_node(state, scope)?;
     let node = &state.nodes[&scope.id];
     let cell = &state.cancellations.slots[node.cancellation.0];
@@ -175,7 +144,7 @@ fn control_facts<'a>(
         || control.active_amounts != cell.base
         || control.facts.key != control.active_facts.key
         || !root_domains::has_effective_domains(state, &control.active_facts, true)
-        || !control.active_facts.key.causal.is_empty()
+        || !control.active_facts.key.source_kind.is_empty()
     {
         return Err(WorkError::Conflict);
     }
@@ -254,7 +223,7 @@ impl UnreceivedProductionReady {
                 || row.active_facts.lane != JointLane::Custody
                 || row.active_facts.key.origin != full.key.origin
                 || row.active_facts.key.dependencies != full.key.dependencies
-                || !row.active_facts.key.causal.is_empty()
+                || !row.active_facts.key.source_kind.is_empty()
             {
                 return Err(WorkError::Conflict);
             }
@@ -330,8 +299,6 @@ impl UnreceivedProductionGrant {
             let charged = row.amounts.checked_sub(released)?;
             let ledger = state.joint.as_mut().unwrap();
             let row = ledger.claims.get_mut(&self.id).unwrap();
-            let profile = ledger.profiles.get_mut(&row.facts.key).unwrap();
-            profile.amounts = profile.amounts.checked_sub(released)?;
             row.amounts = charged;
             row.active_amounts = active;
             row.release_revision += 1;

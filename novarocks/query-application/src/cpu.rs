@@ -1690,125 +1690,14 @@ mod joint_queue_tests {
     }
 
     fn joint_fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-        let fixture = joint_fixture_before_ready(JointResource::BlockingJobs);
+        let fixture = joint_fixture_before_ready();
         fixture.0.mark_ready().unwrap();
         fixture
     }
-    fn joint_fixture_before_ready(
-        source: JointResource,
-    ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fn joint_fixture_before_ready() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver)
+    {
         let count = 8;
-        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
-        let mut config = JointCapacityConfig {
-            global: JointResourceLimits::default(),
-            classes: [JointResourceLimits::default(); 5],
-            lanes: [JointResourceLimits::default(); 3],
-            class_lanes: [[JointResourceLimits::default(); 3]; 5],
-            max_dependencies_per_claim: 2,
-            max_registered_dependencies: 402,
-            max_claims: 16,
-            max_requests: 16,
-            max_changes_per_request: 4,
-            max_snapshot_bytes: 16 * 1024 * 1024,
-            max_scratch_bytes: 16 * 1024 * 1024,
-            max_residual_arcs: 10000,
-            max_total_proof_work: 10000000,
-            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
-        };
-        let base = storage.base_charge(&config).unwrap();
-        let m = base.get(JointResource::MetadataBytes);
-        let b = bounded_worker::queue_record_layout::<CpuResult>().size() as u64;
-        // This fixture protects a real one-job increment. It quotes only the
-        // original row's known inline envelope, not a complete Native source/frame.
-        let step = JointResources::ZERO
-            .with(JointResource::ClaimRecords, 1)
-            .with(source, 1)
-            .with(JointResource::PhysicalQueueRecords, 1)
-            .with(JointResource::PhysicalQueueBytes, b);
-        let progress = base
-            .with(
-                JointResource::ClaimRecords,
-                base.get(JointResource::ClaimRecords) + 1,
-            )
-            .with(source, 1)
-            .with(JointResource::PhysicalQueueRecords, 1)
-            .with(JointResource::PhysicalQueueBytes, b);
-        let custody = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 8)
-                .with(JointResource::ClaimRecords, 12)
-                .with(JointResource::MetadataBytes, m * 16)
-                .with(JointResource::PayloadBytes, 64)
-                .with(JointResource::UnreceivedProductions, 1),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 7)
-                .with(JointResource::ClaimRecords, 12)
-                .with(JointResource::MetadataBytes, m * 8)
-                .with(JointResource::PayloadBytes, 64)
-                .with(JointResource::UnreceivedProductions, 1),
-            protected_progress: base,
-        };
-        let foreground = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ClaimRecords, 4)
-                .with(JointResource::MetadataBytes, m * 16)
-                .with(JointResource::PayloadBytes, 32)
-                .with(JointResource::Computations, 1)
-                .with(source, 3)
-                .with(JointResource::PhysicalQueueRecords, 3)
-                .with(JointResource::PhysicalQueueBytes, b * 3),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ClaimRecords, 4)
-                .with(JointResource::MetadataBytes, m * 8)
-                .with(JointResource::PayloadBytes, 32)
-                .with(JointResource::Computations, 1)
-                .with(JointResource::PhysicalQueueBytes, b * 2)
-                .with(source, 2)
-                .with(JointResource::PhysicalQueueRecords, 2),
-            protected_progress: step,
-        };
-        let global = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 8)
-                .with(JointResource::ClaimRecords, 16)
-                .with(JointResource::MetadataBytes, m * 32)
-                .with(JointResource::PayloadBytes, 96)
-                .with(JointResource::UnreceivedProductions, 1)
-                .with(JointResource::Computations, 1)
-                .with(source, 3)
-                .with(JointResource::PhysicalQueueRecords, 3)
-                .with(JointResource::PhysicalQueueBytes, b * 3),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ScopeRecords, 7)
-                .with(JointResource::ClaimRecords, 16)
-                .with(JointResource::MetadataBytes, m * 16)
-                .with(JointResource::PayloadBytes, 96)
-                .with(JointResource::UnreceivedProductions, 1)
-                .with(JointResource::Computations, 1)
-                .with(JointResource::PhysicalQueueBytes, b * 2)
-                .with(source, 2)
-                .with(JointResource::PhysicalQueueRecords, 2),
-            protected_progress: progress,
-        };
-        config.global = global;
-        config.classes[0] = global;
-        config.lanes[0] = custody;
-        config.lanes[1] = foreground;
-        config.class_lanes[0][0] = custody;
-        config.class_lanes[0][1] = foreground;
-        // Real CPU/queue minimum one is preserved. This still does not qualify
-        // complete Native captures, task frames, physical lanes or source facts.
-        let mut required = RequiredJointProgress {
-            global: progress,
-            classes: [JointResources::ZERO; 5],
-            lanes: [JointResources::ZERO; 3],
-            class_lanes: [[JointResources::ZERO; 3]; 5],
-        };
-        required.classes[0] = progress;
-        required.lanes[0] = base;
-        required.class_lanes[0][0] = base;
-        required.lanes[1] = step;
-        required.class_lanes[0][1] = step;
+        let storage = ControlStorageConfig::new(count, &[]);
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: count,
             business_limit: count,
@@ -1819,9 +1708,14 @@ mod joint_queue_tests {
         .unwrap()
         .owner;
         let (handle, driver) = control
-            .configure_joint_capacity(config.validate(&required).unwrap())
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+            })
             .unwrap();
         control.configure_control_storage(storage).unwrap();
+        control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
         (control, handle, driver)
     }
 
@@ -2067,14 +1961,23 @@ mod joint_queue_tests {
         );
         assert_eq!(executor.handle.snapshot().running, 1);
         drive(&mut driver);
-        assert!(matches!(
-            blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(JointAdmissionFailure {
-                error: novarocks_workload_control::WorkError::JointCapacity(_)
-            }))
-        ));
-        // This paid request has one finite verdict. It cannot self-convert to
-        // a capacity waiter; only a new intent after real exit can be admitted.
+        let mut offer = match blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("responsibility registration does not impose a running-job quota"),
+        };
+        let mut no_physical: Option<QueryBlockingReservation> = None;
+        offer
+            .reobserve_after_drop(&mut no_physical)
+            .unwrap()
+            .notify();
+        drop(offer);
+        // A different request's withdrawal cannot end the original running
+        // call or manufacture the actual-exit observer's completion.
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         drop(blocked);
         release.send(()).unwrap();
         exited(&receipt).await.unwrap();
@@ -2082,7 +1985,7 @@ mod joint_queue_tests {
         drive(&mut driver);
         let mut offer = match blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Ok(offer)) => offer,
-            _ => panic!("a new intent progresses only after original actual exit"),
+            _ => panic!("a new valid request remains observable after original actual exit"),
         };
         let mut no_physical: Option<QueryBlockingReservation> = None;
         offer
@@ -2446,12 +2349,16 @@ mod joint_queue_tests {
         assert_eq!(executor.handle.snapshot().running, 1);
         let mut blocked = request(&handle, &third.owner);
         drive(&mut driver);
-        assert!(matches!(
-            blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(JointAdmissionFailure {
-                error: novarocks_workload_control::WorkError::JointCapacity(_)
-            }))
-        ));
+        let mut offer = match blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("responsibility registration does not impose a running-job quota"),
+        };
+        let mut no_physical: Option<QueryBlockingReservation> = None;
+        offer
+            .reobserve_after_drop(&mut no_physical)
+            .unwrap()
+            .notify();
+        drop(offer);
         drop(blocked);
         release_drop.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), poll_fn(|cx| exit.poll(cx)))
@@ -2463,7 +2370,7 @@ mod joint_queue_tests {
         drive(&mut driver);
         let mut offer = match blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Ok(offer)) => offer,
-            _ => panic!("a new intent progresses only after actual output Drop"),
+            _ => panic!("a new valid request remains observable after actual output Drop"),
         };
         let mut no_physical: Option<QueryBlockingReservation> = None;
         offer
@@ -2601,8 +2508,7 @@ mod joint_queue_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn closed_factory_binds_original_wc_pool_and_call_through_real_worker_exit() {
         use novarocks_workload_control::WorkError;
-        let (mut control, handle, mut driver) =
-            joint_fixture_before_ready(JointResource::InternalCpuJobs);
+        let (mut control, handle, mut driver) = joint_fixture_before_ready();
         let (mut owner, executor) = worker();
         let old_raw_view = executor.clone();
         let descriptor = owner

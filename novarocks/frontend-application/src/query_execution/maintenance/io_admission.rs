@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Same metadata Source, finite original request cells, and same Root paidQ.
+//! Same metadata Source and dynamically retained original request cells.
 //! Provider I/O never owns the WorkOwner. Every foreign poll/Drop/wake occurs
 //! after the metadata mutex is released, with original custody restored on unwind.
 use futures::task::AtomicWaker;
@@ -121,7 +121,6 @@ struct Body {
     root: WorkScope,
     profile: ConnectorMetadataMaintenanceIoProfile,
     source_metadata_bytes: u64,
-    k: usize,
     domains: RootDomainBinding,
     bound: Vec<SharedDependency>,
     full: Option<Arc<[SharedDependency]>>,
@@ -137,7 +136,7 @@ struct Body {
     growth_cell: Option<usize>,
     growth_route: Option<SharedDependency>,
     growth_bytes: u64,
-    cells: Box<[Arc<RequestCell>]>,
+    cells: Vec<Arc<RequestCell>>,
     cursor: usize,
     started: bool,
     adopted_initial: bool,
@@ -200,9 +199,7 @@ fn error(error: &WorkError) -> ConnectorError {
     ConnectorError::new(
         match error {
             WorkError::Cancelled(_) => ConnectorErrorKind::Cancelled,
-            WorkError::Capacity(_) | WorkError::JointCapacity(_) => {
-                ConnectorErrorKind::ResourceExhausted
-            }
+            WorkError::Capacity(_) => ConnectorErrorKind::ResourceExhausted,
             _ => ConnectorErrorKind::Internal,
         },
         format!("original metadata I/O admission refused: {error:?}"),
@@ -215,6 +212,16 @@ fn busy() -> ConnectorError {
     )
 }
 impl RequestCell {
+    fn new(root: Arc<MetadataWake>) -> Self {
+        Self {
+            original: Mutex::new(Some(CellBody::default())),
+            stream: Mutex::new(Some(StreamBody::default())),
+            progress: Mutex::new(None),
+            cleanup_error: Mutex::new(None),
+            observer: AtomicWaker::new(),
+            root,
+        }
+    }
     fn take_cleanup_completion(
         &self,
     ) -> Option<(Result<(), ConnectorError>, Option<Box<dyn Any + Send>>)> {
@@ -506,29 +513,14 @@ impl MetadataIoAdmission {
         profile: ConnectorMetadataMaintenanceIoProfile,
         source_metadata_bytes: u64,
     ) -> Result<Arc<Self>, WorkError> {
-        let k = root.joint_dependency_limit()?;
         // Mark the original root before preparation creates any long-lived
         // claims. This observer alone grants neither D nor physical capacity.
         let domains = root.prepare_root_domains()?;
         let wake = Arc::new(MetadataWake::new());
-        let mut cells = Vec::new();
-        cells
-            .try_reserve_exact(profile.max_concurrent_io().get())
-            .map_err(|_| WorkError::Capacity("metadata fixed request cells"))?;
-        for _ in 0..profile.max_concurrent_io().get() {
-            cells.push(Arc::new(RequestCell {
-                original: Mutex::new(Some(CellBody::default())),
-                stream: Mutex::new(Some(StreamBody::default())),
-                progress: Mutex::new(None),
-                cleanup_error: Mutex::new(None),
-                observer: AtomicWaker::new(),
-                root: Arc::clone(&wake),
-            }));
-        }
-        let mut bound = Vec::new();
-        bound
-            .try_reserve_exact(k)
-            .map_err(|_| WorkError::Capacity("metadata original complete union"))?;
+        // One real bootstrap/local-preparation request is required by the
+        // original source protocol. Later actual requests grow/reuse this Vec.
+        let cells = vec![Arc::new(RequestCell::new(Arc::clone(&wake)))];
+        let bound = Vec::new();
         let provider_owned_floor = profile.initial_owned_bytes().get();
         Ok(Arc::new(Self {
             wake,
@@ -537,7 +529,6 @@ impl MetadataIoAdmission {
                 root,
                 profile,
                 source_metadata_bytes,
-                k,
                 domains,
                 bound,
                 full: None,
@@ -551,7 +542,7 @@ impl MetadataIoAdmission {
                 growth_cell: None,
                 growth_route: None,
                 growth_bytes: 0,
-                cells: cells.into_boxed_slice(),
+                cells,
                 cursor: 0,
                 started: false,
                 adopted_initial: false,
@@ -581,22 +572,9 @@ impl MetadataIoAdmission {
         {
             return Err(WorkError::Conflict);
         }
-        if payload.metadata_bytes().map_err(|_| WorkError::Released)? < body.source_metadata_bytes {
-            return Err(WorkError::Capacity(
-                "metadata source exceeds its original queued envelope",
-            ));
-        }
-        // Authenticate the positive canonical incarnation, not a scope number.
-        // Authenticate the same positive payload through an active run-source
-        // view; this capture does not change its original Custody charge.
+        // Preserve the exact positive incarnation. Profile/layout numbers
+        // are responsibility facts, never a qualification of actual capacity.
         payload.root_domain_source(&body.root, JointLane::Foreground)?;
-        if payload.capacity_bytes().map_err(|_| WorkError::Released)?
-            < body.profile.initial_owned_bytes().get()
-        {
-            return Err(WorkError::Capacity(
-                "statistics original queued payload envelope",
-            ));
-        }
         body.provider_owned_floor = payload.capacity_bytes().map_err(|_| WorkError::Released)?;
         body.bound.push(SharedDependency::LocalHost);
         body.full = Some(body.bound.clone().into());
@@ -606,8 +584,8 @@ impl MetadataIoAdmission {
         body.changed = true;
         Ok(())
     }
-    /// Actual Source containers plus all finite loan/fence/fact replacement scratch.
-    /// This is owned first-party backing, not a recursive SDK/allocator/RSS quote.
+    /// Legacy responsibility-only declaration used by callers not yet migrated.
+    /// This is not a fixed request inventory or a capacity qualification.
     pub(crate) fn fixed_backing_bytes(n: usize, k: usize) -> Result<u64, WorkError> {
         let arc = std::mem::size_of::<[usize; 2]>();
         let mutex_external = if cfg!(target_os = "macos") {
@@ -805,6 +783,11 @@ impl MetadataIoAdmission {
                             .initial_payload_source(&body.root, JointLane::Custody)?,
                     );
                 }
+                body.bound
+                    .try_reserve(body.profile.initial_dependencies().len())
+                    .map_err(|_| {
+                        WorkError::Capacity("metadata dependency record allocation was refused")
+                    })?;
                 let bytes = body.source_metadata_bytes;
                 match body
                     .initial_source
@@ -1029,6 +1012,11 @@ impl MetadataIoAdmission {
                 body.changed = true;
             }
             if route.is_some() || bytes != 0 {
+                if route.is_some() {
+                    body.bound.try_reserve(1).map_err(|_| {
+                        WorkError::Capacity("metadata dependency record allocation was refused")
+                    })?;
+                }
                 // Undelivered all-New actions have not started physical I/O.
                 // Withdraw them before rekeying the same control source; after
                 // install they seek a fresh finite intent from its new fence.
@@ -1439,6 +1427,11 @@ impl MetadataIoAdmission {
             }
         }
         for (index, cell) in body.cells.iter_mut().enumerate() {
+            // Keep the original bootstrap request intact until its own first
+            // readiness cut; an early new route must not overwrite that fact.
+            if index == 0 && !body.first_ready {
+                continue;
+            }
             // The original route/peak request cannot be overwritten while its
             // constructor awaits Q, even if its borrowing caller has exited.
             if body.growth_cell == Some(index) {
@@ -1486,10 +1479,27 @@ impl MetadataIoAdmission {
             self.wake.wake();
             return Ok(request);
         }
-        Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "metadata exhausted its original fixed request cells",
-        ))
+        body.cells.try_reserve(1).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "metadata request record allocation was refused",
+            )
+        })?;
+        let cell = Arc::new(RequestCell::new(Arc::clone(&self.wake)));
+        {
+            let mut original = cell.original.lock().unwrap_or_else(|p| p.into_inner());
+            let state = original.as_mut().expect("new original request cell");
+            state.requested = dependency;
+            state.owned = owned;
+            state.claimed = true;
+        }
+        let request = ConnectorIoRequest::from_original(
+            Arc::clone(&cell) as Arc<dyn ConnectorIoRequestSource>
+        );
+        body.cells.push(cell);
+        drop(source);
+        self.wake.wake();
+        Ok(request)
     }
 }
 impl ConnectorIoAdmissionPort for MetadataIoAdmission {
@@ -1497,18 +1507,17 @@ impl ConnectorIoAdmissionPort for MetadataIoAdmission {
         &self,
         profile: &ConnectorMetadataMaintenanceIoProfile,
     ) -> Result<(), ConnectorError> {
-        let original = self.original.lock().unwrap_or_else(|p| p.into_inner());
-        let body = original.as_ref().ok_or_else(busy)?;
-        let actual = profile.geometry();
-        let sealed = body.profile.geometry();
-        if actual.max_concurrent_io() > sealed.max_concurrent_io()
-            || actual.metadata_bytes() > sealed.metadata_bytes()
-            || actual.initial_owned_bytes() > sealed.initial_owned_bytes()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "read factory exceeds its sealed I/O geometry",
-            ));
+        let mut original = loan(&self.original).ok_or_else(busy)?;
+        let body = original.body.as_mut().expect("same original source loan");
+        // Configuration describes the real Provider source. It grants no I/O:
+        // request/poll_admitted still install each exact selected dependency
+        // into this same Root before a Provider can start that request.
+        let _ = profile;
+        if !body.settlement {
+            body.root.check().map_err(|failure| error(&failure))?;
+            if let Some(failure) = &body.failure {
+                return Err(error(failure));
+            }
         }
         Ok(())
     }
@@ -1580,11 +1589,9 @@ mod original_governor_tests {
     use super::*;
     use novarocks_spi::connector::ConnectorIoPermit;
     use novarocks_workload_control::{
-        ControlStorageConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
-        joint_admission::{
-            JointCapacityConfig, JointProgress, JointProgressDriver, JointResource as R,
-            JointResourceLimits, JointResources, RequiredJointProgress,
-        },
+        ControlStorageConfig, ResponsibilityConfig, ResultCapacityConfig, RootWork, WorkClass,
+        WorkRequest, WorkloadConfig, WorkloadControl,
+        joint_admission::{JointProgress, JointProgressDriver},
     };
     use std::{
         num::NonZeroUsize,
@@ -1603,92 +1610,10 @@ mod original_governor_tests {
         }
     }
 
-    // Finite single-class/single-LocalHost component policy only. This creates
-    // the actual WC substrate, not a Native or external-fault protection token.
+    // This creates the real original substrate and actual result configuration;
+    // neither the dependency count nor profile geometry is a quota.
     fn original_governor() -> (WorkloadControl, JointProgressDriver, RootWork) {
-        original_governor_with_domains(1)
-    }
-    fn original_governor_with_domains(
-        k: usize,
-    ) -> (WorkloadControl, JointProgressDriver, RootWork) {
         let count = 8;
-        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], count - 1, 2, &[]);
-        let mut config = JointCapacityConfig {
-            global: JointResourceLimits::default(),
-            classes: [JointResourceLimits::default(); 5],
-            lanes: [JointResourceLimits::default(); 3],
-            class_lanes: [[JointResourceLimits::default(); 3]; 5],
-            max_dependencies_per_claim: k,
-            max_registered_dependencies: k,
-            max_claims: 64,
-            max_requests: 32,
-            max_changes_per_request: 10,
-            max_snapshot_bytes: 64 * 1024 * 1024,
-            max_scratch_bytes: 64 * 1024 * 1024,
-            max_residual_arcs: 100000,
-            max_total_proof_work: 10000000,
-            work_per_turn: NonZeroUsize::new(7).unwrap(),
-        };
-        config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
-        let base = storage.base_charge(&config).unwrap();
-        let m = base.get(R::MetadataBytes);
-        let custody = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(R::ScopeRecords, count as u64)
-                .with(R::ClaimRecords, 32)
-                .with(R::MetadataBytes, m.checked_mul(128).unwrap())
-                .with(R::PayloadBytes, 4096),
-            per_dependency: JointResources::ZERO
-                .with(R::ScopeRecords, count as u64)
-                .with(R::ClaimRecords, 32)
-                .with(R::MetadataBytes, m.checked_mul(128).unwrap())
-                .with(R::PayloadBytes, 4096),
-            protected_progress: base,
-        };
-        let action = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(R::ClaimRecords, 8)
-                .with(R::MetadataBytes, m.checked_mul(64).unwrap())
-                .with(R::AsyncIo, 8),
-            per_dependency: JointResources::ZERO
-                .with(R::ClaimRecords, 8)
-                .with(R::MetadataBytes, m.checked_mul(64).unwrap())
-                .with(R::AsyncIo, 8),
-            protected_progress: JointResources::ZERO,
-        };
-        // Explicit sum of both original runtime lanes and the custody lane;
-        // no private WC resource arithmetic or hidden extra physical pool.
-        let global = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(R::ScopeRecords, count as u64)
-                .with(R::ClaimRecords, 48)
-                .with(R::MetadataBytes, m.checked_mul(256).unwrap())
-                .with(R::PayloadBytes, 4096)
-                .with(R::AsyncIo, 16),
-            per_dependency: JointResources::ZERO
-                .with(R::ScopeRecords, count as u64)
-                .with(R::ClaimRecords, 48)
-                .with(R::MetadataBytes, m.checked_mul(256).unwrap())
-                .with(R::PayloadBytes, 4096)
-                .with(R::AsyncIo, 16),
-            protected_progress: base,
-        };
-        config.global = global;
-        config.classes[0] = global;
-        config.lanes = [custody, action, action];
-        config.class_lanes[0] = config.lanes;
-        // This component promises the actual fixed substrate. It exercises
-        // real AsyncIo hard caps, without declaring a production bad-domain
-        // or complete five-class Native progress minimum.
-        let mut required = RequiredJointProgress {
-            global: base,
-            classes: [JointResources::ZERO; 5],
-            lanes: [JointResources::ZERO; 3],
-            class_lanes: [[JointResources::ZERO; 3]; 5],
-        };
-        required.classes[0] = base;
-        required.lanes[0] = base;
-        required.class_lanes[0][0] = base;
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: count,
             business_limit: count,
@@ -1698,10 +1623,17 @@ mod original_governor_tests {
         })
         .unwrap()
         .owner;
-        let (_, driver) = control
-            .configure_joint_capacity(config.validate(&required).unwrap())
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
-        control.configure_control_storage(storage).unwrap();
+        let (_, driver) = control
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
+            .unwrap();
+        control
+            .configure_control_storage(ControlStorageConfig::new(count, &[]))
+            .unwrap();
         control.mark_ready().unwrap();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1736,7 +1668,7 @@ mod original_governor_tests {
     }
 
     #[test]
-    fn original_root_alias_observes_owned_growth_only_after_positive_install() {
+    fn original_root_responsibility_growth_does_not_change_the_actual_result_budget() {
         let (control, mut driver, root) = original_governor();
         let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
@@ -1761,11 +1693,28 @@ mod original_governor_tests {
         // either prospective request; no fresh alias can conceal a stale cap.
         let original = source.root_capacity().unwrap();
         original.window_alias().check_backing_total(128).unwrap();
+        let actual_budget = ResultCapacityConfig::V1.all_objects_bytes[2];
+        let held = original.window_alias().reserve_payload_bytes(64).unwrap();
+        let recorded = || {
+            source
+                .original
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .payload
+                .as_ref()
+                .unwrap()
+                .capacity_bytes()
+                .unwrap()
+        };
         for required in [768, 1536] {
-            assert!(matches!(
-                original.window_alias().check_backing_total(required),
-                Err(WorkError::Capacity(_))
-            ));
+            let before = recorded();
+            assert!(before < required);
+            original
+                .window_alias()
+                .check_backing_total(required)
+                .unwrap();
             let mut request = Box::pin(
                 source
                     .request_owned(NonZeroU64::new(required).unwrap())
@@ -1773,12 +1722,12 @@ mod original_governor_tests {
                     .admitted(),
             );
             assert!(request.as_mut().poll(&mut cx).is_pending());
-            assert!(
-                original
-                    .window_alias()
-                    .check_backing_total(required)
-                    .is_err()
+            assert_eq!(
+                recorded(),
+                before,
+                "waiting cannot install responsibility growth"
             );
+            assert_eq!(original.window_alias().retained_payload_bytes(), 64);
             let mut permit = None;
             for _ in 0..256 {
                 source.poll_progress(&root.owner, &mut cx).unwrap();
@@ -1796,14 +1745,18 @@ mod original_governor_tests {
             assert!(
                 original
                     .window_alias()
-                    .check_backing_total(required + 1)
+                    .check_backing_total(actual_budget + 1)
                     .is_err()
             );
+            assert!(recorded() >= required);
+            assert_eq!(original.window_alias().retained_payload_bytes(), 64);
             drop((request, permit));
             assert!(source.poll_quiescent(&root.owner, &mut cx).is_ready());
             drive_original(&mut driver);
         }
         assert_original_healthy(&source);
+        drop(held);
+        assert_eq!(original.window_alias().retained_payload_bytes(), 0);
         drop((original, source));
         root.business.release();
         root.owner.complete();
@@ -1945,7 +1898,7 @@ mod original_governor_tests {
 
     #[test]
     fn queued_root_payload_is_adopted_and_provider_domains_are_proved_before_ready() {
-        let (control, mut driver, root) = original_governor_with_domains(2);
+        let (control, mut driver, root) = original_governor();
         let scope = root.owner.scope();
         let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
         let route = SharedDependency::Network(
@@ -2048,7 +2001,7 @@ mod original_governor_tests {
 
     #[test]
     fn reused_bootstrap_grant_cannot_dispatch_a_new_route_before_full_domain_install() {
-        let (control, mut driver, root) = original_governor_with_domains(2);
+        let (control, mut driver, root) = original_governor();
         let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
@@ -2126,7 +2079,7 @@ mod original_governor_tests {
 
     #[test]
     fn covered_owned_peak_retains_positive_domains_and_proves_each_new_route() {
-        let (control, mut driver, root) = original_governor_with_domains(2);
+        let (control, mut driver, root) = original_governor();
         let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
@@ -2218,7 +2171,7 @@ mod original_governor_tests {
     }
 
     #[test]
-    fn ordinary_resource_refusal_retains_its_fact_after_actual_io_and_alias_exit() {
+    fn original_cancellation_retains_its_fact_after_actual_io_and_alias_exit() {
         use std::sync::atomic::AtomicBool;
 
         struct ActualIo {
@@ -2291,15 +2244,14 @@ mod original_governor_tests {
             .unwrap_or_else(|_| panic!("same original stream accepts its actual F"));
         assert!(original.is_none());
 
-        // The original component has a 4096 hard custody cap and promises no
-        // positive next-payload increment. The real Source rejects this whole
-        // growth request before dispatch; no error or grant is injected.
         let mut refused = Box::pin(
             source
-                .request_owned(NonZeroU64::new(4097).unwrap())
+                .request(SharedDependency::LocalHost)
                 .unwrap()
                 .admitted(),
         );
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
         let mut refusal = None;
         for _ in 0..256 {
             source.poll_progress(&root.owner, &mut cx).unwrap();
@@ -2309,19 +2261,16 @@ mod original_governor_tests {
                     refusal = Some(error);
                     break;
                 }
-                Poll::Ready(Ok(_)) => panic!("the original custody cap cannot grant 4097"),
+                Poll::Ready(Ok(_)) => panic!("cancelled original request cannot start"),
                 Poll::Pending => {}
             }
         }
         assert!(matches!(
             refusal.unwrap().kind(),
-            ConnectorErrorKind::ResourceExhausted
+            ConnectorErrorKind::Cancelled
         ));
         drop(refused);
-        assert!(matches!(
-            source.failure(),
-            Some(WorkError::Capacity(_) | WorkError::JointCapacity(_))
-        ));
+        assert!(matches!(source.failure(), Some(WorkError::Cancelled(_))));
         assert!(source.health_failure().is_none());
         assert!(
             source
@@ -2349,7 +2298,7 @@ mod original_governor_tests {
         };
         assert!(matches!(
             observed.into_ordinary_failure(),
-            Some(WorkError::Capacity(_) | WorkError::JointCapacity(_))
+            Some(WorkError::Cancelled(_))
         ));
         assert!(
             source.failure().is_some(),
@@ -2409,11 +2358,11 @@ mod original_governor_tests {
     }
 
     #[test]
-    fn eight_original_requests_share_two_proposal_cells_and_all_exit() {
+    fn eight_original_requests_exceed_a_one_request_profile_and_all_exit() {
         let (control, mut driver, root) = original_governor();
         let source_bytes = MetadataIoAdmission::fixed_backing_bytes(8, 1).unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
-            NonZeroUsize::new(8).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
             NonZeroU64::new(128).unwrap(),
             vec![SharedDependency::LocalHost],
@@ -2457,17 +2406,6 @@ mod original_governor_tests {
             let original = source.original.lock().unwrap();
             let body = original.as_ref().unwrap();
             assert_eq!(body.cells.len(), 8);
-            assert!(
-                body.cells.iter().any(|cell| cell
-                    .original
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .slot_wait
-                    .is_some()),
-                "real Q2 exhaustion must reach the Source's typed Full wait"
-            );
         }
 
         // No driver step or external event occurs here. After registration
@@ -2480,13 +2418,13 @@ mod original_governor_tests {
         assert_eq!(
             wake.0.load(Ordering::SeqCst),
             quiet,
-            "temporary Full alone cannot create an endless self-wake"
+            "unchanged waiting cannot create an endless self-wake"
         );
         assert_original_healthy(&source);
 
         for _ in 0..256 {
             // Only this one original driver proves/grants/reaps. The Source
-            // keeps receiving every cell while Q waiters remain Pending.
+            // keeps receiving every cell while original requests remain Pending.
             drive_original(&mut driver);
             source.poll_progress(&root.owner, &mut cx).unwrap();
             assert_original_healthy(&source);
@@ -2511,7 +2449,7 @@ mod original_governor_tests {
         }
         assert!(
             permits.iter().all(Option::is_some),
-            "all eight real Async grants must be simultaneously held with Q2"
+            "all eight real Async grants must be simultaneously held without a profile-concurrency quota"
         );
         {
             let original = source.original.lock().unwrap();

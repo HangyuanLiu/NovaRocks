@@ -233,8 +233,5 @@ mod tests {
             quote.records
                 * (quote.slot.size() + quote.future.size() + 2 * quote.exit_failure.size())
         );
-        // Independent Apply/canonical S charges stay in their original author.
-        let apply = NativeTaskOperationSink::source_geometry_for_composition(budget).unwrap();
-        assert_eq!(apply.canonical_headers, apply.records + 1);
     }
 }

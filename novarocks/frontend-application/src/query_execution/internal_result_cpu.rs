@@ -58,8 +58,8 @@ pub use metadata_geometry::InternalCpuMetadataGeometry;
 use scoped_statistics::ClosedCreatorInput;
 pub(crate) use scoped_statistics::StatisticsPlanCpuJob;
 
-// The whole maximum coexistence envelope is authorized before any domain
-// decoder/collector construction. Nested stages reuse it, never acquire again.
+// Historical COW coexistence envelope. This is not a generic Root, Statistics
+// or CPU factory minimum; actual domain byte receipts are separate.
 pub(crate) const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
 
 /// Coverage check for closed first-party factories which embed the supplied
@@ -76,7 +76,7 @@ pub(crate) fn require_internal_result_capacity(
         return Err("internal result CPU requires an admitted Internal window".into());
     }
     window
-        .check_backing_total(INTERNAL_PEAK_BYTES)
+        .check_backing_total(0)
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -86,6 +86,8 @@ pub(crate) fn require_internal_result_capacity(
 #[derive(Clone)]
 pub(crate) struct InternalResultRetention {
     binding: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    bytes: Arc<std::sync::Mutex<novarocks_workload_control::ResultPayloadBytes>>,
+    merged: Vec<Arc<std::sync::Mutex<novarocks_workload_control::ResultPayloadBytes>>>,
 }
 impl InternalResultRetention {
     pub(crate) fn try_new(
@@ -95,8 +97,13 @@ impl InternalResultRetention {
             .try_window_alias()
             .map_err(|error| error.to_string())?;
         require_internal_result_capacity(binding.scope(), &window)?;
+        let bytes = window
+            .reserve_payload_bytes(0)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             binding: binding.try_clone().map_err(|error| error.to_string())?,
+            bytes: Arc::new(std::sync::Mutex::new(bytes)),
+            merged: Vec::new(),
         })
     }
     pub(crate) fn try_spi_guard(
@@ -105,13 +112,31 @@ impl InternalResultRetention {
         novarocks_spi::connector::ConnectorPayloadRetentionGuard,
         novarocks_workload_control::WorkError,
     > {
-        let window = self.binding.try_window_alias()?;
-        Ok(match window.into_internal_retention() {
-            Ok(lease) => {
-                novarocks_spi::connector::ConnectorPayloadRetentionGuard::from_existing_lease(lease)
+        // The guard must retain actual data-byte receipts as well as the
+        // original responsibility pin. A pin alone is not byte authority.
+        Ok(
+            novarocks_spi::connector::ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(
+                self.clone(),
+            )),
+        )
+    }
+    pub(crate) fn reserve_bytes(&self, additional: usize) -> Result<(), WorkError> {
+        let additional = u64::try_from(additional).map_err(|_| WorkError::ArithmeticOverflow)?;
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_grow(additional)
+    }
+    /// Keep the same receipts when moving another completed segment into the
+    /// statement union. No allocation is charged again by this handoff.
+    pub(crate) fn merge_retention(&mut self, incoming: &Self) {
+        for charge in std::iter::once(&incoming.bytes).chain(incoming.merged.iter()) {
+            if !Arc::ptr_eq(&self.bytes, charge)
+                && !self.merged.iter().any(|old| Arc::ptr_eq(old, charge))
+            {
+                self.merged.push(Arc::clone(charge));
             }
-            Err(window) => novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(window),
-        })
+        }
     }
     // Explicit old infallible bridge, as with SPI's existing Clone callers.
     pub(crate) fn spi_guard(&self) -> novarocks_spi::connector::ConnectorPayloadRetentionGuard {
@@ -124,43 +149,52 @@ impl InternalResultRetention {
             && window.root_scope().id() == other.binding.window_alias().root_scope().id()
     }
 }
+impl novarocks_spi::connector::ConnectorPayloadByteBudget for InternalResultRetention {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
+        };
+        let bytes = u64::try_from(bytes).map_err(|_| {
+            ConnectorError::from_domain(
+                ConnectorErrorKind::ResourceExhausted,
+                WorkError::ArithmeticOverflow,
+            )
+        })?;
+        let window = self.binding.try_window_alias().map_err(|error| {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        })?;
+        let receipt = window.reserve_payload_bytes(bytes).map_err(|error| {
+            ConnectorError::from_domain(ConnectorErrorKind::ResourceExhausted, error)
+        })?;
+        // This receipt, rather than the whole collector's other buffers,
+        // follows this one actual allocation through its final Arrow alias.
+        Ok(ConnectorPayloadRetentionGuard::new(receipt))
+    }
+}
 impl std::fmt::Debug for InternalResultRetention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("InternalResultRetention")
     }
 }
 
-/// Frozen FE result capacity shared by the original window and CPU owners.
-/// This validates declarations only; it grants no position or retained bytes.
+/// Frozen FE result-window configuration. CPU workers and their queue use
+/// the original executor configuration independently of retained windows.
 #[derive(Clone, Copy, Debug)]
 pub struct FrontendResultCapacityProfile {
     capacity: ResultCapacityConfig,
-    internal_positions: NonZeroUsize,
 }
 impl FrontendResultCapacityProfile {
     pub fn try_new(
         capacity: ResultCapacityConfig,
     ) -> Result<Self, novarocks_workload_control::WorkError> {
         let capacity = capacity.validate()?;
-        if capacity.all_objects_bytes[2] < INTERNAL_PEAK_BYTES {
-            return Err(novarocks_workload_control::WorkError::InvalidConfig(
-                "internal result capacity does not cover its supported peak",
-            ));
-        }
-        let internal_positions = NonZeroUsize::new(capacity.positions[2]).ok_or(
-            novarocks_workload_control::WorkError::InvalidConfig("internal result positions"),
-        )?;
-        Ok(Self {
-            capacity,
-            internal_positions,
-        })
-    }
-
-    /// Initial Root payload required by the same closed decoder/collector
-    /// construction guard. This is the factory's actual coexistence envelope,
-    /// not the configured Internal window maximum or a second CPU payload fee.
-    pub const fn internal_initial_payload_bytes(self) -> u64 {
-        INTERNAL_PEAK_BYTES
+        Ok(Self { capacity })
     }
 
     /// Known metadata from the actual closed production job factory.
@@ -180,10 +214,6 @@ impl FrontendResultCapacityProfile {
     /// This quote alone does not authorize a CPU action or fund its lifetime.
     pub fn internal_cpu_action_quote(self) -> Result<InternalCpuActionQuote, WorkError> {
         metadata_geometry::operation_action_quote_for_composition()
-    }
-
-    pub const fn internal_cpu_capacity(self) -> QueryBlockingExecutorConfig {
-        QueryBlockingExecutorConfig::new(self.internal_positions, self.internal_positions)
     }
 
     pub const fn declared(self) -> ResultCapacityConfig {
@@ -209,18 +239,15 @@ pub(crate) struct InternalResultCpu {
 
 impl InternalResultCpuOwner {
     pub(crate) fn try_new(
-        profile: FrontendResultCapacityProfile,
+        config: QueryBlockingExecutorConfig,
         workload: &mut novarocks_workload_control::WorkloadControl,
     ) -> Result<Self, String> {
-        let mut owner = Self::new_workers(profile)?;
+        let mut owner = Self::new_workers(config)?;
         owner.bind_for_composition(workload)?;
         Ok(owner)
     }
-    fn new_workers(profile: FrontendResultCapacityProfile) -> Result<Self, String> {
-        let positions = profile.internal_positions;
-        let workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
-            positions, positions,
-        ))?;
+    fn new_workers(config: QueryBlockingExecutorConfig) -> Result<Self, String> {
+        let workers = QueryBlockingExecutorOwner::try_new(config)?;
         let runtime = InternalResultCpu {
             executor: workers.executor(),
             factory: None,
@@ -246,7 +273,10 @@ impl InternalResultCpuOwner {
     // WC owner; this constructor never grants a finite source qualification.
     #[cfg(test)]
     pub(crate) fn try_new_for_test() -> Result<Self, String> {
-        Self::new_workers(FrontendResultCapacityProfile::for_test())
+        Self::new_workers(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(32).unwrap(),
+        ))
     }
     #[cfg(test)]
     pub(crate) fn bind_for_test_before_ready(
@@ -963,6 +993,17 @@ impl InternalResultOperation {
 }
 
 impl InternalResultCpu {
+    /// Verify the original live WC/factory binding without a capacity quote.
+    pub(crate) fn validate_workload_source(
+        &self,
+        workload: &novarocks_workload_control::WorkloadControl,
+    ) -> Result<(), WorkError> {
+        self.factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .validate_in(workload)
+    }
+
     pub(crate) fn capture_action_source(
         &self,
         grant: &InternalComputationGrant,
@@ -1958,6 +1999,422 @@ mod tests {
         .expect("CPU outcome watchdog")
     }
 
+    // These component tests use the original Root/factory fixture and the
+    // production forwarder, not the unqualified generic closure bridge.
+    struct RootCpuBackpressure {
+        owner: InternalResultCpuOwner,
+        control: WorkloadControl,
+        root: novarocks_workload_control::RootWork,
+        driver: novarocks_workload_control::joint_admission::JointProgressDriver,
+        window: ResultWindowAlias,
+    }
+    impl RootCpuBackpressure {
+        fn new() -> Self {
+            use crate::query_execution::internal_consumer::domain_cpu::root_action_tests::{
+                bind, paid_claim, root_control,
+            };
+            use novarocks_workload_control::joint_admission::{
+                JointLane, JointResource, RetainedPayloadGrant,
+            };
+            let mut owner = InternalResultCpuOwner::new_workers(QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+            ))
+            .unwrap();
+            let (control, handle, mut driver) = root_control(&mut owner);
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let scope = root.owner.scope();
+            bind(&scope, &mut driver);
+            let mut raw = Some(paid_claim(
+                &handle,
+                &root.owner,
+                JointLane::Custody,
+                JointResource::PayloadBytes,
+                INTERNAL_PEAK_BYTES,
+                &mut driver,
+            ));
+            let mut payload = None;
+            RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+                .unwrap()
+                .notify();
+            let window =
+                ResultWindowAlias::from_internal_payload(&scope, &scope, payload.as_ref().unwrap())
+                    .unwrap();
+            // The alias keeps this same positive payload, without a new window.
+            drop(payload);
+            Self {
+                owner,
+                control,
+                root,
+                driver,
+                window,
+            }
+        }
+        fn drive(&mut self) {
+            use crate::query_execution::internal_consumer::domain_cpu::root_action_tests::drive;
+            self.driver.recheck_retired_backing();
+            drive(&mut self.driver);
+        }
+        async fn close(self) {
+            let Self {
+                mut owner,
+                control,
+                root,
+                driver,
+                window,
+            } = self;
+            drop(window);
+            root.owner.complete();
+            root.business.release();
+            drop(driver);
+            drop(control);
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+    }
+
+    struct MetadataCanary {
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        barrier: std::sync::Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+    impl novarocks_spi::connector::ProviderMetadataCpuSource for MetadataCanary {
+        fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> novarocks_spi::connector::ProviderBindingEpoch {
+            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([19; 16])
+        }
+        fn run_metadata(&self) {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let barrier = self.barrier.lock().unwrap().take();
+            if let Some((entered, release)) = barrier {
+                let _ = entered.send(());
+                // A finite test-only stop inside this concrete input phase,
+                // never a production Source or arbitrary closure qualification.
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }
+    }
+    impl Drop for MetadataCanary {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    struct MetadataCanaryObservation {
+        original: Weak<dyn novarocks_spi::connector::ProviderMetadataCpuSource>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    fn metadata_canary(
+        barrier: Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>,
+    ) -> (
+        novarocks_spi::connector::ProviderMetadataCpuInput,
+        MetadataCanaryObservation,
+    ) {
+        use novarocks_spi::connector::{
+            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+            ProviderMetadataCpuInput, ProviderMetadataCpuSource,
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let original: Arc<dyn ProviderMetadataCpuSource> = Arc::new(MetadataCanary {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("cpu-backpressure-component").unwrap(),
+            },
+            calls: Arc::clone(&calls),
+            drops: Arc::clone(&drops),
+            barrier: std::sync::Mutex::new(barrier),
+        });
+        let observation = MetadataCanaryObservation {
+            original: Arc::downgrade(&original),
+            calls,
+            drops,
+        };
+        (ProviderMetadataCpuInput(original), observation)
+    }
+    type OriginalCpuForwarder = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    fn original_metadata_forwarder(
+        fixture: &RootCpuBackpressure,
+        input: novarocks_spi::connector::ProviderMetadataCpuInput,
+        cancellation: &QueryCancellationSource,
+    ) -> (
+        Arc<InternalCpuRetirement<OperationOutput>>,
+        OriginalCpuForwarder,
+        oneshot::Receiver<OperationResult>,
+    ) {
+        let cpu = fixture.owner.runtime();
+        let packet = Arc::new(InternalCpuRetirement::new(fixture.window.clone(), None));
+        {
+            let mut state = packet.state.lock().unwrap();
+            state.closed_operation = Some(InternalResultOperation::ProviderCreator);
+            state.provider_input = Some(Box::new(ClosedCreatorInput::ProviderMetadata(input)));
+            state.action = Some(CpuActionState::default());
+        }
+        let (completed, completion) = oneshot::channel();
+        let source = cpu
+            .provider_creator_source(&fixture.root.owner.scope())
+            .unwrap();
+        let forwarder: OriginalCpuForwarder = Box::pin(make_operation_forwarder(
+            cpu.executor.clone(),
+            cpu.factory.clone(),
+            Some(source),
+            cancellation.view(),
+            Arc::new(CondvarWake::default()),
+            Arc::clone(&packet),
+            completed,
+        ));
+        (packet, forwarder, completion)
+    }
+    fn poll_original_forwarder(forwarder: &mut OriginalCpuForwarder) -> std::task::Poll<()> {
+        std::future::Future::poll(
+            forwarder.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+    }
+    fn assert_original_metadata_input(
+        packet: &InternalCpuRetirement<OperationOutput>,
+        observation: &MetadataCanaryObservation,
+    ) {
+        let state = packet.state.lock().unwrap();
+        let ClosedCreatorInput::ProviderMetadata(input) = state.provider_input.as_deref().unwrap()
+        else {
+            panic!("the original closed metadata input was replaced")
+        };
+        assert!(Weak::ptr_eq(
+            &Arc::downgrade(&input.0),
+            &observation.original
+        ));
+        assert!(state.admission_failure.is_none());
+        assert!(
+            state.reserve_refusal.is_none(),
+            "Full is backpressure, not Resource"
+        );
+        assert!(state.publication_refusal.is_none());
+    }
+    async fn finish_original_forwarder(
+        fixture: &mut RootCpuBackpressure,
+        forwarder: &mut OriginalCpuForwarder,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                fixture.drive();
+                if poll_original_forwarder(forwarder).is_ready() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original forwarder/worker actual-exit watchdog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bound_root_forwarder_keeps_original_input_across_full_queue_and_actual_exit() {
+        use std::sync::atomic::Ordering;
+        let mut fixture = RootCpuBackpressure::new();
+        let cpu = fixture.owner.runtime();
+        let factory = cpu.factory.as_ref().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..cpu.configured_capacity().queue_capacity().get() {
+            held.push(
+                cpu.executor
+                    .try_reserve_internal_result_closed_factory(factory)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            cpu.executor
+                .try_reserve_internal_result_closed_factory(factory),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        let cancellation = QueryCancellationSource::new();
+        let (input, observation) = metadata_canary(None);
+        let (packet, mut forwarder, mut completion) =
+            original_metadata_forwarder(&fixture, input, &cancellation);
+        assert!(poll_original_forwarder(&mut forwarder).is_pending());
+        fixture.drive();
+        assert!(poll_original_forwarder(&mut forwarder).is_pending());
+        assert_original_metadata_input(&packet, &observation);
+        {
+            let state = packet.state.lock().unwrap();
+            let action = state.action.as_ref().unwrap();
+            // reobserve_after_drop keeps the original admission; no new Source
+            // or request is constructed by the semaphore wait/retry loop.
+            assert!(action.admission.is_some());
+            assert!(!action.published && action.receipt.is_none() && action.physical.is_none());
+        }
+        assert!(matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(observation.calls.load(Ordering::Acquire), 0);
+        assert_eq!(observation.drops.load(Ordering::Acquire), 0);
+        drop(held.pop());
+        // Do not run the WC driver: the exact original reservation is now
+        // acquired, but the original rolled-back request has not regranted.
+        assert!(poll_original_forwarder(&mut forwarder).is_pending());
+        assert!(matches!(
+            cpu.executor
+                .try_reserve_internal_result_closed_factory(factory),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        assert_original_metadata_input(&packet, &observation);
+        finish_original_forwarder(&mut fixture, &mut forwarder).await;
+        let output = completion.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            output.value(),
+            Ok(InternalDomainSlot::ProviderCreatorFinished)
+        ));
+        assert!(
+            poll_cpu_actual_exit(
+                &packet,
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_ready()
+        );
+        assert_original_metadata_input(&packet, &observation);
+        assert_eq!(observation.calls.load(Ordering::Acquire), 1);
+        assert!(!packet.has_failure());
+        drop(output);
+        drop(forwarder);
+        drop(packet);
+        assert!(observation.original.upgrade().is_none());
+        assert_eq!(observation.drops.load(Ordering::Acquire), 1);
+        drop(held);
+        fixture.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bound_root_forwarder_cancel_after_reserve_does_not_publish_or_retire_other_work() {
+        use std::sync::atomic::Ordering;
+        let mut fixture = RootCpuBackpressure::new();
+        let cpu = fixture.owner.runtime();
+        let factory = cpu.factory.as_ref().unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, blocked) = mpsc::channel();
+        let other_cancellation = QueryCancellationSource::new();
+        let (other_input, other) = metadata_canary(Some((entered, blocked)));
+        let (other_packet, mut other_forwarder, mut other_completion) =
+            original_metadata_forwarder(&fixture, other_input, &other_cancellation);
+        assert!(poll_original_forwarder(&mut other_forwarder).is_pending());
+        fixture.drive();
+        assert!(poll_original_forwarder(&mut other_forwarder).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.calls.load(Ordering::Acquire), 1);
+        // Dequeue returns the original queue permit even while the same
+        // published call and its physical/actual-exit responsibility remain.
+        let mut held = vec![
+            cpu.executor
+                .try_reserve_internal_result_closed_factory(factory)
+                .expect("running call must no longer consume a queue reservation"),
+        ];
+        assert!(
+            poll_cpu_actual_exit(
+                &other_packet,
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            )
+            .is_pending()
+        );
+        for _ in 1..cpu.configured_capacity().queue_capacity().get() {
+            held.push(
+                cpu.executor
+                    .try_reserve_internal_result_closed_factory(factory)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            cpu.executor
+                .try_reserve_internal_result_closed_factory(factory),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        let cancellation = QueryCancellationSource::new();
+        let (input, cancelled) = metadata_canary(None);
+        let (packet, mut forwarder, mut completion) =
+            original_metadata_forwarder(&fixture, input, &cancellation);
+        assert!(poll_original_forwarder(&mut forwarder).is_pending());
+        fixture.drive();
+        assert!(poll_original_forwarder(&mut forwarder).is_pending());
+        assert_original_metadata_input(&packet, &cancelled);
+        drop(held.pop());
+        // Acquire the permit, then pause proof progress before any publication.
+        assert!(poll_original_forwarder(&mut forwarder).is_pending());
+        assert!(matches!(
+            cpu.executor
+                .try_reserve_internal_result_closed_factory(factory),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        cancellation.request(QueryCancellationReason::ExecutionCancellationRequested);
+        assert!(poll_original_forwarder(&mut forwarder).is_ready());
+        let result = completion.try_recv().unwrap();
+        assert!(matches!(result, Err(ref failure)
+            if failure.fact() == QueryFailureReason::Cancelled.failure_fact()));
+        assert_original_metadata_input(&packet, &cancelled);
+        {
+            let state = packet.state.lock().unwrap();
+            let action = state.action.as_ref().unwrap();
+            assert!(!action.published && action.receipt.is_none());
+            assert!(action.admission.is_none() && action.physical.is_none());
+        }
+        assert_eq!(cancelled.calls.load(Ordering::Acquire), 0);
+        assert_eq!(cancelled.drops.load(Ordering::Acquire), 0);
+        // Exactly the cancelled unstarted reservation returned; the remaining
+        // independently held reservations still fill the rest of the queue.
+        // The other published job keeps its distinct actual-exit responsibility.
+        let returned = cpu
+            .executor
+            .try_reserve_internal_result_closed_factory(factory)
+            .unwrap();
+        assert!(matches!(
+            cpu.executor
+                .try_reserve_internal_result_closed_factory(factory),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        assert!(
+            poll_cpu_actual_exit(
+                &other_packet,
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        assert!(matches!(
+            other_completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(other.drops.load(Ordering::Acquire), 0);
+        drop(returned);
+        drop(held);
+        let _ = release.send(());
+        finish_original_forwarder(&mut fixture, &mut other_forwarder).await;
+        let other_output = other_completion.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            other_output.value(),
+            Ok(InternalDomainSlot::ProviderCreatorFinished)
+        ));
+        assert_eq!(other.calls.load(Ordering::Acquire), 1);
+        assert_original_metadata_input(&other_packet, &other);
+        assert!(!packet.has_failure() && !other_packet.has_failure());
+        drop(result);
+        drop(other_output);
+        drop(forwarder);
+        drop(other_forwarder);
+        drop(packet);
+        drop(other_packet);
+        assert_eq!(cancelled.drops.load(Ordering::Acquire), 1);
+        assert_eq!(other.drops.load(Ordering::Acquire), 1);
+        fixture.close().await;
+    }
+
     #[test]
     fn statistics_action_detail_requests_one_bounded_utf8_backing() {
         const TEXT: &str = concat!(
@@ -1975,10 +2432,6 @@ mod tests {
 
     #[test]
     fn original_action_refusal_keeps_typed_axis_detail_and_first_packet_error() {
-        use novarocks_workload_control::joint_admission::{
-            JointCapacityConstraint, JointCapacityFailure, JointCapacityProjection, JointLane,
-            JointResource,
-        };
         let (control, capacity) = control();
         let (root, window) = control
             .root_admission()
@@ -1988,11 +2441,7 @@ mod tests {
             )
             .unwrap();
         let packet = InternalCpuRetirement::<OperationOutput>::new(window.retain_alias(), None);
-        let refusal = WorkError::JointCapacity(JointCapacityFailure {
-            resource: JointResource::PhysicalQueueBytes,
-            projection: JointCapacityProjection::Lane(JointLane::Foreground),
-            constraint: JointCapacityConstraint::Dependency,
-        });
+        let refusal = WorkError::Capacity("original result payload bytes");
         let marker = action_failure(&packet, CpuActionFailureSite::LocalOffer, refusal.clone());
         assert_eq!(marker.fact(), refusal.failure_fact());
         assert_eq!(
@@ -2001,9 +2450,7 @@ mod tests {
         );
         let detail = cpu_action_failure_detail(CpuActionFailureSite::LocalOffer, &refusal);
         assert!(detail.as_str().contains("LocalOffer"));
-        assert!(detail.as_str().contains("PhysicalQueueBytes"));
-        assert!(detail.as_str().contains("Foreground"));
-        assert!(detail.as_str().contains("Dependency"));
+        assert!(detail.as_str().contains("original result payload bytes"));
         assert!(
             !packet.has_failure(),
             "ordinary capacity is not process health"
@@ -2011,7 +2458,7 @@ mod tests {
         let later = action_failure(
             &packet,
             CpuActionFailureSite::Begin,
-            WorkError::Capacity("fixed proposal and reply cells"),
+            WorkError::Capacity("original executor queue"),
         );
         assert_eq!(
             later.detail().as_str(),
@@ -2030,7 +2477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_validated_profile_governs_actual_windows_and_physical_cpu_geometry() {
+    async fn result_windows_and_actual_cpu_geometry_are_independent() {
         let profile = FrontendResultCapacityProfile::try_new(ResultCapacityConfig {
             positions: [320, 16, 1, 64],
             all_objects_bytes: [
@@ -2072,10 +2519,14 @@ mod tests {
                 .check_backing_total(INTERNAL_PEAK_BYTES + 1)
                 .is_err()
         );
-        let mut owner = InternalResultCpuOwner::new_workers(profile).unwrap();
+        let mut owner = InternalResultCpuOwner::new_workers(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(3).unwrap(),
+        ))
+        .unwrap();
         let installed = owner.runtime().executor.configured_capacity();
-        assert_eq!(installed.worker_threads().get(), 1);
-        assert_eq!(installed.queue_capacity().get(), 1);
+        assert_eq!(installed.worker_threads().get(), 2);
+        assert_eq!(installed.queue_capacity().get(), 3);
         drop(window);
         root.owner.complete();
         root.business.release();
@@ -2086,17 +2537,21 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_internal_declarations_fail_before_opening_workers() {
-        for (positions, bytes) in [(0, INTERNAL_PEAK_BYTES), (1, INTERNAL_PEAK_BYTES - 1)] {
+    fn invalid_result_declarations_fail_but_small_actual_budgets_are_supported() {
+        for (positions, bytes) in [(0, 64), (1, 0)] {
             let mut capacity = ResultCapacityConfig::V1;
             capacity.positions[2] = positions;
             capacity.all_objects_bytes[2] = bytes;
             assert!(FrontendResultCapacityProfile::try_new(capacity).is_err());
         }
+        let mut capacity = ResultCapacityConfig::V1;
+        capacity.positions[2] = 1;
+        capacity.all_objects_bytes[2] = 64;
+        assert!(FrontendResultCapacityProfile::try_new(capacity).is_ok());
     }
 
     #[test]
-    fn foreign_class_or_incomplete_envelope_refuses_before_constructor() {
+    fn foreign_class_refuses_before_constructor_and_small_original_budget_is_supported() {
         let (control, _) = control();
         let (root, window) = control
             .root_admission()
@@ -2161,14 +2616,13 @@ mod tests {
                 ResultWindowClass::Internal,
             )
             .unwrap();
-        assert!(
-            InternalResultValue::<()>::try_produce(
-                &root.owner.scope(),
-                window.retain_alias(),
-                |_| panic!("peak refusal precedes growth")
-            )
-            .is_err()
-        );
+        let value = InternalResultValue::<()>::try_produce(
+            &root.owner.scope(),
+            window.retain_alias(),
+            |_| Ok(()),
+        )
+        .expect("small actual results have no universal construction floor");
+        drop(value);
         drop(window);
         root.owner.complete();
         root.business.release();

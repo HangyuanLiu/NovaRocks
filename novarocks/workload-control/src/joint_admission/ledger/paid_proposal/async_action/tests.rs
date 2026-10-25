@@ -30,95 +30,10 @@ fn fixture_with_positions(
     positions: u64,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[]);
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 4,
-        max_registered_dependencies: (4 * 16 + 2 * 8 * 2 * 4 + 2 * 4 + 1) * 4,
-        max_claims: 16,
-        max_requests: 16,
-        max_changes_per_request: 4,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
+    let storage = ControlStorageConfig::new(count, &[]);
+    let config = ResponsibilityConfig {
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
-    config.max_registered_dependencies =
-        crate::joint_admission::ledger::metadata_geometry::maximum_fact_roots(&config, count * 2)
-            .unwrap()
-            .checked_mul(config.max_dependencies_per_claim)
-            .unwrap();
-    let base = storage.base_charge(&config).unwrap();
-    let m = base.get(JointResource::MetadataBytes);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 8)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, 7)
-            .with(JointResource::ClaimRecords, 12)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
-        protected_progress: base,
-    };
-    let foreground = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, positions)
-            .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::AsyncIo, positions)
-            .with(JointResource::PhysicalQueueRecords, positions)
-            .with(JointResource::PhysicalQueueBytes, 4096),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, positions)
-            .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::AsyncIo, positions)
-            .with(JointResource::PhysicalQueueRecords, positions)
-            .with(JointResource::PhysicalQueueBytes, 4096),
-        protected_progress: JointResources::ZERO,
-    };
-    let settlement = foreground;
-    let global = JointResourceLimits {
-        global: custody
-            .global
-            .checked_add(foreground.global)
-            .unwrap()
-            .checked_add(settlement.global)
-            .unwrap(),
-        per_dependency: custody
-            .per_dependency
-            .checked_add(foreground.per_dependency)
-            .unwrap()
-            .checked_add(settlement.per_dependency)
-            .unwrap(),
-        protected_progress: base,
-    };
-    config.global = global;
-    config.classes[0] = global;
-    config.lanes[0] = custody;
-    config.lanes[1] = foreground;
-    config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
-    config.lanes[2] = settlement;
-    config.class_lanes[0][2] = settlement;
-    // Only the original fixed substrate requires progress in this fixture.
-    // CPU/complete Native action protection is deliberately not asserted.
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = base;
-    required.lanes[0] = base;
-    required.class_lanes[0][0] = base;
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -128,9 +43,7 @@ fn fixture_with_positions(
     })
     .unwrap()
     .owner;
-    let (handle, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
-        .unwrap();
+    let (handle, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver)
@@ -347,7 +260,7 @@ fn root_payload_rekeys_live_async_rows_without_child_or_payload_pin_replacement(
 }
 
 #[test]
-fn two_original_proposal_cells_install_eight_simultaneous_async_grants() {
+fn eight_original_async_requests_keep_independent_grants_without_a_q_gate() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct WakeCount(AtomicUsize);
     impl std::task::Wake for WakeCount {
@@ -367,64 +280,39 @@ fn two_original_proposal_cells_install_eight_simultaneous_async_grants() {
         .async_action_source(JointLane::Foreground)
         .unwrap();
     let mut admissions = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..8 {
         admissions.push(
             match source
                 .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
                 .unwrap()
             {
                 JointTryBegin::Started(value) => value,
-                JointTryBegin::Full(_) => panic!("two original construction positions"),
+                JointTryBegin::Full(_) => panic!("responsibility construction has no fixed Q gate"),
             },
         );
     }
     let marker = control.progress_revision();
-    let mut wait = match source
-        .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
-        .unwrap()
-    {
-        JointTryBegin::Full(wait) => wait,
-        JointTryBegin::Started(_) => panic!("original Q must be full"),
-    };
-    assert_eq!(control.progress_revision(), marker);
     let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
     let waker = Waker::from(Arc::clone(&wake));
     let mut cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
-    // Polling the same pending replies must not notify this root's Q wait.
+    // Register all original reply wakers, then observe them again without
+    // inventing a slot wait or changing the original service revision.
     for _ in 0..2 {
         for admission in &mut admissions {
             let mut target = None;
             assert!(admission.poll_install_in(&mut cx, &mut target).is_pending());
         }
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
     }
     assert_eq!(control.progress_revision(), marker);
     assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+    drive(&mut driver);
+    assert!(wake.0.load(Ordering::SeqCst) > 0);
     let mut grants = Vec::new();
     for admission in &mut admissions {
         grants.push(install(admission, &mut driver));
     }
-    drive(&mut driver);
-    assert!(wake.0.load(Ordering::SeqCst) > 0);
-    assert!(matches!(
-        Pin::new(&mut wait).poll(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
-    // Keep even the completed admission objects alive: their empty replies no
-    // longer retain the paid proposal-body container or either original Q cell.
-    for _ in 2..8 {
-        let mut admission = match source
-            .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
-            .unwrap()
-        {
-            JointTryBegin::Started(value) => value,
-            JointTryBegin::Full(_) => panic!("received empty container must release Q"),
-        };
-        grants.push(install(&mut admission, &mut driver));
-        admissions.push(admission);
-        drive(&mut driver);
-    }
+    // Completed admission objects remain alive while all eight exact grants
+    // retain their independent I/O responsibilities.
     let async_count = || {
         control
             .inner
@@ -445,10 +333,15 @@ fn two_original_proposal_cells_install_eight_simultaneous_async_grants() {
     drive(&mut driver);
     assert_eq!(async_count(), 0);
     drop(admissions);
+    work.business.release();
+    work.owner.complete();
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
 }
 
 #[test]
-fn root_initial_and_growth_retry_only_after_original_q_progress() {
+fn root_initial_and_growth_preserve_original_epoch_and_aliases_without_a_q_gate() {
     let (control, handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
@@ -456,23 +349,7 @@ fn root_initial_and_growth_retry_only_after_original_q_progress() {
     let first = handle.begin_paid_proposal(&work.owner).unwrap();
     let second = handle.begin_paid_proposal(&work.owner).unwrap();
     let source = work.owner.root_payload_initial_source().unwrap();
-    let marker = control.progress_revision();
-    let mut wait = match source
-        .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(8).unwrap())
-        .unwrap()
-    {
-        JointTryBegin::Full(wait) => wait,
-        JointTryBegin::Started(_) => panic!("initial construction needs the same Q"),
-    };
-    assert_eq!(marker, control.progress_revision());
     let mut cx = Context::from_waker(Waker::noop());
-    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
-    drop(first);
-    drive(&mut driver);
-    assert!(matches!(
-        Pin::new(&mut wait).poll(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
     let mut initial = match source
         .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(8).unwrap())
         .unwrap()
@@ -505,30 +382,15 @@ fn root_initial_and_growth_retry_only_after_original_q_progress() {
             .unwrap()
     };
     let third = handle.begin_paid_proposal(&work.owner).unwrap();
-    let mut wait = match payload
-        .root_payload_source(&scope, JointLane::Foreground, &[])
-        .unwrap()
-        .try_begin(4)
-        .unwrap()
-    {
-        JointTryBegin::Full(wait) => wait,
-        JointTryBegin::Started(_) => panic!("growth construction needs the same Q"),
-    };
-    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
-    // A shape/policy refusal is never converted into temporary Full.
+    // Overflow is an actual typed input refusal, never a synthetic Q Full.
     assert!(matches!(
         payload
             .root_payload_source(&scope, JointLane::Foreground, &[])
             .unwrap()
             .try_begin(u64::MAX),
-        Err(WorkError::Capacity(_))
+        Err(WorkError::ArithmeticOverflow)
     ));
     drop(third);
-    drive(&mut driver);
-    assert!(matches!(
-        Pin::new(&mut wait).poll(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
     let mut proposal = match payload
         .root_payload_source(&scope, JointLane::Foreground, &[])
         .unwrap()
@@ -556,7 +418,7 @@ fn root_initial_and_growth_retry_only_after_original_q_progress() {
     drop(state);
     drop(ready);
     drop(pending);
-    drop(second);
+    drop((first, second));
     drop(alias);
     drop(payload);
     drive(&mut driver);

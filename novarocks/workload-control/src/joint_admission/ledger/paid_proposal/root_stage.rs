@@ -30,6 +30,7 @@ use super::*;
 /// ```
 #[must_use = "Capture is not a grant; construct outside receiver locks"]
 pub struct RootStageSource {
+    computation_window: Option<crate::result_window::ClientComputationWindow>,
     writer_revision: Option<u64>,
     inner: Weak<Inner>,
     root: WorkId,
@@ -130,6 +131,7 @@ impl RetainedPayloadGrant {
             return Err(WorkError::Conflict);
         }
         Ok(RootStageSource {
+            computation_window: None,
             writer_revision: state.nodes[&root.id]
                 .root_domains
                 .as_ref()
@@ -152,6 +154,20 @@ impl RetainedPayloadGrant {
 }
 const ROOT_STAGE_BASE_CHANGES: usize = 4;
 impl RootStageSource {
+    /// Reuse the SAME actual Client computation window. A weak fence adds no
+    /// second position; the caller must keep the original window alive.
+    pub fn for_client_window(
+        mut self,
+        window: &crate::ResultWindowAlias,
+    ) -> Result<Self, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        self.computation_window = Some(window.client_computation_window(&WorkScope {
+            inner,
+            id: self.root,
+        })?);
+        Ok(self)
+    }
+
     /// The original Root and its distinct execution stage each retain one
     /// complete fixed control record until their actual owner exits.
     pub const fn minimum_control_records() -> usize {
@@ -168,31 +184,6 @@ impl RootStageSource {
     /// CPU, physical job or queue resource is implied by this computation pin.
     pub fn computation_progress() -> JointResources {
         computation_amounts()
-    }
-
-    /// Source support derived from finite per-D policy, not a declaration of
-    /// the Root's cumulative retained union. A complete profile includes the
-    /// returned quantum in Required; this pure fact itself grants nothing.
-    pub fn protected_payload_increment_for_policy(
-        per_dependency_bytes: u64,
-        fanout: std::num::NonZeroUsize,
-    ) -> Result<u64, WorkError> {
-        let k = u64::try_from(fanout.get()).map_err(|_| WorkError::ArithmeticOverflow)?;
-        per_dependency_bytes
-            .checked_div(k)
-            .filter(|n| *n != 0)
-            .ok_or(WorkError::Capacity(
-                "Root/stage protected payload increment",
-            ))
-    }
-
-    /// Read this same source's configured maximum before preparing any input
-    /// whose complete new backing would exceed the supported increment.
-    pub fn maximum_protected_payload_increment(&self) -> Result<u64, WorkError> {
-        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
-        let state = inner.state.lock().unwrap();
-        validate_nodes(&state, self.root, self.fence.stage)?;
-        maximum_payload_increment(&state, self.root)
     }
 
     /// Actual current originals in this closed action, including every
@@ -237,11 +228,6 @@ impl RootStageSource {
         if !matches!(lane, JointLane::Foreground | JointLane::Settlement) {
             return Err(WorkError::Conflict);
         }
-        if payload_delta_bytes > self.maximum_protected_payload_increment()? {
-            return Err(WorkError::Capacity(
-                "Root/stage protected payload increment",
-            ));
-        }
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         self.validate_writer_capture(&inner)?;
         let root = WorkScope {
@@ -273,11 +259,6 @@ impl RootStageSource {
     ) -> Result<JointTryBegin<RootStageProposal, JointProposalSlotSignal>, WorkError> {
         if !matches!(lane, JointLane::Foreground | JointLane::Settlement) {
             return Err(WorkError::Conflict);
-        }
-        if payload_delta_bytes > self.maximum_protected_payload_increment()? {
-            return Err(WorkError::Capacity(
-                "Root/stage protected payload increment",
-            ));
         }
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         self.validate_writer_capture(&inner)?;
@@ -328,9 +309,6 @@ impl RootStageSource {
         lane: JointLane,
     ) -> Result<RootStageProposal, WorkError> {
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
-        if proposal.config.config.max_changes_per_request < self.required_change_records()? {
-            return Err(WorkError::Capacity("Root/stage paid batch backing"));
-        }
         let stage_facts = {
             let state = inner.state.lock().unwrap();
             validate_nodes(&state, self.root, self.fence.stage)?;
@@ -373,6 +351,7 @@ impl RootStageSource {
             )
         };
         proposal.root_stage = Some(self.fence);
+        proposal.computation_window = self.computation_window;
         proposal.begin_grow(
             self.payload,
             JointResources::ZERO.with(JointResource::PayloadBytes, payload_delta_bytes),
@@ -403,7 +382,7 @@ impl RootStageSource {
 pub struct RootStageProposal {
     root_control: JointClaimView,
     stage_control: JointClaimView,
-    stage_facts: Arc<ProfileFacts>,
+    stage_facts: Arc<ResponsibilityFacts>,
     computation: Option<JointClaimView>,
     lane: JointLane,
     phase: u8,
@@ -528,12 +507,12 @@ impl RootStageProposal {
                 let root_origin = self.proposal.records[1].claim.facts.key.origin;
                 let stage = &mut self.proposal.records[2];
                 let local = stage.original_facts.as_ref().unwrap();
-                stage.claim.facts = Arc::new(ProfileFacts {
-                    key: Arc::new(ProfileKey {
+                stage.claim.facts = Arc::new(ResponsibilityFacts {
+                    key: Arc::new(FactKey {
                         origin: root_origin,
                         class: local.key.class,
                         lane: local.key.lane,
-                        causal: local.key.causal,
+                        source_kind: local.key.source_kind,
                         dependencies: local.key.dependencies.clone(),
                     }),
                     class: local.class,
@@ -545,12 +524,12 @@ impl RootStageProposal {
                 compute.claim.facts = if let Some(original) = &compute.original_facts {
                     Arc::clone(original)
                 } else {
-                    Arc::new(ProfileFacts {
-                        key: Arc::new(ProfileKey {
+                    Arc::new(ResponsibilityFacts {
+                        key: Arc::new(FactKey {
                             origin: local.key.origin,
                             class: local.key.class,
                             lane: self.lane as usize,
-                            causal: CausalMask::NONE,
+                            source_kind: SourceKind::Plain,
                             dependencies: local.key.dependencies.clone(),
                         }),
                         class: local.class,
@@ -584,76 +563,22 @@ impl RootStageProposal {
             .submit()
             .map(|admission| RootStageAdmission { admission })
     }
-    pub fn submit_finite(
-        self,
-        limit: std::num::NonZeroU64,
-    ) -> Result<RootStageAdmission, JointAdmissionFailure> {
-        if self.phase != 2 {
-            return Err(JointAdmissionFailure {
-                error: WorkError::Conflict,
-            });
-        }
-        let Self {
-            proposal,
-            root_control,
-            stage_control,
-            stage_facts,
-            ..
-        } = self;
-        drop(root_control);
-        drop(stage_control);
-        drop(stage_facts);
-        proposal
-            .submit_finite(limit)
-            .map(|admission| RootStageAdmission { admission })
-    }
 }
 pub(super) fn merge(
     proposal: &mut JointProposal,
     references: &[DependencyRef],
 ) -> Result<(), WorkError> {
     let current = proposal.current.as_mut().ok_or(WorkError::Conflict)?;
-    let k = proposal.config.config.max_dependencies_per_claim;
     for reference in references {
         if let Err(position) = current
             .selected
             .binary_search_by_key(&reference.ordinal, |r| r.ordinal)
         {
-            if current.selected.len() == k {
-                return Err(WorkError::Capacity("joint dependency union"));
-            }
             current.selected.insert(position, reference.clone());
         }
     }
     Ok(())
 }
-pub(super) fn maximum_payload_increment(state: &State, root: WorkId) -> Result<u64, WorkError> {
-    let node = state.nodes.get(&root).ok_or(WorkError::Released)?;
-    let config = &state
-        .joint
-        .as_ref()
-        .ok_or(WorkError::NotReady)?
-        .config
-        .config;
-    let class = crate::joint_admission::class_index(node.class);
-    let custody = JointLane::Custody as usize;
-    let cap = [
-        config.global,
-        config.classes[class],
-        config.lanes[custody],
-        config.class_lanes[class][custody],
-    ]
-    .into_iter()
-    .map(|l| l.per_dependency.get(JointResource::PayloadBytes))
-    .min()
-    .ok_or(WorkError::Conflict)?;
-    RootStageSource::protected_payload_increment_for_policy(
-        cap,
-        std::num::NonZeroUsize::new(config.max_dependencies_per_claim)
-            .ok_or(WorkError::Conflict)?,
-    )
-}
-
 fn computation_amounts() -> JointResources {
     JointResources::ZERO
         .with(JointResource::ClaimRecords, 1)
@@ -723,11 +648,6 @@ pub(in crate::joint_admission::ledger) fn validate_root_stage(
             || changes[0].claim.facts.key.dependencies != changes[1].claim.facts.key.dependencies)
     {
         return Err(WorkError::Conflict);
-    }
-    if delta.get(JointResource::PayloadBytes) > maximum_payload_increment(state, root)? {
-        return Err(WorkError::Capacity(
-            "Root/stage protected payload increment",
-        ));
     }
     let full_index = if fence.canonical { 2 } else { 1 };
     let full = &changes[full_index].claim.facts.dependencies;
@@ -899,6 +819,9 @@ impl RootStageReady {
                 || row.active_facts.key != row.facts.key
             {
                 return Err(WorkError::Conflict);
+            }
+            if let Some(window) = &row.computation_window {
+                window.validate_claim(compute)?;
             }
             // All fallible checks precede the first move. No callbacks, raw
             // aliases or old pin changes occur during this original commit.

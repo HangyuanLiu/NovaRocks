@@ -312,20 +312,17 @@ impl Clone for FrontendDataRuntime {
 }
 
 impl FrontendDataRuntime {
-    pub(crate) fn capacity_sources(
+    /// Capture facts from the original installed owners without requiring a
+    /// predicted layout of their records or SDK pointees.
+    pub(crate) fn installed_runtime_sources(
         &self,
     ) -> Result<
         crate::native_workload::NativeProcessCapacitySources,
         novarocks_workload_control::WorkError,
     > {
-        let (subscription_records, subscription_resident_bytes) =
-            self.subscription_port.capacity_sources()?;
-        let (apply_records, apply_resident_bytes) = self.apply_send_port.capacity_sources()?;
         Ok(crate::native_workload::NativeProcessCapacitySources {
-            apply_records,
-            apply_resident_bytes,
-            subscription_records,
-            subscription_resident_bytes,
+            apply_records: self.apply_send_port.installed_records()?,
+            subscription_records: self.subscription_port.installed_records()?,
             transport: self.task_transport_supervisor.capacity_sources(),
             physical: self.transport_admission.dimensions(),
         })
@@ -850,8 +847,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_capture_reads_the_original_pools_factory_and_subscription_inventory() {
         use crate::native_workload::{
-            FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs,
-            FrontendWorkloadCapacityConfig,
+            FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig,
         };
         use crate::query_execution::internal_result_cpu::{
             FrontendResultCapacityProfile, InternalResultCpuOwner,
@@ -868,28 +864,22 @@ mod tests {
         let workload = WorkloadConfig::default();
         let mut control = WorkloadControl::try_new_counted(workload.clone()).unwrap();
         let result = FrontendResultCapacityProfile::for_test();
-        let mut internal = InternalResultCpuOwner::try_new(result, &mut control.owner).unwrap();
         let config = QueryBlockingExecutorConfig::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(1).unwrap(),
         );
+        let mut internal = InternalResultCpuOwner::try_new(config, &mut control.owner).unwrap();
         let mut blocking = QueryBlockingExecutorOwner::try_new(config).unwrap();
         let policy = |slots| {
             FrontendWorkloadCapacityConfig::try_new(
                 slots,
-                FrontendDependencyCustodyLimits {
-                    unreceived_productions: 1,
-                    publications: 2,
-                    residuals: 3,
-                    retained_payload_bytes: 4,
-                },
                 NonZeroUsize::new(7).unwrap(),
                 Duration::from_millis(25),
             )
             .unwrap()
         };
         let inputs =
-            FrontendNativeCapacityInputs::try_new(policy([4096, 1024, 1024, 1024, 1024]), config)
+            FrontendNativeCapacityInputs::try_new(policy(workload.scope_records_limit), config)
                 .unwrap()
                 .with_native_sources(&native)
                 .unwrap();
@@ -897,7 +887,7 @@ mod tests {
             .capture_sources(&workload, result, &blocking.executor(), &internal.runtime())
             .unwrap();
         let wrong_pool = FrontendNativeCapacityInputs::try_new(
-            policy([4096, 1024, 1024, 1024, 1024]),
+            policy(workload.scope_records_limit),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -911,10 +901,11 @@ mod tests {
                 &blocking.executor(),
                 &internal.runtime()
             ),
-            Err(WorkError::InvalidConfig("frontend actual source geometry"))
+            Err(WorkError::InvalidConfig(
+                "frontend actual source configuration"
+            ))
         );
-        let wrong_inventory =
-            FrontendNativeCapacityInputs::try_new(policy([4, 1, 1, 1, 1]), config).unwrap();
+        let wrong_inventory = FrontendNativeCapacityInputs::try_new(policy(4), config).unwrap();
         let inventory_refused = matches!(
             wrong_inventory.with_native_sources(&native),
             Err(WorkError::InvalidConfig(
@@ -932,19 +923,10 @@ mod tests {
             )
         });
         assert_eq!(captured.query_blocking, config);
-        assert_eq!(captured.internal_cpu, result.internal_cpu_capacity());
-        assert_eq!(
-            captured.internal_action,
-            result.internal_cpu_action_quote().unwrap()
-        );
+        assert_eq!(captured.internal_cpu.configured_capacity(), config);
         assert_eq!(
             captured.native.unwrap().subscription_records,
             workload.scope_records_limit
-        );
-        assert_eq!(
-            captured.native.unwrap().subscription_resident_bytes,
-            super::NativeSubscriptionOwner::resident_storage_bytes(workload.scope_records_limit)
-                .unwrap()
         );
         assert_eq!(
             captured.native.unwrap().transport,
@@ -955,16 +937,9 @@ mod tests {
             native.transport_admission().dimensions()
         );
         assert_eq!(
-            (
-                captured.native.unwrap().apply_records,
-                captured.native.unwrap().apply_resident_bytes
-            ),
-            native.apply_send_port.capacity_sources().unwrap()
+            captured.native.unwrap().apply_records,
+            native.apply_send_port.installed_records().unwrap(),
         );
-        assert_eq!(captured.logical_role,
-            novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_role_poll_geometry().unwrap());
-        assert_eq!(captured.logical_root_custody,
-            novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_root_custody_geometry());
         assert!(pool_refused);
         assert!(inventory_refused);
     }

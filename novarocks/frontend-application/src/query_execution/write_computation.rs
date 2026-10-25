@@ -369,8 +369,10 @@ impl ConnectorWriteSession {
                     )
                 })?;
         }
-        if accumulated.retention.is_none() {
-            accumulated.retention = retention;
+        match (&mut accumulated.retention, retention) {
+            (Some(current), Some(incoming)) => current.merge_retention(&incoming),
+            (target @ None, incoming) => *target = incoming,
+            _ => {}
         }
         accumulated.rows = next_rows;
         accumulated.ledger = next_ledger;

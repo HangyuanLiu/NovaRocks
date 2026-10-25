@@ -15,177 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Mandatory installation recipe from the frontend's complete action authors.
-//! The actual WC/source validation happens after binding the same CPU factory.
-
+//! Install actual responsibility services and the original source bindings.
 use super::*;
-use novarocks_workload_control::joint_admission::{
-    JointAdmissionHandle, JointCapacityConfig, JointLane, JointProgressDriver, JointResource,
-    JointResources, RequiredJointProgress,
-};
-use novarocks_workload_control::{ControlStorageConfig, PollRoleGeometry, WorkloadControl};
+use novarocks_workload_control::joint_admission::{JointAdmissionHandle, JointProgressDriver};
+use novarocks_workload_control::{ControlStorageConfig, ResponsibilityConfig, WorkloadControl};
 
-/// Opaque production recipe. Only the frontend's concrete action composer can
-/// construct one; neither geometry nor caller-supplied Required is a public
-/// Native qualification API. Installation revalidates the original sources.
 #[derive(Clone, Debug)]
 pub struct FrontendWorkloadCapacityProfile {
     pub(super) inputs: FrontendNativeCapacityInputs,
     pub(super) workload: WorkloadConfig,
-    pub(super) capacity: JointCapacityConfig,
-    required: RequiredJointProgress,
-    children_per_slot: usize,
-    proposals_per_slot: NonZeroUsize,
-    poll_roles: [PollRoleGeometry; 1],
-    process_sources: novarocks_workload_control::PollRoleSourceBacking,
-    pub(super) composition_facts: Option<super::composition::FrontendCompositionFacts>,
+    pub(super) result: Option<novarocks_workload_control::ResultCapacityConfig>,
     pub(super) transport_budget: Option<novarocks_native_adapter::FrontendTaskTransportBudget>,
     pub(super) statement_ingress: Option<super::composition::FrontendStatementIngress>,
-    pub(super) recipe: Option<super::composition::NativeCompositionRecipe>,
 }
 impl FrontendWorkloadCapacityProfile {
-    /// Private to this original frontend composer. Call only after deriving
-    /// complete supported action vectors, inputs and retained-source envelopes.
-    /// The raw vector convenience remains only in original unit fixtures;
-    /// production enters through the concrete composition recipe.
-    #[cfg(test)]
-    pub(super) fn from_complete_actions(
+    pub(super) fn from_configuration(
         inputs: FrontendNativeCapacityInputs,
         workload: &WorkloadConfig,
-        capacity: JointCapacityConfig,
-        required: RequiredJointProgress,
-        children_per_slot: usize,
-        proposals_per_slot: NonZeroUsize,
-    ) -> Result<Self, WorkError> {
-        Self::from_complete_actions_with_sources(
-            inputs,
-            workload,
-            capacity,
-            required,
-            children_per_slot,
-            proposals_per_slot,
-            novarocks_workload_control::PollRoleSourceBacking::default(),
-        )
-    }
-
-    pub(super) fn from_complete_actions_with_sources(
-        inputs: FrontendNativeCapacityInputs,
-        workload: &WorkloadConfig,
-        capacity: JointCapacityConfig,
-        required: RequiredJointProgress,
-        children_per_slot: usize,
-        proposals_per_slot: NonZeroUsize,
-        process_sources: novarocks_workload_control::PollRoleSourceBacking,
+        result: Option<novarocks_workload_control::ResultCapacityConfig>,
+        transport_budget: Option<novarocks_native_adapter::FrontendTaskTransportBudget>,
+        statement_ingress: Option<super::composition::FrontendStatementIngress>,
     ) -> Result<Self, WorkError> {
         workload.validate()?;
-        let policy = inputs.policy();
-        if workload.scope_records_limit != policy.scope_limit()
-            || workload.query_concurrency_limit > policy.slots_per_class()[0]
-        {
-            return Err(WorkError::InvalidConfig("frontend scope inventory"));
-        }
-        if capacity.max_changes_per_request < production_batch_records(&capacity)? {
-            return Err(WorkError::InvalidConfig(
-                "frontend production growth records",
-            ));
-        }
-        let poll_roles = [novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_role_poll_geometry()?];
-        let storage = ControlStorageConfig::new(
-            policy.slots_per_class(),
-            children_per_slot,
-            proposals_per_slot.get(),
-            &poll_roles,
-        )
-        .with_process_source_backing(process_sources);
-        // Keep the formula with the original WC metadata author. In particular,
-        // changing C for all canonical productions changes the actual Q/M fee.
-        if capacity.max_registered_dependencies < storage.minimum_dependency_records(&capacity)? {
-            return Err(WorkError::InvalidConfig(
-                "frontend fixed dependency inventory",
-            ));
-        }
-        let base = storage.base_charge(&capacity)?;
-        let custody = JointLane::Custody as usize;
-        let count = policy.scope_limit();
-        let n = u64::try_from(count).map_err(|_| WorkError::ArithmeticOverflow)?;
-        if capacity.max_claims < count
-            || capacity.max_requests
-                < count
-                    .checked_mul(proposals_per_slot.get())
-                    .ok_or(WorkError::ArithmeticOverflow)?
-            || capacity.global.global.get(JointResource::ScopeRecords) != n
-            || capacity.lanes[custody]
-                .global
-                .get(JointResource::ScopeRecords)
-                != n
-            || !covers(capacity.global.global, scale(base, count)?)
-            || !covers(capacity.lanes[custody].global, scale(base, count)?)
-            || !covers(required.global, base)
-            || !covers(required.lanes[custody], base)
-        {
-            return Err(WorkError::InvalidConfig("frontend fixed global inventory"));
-        }
-        for (class, count) in policy.slots_per_class().into_iter().enumerate() {
-            let n = u64::try_from(count).map_err(|_| WorkError::ArithmeticOverflow)?;
-            if capacity.classes[class]
-                .global
-                .get(JointResource::ScopeRecords)
-                != n
-                || capacity.class_lanes[class][custody]
-                    .global
-                    .get(JointResource::ScopeRecords)
-                    != n
-                || !covers(capacity.classes[class].global, scale(base, count)?)
-                || !covers(
-                    capacity.class_lanes[class][custody].global,
-                    scale(base, count)?,
-                )
-                || !covers(required.classes[class], base)
-                || !covers(required.class_lanes[class][custody], base)
-            {
-                return Err(WorkError::InvalidConfig("frontend fixed class inventory"));
-            }
-        }
-        for (resource, maximum) in [
-            (
-                JointResource::UnreceivedProductions,
-                policy.dependency_custody().unreceived_productions,
-            ),
-            (
-                JointResource::Publications,
-                policy.dependency_custody().publications,
-            ),
-            (
-                JointResource::Residuals,
-                policy.dependency_custody().residuals,
-            ),
-            (
-                JointResource::PayloadBytes,
-                policy.dependency_custody().retained_payload_bytes,
-            ),
-        ] {
-            if capacity.global.per_dependency.get(resource) > maximum {
-                return Err(WorkError::InvalidConfig(
-                    "frontend dependency custody policy",
-                ));
-            }
-        }
+        inputs.validate_pool_declarations(workload, inputs.query_blocking_capacity())?;
         Ok(Self {
             inputs,
             workload: workload.clone(),
-            capacity,
-            required,
-            children_per_slot,
-            proposals_per_slot,
-            poll_roles,
-            process_sources,
-            composition_facts: None,
-            transport_budget: None,
-            statement_ingress: None,
-            recipe: None,
+            result,
+            transport_budget,
+            statement_ingress,
         })
     }
-
     pub const fn inputs(&self) -> &FrontendNativeCapacityInputs {
         &self.inputs
     }
@@ -199,7 +59,10 @@ impl FrontendWorkloadCapacityProfile {
         self.inputs = self.inputs.with_native_sources(native)?;
         if let Some(budget) = self.transport_budget {
             let source = self.inputs.native.as_ref().ok_or(WorkError::NotReady)?;
-            if source.apply_records != budget.max_backend_queued_operations()
+            if !native
+                .task_transport_supervisor()
+                .accepts_transport_budget(budget.into_codec())
+                || source.apply_records != budget.max_backend_queued_operations()
                 || source.transport.process_items != budget.max_backend_queued_operations()
                 || source.transport.process_retained_bytes != budget.max_backend_queued_bytes()
                 || source.transport.target_items != budget.max_query_backend_queued_operations()
@@ -207,11 +70,11 @@ impl FrontendWorkloadCapacityProfile {
                 || source.transport.maximum_batch_encoded_bytes != budget.max_batch_encoded_bytes()
             {
                 return Err(WorkError::InvalidConfig(
-                    "frontend actual Native source capacity",
+                    "frontend actual Native source configuration",
                 ));
             }
         }
-        self.rebind_process_sources()
+        Ok(self)
     }
     pub(crate) fn validate_pool_declarations(
         &self,
@@ -230,82 +93,42 @@ impl FrontendWorkloadCapacityProfile {
         blocking: &QueryBlockingExecutor,
         cpu: &InternalResultCpu,
     ) -> Result<FrontendNativeCapacitySources, WorkError> {
+        self.validate_pool_declarations(workload, blocking.configured_capacity())?;
+        if self
+            .result
+            .is_some_and(|expected| expected != result.declared())
+        {
+            return Err(WorkError::Conflict);
+        }
         self.inputs.capture_sources(workload, result, blocking, cpu)
     }
-
-    /// Same original WC, same registered closed CPU source, actual QA factory.
-    /// Storage installation is still not Native serving readiness or I/O grant.
     pub(crate) fn install(
         &self,
         workload: &mut WorkloadControl,
         sources: &FrontendNativeCapacitySources,
     ) -> Result<(JointAdmissionHandle, JointProgressDriver), WorkError> {
-        if sources.logical_role != self.poll_roles[0] {
-            return Err(WorkError::InvalidConfig("frontend actual logical factory"));
+        self.inputs
+            .validate_pool_declarations(&self.workload, sources.query_blocking)?;
+        if self
+            .result
+            .is_some_and(|expected| expected != sources.result)
+        {
+            return Err(WorkError::Conflict);
         }
         #[cfg(not(test))]
         if sources.native.is_none() {
             return Err(WorkError::NotReady);
         }
-        if self
-            .capacity
-            .global
-            .global
-            .get(JointResource::InternalCpuJobs)
-            > u64::try_from(sources.internal_cpu.worker_threads().get())
-                .map_err(|_| WorkError::ArithmeticOverflow)?
-            || self.capacity.global.global.get(JointResource::BlockingJobs)
-                > u64::try_from(sources.query_blocking.worker_threads().get())
-                    .map_err(|_| WorkError::ArithmeticOverflow)?
-        {
-            return Err(WorkError::InvalidConfig("frontend actual worker capacity"));
-        }
-        let capacity = self.inputs.validate_joint_sources(
-            workload,
-            sources,
-            self.capacity.clone(),
-            &self.required,
-        )?;
-        let pair = workload.configure_joint_capacity(capacity)?;
-        workload.configure_control_storage(
-            ControlStorageConfig::new(
-                self.policy().slots_per_class(),
-                self.children_per_slot,
-                self.proposals_per_slot.get(),
-                &self.poll_roles,
-            )
-            .with_process_source_backing(self.process_sources),
-        )?;
-        tracing::debug!(
-            dependency_limit = self.capacity.max_dependencies_per_claim,
-            publication_global = self.capacity.global.global.get(JointResource::Publications),
-            publication_per_dependency = self
-                .capacity
-                .global
-                .per_dependency
-                .get(JointResource::Publications),
-            publication_protected_progress = self
-                .capacity
-                .global
-                .protected_progress
-                .get(JointResource::Publications),
-            unreceived_global = self
-                .capacity
-                .global
-                .global
-                .get(JointResource::UnreceivedProductions),
-            unreceived_per_dependency = self
-                .capacity
-                .global
-                .per_dependency
-                .get(JointResource::UnreceivedProductions),
-            configured_publications = self.policy().dependency_custody().publications,
-            configured_unreceived = self.policy().dependency_custody().unreceived_productions,
-            "Frontend installed original publication capacity",
-        );
+        // Identity validation does not reserve physical positions or payload.
+        sources.internal_cpu.validate_workload_source(workload)?;
+        let roles=[novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_role_poll_geometry()?];
+        let slots = self.policy().scope_limit();
+        let pair = workload.configure_responsibility(ResponsibilityConfig {
+            work_per_turn: self.policy().turn_budget(),
+        })?;
+        workload.configure_control_storage(ControlStorageConfig::new(slots, &roles))?;
         Ok(pair)
     }
-
     fn matches_workload(&self, other: &WorkloadConfig) -> bool {
         self.workload.root_limit == other.root_limit
             && self.workload.business_limit == other.business_limit
@@ -327,57 +150,9 @@ impl FrontendWorkloadCapacityProfile {
     }
 }
 
-/// Each canonical production Claim retains Publications=1 through Unknown and
-/// Received. receive_in only retires UnreceivedProductions; settle removes the
-/// row. Thus two distinct Root/stage works together cannot exceed this one
-/// global bound. Occurrences within a cohort do not consume additional changes.
-fn production_batch_records(capacity: &JointCapacityConfig) -> Result<usize, WorkError> {
-    usize::try_from(capacity.global.global.get(JointResource::Publications))
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .checked_add(
-            novarocks_workload_control::joint_admission::RootStageSource::minimum_change_records(),
-        )
-        .ok_or(WorkError::ArithmeticOverflow)
-}
-const RESOURCES: [JointResource; 15] = [
-    JointResource::ScopeRecords,
-    JointResource::ClaimRecords,
-    JointResource::ReplyRecords,
-    JointResource::QueueRecords,
-    JointResource::MetadataBytes,
-    JointResource::PayloadBytes,
-    JointResource::UnreceivedProductions,
-    JointResource::Publications,
-    JointResource::Residuals,
-    JointResource::Computations,
-    JointResource::AsyncIo,
-    JointResource::BlockingJobs,
-    JointResource::InternalCpuJobs,
-    JointResource::PhysicalQueueRecords,
-    JointResource::PhysicalQueueBytes,
-];
-fn covers(have: JointResources, need: JointResources) -> bool {
-    RESOURCES.into_iter().all(|r| have.get(r) >= need.get(r))
-}
-fn scale(value: JointResources, count: usize) -> Result<JointResources, WorkError> {
-    let count = u64::try_from(count).map_err(|_| WorkError::ArithmeticOverflow)?;
-    RESOURCES
-        .into_iter()
-        .try_fold(JointResources::ZERO, |total, r| {
-            let amount = value
-                .get(r)
-                .checked_mul(count)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            Ok(total.with(r, amount))
-        })
-}
-
 #[cfg(test)]
 #[path = "installation_tests.rs"]
 mod tests;
-
-/// This small lifecycle-only fixture never leaves a cfg(test) build. It does
-/// not claim to describe Native action or result/physical-source support.
 #[cfg(test)]
 pub(crate) fn original_owner_test_workload() -> WorkloadConfig {
     WorkloadConfig {
@@ -395,64 +170,19 @@ pub(crate) fn original_owner_test_workload() -> WorkloadConfig {
 pub(crate) fn original_owner_test_profile(
     blocking: QueryBlockingExecutorConfig,
 ) -> FrontendWorkloadCapacityProfile {
-    use novarocks_workload_control::joint_admission::JointResourceLimits;
     let workload = original_owner_test_workload();
     let policy = FrontendWorkloadCapacityConfig::try_new(
-        [4; 5],
-        FrontendDependencyCustodyLimits {
-            unreceived_productions: 256,
-            publications: 256,
-            residuals: 256,
-            retained_payload_bytes: 4 << 30,
-        },
+        workload.scope_records_limit,
         NonZeroUsize::new(7).unwrap(),
         Duration::from_millis(25),
     )
     .unwrap();
-    let inputs = FrontendNativeCapacityInputs::try_new(policy, blocking).unwrap();
-    let count = workload.scope_records_limit;
-    let proposals = NonZeroUsize::new(2).unwrap();
-    let mut capacity = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 1,
-        max_registered_dependencies: 1,
-        max_claims: count * 8,
-        max_requests: count * proposals.get(),
-        max_changes_per_request: 4,
-        max_snapshot_bytes: 16 << 20,
-        max_scratch_bytes: 16 << 20,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: NonZeroUsize::new(7).unwrap(),
-    };
-    let roles = [novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_role_poll_geometry().unwrap()];
-    let storage = ControlStorageConfig::new([4; 5], 4, proposals.get(), &roles);
-    capacity.max_registered_dependencies = storage.minimum_dependency_records(&capacity).unwrap();
-    let base = storage.base_charge(&capacity).unwrap();
-    let limits = |count| JointResourceLimits {
-        global: scale(base, count).unwrap(),
-        per_dependency: base,
-        protected_progress: base,
-    };
-    capacity.global = limits(count);
-    capacity.lanes[0] = limits(count);
-    let mut required = RequiredJointProgress {
-        global: base,
-        classes: [base; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.lanes[0] = base;
-    for class in 0..5 {
-        capacity.classes[class] = limits(4);
-        capacity.class_lanes[class][0] = limits(4);
-        required.class_lanes[class][0] = base;
-    }
-    FrontendWorkloadCapacityProfile::from_complete_actions(
-        inputs, &workload, capacity, required, 4, proposals,
+    FrontendWorkloadCapacityProfile::from_configuration(
+        FrontendNativeCapacityInputs::try_new(policy, blocking).unwrap(),
+        &workload,
+        None,
+        None,
+        None,
     )
     .unwrap()
 }

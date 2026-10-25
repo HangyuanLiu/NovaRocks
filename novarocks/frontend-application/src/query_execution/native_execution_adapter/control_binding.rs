@@ -283,90 +283,10 @@ mod tests {
         JointProgressDriver,
         novarocks_workload_control::ResultCapacityHandle,
     ) {
-        fixture_with_domains(2)
-    }
-    fn fixture_with_domains(
-        max_dependencies_per_claim: usize,
-    ) -> (
-        WorkloadControl,
-        JointProgressDriver,
-        novarocks_workload_control::ResultCapacityHandle,
-    ) {
         let count = 8;
-        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[])
-            .with_process_source_backing(
-                PollRoleSourceBacking::from_layouts(&metadata_layouts(), &[]).unwrap(),
-            );
-        let mut config = JointCapacityConfig {
-            global: JointResourceLimits::default(),
-            classes: [JointResourceLimits::default(); 5],
-            lanes: [JointResourceLimits::default(); 3],
-            class_lanes: [[JointResourceLimits::default(); 3]; 5],
-            max_dependencies_per_claim,
-            max_registered_dependencies: 1,
-            max_claims: 32,
-            max_requests: 16,
-            max_changes_per_request: 2,
-            max_snapshot_bytes: 16 * 1024 * 1024,
-            max_scratch_bytes: 16 * 1024 * 1024,
-            max_residual_arcs: 10000,
-            max_total_proof_work: 10000000,
-            work_per_turn: NonZeroUsize::new(7).unwrap(),
-        };
-        config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
-        let base = storage.base_charge(&config).unwrap();
-        let metadata = base.get(JointResource::MetadataBytes);
-        let encoding =
-            2 * novarocks_task_codec::TransportBudget::DEFAULT.max_batch_encoded_bytes() as u64;
-        let support = encoding + 1024 * 1024;
-        let progress = JointResources::ZERO.with(JointResource::PayloadBytes, support);
-        // Preserve the original two-domain envelope; every selected domain
-        // also needs one complete protected action in EACH execution lane.
-        let dependency_support = support
-            .checked_mul(u64::try_from(max_dependencies_per_claim.max(4)).unwrap())
-            .unwrap();
-        let custody = JointResourceLimits {
-            global: JointResources::ZERO
-                .with(JointResource::ScopeRecords, count as u64)
-                .with(JointResource::ClaimRecords, 32)
-                .with(JointResource::MetadataBytes, metadata * 128),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::ScopeRecords, (count - 1) as u64)
-                .with(JointResource::ClaimRecords, 16)
-                .with(JointResource::MetadataBytes, metadata * 64),
-            protected_progress: base,
-        };
-        let execution = JointResourceLimits {
-            global: JointResources::ZERO.with(JointResource::PayloadBytes, support * 8),
-            per_dependency: JointResources::ZERO
-                .with(JointResource::PayloadBytes, dependency_support),
-            protected_progress: progress,
-        };
-        let all_progress = base.with(JointResource::PayloadBytes, support * 2);
-        let total = JointResourceLimits {
-            global: custody
-                .global
-                .with(JointResource::PayloadBytes, support * 16),
-            per_dependency: custody.per_dependency.with(
-                JointResource::PayloadBytes,
-                dependency_support.checked_mul(2).unwrap(),
-            ),
-            protected_progress: all_progress,
-        };
-        config.global = total;
-        config.classes[0] = total;
-        config.lanes = [custody, execution, execution];
-        config.class_lanes[0] = config.lanes;
-        let mut required = RequiredJointProgress {
-            global: all_progress,
-            classes: [JointResources::ZERO; 5],
-            lanes: [base, progress, progress],
-            class_lanes: [[JointResources::ZERO; 3]; 5],
-        };
-        required.classes[0] = all_progress;
-        required.class_lanes[0] = required.lanes;
-        // This finite component supports only the control substrate/policy
-        // read, not the complete production Native action/physical profile.
+        let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
+            PollRoleSourceBacking::from_layouts(&metadata_layouts(), &[]).unwrap(),
+        );
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: count,
             business_limit: count,
@@ -377,7 +297,9 @@ mod tests {
         .unwrap()
         .owner;
         let (_, driver) = control
-            .configure_joint_capacity(config.validate(&required).unwrap())
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
             .unwrap();
         control.configure_control_storage(storage).unwrap();
         let capacity = control
@@ -422,7 +344,7 @@ mod tests {
         panic!("original production binding did not finish");
     }
     #[test]
-    fn original_projection_binding_precedes_native_policy_read_and_reuses_full_q() {
+    fn original_projection_binding_precedes_native_source_capture_with_other_builders_live() {
         let (control, mut driver, capacity) = fixture();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -433,14 +355,15 @@ mod tests {
             .unwrap();
         let window = window_grant.retain_alias();
         let authority = window.native_action_authority().unwrap();
-        let encoding = std::num::NonZeroU64::new(
-            2 * novarocks_task_codec::TransportBudget::DEFAULT.max_batch_encoded_bytes() as u64,
-        )
-        .unwrap();
-        assert_eq!(
-            authority.maximum_owned_increment(encoding),
-            Err(WorkError::Conflict),
-            "real Native policy read rejects the original unbound root"
+        // Quote the original replay/creation headers using their actual
+        // Native author; these quantities alone confer no source authority.
+        let quote = crate::native::task_transport::queued_creation_quote(0).unwrap();
+        assert!(
+            matches!(
+                authority.begin_queued_input(JointLane::Foreground, quote),
+                Err(failure) if failure.error == WorkError::Conflict
+            ),
+            "Native source capture rejects this exact unbound Root"
         );
         let endpoints = [
             novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 19010)
@@ -469,17 +392,20 @@ mod tests {
                 .is_pending()
         );
         assert!(
-            binding.wait.is_some(),
-            "Q2 Full is a real original source wait"
+            binding.wait.is_none(),
+            "unsubmitted builders do not impose a proposal quota"
         );
-        assert!(binding.admission.is_none(), "Full did not mint a ticket");
+        assert!(
+            binding.admission.is_some(),
+            "same original binding request is retained"
+        );
+        bind(&mut binding, &window, &scope, &endpoints, &mut driver);
+        let original = authority
+            .begin_queued_input(JointLane::Foreground, quote)
+            .unwrap();
+        drop(original);
         drop((first, second));
         drive(&mut driver);
-        bind(&mut binding, &window, &scope, &endpoints, &mut driver);
-        assert_eq!(
-            authority.maximum_owned_increment(encoding).unwrap().get(),
-            1024 * 1024
-        );
         assert!(binding.wait.is_none() && binding.ready.is_none() && binding.admission.is_none());
         // The separate execution path uses the same exact capacity association,
         // not numeric equality or a second Root/result permit.
@@ -513,15 +439,13 @@ mod tests {
             &mut driver,
         );
         assert!(matches!(child_binding.phase, Phase::Bound));
-        assert_eq!(
-            child_window
-                .native_action_authority()
-                .unwrap()
-                .maximum_owned_increment(encoding)
-                .unwrap()
-                .get(),
-            1024 * 1024
-        );
+        let original = child_window
+            .native_action_authority()
+            .unwrap()
+            .begin_queued_input(JointLane::Foreground, quote)
+            .unwrap();
+        drop(original);
+        drive(&mut driver);
         child_binding.close();
         drop(child_window);
         child.complete();
@@ -558,7 +482,7 @@ mod tests {
     #[test]
     fn successor_b_actual_origins_wait_for_original_positive_binding_and_exclude_eligible_c() {
         use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId};
-        let (control, mut driver, capacity) = fixture_with_domains(6);
+        let (control, mut driver, capacity) = fixture();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
@@ -635,7 +559,7 @@ mod tests {
         );
         drive(&mut driver);
         let before = capacity.snapshot();
-        let blockers = [
+        let unsubmitted = [
             scope.begin_control_binding().unwrap(),
             scope.begin_control_binding().unwrap(),
         ];
@@ -650,9 +574,9 @@ mod tests {
             )
             .is_pending()
         );
-        assert!(replacement.wait.is_some() && replacement.admission.is_none());
-        drop(blockers);
-        drive(&mut driver);
+        assert!(replacement.wait.is_none() && replacement.admission.is_some());
+        assert!(!matches!(replacement.phase, Phase::Bound));
+        assert_eq!(capacity.snapshot(), before);
         assert!(
             poll_manifest(
                 &mut replacement,
@@ -676,6 +600,7 @@ mod tests {
             Poll::Ready(Ok(()))
         ));
         assert!(matches!(replacement.phase, Phase::Bound));
+        drop(unsubmitted);
         // Original Client position/bytes were never replaced during A -> B.
         assert_eq!(capacity.snapshot(), before);
         replacement.close();

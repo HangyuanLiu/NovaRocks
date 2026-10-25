@@ -44,7 +44,6 @@ impl Wake for TaskAckIntakeInner {
 pub(super) struct NativeInputQueuePermit {
     physical: Option<super::super::transport_supervisor::NativeTransportQueuePermit>,
     input: Option<NativeQueuedInputGrant>,
-    maximum_owned_increment: std::num::NonZeroU64,
 }
 impl std::fmt::Debug for NativeInputQueuePermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -57,15 +56,6 @@ impl TaskOperationQueuePermit for NativeInputQueuePermit {
             .as_mut()
             .expect("original process queue holder")
             .mark_in_flight()
-    }
-    fn packing_support(
-        &self,
-        input: &OperationIntent,
-    ) -> Result<crate::task_execution::intent::OriginalOperationPacking, WorkError> {
-        crate::task_execution::intent::OriginalOperationPacking::new(
-            super::joint_action::original_operation_clone_bytes(input)?,
-            self.maximum_owned_increment,
-        )
     }
     fn native_dispatch_input(&self) -> Option<&NativeQueuedInputGrant> {
         self.input.as_ref()
@@ -175,13 +165,6 @@ impl NativeTaskOperationSink {
         if let Some(error) = preparation.failure.as_ref() {
             return TaskOperationQueueAdmission::Rejected(error.clone());
         }
-        let maximum_owned_increment = match self.maximum_owned_increment() {
-            Ok(maximum) => maximum,
-            Err(error) => {
-                preparation.failure = Some(error.clone());
-                return TaskOperationQueueAdmission::Rejected(error);
-            }
-        };
         if preparation
             .request
             .is_some_and(|original| original != request)
@@ -198,17 +181,8 @@ impl NativeTaskOperationSink {
             let Some(quote) = request.native_input else {
                 return TaskOperationQueueAdmission::Rejected(WorkError::Conflict);
             };
-            // This exact quote includes Creation's new backing and owner
-            // headers. Check before paid grant and before the caller freezes.
-            if quote
-                .custody()
-                .get(novarocks_workload_control::joint_admission::JointResource::PayloadBytes)
-                > maximum_owned_increment.get()
-            {
-                let error = WorkError::Capacity("Native queued input owned backing");
-                preparation.failure = Some(error.clone());
-                return TaskOperationQueueAdmission::Rejected(error);
-            }
+            // The original grant retains this actual creation/new-backing
+            // quote; the process/target queue budget is reserved below.
             let lane = if request.requires_control_progress() {
                 JointLane::Settlement
             } else {
@@ -286,7 +260,6 @@ impl NativeTaskOperationSink {
                 TaskOperationQueueAdmission::Admitted(Box::new(NativeInputQueuePermit {
                     physical: Some(physical),
                     input: Some(input),
-                    maximum_owned_increment,
                 }))
             }
             Err(NativeTransportBackpressure::Target) => TaskOperationQueueAdmission::TargetFull,

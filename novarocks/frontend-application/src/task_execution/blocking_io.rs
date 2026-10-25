@@ -452,8 +452,6 @@ impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
 
 #[derive(Clone)]
 struct OriginalExecutors {
-    read_geometry:
-        std::sync::OnceLock<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry>,
     cpu: novarocks_query_application::cpu::QueryCpuExecutor,
     blocking: novarocks_query_application::cpu::QueryBlockingExecutor,
     provider_creator:
@@ -517,7 +515,6 @@ impl ConnectorBlockingIoSupervisor {
     ) -> Result<(), WorkError> {
         self.executors
             .set(OriginalExecutors {
-                read_geometry: std::sync::OnceLock::new(),
                 cpu,
                 blocking,
                 provider_creator: std::sync::OnceLock::new(),
@@ -538,25 +535,12 @@ impl ConnectorBlockingIoSupervisor {
             .set(cpu)
             .map_err(|_| WorkError::Conflict)
     }
-    pub(crate) fn install_read_io_geometry(
-        &self,
-        geometry: novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    ) -> Result<(), WorkError> {
-        self.executors
-            .get()
-            .ok_or(WorkError::NotReady)?
-            .read_geometry
-            .set(geometry)
-            .map_err(|_| WorkError::Conflict)
-    }
-    pub(crate) fn read_io_geometry(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, WorkError> {
-        self.executors
-            .get()
-            .and_then(|e| e.read_geometry.get())
-            .copied()
-            .ok_or(WorkError::NotReady)
+    /// Read preparation uses the SAME installed runtime owners. This is no
+    /// Provider, catalog-route, byte-budget, or source-readiness permission.
+    pub(crate) fn validate_original_read_runtime(&self) -> Result<(), WorkError> {
+        let original = self.executors.get().ok_or(WorkError::NotReady)?;
+        original.provider_creator.get().ok_or(WorkError::NotReady)?;
+        Ok(())
     }
     pub(crate) fn provider_creator_cpu(
         &self,
@@ -845,6 +829,50 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[tokio::test]
+    async fn read_runtime_requires_the_actual_original_executors_and_creator() {
+        let supervisor = ConnectorBlockingIoSupervisor::new(Handle::current());
+        let missing_runtime = matches!(
+            supervisor.validate_original_read_runtime(),
+            Err(WorkError::NotReady)
+        );
+        let mut physical = OriginalExecutorsFixture::install(&supervisor);
+        let missing_creator = matches!(
+            supervisor.validate_original_read_runtime(),
+            Err(WorkError::NotReady)
+        );
+        let mut control = novarocks_workload_control::WorkloadControl::try_new_counted(
+            novarocks_workload_control::WorkloadConfig::default(),
+        )
+        .unwrap();
+        let config = novarocks_query_application::cpu::QueryBlockingExecutorConfig::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        );
+        let mut creator =
+            crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new(
+                config,
+                &mut control.owner,
+            )
+            .unwrap();
+        supervisor
+            .install_provider_creator_cpu(creator.runtime())
+            .unwrap();
+        let installed = supervisor.validate_original_read_runtime().is_ok();
+        drop(supervisor);
+        creator
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        physical.shutdown().await;
+        control.owner.close_admission();
+        let exited = control.owner.shutdown();
+        assert!(missing_runtime);
+        assert!(missing_creator);
+        assert!(installed);
+        assert!(exited.is_ok());
+    }
 
     pub(crate) struct OriginalExecutorsFixture {
         cpu: novarocks_query_application::cpu::QueryCpuExecutorOwner,

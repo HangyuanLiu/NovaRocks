@@ -20,7 +20,8 @@ mod client_computation_tests {
     use super::*;
     use crate::admitted_query_context::QueryResultCapacityBinding;
     use novarocks_workload_control::joint_admission::{
-        InternalComputationGrant, JointLane, NativeAsyncActionQuote, RetainedPayloadGrant,
+        InternalComputationGrant, JointLane, JointResource, JointResources, NativeAsyncActionQuote,
+        RetainedPayloadGrant,
     };
     use novarocks_workload_control::{WorkError, WorkOwner, WorkScope};
     use std::num::NonZeroU64;
@@ -270,9 +271,12 @@ mod client_computation_tests {
         payload: &RetainedPayloadGrant,
         root: &WorkScope,
         owner: &WorkOwner,
+        window: &novarocks_workload_control::ResultWindowAlias,
     ) -> InternalComputationGrant {
         let mut builder = payload
             .root_stage_source(root, owner)
+            .unwrap()
+            .for_client_window(window)
             .unwrap()
             .begin(8 * 1024 * 1024, JointLane::Foreground)
             .unwrap();
@@ -402,7 +406,6 @@ mod client_computation_tests {
             drop(pending);
             let payload = payload.unwrap();
             let first = child(&scope).await;
-            let mut compute = Some(stage(&payload, &scope, &first).await);
             let window = scope
                 .result_capacity()
                 .unwrap()
@@ -411,6 +414,7 @@ mod client_computation_tests {
                     novarocks_workload_control::ResultWindowClass::Client,
                 )
                 .unwrap();
+            let mut compute = Some(stage(&payload, &scope, &first, &window.retain_alias()).await);
             let mut capacity = None;
             QueryResultCapacityBinding::from_owned_client_computation_in(
                 &scope,
@@ -422,6 +426,11 @@ mod client_computation_tests {
             )
             .unwrap();
             let capacity = capacity.unwrap();
+            assert_eq!(
+                scope.result_capacity().unwrap().snapshot().held_positions,
+                [1, 0, 0, 0],
+                "Client computation must reuse its original Client window"
+            );
             let original_tail = capacity.try_clone().unwrap();
             let old_manifest = capacity
                 .try_window_alias()
@@ -496,49 +505,36 @@ mod client_computation_tests {
                 }
                 end.complete();
                 wait_preparation_exit_fact(&signals.sealed).await?;
-                if hold_activity {
-                    // submit() is finite: a saturated P returns a negative
-                    // verdict, not a parked request that can later succeed.
-                    let mut builder = payload
-                        .root_stage_source(&scope, &second)
-                        .unwrap()
-                        .begin(8 * 1024 * 1024, JointLane::Foreground)
-                        .unwrap();
-                    builder.end_payload().unwrap();
-                    builder.end_stage().unwrap();
-                    let mut probe = builder.submit().unwrap();
-                    match tokio::time::timeout(Duration::from_secs(2), &mut probe)
-                        .await
-                        .map_err(|_| "held activity finite P=1 probe did not finish")?
-                    {
-                        Err(failure) => {
-                            eprintln!("Client held activity finite P=1 probe: {failure:?}");
-                            if !matches!(failure.error, WorkError::JointCapacity(_)) {
-                                return Err(ClientObservationFailure::Admission {
-                                    phase: "held activity finite P=1 refusal",
-                                    error: failure.error,
-                                });
-                            }
-                        }
-                        Ok(_) => return Err("held activity released P early".into()),
-                    }
-                    drop(probe);
-                    if signals.cleanup_entered.load(Ordering::SeqCst) {
-                        return Err("cleanup passed held activity".into());
-                    }
-                }
-                drop(activity.take());
-                // converge is entered only after the production pump/local
-                // cut retired P; its real Native cleanup remains held below.
-                wait_preparation_exit_fact(&signals.cleanup_entered).await?;
                 let mut builder = payload
                     .root_stage_source(&scope, &second)
+                    .unwrap()
+                    .for_client_window(&window.retain_alias())
                     .unwrap()
                     .begin(8 * 1024 * 1024, JointLane::Foreground)
                     .unwrap();
                 builder.end_payload().unwrap();
                 builder.end_stage().unwrap();
                 let mut next = builder.submit().unwrap();
+                if hold_activity {
+                    // The actual Client position remains busy. The SAME
+                    // request waits fairly and must not receive a quota error.
+                    if tokio::time::timeout(Duration::from_millis(20), &mut next)
+                        .await
+                        .is_ok()
+                    {
+                        return Err(
+                            "held activity released the actual Client position early".into()
+                        );
+                    }
+                    if signals.cleanup_entered.load(Ordering::SeqCst) {
+                        return Err("cleanup passed held activity".into());
+                    }
+                }
+                drop(activity.take());
+                // The real local producer/activity cut retires its position;
+                // held Native cleanup still has not exited. Reuse the SAME
+                // pending request, not a replacement admission or authority.
+                wait_preparation_exit_fact(&signals.cleanup_entered).await?;
                 let mut ready = tokio::time::timeout(Duration::from_secs(2), &mut next)
                     .await
                     .map_err(|_| "actual second P=1 stage did not fit before Native cleanup")?
@@ -552,6 +548,11 @@ mod client_computation_tests {
                     .notify();
                 drop(ready);
                 drop(next);
+                if scope.result_capacity().unwrap().snapshot().held_positions != [1, 0, 0, 0] {
+                    return Err(
+                        "Client stage incorrectly consumed a separate Internal position".into(),
+                    );
+                }
                 if signals.cleanup_exited.load(Ordering::SeqCst) {
                     return Err("Native cleanup was not held".into());
                 }

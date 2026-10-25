@@ -34,81 +34,17 @@ fn fixture() -> (
     novarocks_workload_control::ResultCapacityHandle,
 ) {
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[])
-        .with_process_source_backing(
-            PollRoleSourceBacking::from_layouts(
-                &[std::alloc::Layout::from_size_align(
-                    NativeSubscriptionOwner::resident_storage_bytes(count).unwrap(),
-                    8,
-                )
-                .unwrap()],
-                &[],
+    let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
+        PollRoleSourceBacking::from_layouts(
+            &[std::alloc::Layout::from_size_align(
+                NativeSubscriptionOwner::resident_storage_bytes(count).unwrap(),
+                8,
             )
-            .unwrap(),
-        );
-    let mut config = JointCapacityConfig {
-        global: JointResourceLimits::default(),
-        classes: [JointResourceLimits::default(); 5],
-        lanes: [JointResourceLimits::default(); 3],
-        class_lanes: [[JointResourceLimits::default(); 3]; 5],
-        max_dependencies_per_claim: 2,
-        max_registered_dependencies: 1,
-        max_claims: 32,
-        max_requests: 16,
-        max_changes_per_request: 2,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: NonZeroUsize::new(7).unwrap(),
-    };
-    config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
-    let base = storage.base_charge(&config).unwrap();
-    let metadata = base.get(JointResource::MetadataBytes);
-    let encoding =
-        2 * novarocks_task_codec::TransportBudget::DEFAULT.max_batch_encoded_bytes() as u64;
-    let support = encoding + 1024 * 1024;
-    let progress = JointResources::ZERO.with(JointResource::PayloadBytes, support);
-    let custody = JointResourceLimits {
-        global: JointResources::ZERO
-            .with(JointResource::ScopeRecords, count as u64)
-            .with(JointResource::ClaimRecords, 32)
-            .with(JointResource::MetadataBytes, metadata * 128),
-        per_dependency: JointResources::ZERO
-            .with(JointResource::ScopeRecords, (count - 1) as u64)
-            .with(JointResource::ClaimRecords, 16)
-            .with(JointResource::MetadataBytes, metadata * 64),
-        protected_progress: base,
-    };
-    let execution = JointResourceLimits {
-        global: JointResources::ZERO.with(JointResource::PayloadBytes, support * 8),
-        per_dependency: JointResources::ZERO.with(JointResource::PayloadBytes, support * 4),
-        protected_progress: progress,
-    };
-    let all_progress = base.with(JointResource::PayloadBytes, support * 2);
-    let total = JointResourceLimits {
-        global: custody
-            .global
-            .with(JointResource::PayloadBytes, support * 16),
-        per_dependency: custody
-            .per_dependency
-            .with(JointResource::PayloadBytes, support * 8),
-        protected_progress: all_progress,
-    };
-    config.global = total;
-    config.classes[0] = total;
-    config.lanes = [custody, execution, execution];
-    config.class_lanes[0] = config.lanes;
-    let mut required = RequiredJointProgress {
-        global: all_progress,
-        classes: [JointResources::ZERO; 5],
-        lanes: [base, progress, progress],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    required.classes[0] = all_progress;
-    required.class_lanes[0] = required.lanes;
-    // This finite component supports only the control substrate/policy
-    // read, not the complete production Native action/physical profile.
+            .unwrap()],
+            &[],
+        )
+        .unwrap(),
+    );
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
@@ -119,7 +55,9 @@ fn fixture() -> (
     .unwrap()
     .owner;
     let (_, driver) = control
-        .configure_joint_capacity(config.validate(&required).unwrap())
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: NonZeroUsize::new(7).unwrap(),
+        })
         .unwrap();
     control.configure_control_storage(storage).unwrap();
     let capacity = control
@@ -163,7 +101,7 @@ impl Drop for OriginalProbe {
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bound_parent_subscription_starts_after_same_child_receipt_and_q_reuse() {
+async fn bound_parent_subscription_starts_after_same_child_receipt_with_other_builders_live() {
     use std::sync::atomic::Ordering::SeqCst;
     let (control, mut driver, capacity) = fixture();
     let root = control
@@ -211,7 +149,7 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_and_q_reuse()
     );
     let (mut owner, port) = NativeSubscriptionOwner::new(Handle::current(), 8).unwrap();
     owner.start_reaper().unwrap();
-    let blockers = [
+    let unsubmitted = [
         scope.begin_control_binding().unwrap(),
         scope.begin_control_binding().unwrap(),
     ];
@@ -229,7 +167,7 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_and_q_reuse()
                 let pending = row.input.child.lock().unwrap();
                 let waiting = pending
                     .as_ref()
-                    .is_some_and(|child| child.wait.is_some() && child.proposal.is_none());
+                    .is_some_and(|child| child.wait.is_none() && child.proposal.is_some());
                 assert!(row.backing.owner.lock().unwrap().is_none());
                 assert!(row.input.future.lock().unwrap().is_none());
                 waiting
@@ -245,7 +183,7 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_and_q_reuse()
     assert_eq!(
         control.snapshot().scopes.len(),
         1,
-        "Q Full minted no child/ticket"
+        "a queued responsibility request has not installed a child"
     );
     assert_eq!(
         wake_impl.0.load(SeqCst),
@@ -261,7 +199,6 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_and_q_reuse()
         0,
         "level reads do not wake their own runner"
     );
-    drop(blockers);
     tokio::time::timeout_at(deadline, async {
         loop {
             drive(&mut driver);
@@ -273,6 +210,9 @@ async fn bound_parent_subscription_starts_after_same_child_receipt_and_q_reuse()
     })
     .await
     .unwrap();
+    // Unsubmitted builders impose no request quota and own no child. Their
+    // destruction cannot revoke the child's already installed responsibility.
+    drop(unsubmitted);
     let child_scope = {
         let state = owner.core.state.lock().unwrap();
         let row = state.records[reservation.index].as_ref().unwrap();

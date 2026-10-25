@@ -70,7 +70,7 @@ pub(crate) fn retain_claim_in(
             .get_mut(&claim)
             .ok_or(WorkError::Released)?;
         if !record.custody.is_raw()
-            || !record.active_facts.key.causal.is_empty()
+            || !record.active_facts.key.source_kind.is_empty()
             || record.owner != ClaimOwner::PhysicalWork(scope.id)
             || record.pending.is_some()
             || record.amounts != record.active_amounts
@@ -122,7 +122,7 @@ pub(crate) fn settle_retained_claim_in(
             .get(&receipt.claim)
             .ok_or(WorkError::Released)?;
         if !record.custody.is_raw()
-            || !record.active_facts.key.causal.is_empty()
+            || !record.active_facts.key.source_kind.is_empty()
             || record.owner != ClaimOwner::OwnerRetained(receipt.work)
             || record.structure_revision != receipt.structure_revision
             || record.release_revision != receipt.release_revision
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_bad_domains_preserve_healthy_and_settlement_progress_after_owner_completion() {
+    fn retained_full_domains_survive_owner_completion_until_explicit_settlement() {
         let (control, handle, mut driver) = control();
         let producing = control
             .try_begin_root(WorkRequest::new(WorkClass::Management))
@@ -625,14 +625,13 @@ mod tests {
         let mut healthy = request(&handle, &consumer, &[&c], JointLane::Foreground, 1);
         let mut settlement = request(&handle, &consumer, &[&a], JointLane::Settlement, 1);
         drive(&mut driver);
-        assert!(crate::joint_admission::tests::poll(&mut blocked).is_pending());
+        let released = granted(&mut blocked);
         let healthy = granted(&mut healthy);
         let settlement = granted(&mut settlement);
-        assert_eq!(held(&control), (3, 3));
+        assert_eq!(held(&control), (4, 5));
         drop(healthy);
         settle_retained_claim_in(&mut receipt).unwrap().notify();
         drive(&mut driver);
-        let released = granted(&mut blocked);
         assert_eq!(held(&control), (2, 3));
         drop((released, settlement));
         consuming.business.release();

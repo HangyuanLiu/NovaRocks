@@ -23,7 +23,14 @@ use crate::{
     WorkError, WorkId, WorkScope, WorkloadControl,
     scope::{Inner, State},
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+pub(crate) mod retained_bytes;
+pub use retained_bytes::ResultPayloadBytes;
+use retained_bytes::RetainedBytes;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultWindowClass {
@@ -285,12 +292,66 @@ pub(crate) fn adopt_window(
             scope: scope.clone(),
             class,
             all_objects_bytes,
+            retained_bytes: RetainedBytes::new(all_objects_bytes),
+            computation: Arc::new(ClientComputationPosition::default()),
         }),
         closing_cut: None,
     }
 }
 
+#[derive(Default)]
+struct ClientComputationPosition {
+    active_claim: AtomicU64,
+    window_exited: AtomicBool,
+}
+
+/// A fence to one original Client position. State serializes every transition;
+/// the cell never upgrades the holder or runs its destructor under State.
+#[derive(Clone)]
+pub(crate) struct ClientComputationWindow {
+    holder: Weak<WindowHolder>,
+    position: Arc<ClientComputationPosition>,
+    root: WorkId,
+}
+impl ClientComputationWindow {
+    pub(crate) fn room(&self) -> Result<bool, WorkError> {
+        self.validate_live()?;
+        Ok(self.position.active_claim.load(Ordering::Relaxed) == 0)
+    }
+    pub(crate) fn validate_live(&self) -> Result<(), WorkError> {
+        if self.holder.strong_count() == 0 {
+            Err(WorkError::Released)
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn acquire(&self, claim: u64) {
+        assert_eq!(self.position.active_claim.swap(claim, Ordering::Relaxed), 0);
+    }
+    pub(crate) fn validate_claim(&self, claim: u64) -> Result<(), WorkError> {
+        self.validate_live()?;
+        if self.position.active_claim.load(Ordering::Relaxed) != claim {
+            return Err(WorkError::Conflict);
+        }
+        Ok(())
+    }
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        self.root == other.root
+            && Weak::ptr_eq(&self.holder, &other.holder)
+            && Arc::ptr_eq(&self.position, &other.position)
+    }
+    pub(crate) fn release(&self, state: &mut State, claim: u64) {
+        assert_eq!(self.position.active_claim.swap(0, Ordering::Relaxed), claim);
+        if self.position.window_exited.load(Ordering::Relaxed) {
+            uncount_window(state, self.root, ResultWindowClass::Client);
+            state.collect(self.root);
+        }
+    }
+}
+
 pub(crate) struct WindowHolder {
+    computation: Arc<ClientComputationPosition>,
+    retained_bytes: RetainedBytes,
     scope: WorkScope,
     class: ResultWindowClass,
     all_objects_bytes: u64,
@@ -298,8 +359,15 @@ pub(crate) struct WindowHolder {
 impl Drop for WindowHolder {
     fn drop(&mut self) {
         self.scope.inner.update(|state| {
-            uncount_window(state, self.scope.id, self.class);
-            state.collect(self.scope.id);
+            self.computation
+                .window_exited
+                .store(true, Ordering::Relaxed);
+            if self.computation.active_claim.load(Ordering::Relaxed) == 0 {
+                uncount_window(state, self.scope.id, self.class);
+                state.collect(self.scope.id);
+            }
+            // A live computation retains this exact counted Client position
+            // until its last actual execution alias exits.
         });
     }
 }
@@ -368,6 +436,7 @@ enum AliasBacking {
         )>,
     },
     InternalRoot {
+        budget: Arc<RetainedBytes>,
         payload: crate::joint_admission::RetainedPayloadAlias,
         root: WorkScope,
         execution: WorkScope,
@@ -435,6 +504,24 @@ impl NativeCapacityFence {
     }
 }
 impl ResultWindowAlias {
+    pub(crate) fn client_computation_window(
+        &self,
+        root: &WorkScope,
+    ) -> Result<ClientComputationWindow, WorkError> {
+        match &self.backing {
+            AliasBacking::Window { holder, .. }
+                if holder.class == ResultWindowClass::Client && self.is_for_scope(root) =>
+            {
+                Ok(ClientComputationWindow {
+                    holder: Arc::downgrade(holder),
+                    position: Arc::clone(&holder.computation),
+                    root: holder.scope.id,
+                })
+            }
+            _ => Err(WorkError::Conflict),
+        }
+    }
+
     pub fn native_action_authority(
         &self,
     ) -> Result<crate::joint_admission::NativeAsyncActionAuthority, WorkError> {
@@ -541,9 +628,26 @@ impl ResultWindowAlias {
                 return Err(WorkError::Conflict);
             }
         }
+        let budget = {
+            let mut state = root.inner.state.lock().unwrap();
+            let limit = state
+                .result_capacity
+                .ok_or(WorkError::NotReady)?
+                .all_objects_bytes[2];
+            let node = state.nodes.get_mut(&root.id).ok_or(WorkError::Released)?;
+            match node.internal_result_bytes.upgrade() {
+                Some(budget) => budget,
+                None => {
+                    let budget = Arc::new(RetainedBytes::new(limit));
+                    node.internal_result_bytes = Arc::downgrade(&budget);
+                    budget
+                }
+            }
+        };
         let payload = grant.retain_alias().map_err(internal_pin_error)?;
         Ok(Self {
             backing: AliasBacking::InternalRoot {
+                budget,
                 payload,
                 root: root.clone(),
                 execution: execution.clone(),
@@ -559,6 +663,7 @@ impl ResultWindowAlias {
         payload: &crate::joint_admission::RetainedPayloadGrant,
         computation: &crate::joint_admission::InternalComputationGrant,
     ) -> Result<Self, WorkError> {
+        computation.validate_internal_position()?;
         let binding = crate::joint_admission::InternalManifestBinding::from_grants(
             root,
             stage,
@@ -588,13 +693,7 @@ impl ResultWindowAlias {
         if original.class() != ResultWindowClass::Client || !original.is_for_scope(root) {
             return Err(WorkError::Conflict);
         }
-        if payload.capacity_bytes().map_err(internal_pin_error)?
-            < original.client_all_objects_bytes()?
-        {
-            return Err(WorkError::Capacity(
-                "Client stage original payload envelope",
-            ));
-        }
+        computation.validate_client_position(&original.client_computation_window(root)?)?;
         let binding = crate::joint_admission::InternalManifestBinding::from_grants(
             root,
             stage,
@@ -648,6 +747,7 @@ impl ResultWindowAlias {
                 root,
                 execution,
                 payload,
+                ..
             } => {
                 binding.validate_alias(root, execution, payload.native_source_key()?)?;
                 Ok(Some(binding))
@@ -689,6 +789,7 @@ impl ResultWindowAlias {
             root,
             execution,
             binding,
+            ..
         } = &mut self.backing
         else {
             return Err(WorkError::Conflict);
@@ -755,11 +856,13 @@ impl ResultWindowAlias {
                     .transpose()?,
             },
             AliasBacking::InternalRoot {
+                budget,
                 payload,
                 root,
                 execution,
                 binding,
             } => AliasBacking::InternalRoot {
+                budget: Arc::clone(budget),
                 payload: payload.try_clone().map_err(internal_pin_error)?,
                 root: root.clone(),
                 execution: execution.clone(),
@@ -786,7 +889,13 @@ impl ResultWindowAlias {
         if self.class() == ResultWindowClass::Closing {
             return Err(WorkError::Conflict);
         }
-        if let AliasBacking::InternalRoot { payload, root, .. } = &self.backing {
+        if let AliasBacking::InternalRoot {
+            budget,
+            payload,
+            root,
+            ..
+        } = &self.backing
+        {
             // Clone while the original alias is borrowed, outside State. On
             // refusal this cannot be the last payload pin.
             let payload = payload.try_clone().map_err(internal_pin_error)?;
@@ -802,6 +911,7 @@ impl ResultWindowAlias {
             }
             return Ok(Self {
                 backing: AliasBacking::InternalRoot {
+                    budget: Arc::clone(budget),
                     payload,
                     root: root.clone(),
                     execution: child.clone(),
@@ -860,8 +970,12 @@ impl ResultWindowAlias {
                 Err(WorkError::Capacity("result backing envelope"))
             }
             AliasBacking::Window { .. } => Ok(()),
-            AliasBacking::InternalRoot { payload, .. } => {
-                payload.check_backing_total(simultaneously_live_bytes)
+            AliasBacking::InternalRoot { budget, .. } => {
+                if simultaneously_live_bytes > budget.limit() {
+                    Err(WorkError::Capacity("result backing envelope"))
+                } else {
+                    Ok(())
+                }
             }
         }
     }

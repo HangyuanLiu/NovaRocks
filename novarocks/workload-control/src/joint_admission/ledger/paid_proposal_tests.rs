@@ -48,18 +48,17 @@ fn receive(request: &mut JointAdmission) -> JointGrantedBatch {
     batch
 }
 fn published(handle: &JointAdmissionHandle, fact: &SharedDependency) -> Option<bool> {
-    handle
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .joint
-        .as_ref()
-        .unwrap()
-        .dependencies
-        .as_ref()
-        .unwrap()
-        .published(fact)
+    let state = handle.inner.state.lock().unwrap();
+    let ledger = state.joint.as_ref().unwrap();
+    if !ledger.dependencies.as_ref().unwrap().contains(fact) {
+        return None;
+    }
+    Some(
+        ledger
+            .claims
+            .values()
+            .any(|row| row.facts.dependencies.iter().any(|d| &d.fact == fact)),
+    )
 }
 fn root(control: &WorkloadControl) -> crate::RootWork {
     control
@@ -69,71 +68,6 @@ fn root(control: &WorkloadControl) -> crate::RootWork {
 fn finish(root: crate::RootWork) {
     root.business.release();
     root.owner.complete();
-}
-
-#[test]
-fn original_q_is_reserved_before_backing_and_requires_actual_reap_before_reuse() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 2);
-    let work = root(&control);
-    let a = handle.begin_paid_proposal(&work.owner).unwrap();
-    let b = handle.begin_paid_proposal(&work.owner).unwrap();
-    assert!(matches!(
-        handle.begin_paid_proposal(&work.owner),
-        Err(WorkError::Capacity(_))
-    ));
-    assert_eq!(a.records.capacity(), 2);
-    drop(a);
-    assert!(matches!(
-        handle.begin_paid_proposal(&work.owner),
-        Err(WorkError::Capacity(_))
-    ));
-    drive(&mut driver);
-    let replacement = handle.begin_paid_proposal(&work.owner).unwrap();
-    drop(replacement);
-    drop(b);
-    finish(work);
-    drive(&mut driver);
-}
-
-#[test]
-fn distinct_union_overflow_is_rejected_before_mint_and_cannot_submit_partial_batch() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
-    let work = root(&control);
-    let mut bind = handle.begin_paid_proposal(&work.owner).unwrap();
-    bind.begin_first_bind(work.owner.control_claim_view().unwrap())
-        .unwrap();
-    bind.push_dependency(&network(0)).unwrap();
-    bind.end_change().unwrap();
-    let mut bind = bind.submit().unwrap();
-    drive(&mut driver);
-    let mut reply = receive(&mut bind);
-    reply
-        .adjustment
-        .take()
-        .unwrap()
-        .install_control(&work.owner, &[])
-        .unwrap();
-    drop(reply);
-    drive(&mut driver);
-    let mut grow = handle.begin_paid_proposal(&work.owner).unwrap();
-    grow.begin_grow(
-        work.owner.control_claim_view().unwrap(),
-        JointResources::ZERO,
-    )
-    .unwrap();
-    let next = handle.inner.state.lock().unwrap().next_id;
-    assert!(matches!(
-        grow.push_dependency(&network(1)),
-        Err(WorkError::Capacity(_))
-    ));
-    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
-    assert_eq!(published(&handle, &network(1)), None);
-    assert!(grow.end_change().is_err());
-    assert!(grow.submit().is_err());
-    finish(work);
-    drive(&mut driver);
 }
 
 #[test]
@@ -179,54 +113,6 @@ fn shared_provisional_identity_survives_one_withdrawal_and_publishes_only_on_gra
     finish(b);
     drive(&mut driver);
     assert_eq!(published(&handle, &fact), None);
-}
-
-#[test]
-fn first_bind_deduplicates_but_new_duplicate_poison_and_c_limits_are_finite() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 2);
-    let work = root(&control);
-    let fact = network(0);
-    let mut duplicate = handle.begin_paid_proposal(&work.owner).unwrap();
-    duplicate
-        .begin_new(JointLane::Custody, JointResources::ZERO)
-        .unwrap();
-    duplicate.push_dependency(&fact).unwrap();
-    assert_eq!(duplicate.push_dependency(&fact), Err(WorkError::Conflict));
-    assert!(duplicate.submit().is_err());
-    drive(&mut driver);
-    let mut bind = handle.begin_paid_proposal(&work.owner).unwrap();
-    bind.begin_first_bind(work.owner.control_claim_view().unwrap())
-        .unwrap();
-    bind.push_dependency(&fact).unwrap();
-    bind.push_dependency(&fact).unwrap();
-    assert_eq!(bind.current.as_ref().unwrap().selected.len(), 1);
-    bind.end_change().unwrap();
-    let mut bind = bind.submit().unwrap();
-    drive(&mut driver);
-    let mut reply = receive(&mut bind);
-    reply
-        .adjustment
-        .take()
-        .unwrap()
-        .install_control(&work.owner, &[])
-        .unwrap();
-    drop(reply);
-    drive(&mut driver);
-    let mut limit = handle.begin_paid_proposal(&work.owner).unwrap();
-    for _ in 0..2 {
-        limit
-            .begin_new(JointLane::Custody, JointResources::ZERO)
-            .unwrap();
-        limit.end_change().unwrap();
-    }
-    assert!(matches!(
-        limit.begin_new(JointLane::Custody, JointResources::ZERO),
-        Err(WorkError::Capacity(_))
-    ));
-    assert!(limit.submit().is_err());
-    finish(work);
-    drive(&mut driver);
 }
 
 #[test]
@@ -290,61 +176,6 @@ fn paid_grow_reauthenticates_and_keeps_full_old_and_new_domains() {
     drop(stale);
     finish(work);
     drive(&mut driver);
-}
-
-#[test]
-fn provisional_identity_does_not_mutate_an_active_proofs_numeric_input() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
-    let a = root(&control);
-    let b = root(&control);
-    let mut first = handle.begin_paid_proposal(&a.owner).unwrap();
-    first
-        .begin_new(
-            JointLane::Custody,
-            JointResources::ZERO.with(JointResource::ClaimRecords, 1),
-        )
-        .unwrap();
-    first.push_dependency(&network(0)).unwrap();
-    first.end_change().unwrap();
-    let mut first = first.submit().unwrap();
-    assert!(matches!(driver.step(), JointProgress::More));
-    let before = {
-        let state = handle.inner.state.lock().unwrap();
-        let ledger = state.joint.as_ref().unwrap();
-        assert!(ledger.active.is_some());
-        (
-            ledger.active,
-            ledger.profile_layout_revision,
-            ledger.profiles.len(),
-        )
-    };
-    let mut second = handle.begin_paid_proposal(&b.owner).unwrap();
-    second
-        .begin_new(JointLane::Custody, JointResources::ZERO)
-        .unwrap();
-    second.push_dependency(&network(1)).unwrap();
-    {
-        let state = handle.inner.state.lock().unwrap();
-        let ledger = state.joint.as_ref().unwrap();
-        assert_eq!(
-            (
-                ledger.active,
-                ledger.profile_layout_revision,
-                ledger.profiles.len()
-            ),
-            before
-        );
-    }
-    assert_eq!(published(&handle, &network(1)), Some(false));
-    drop(second);
-    drive(&mut driver);
-    let batch = receive(&mut first);
-    drop(batch);
-    finish(a);
-    finish(b);
-    drive(&mut driver);
-    assert_eq!(published(&handle, &network(1)), None);
 }
 
 struct PanicOnceWake {
@@ -450,116 +281,6 @@ fn assert_caught_push_exit(selected_route: bool) {
 }
 
 #[test]
-fn production_builder_has_no_unfunded_legacy_fallback() {
-    let (_fixed, fixed_handle, _driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
-    let geometry = fixed_handle
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .joint
-        .as_ref()
-        .unwrap()
-        .config
-        .config
-        .clone();
-    let required = RequiredJointProgress {
-        global: JointResources::ZERO,
-        classes: [JointResources::ZERO; 5],
-        lanes: [JointResources::ZERO; 3],
-        class_lanes: [[JointResources::ZERO; 3]; 5],
-    };
-    let control = WorkloadControl::try_new_counted(crate::WorkloadConfig::default())
-        .unwrap()
-        .owner;
-    let (handle, _driver) = control
-        .configure_joint_capacity(geometry.validate(&required).unwrap())
-        .unwrap();
-    control.mark_ready().unwrap();
-    let work = root(&control);
-    assert!(matches!(
-        handle.begin_paid_proposal(&work.owner),
-        Err(WorkError::NotReady)
-    ));
-    finish(work);
-}
-
-#[test]
-fn paid_body_store_wake_panic_keeps_original_custody_until_actual_reap() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
-    let work = root(&control);
-    let fact = network(0);
-    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
-    proposal
-        .begin_new(
-            JointLane::Custody,
-            JointResources::ZERO.with(JointResource::ClaimRecords, 1),
-        )
-        .unwrap();
-    proposal.push_dependency(&fact).unwrap();
-    proposal.end_change().unwrap();
-    let wake = Arc::new(PanicOnceWake {
-        panicked: std::sync::atomic::AtomicBool::new(false),
-        inner: Arc::downgrade(&handle.inner),
-        before_panic: std::sync::Mutex::new(None),
-    });
-    let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
-    let waker = Waker::from(Arc::clone(&wake));
-    assert!(
-        waiter
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending()
-    );
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| proposal.submit()));
-    assert!(outcome.is_err());
-    {
-        let state = handle.inner.state.lock().unwrap();
-        assert!(state.joint.as_ref().unwrap().requests.is_empty());
-        assert_eq!(state.nodes[&work.owner.scope().id()].resource_waiters, 0);
-    }
-    assert_eq!(
-        published(&handle, &fact),
-        Some(false),
-        "original anchor retains the unpaid-to-publish proposal graph"
-    );
-    drive(&mut driver);
-    assert_eq!(published(&handle, &fact), None);
-    drop(waiter);
-    finish(work);
-    drive(&mut driver);
-}
-
-#[test]
-fn explicit_proof_budget_cannot_raise_the_composed_total_work_ceiling() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
-    let work = root(&control);
-    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
-    proposal
-        .begin_new(JointLane::Custody, JointResources::ZERO)
-        .unwrap();
-    proposal.end_change().unwrap();
-    let request = proposal
-        .submit_finite(std::num::NonZeroU64::new(u64::MAX).unwrap())
-        .unwrap();
-    {
-        let state = handle.inner.state.lock().unwrap();
-        let ledger = state.joint.as_ref().unwrap();
-        let RequestBudget::Finite { remaining } = ledger.requests.values().next().unwrap().budget
-        else {
-            panic!("a paid proposal cannot anonymously wait")
-        };
-        assert_eq!(remaining, ledger.config.config.max_total_proof_work);
-    }
-    drop(request);
-    finish(work);
-    drive(&mut driver);
-}
-
-#[test]
 fn paid_selected_origin_deduplicates_before_owned_output_and_preserves_full_union() {
     let (control, handle, mut driver) =
         crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
@@ -620,47 +341,19 @@ fn paid_selected_origin_deduplicates_before_owned_output_and_preserves_full_unio
         .unwrap();
     let next = handle.inner.state.lock().unwrap().next_id;
     let c = url::Url::parse("https://new.example/not-yet-owned").unwrap();
-    assert!(matches!(
-        overflow.push_selected_network(SelectedNetworkOrigin::from_selected_url(&c).unwrap()),
-        Err(WorkError::Capacity(_))
-    ));
-    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
-    assert!(overflow.submit().is_err());
+    overflow
+        .push_selected_network(SelectedNetworkOrigin::from_selected_url(&c).unwrap())
+        .unwrap();
+    overflow.end_change().unwrap();
+    let mut pending = overflow.submit().unwrap();
+    drive(&mut driver);
+    receive(&mut pending)
+        .adjustment
+        .unwrap()
+        .install_control(&work.owner, &[])
+        .unwrap();
     finish(work);
     drive(&mut driver);
-}
-
-#[test]
-fn complete_request_union_is_bounded_before_another_change_mints_a_domain() {
-    let (control, handle, mut driver) =
-        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 2);
-    let work = root(&control);
-    let a = network(0);
-    let b = network(1);
-    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
-    proposal
-        .begin_new(JointLane::Custody, JointResources::ZERO)
-        .unwrap();
-    proposal.push_dependency(&a).unwrap();
-    proposal.end_change().unwrap();
-    proposal
-        .begin_new(JointLane::Custody, JointResources::ZERO)
-        .unwrap();
-    let next = handle.inner.state.lock().unwrap().next_id;
-    assert!(matches!(
-        proposal.push_dependency(&b),
-        Err(WorkError::Capacity(_))
-    ));
-    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
-    assert_eq!(published(&handle, &b), None);
-    assert!(proposal.end_change().is_err());
-    assert!(proposal.submit().is_err());
-    finish(work);
-    drive(&mut driver);
-    assert_eq!(published(&handle, &a), None);
-    control.close_admission();
-    drive(&mut driver);
-    assert!(control.shutdown().is_ok());
 }
 
 #[test]
@@ -697,4 +390,314 @@ fn multiple_changes_share_the_complete_request_union_without_new_canonical_facts
     control.close_admission();
     drive(&mut driver);
     assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn responsibility_records_and_complete_dependencies_have_no_cancelled_q_or_k_gate() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+    let work = root(&control);
+    let facts: Vec<_> = (0..16).map(network).collect();
+    let mut proposals = Vec::new();
+    for _ in 0..24 {
+        let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
+        proposal
+            .begin_new(
+                JointLane::Custody,
+                JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+            )
+            .unwrap();
+        for fact in &facts {
+            proposal.push_dependency(fact).unwrap();
+        }
+        proposal.end_change().unwrap();
+        proposals.push(proposal);
+    }
+    // This is a responsibility-kernel component, not an allocation/CPU grant.
+    let mut pending: Vec<_> = proposals.into_iter().map(|p| p.submit().unwrap()).collect();
+    drive(&mut driver);
+    let mut claims = Vec::new();
+    for request in &mut pending {
+        let mut batch = receive(request);
+        claims.push(batch.new_claims.pop().unwrap());
+    }
+    {
+        let state = control.inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().unwrap();
+        for claim in &claims {
+            assert_eq!(
+                ledger.claims[&claim.id.unwrap()]
+                    .active_facts
+                    .dependencies
+                    .len(),
+                16
+            );
+        }
+    }
+    drop((pending, claims, facts));
+    finish(work);
+    drive(&mut driver);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn fair_turn_checks_at_most_the_original_service_budget_and_does_not_extend_its_pass() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+    let work = root(&control);
+    let mut pending = Vec::new();
+    for _ in 0..20 {
+        let mut p = handle.begin_paid_proposal(&work.owner).unwrap();
+        p.begin_new(
+            JointLane::Custody,
+            JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+        )
+        .unwrap();
+        p.push_dependency(&SharedDependency::LocalHost).unwrap();
+        p.end_change().unwrap();
+        pending.push(p.submit().unwrap());
+    }
+    let before = driver.request_checks;
+    assert!(matches!(driver.step(), JointProgress::More));
+    assert_eq!(driver.request_checks - before, 7);
+    drop(pending);
+    finish(work);
+    drive(&mut driver);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn first_bind_deduplicates_but_new_duplicate_poisons_entire_proposal() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 2);
+    let work = root(&control);
+    let fact = network(0);
+    let mut duplicate = handle.begin_paid_proposal(&work.owner).unwrap();
+    duplicate
+        .begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    duplicate.push_dependency(&fact).unwrap();
+    assert_eq!(duplicate.push_dependency(&fact), Err(WorkError::Conflict));
+    assert!(duplicate.submit().is_err());
+    drive(&mut driver);
+    let mut bind = handle.begin_paid_proposal(&work.owner).unwrap();
+    bind.begin_first_bind(work.owner.control_claim_view().unwrap())
+        .unwrap();
+    bind.push_dependency(&fact).unwrap();
+    bind.push_dependency(&fact).unwrap();
+    assert_eq!(bind.current.as_ref().unwrap().selected.len(), 1);
+    bind.end_change().unwrap();
+    let mut bind = bind.submit().unwrap();
+    drive(&mut driver);
+    let mut reply = receive(&mut bind);
+    reply
+        .adjustment
+        .take()
+        .unwrap()
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drop(reply);
+    drive(&mut driver);
+    finish(work);
+    drive(&mut driver);
+}
+
+#[test]
+fn rejection_of_a_later_change_poison_cannot_publish_an_earlier_complete_change() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 2);
+    let work = root(&control);
+    let a = network(0);
+    let b = network(1);
+    let mut p = handle.begin_paid_proposal(&work.owner).unwrap();
+    p.begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    p.push_dependency(&a).unwrap();
+    p.end_change().unwrap();
+    p.begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    p.push_dependency(&b).unwrap();
+    let next = handle.inner.state.lock().unwrap().next_id;
+    assert_eq!(p.push_dependency(&b), Err(WorkError::Conflict));
+    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
+    assert!(p.end_change().is_err());
+    assert!(p.submit().is_err());
+    assert!(
+        handle
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+    finish(work);
+    drive(&mut driver);
+    assert_eq!(published(&handle, &a), None);
+    assert_eq!(published(&handle, &b), None);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn rejected_push_after_complete_growth_does_not_mint_or_partially_bind_a_new_domain() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+    let work = root(&control);
+    let a = network(0);
+    let b = network(1);
+    let c = network(2);
+    let mut bind = work.owner.scope().begin_control_binding().unwrap();
+    bind.push_dependency(&a).unwrap();
+    bind.end_change().unwrap();
+    let mut bind = bind.submit().unwrap();
+    drive(&mut driver);
+    receive(&mut bind)
+        .adjustment
+        .unwrap()
+        .install_control(&work.owner, &[])
+        .unwrap();
+    let mut grow = handle.begin_paid_proposal(&work.owner).unwrap();
+    grow.begin_grow(
+        work.owner.control_claim_view().unwrap(),
+        JointResources::ZERO,
+    )
+    .unwrap();
+    grow.push_dependency(&b).unwrap();
+    grow.end_change().unwrap();
+    let next = handle.inner.state.lock().unwrap().next_id;
+    assert_eq!(grow.push_dependency(&c), Err(WorkError::Conflict));
+    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
+    assert_eq!(published(&handle, &c), None);
+    assert!(grow.submit().is_err());
+    let state = handle.inner.state.lock().unwrap();
+    let slot = state.nodes[&work.owner.scope().id()].cancellation;
+    let id = state.cancellations.slots[slot.0].claim.unwrap();
+    assert!(
+        state
+            .joint
+            .as_ref()
+            .unwrap()
+            .control_has_domains_for_test(id, &[a.clone()])
+    );
+    drop(state);
+    finish(work);
+    drive(&mut driver);
+}
+
+#[test]
+fn production_builder_requires_original_control_storage_and_has_no_legacy_fallback() {
+    let control = WorkloadControl::try_new_counted(crate::WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let (handle, _driver) = control
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+        })
+        .unwrap();
+    control.mark_ready().unwrap();
+    let work = root(&control);
+    assert!(matches!(
+        handle.begin_paid_proposal(&work.owner),
+        Err(WorkError::NotReady)
+    ));
+    finish(work);
+}
+
+#[test]
+fn provisional_dependency_identity_does_not_publish_or_mutate_other_original_rows() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
+    let a = root(&control);
+    let b = root(&control);
+    let mut first = handle.begin_paid_proposal(&a.owner).unwrap();
+    first
+        .begin_new(
+            JointLane::Custody,
+            JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+        )
+        .unwrap();
+    first.push_dependency(&network(0)).unwrap();
+    first.end_change().unwrap();
+    let mut first = first.submit().unwrap();
+    drive(&mut driver);
+    let batch = receive(&mut first);
+    let before = {
+        let state = handle.inner.state.lock().unwrap();
+        let l = state.joint.as_ref().unwrap();
+        (l.facts_revision, l.claims.len())
+    };
+    let mut second = handle.begin_paid_proposal(&b.owner).unwrap();
+    second
+        .begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    second.push_dependency(&network(1)).unwrap();
+    {
+        let state = handle.inner.state.lock().unwrap();
+        let l = state.joint.as_ref().unwrap();
+        assert_eq!((l.facts_revision, l.claims.len()), before);
+    }
+    assert_eq!(published(&handle, &network(1)), Some(false));
+    drop(second);
+    drive(&mut driver);
+    assert_eq!(published(&handle, &network(1)), None);
+    drop(batch);
+    finish(a);
+    finish(b);
+    drive(&mut driver);
+}
+
+#[test]
+fn paid_submission_wake_panic_withdraws_original_request_and_reclaims_unpublished_facts() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
+    let work = root(&control);
+    let fact = network(0);
+    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
+    proposal
+        .begin_new(
+            JointLane::Custody,
+            JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+        )
+        .unwrap();
+    proposal.push_dependency(&fact).unwrap();
+    proposal.end_change().unwrap();
+    let wake = Arc::new(PanicOnceWake {
+        panicked: std::sync::atomic::AtomicBool::new(false),
+        inner: Arc::downgrade(&handle.inner),
+        before_panic: std::sync::Mutex::new(None),
+    });
+    let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+    let waker = Waker::from(Arc::clone(&wake));
+    assert!(
+        waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| proposal.submit()));
+    assert!(outcome.is_err());
+    {
+        let state = handle.inner.state.lock().unwrap();
+        assert!(state.joint.as_ref().unwrap().requests.is_empty());
+        assert_eq!(state.nodes[&work.owner.scope().id()].resource_waiters, 0);
+    }
+    assert_eq!(
+        published(&handle, &fact),
+        None,
+        "unwound submission drops its original request and uncommitted facts"
+    );
+    drive(&mut driver);
+    assert_eq!(published(&handle, &fact), None);
+    drop(waiter);
+    finish(work);
+    drive(&mut driver);
 }

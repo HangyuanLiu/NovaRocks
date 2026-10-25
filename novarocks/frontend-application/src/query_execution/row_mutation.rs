@@ -490,7 +490,20 @@ fn normalize_owned_to_signed_selection(
         )?,
         None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
     };
-    let normalized = plan.execute(conversions, work)?;
+    // Hydrate supplies its real output/scratch layouts before any allocation.
+    // Keep these original receipts until the temporary normalized batch exits;
+    // the independent SourceBuilder copies obtain their own Buffer receipts.
+    let mut normalization_receipts = Vec::new();
+    let normalized = plan.execute_with_growth(
+        conversions,
+        &mut |layout| {
+            if let Some(author) = retention {
+                normalization_receipts.push(author.reserve_owned_bytes(layout.size())?);
+            }
+            Ok(())
+        },
+        work,
+    )?;
     let mut columns = owner.children(schema.fields().len())?;
     let mut node = 0;
     for column in normalized.columns() {
@@ -717,7 +730,12 @@ impl CowMatchRootConsumer {
             &window,
         )
         .map_err(invalid_match)?;
-        let guard = ConnectorPayloadRetentionGuard::new(window);
+        let retention =
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(binding)
+                .map_err(invalid_match)?;
+        let guard = retention
+            .try_spi_guard()
+            .map_err(|error| invalid_match(error.to_string()))?;
         let mut consumer = Self::try_new_declared(context, schema, declarations, contract, intent)?;
         consumer.collector.collector.retention = Some(guard.clone());
         consumer.collector.retention = Some(guard);

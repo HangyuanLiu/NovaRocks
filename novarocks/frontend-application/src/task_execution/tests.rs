@@ -472,13 +472,6 @@ impl Drop for SwitchableQueuePermit {
 
 impl TaskOperationQueuePermit for SwitchableQueuePermit {
     fn mark_in_flight(&mut self) {}
-    fn packing_support(
-        &self,
-        _: &OperationIntent,
-    ) -> Result<super::intent::OriginalOperationPacking, novarocks_workload_control::WorkError>
-    {
-        Ok(super::intent::test_operation_packing())
-    }
 }
 
 impl SwitchableQueueSink {
@@ -11598,12 +11591,10 @@ fn protocol_owner_keeps_one_original_writer_witness_across_a_coalesced_status_fo
 include!("split_delivery_local_terminal_tests.rs");
 
 #[test]
-fn original_owned_prefix_keeps_unselected_sources_and_restores_the_same_head() {
-    use super::intent::OriginalOperationPacking;
+fn actual_batch_limit_keeps_unselected_sources_and_restores_the_same_head() {
     use novarocks_execution::task_execution::CancelTask;
     #[derive(Debug)]
     struct ExactPermit {
-        maximum: NonZeroU64,
         dropped: Arc<AtomicUsize>,
     }
     impl Drop for ExactPermit {
@@ -11613,15 +11604,6 @@ fn original_owned_prefix_keeps_unselected_sources_and_restores_the_same_head() {
     }
     impl TaskOperationQueuePermit for ExactPermit {
         fn mark_in_flight(&mut self) {}
-        fn packing_support(
-            &self,
-            input: &OperationIntent,
-        ) -> Result<OriginalOperationPacking, novarocks_workload_control::WorkError> {
-            OriginalOperationPacking::new(
-                crate::native::task_transport::original_operation_clone_bytes(input)?,
-                self.maximum,
-            )
-        }
     }
     let backend = BackendProcessId::new_v7();
     let execution =
@@ -11641,20 +11623,30 @@ fn original_owned_prefix_keeps_unselected_sources_and_restores_the_same_head() {
         })
         .collect();
     let ids: Vec<_> = intents.iter().map(OperationIntent::operation_id).collect();
-    let cost = crate::native::task_transport::original_operation_clone_bytes(&intents[0]).unwrap();
-    let maximum = NonZeroU64::new(cost.checked_mul(2).unwrap()).unwrap();
     let dropped = Arc::new(AtomicUsize::new(0));
     let clock = ManualClock::new();
     let now = clock.now();
-    let mut dispatcher =
-        OperationDispatcher::new(DispatchBudget::DEFAULT, TransportBudget::DEFAULT);
+    let original = TransportBudget::DEFAULT;
+    let transport = TransportBudget::new(
+        2,
+        original.max_batch_encoded_bytes(),
+        original.max_descriptor_encoded_bytes(),
+        original.max_query_backend_queued_operations(),
+        original.max_query_backend_queued_bytes(),
+        original.max_backend_queued_operations(),
+        original.max_backend_queued_bytes(),
+        original.max_tasks_per_context(),
+        original.max_active_tasks_per_backend(),
+        original.frontend_queue_residence(),
+    )
+    .unwrap();
+    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
     for intent in intents {
         dispatcher
             .enqueue_reserved(
                 intent,
                 now,
                 Box::new(ExactPermit {
-                    maximum,
                     dropped: Arc::clone(&dropped),
                 }),
             )
@@ -11693,50 +11685,15 @@ fn original_owned_prefix_keeps_unselected_sources_and_restores_the_same_head() {
     drop(last);
     assert_eq!(dropped.load(Ordering::SeqCst), 3);
     assert_eq!(dispatcher.queued_items(), 0);
-
-    let one = OperationIntent::CancelTask(CancelTask::new(
-        TaskOperationId::new_v7(),
-        TaskIdentity::new(
-            execution,
-            StageId::new(1).unwrap(),
-            TaskId::new(4).unwrap(),
-            backend,
-        ),
-        CancelReason::UpstreamNoLongerNeeded,
-    ));
-    assert!(
-        dispatcher
-            .enqueue_reserved(
-                one,
-                now,
-                Box::new(ExactPermit {
-                    maximum: NonZeroU64::new(cost - 1).unwrap(),
-                    dropped: Arc::clone(&dropped)
-                })
-            )
-            .is_err()
-    );
-    assert_eq!(dispatcher.queued_items(), 0);
-    assert_eq!(dropped.load(Ordering::SeqCst), 4);
 }
 
 #[test]
-fn original_owned_prefix_keeps_the_whole_configured_small_method_run() {
-    use super::intent::OriginalOperationPacking;
+fn actual_batch_limit_keeps_the_whole_configured_method_run() {
     use novarocks_execution::task_execution::CancelTask;
     #[derive(Debug)]
-    struct ExactPermit(NonZeroU64);
+    struct ExactPermit;
     impl TaskOperationQueuePermit for ExactPermit {
         fn mark_in_flight(&mut self) {}
-        fn packing_support(
-            &self,
-            input: &OperationIntent,
-        ) -> Result<OriginalOperationPacking, novarocks_workload_control::WorkError> {
-            OriginalOperationPacking::new(
-                crate::native::task_transport::original_operation_clone_bytes(input)?,
-                self.0,
-            )
-        }
     }
     let backend = BackendProcessId::new_v7();
     let execution =
@@ -11756,11 +11713,6 @@ fn original_owned_prefix_keeps_the_whole_configured_small_method_run() {
             ))
         })
         .collect();
-    let owned = intents
-        .iter()
-        .map(|input| crate::native::task_transport::original_operation_clone_bytes(input).unwrap())
-        .sum::<u64>();
-    let maximum = NonZeroU64::new(owned).unwrap();
     let clock = ManualClock::new();
     let mut dispatcher = OperationDispatcher::new(
         DispatchBudget::new(count, count, count, count).unwrap(),
@@ -11768,7 +11720,7 @@ fn original_owned_prefix_keeps_the_whole_configured_small_method_run() {
     );
     for intent in intents {
         dispatcher
-            .enqueue_reserved(intent, clock.now(), Box::new(ExactPermit(maximum)))
+            .enqueue_reserved(intent, clock.now(), Box::new(ExactPermit))
             .unwrap();
     }
     let batch = dispatcher.take_batch().unwrap();

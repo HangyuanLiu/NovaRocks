@@ -62,7 +62,6 @@ pub(crate) struct ControlSlot {
     pub(crate) retired_root_domains:
         Option<crate::joint_admission::ledger::root_domains::RootDomains>,
     pub(crate) cell: Option<Arc<Cancellation>>,
-    pub(crate) proposals: Vec<crate::joint_admission::ledger::proposal_storage::ProposalCell>,
     pub(crate) polls: Vec<crate::role_poll::PollBacking>,
     pub(crate) class: WorkClass,
     pub(crate) phase: SlotPhase,
@@ -78,9 +77,8 @@ pub(crate) struct CancellationStorage {
     pub(crate) slots: Vec<ControlSlot>,
     pub(crate) fixed: bool,
     pub(crate) retired: usize,
-    pub(crate) retired_proposals: usize,
     pub(crate) retired_polls: usize,
-    pub(crate) free_heads: [Option<SlotId>; 5],
+    pub(crate) free_head: Option<SlotId>,
     pub(crate) legacy_vacant: Option<SlotId>,
 }
 
@@ -91,26 +89,17 @@ pub(crate) struct CancellationStorage {
 /// Installing this storage does not establish application readiness.
 #[derive(Clone, Copy)]
 pub struct ControlStorageConfig<'a> {
-    pub(crate) slots_per_class: [usize; 5],
-    pub(crate) children_per_slot: usize,
-    pub(crate) proposals_per_slot: usize,
+    pub(crate) scope_records: usize,
     pub(crate) poll_roles: &'a [crate::role_poll::PollRoleGeometry],
     pub(crate) process_sources: crate::PollRoleSourceBacking,
 }
 
 impl<'a> ControlStorageConfig<'a> {
-    /// Class order follows WorkClass: Query, MaterializedView, Statistics,
-    /// TableMaintenance, Management. Zero slots explicitly disable a class.
-    pub fn new(
-        slots_per_class: [usize; 5],
-        children_per_slot: usize,
-        proposals_per_slot: usize,
-        poll_roles: &'a [crate::PollRoleGeometry],
-    ) -> Self {
+    /// One original global scope inventory. WorkClass is assigned on actual
+    /// installation and does not partition or reserve this inventory.
+    pub fn new(scope_records: usize, poll_roles: &'a [crate::PollRoleGeometry]) -> Self {
         Self {
-            slots_per_class,
-            children_per_slot,
-            proposals_per_slot,
+            scope_records,
             poll_roles,
             process_sources: crate::PollRoleSourceBacking::default(),
         }
@@ -123,28 +112,13 @@ impl<'a> ControlStorageConfig<'a> {
         self
     }
 
-    /// Pure per-slot charge for these actual containers and the original
-    /// ledger's metadata. This neither allocates storage nor grants capacity.
-    pub fn base_charge(
-        self,
-        joint: &crate::joint_admission::JointCapacityConfig,
-    ) -> Result<JointResources, WorkError> {
-        crate::joint_admission::ledger::control_storage_base(self, joint)
-    }
-
-    /// Canonical dependency slots required by these exact fixed proposal and
-    /// ledger containers. This is a checked layout fact, never admission.
-    pub fn minimum_dependency_records(
-        self,
-        joint: &crate::joint_admission::JointCapacityConfig,
-    ) -> Result<usize, WorkError> {
-        crate::joint_admission::ledger::control_storage_dependency_records(self, joint)
+    /// Original fixed container storage only. No request inventory is reserved.
+    pub fn base_charge(self) -> Result<JointResources, WorkError> {
+        crate::joint_admission::ledger::control_storage_base(self)
     }
 
     pub(crate) fn count(self) -> Result<usize, WorkError> {
-        self.slots_per_class.into_iter().try_fold(0usize, |sum, n| {
-            sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)
-        })
+        Ok(self.scope_records)
     }
 }
 
@@ -158,14 +132,9 @@ impl CancellationStorage {
 
     pub(crate) fn drained(&self) -> bool {
         self.free_inventory_valid()
-            && self.retired_proposals == 0
             && self.retired_polls == 0
             && self.slots.iter().all(|slot| {
-                slot.proposals.iter().all(|cell| {
-                    cell.phase
-                        == crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
-                }) && slot
-                    .polls
+                slot.polls
                     .iter()
                     .all(|role| role.phase == crate::role_poll::PollPhase::Free)
                     && slot.phase
@@ -184,7 +153,6 @@ impl CancellationStorage {
     pub(crate) fn free_inventory_valid(&self) -> bool {
         let mut expected = 0usize;
         let mut retired = 0usize;
-        let mut retired_proposals = 0usize;
         let mut retired_polls = 0usize;
         for slot in &self.slots {
             if self.fixed {
@@ -193,18 +161,6 @@ impl CancellationStorage {
                     .iter()
                     .filter(|role| role.phase == crate::role_poll::PollPhase::Retired)
                     .count();
-                for cell in &slot.proposals {
-                    use crate::joint_admission::ledger::proposal_storage::ProposalPhase;
-                    if matches!(
-                        cell.phase,
-                        ProposalPhase::Retired | ProposalPhase::Resetting
-                    ) {
-                        retired_proposals += 1;
-                    }
-                    if slot.phase == SlotPhase::Free && cell.phase != ProposalPhase::Free {
-                        return false;
-                    }
-                }
                 if slot.phase == SlotPhase::Vacant || slot.cell.is_none() || slot.claim.is_none() {
                     return false;
                 }
@@ -244,36 +200,31 @@ impl CancellationStorage {
                 }
             }
         }
-        if retired != self.retired
-            || retired_proposals != self.retired_proposals
-            || retired_polls != self.retired_polls
-        {
+        if retired != self.retired || retired_polls != self.retired_polls {
             return false;
         }
         if self.fixed {
             if self.legacy_vacant.is_some() {
                 return false;
             }
-        } else if self.free_heads.iter().any(Option::is_some) {
+        } else if self.free_head.is_some() {
             return false;
         }
         let mut visited = 0usize;
         if self.fixed {
-            for (class, head) in self.free_heads.iter().copied().enumerate() {
-                let mut next = head;
-                while let Some(id) = next {
-                    if visited >= self.slots.len() {
-                        return false;
-                    }
-                    let Some(slot) = self.slots.get(id.0) else {
-                        return false;
-                    };
-                    if slot.phase != SlotPhase::Free || free_class_index(slot.class) != class {
-                        return false;
-                    }
-                    visited += 1;
-                    next = slot.next_free;
+            let mut next = self.free_head;
+            while let Some(id) = next {
+                if visited >= self.slots.len() {
+                    return false;
                 }
+                let Some(slot) = self.slots.get(id.0) else {
+                    return false;
+                };
+                if slot.phase != SlotPhase::Free {
+                    return false;
+                }
+                visited += 1;
+                next = slot.next_free;
             }
         } else {
             let mut next = self.legacy_vacant;
@@ -320,7 +271,6 @@ impl CancellationStorage {
         self.slots.push(ControlSlot {
             retired_root_domains: None,
             cell: Some(cell),
-            proposals: Vec::new(),
             polls: Vec::new(),
             class,
             phase: SlotPhase::Node(id),
@@ -347,11 +297,11 @@ impl CancellationStorage {
             return self.insert_legacy(cell, class, id, None);
         }
         let class_index = free_class_index(class);
-        let free =
-            self.free_heads[class_index].ok_or(WorkError::Capacity("fixed control slots"))?;
+        let free = self
+            .free_head
+            .ok_or(WorkError::Capacity("fixed control slots"))?;
         let slot = &mut self.slots[free.0];
         assert_eq!(slot.phase, SlotPhase::Free);
-        assert_eq!(slot.class, class);
         let generation = slot
             .generation
             .checked_add(1)
@@ -362,8 +312,9 @@ impl CancellationStorage {
             cell.reuse_root(None);
             return Err(WorkError::Cancelled(reason));
         }
-        self.free_heads[class_index] = slot.next_free.take();
+        self.free_head = slot.next_free.take();
         slot.generation = generation;
+        slot.class = class;
         slot.parent = None;
         slot.phase = SlotPhase::Node(id);
         Ok(free)
@@ -391,11 +342,11 @@ impl CancellationStorage {
             return result;
         }
         let class_index = free_class_index(class);
-        let free =
-            self.free_heads[class_index].ok_or(WorkError::Capacity("fixed control slots"))?;
+        let free = self
+            .free_head
+            .ok_or(WorkError::Capacity("fixed control slots"))?;
         let index = free.0;
         assert_eq!(self.slots[index].phase, SlotPhase::Free);
-        assert_eq!(self.slots[index].class, class);
         let generation = self.slots[index]
             .generation
             .checked_add(1)
@@ -408,8 +359,9 @@ impl CancellationStorage {
             id,
         )?;
         // A failed capacity/uniqueness preflight must not consume the head.
-        self.free_heads[class_index] = self.slots[index].next_free.take();
+        self.free_head = self.slots[index].next_free.take();
         self.slots[index].generation = generation;
+        self.slots[index].class = class;
         self.slots[index].parent = Some(parent);
         self.slots[index].phase = SlotPhase::Node(id);
         let slot = SlotId(index);
@@ -468,8 +420,8 @@ impl CancellationStorage {
         assert!(slot.next_free.is_none());
         slot.phase = SlotPhase::Free;
         let class = free_class_index(slot.class);
-        slot.next_free = self.free_heads[class];
-        self.free_heads[class] = Some(id);
+        slot.next_free = self.free_head;
+        self.free_head = Some(id);
     }
 
     pub(crate) fn retire(&mut self, id: SlotId) {
@@ -517,8 +469,8 @@ impl CancellationStorage {
         slot.parent = None;
         slot.phase = SlotPhase::Free;
         let class = free_class_index(slot.class);
-        slot.next_free = self.free_heads[class];
-        self.free_heads[class] = Some(id);
+        slot.next_free = self.free_head;
+        self.free_head = Some(id);
         self.retired -= 1;
         advanced
     }
@@ -538,9 +490,6 @@ impl CancellationStorage {
                 .polls
                 .iter()
                 .any(|role| role.phase != crate::role_poll::PollPhase::Free)
-            || slot.proposals.iter().any(|cell| {
-                cell.phase != crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
-            })
         {
             return None;
         }

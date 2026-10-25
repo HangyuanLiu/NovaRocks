@@ -1188,9 +1188,8 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub old_attempts_per_work: usize,
     pub old_attempts_limit: usize,
     pub unknown_creates_limit: usize,
-    /// The checked sum is the sole FE scope inventory.
-    pub scope_slots: FrontendScopeSlotsConfig,
-    pub dependency_custody: FrontendDependencyCustodyConfig,
+    /// Original global limit for live Work records, independent of Work class.
+    pub scope_records_limit: usize,
     pub joint_progress_turn_budget: usize,
     pub retired_backing_recheck_ms: u64,
     pub obligation_records_limit: usize,
@@ -1222,8 +1221,7 @@ impl Default for FrontendWorkloadRuntimeConfig {
             old_attempts_per_work: 2,
             old_attempts_limit: 128,
             unknown_creates_limit: 4096,
-            scope_slots: FrontendScopeSlotsConfig::default(),
-            dependency_custody: FrontendDependencyCustodyConfig::default(),
+            scope_records_limit: 8192,
             joint_progress_turn_budget: 7,
             retired_backing_recheck_ms: 25,
             obligation_records_limit: 8192,
@@ -1237,62 +1235,6 @@ impl Default for FrontendWorkloadRuntimeConfig {
             logical_replacement_reservation_ms: 30_000,
             logical_remote_cleanup_timeout_ms: 5_000,
             planning_idle_keepalive_ms: 60_000,
-        }
-    }
-}
-
-/// Explicit Server policy for five classes, not a physical-layout quote.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FrontendScopeSlotsConfig {
-    pub query: usize,
-    pub materialized_view: usize,
-    pub statistics: usize,
-    pub table_maintenance: usize,
-    pub management: usize,
-}
-impl Default for FrontendScopeSlotsConfig {
-    fn default() -> Self {
-        // Deliberate Server policy, never inferred from worker/thread counts.
-        Self {
-            query: 4096,
-            materialized_view: 1024,
-            statistics: 1024,
-            table_maintenance: 1024,
-            management: 1024,
-        }
-    }
-}
-impl FrontendScopeSlotsConfig {
-    pub fn declared(&self) -> [usize; 5] {
-        [
-            self.query,
-            self.materialized_view,
-            self.statistics,
-            self.table_maintenance,
-            self.management,
-        ]
-    }
-}
-/// Independent per-dependency policy, not an actual backing quote.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FrontendDependencyCustodyConfig {
-    pub unreceived_productions: u64,
-    pub publications: u64,
-    pub residuals: u64,
-    pub retained_payload_bytes: u64,
-}
-impl Default for FrontendDependencyCustodyConfig {
-    fn default() -> Self {
-        // Complete supported progress validation may reject stricter policies.
-        Self {
-            unreceived_productions: 256,
-            publications: 256,
-            residuals: 256,
-            // The concrete composer invoices the closed Internal factory and
-            // every original Native lane before selecting its full-D bound.
-            retained_payload_bytes: 12 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -2026,10 +1968,7 @@ fn default_task_backend_max_queued_operations() -> usize {
 }
 
 fn default_task_backend_max_queued_bytes() -> usize {
-    // Server deployment policy: leave physical queue headroom for protected
-    // foreground and settlement runs across the complete supported domain set.
-    // The frozen codec defaults remain independently configurable inputs.
-    1024 * 1024 * 1024
+    FrontendTaskTransportBudget::DEFAULT.max_backend_queued_bytes()
 }
 
 fn default_task_max_tasks_per_context() -> usize {
@@ -3320,7 +3259,6 @@ mod tests {
     fn frontend_workload_rejects_retired_capacity_switches() {
         for field in [
             "root_limit",
-            "scope_records_limit",
             "business_limit",
             "preparation_limit",
             "execution_limit",
@@ -3757,7 +3695,7 @@ access_key_secret = ""
             runtime.task_backend_max_queued_operations,
             frozen.max_backend_queued_operations()
         );
-        assert_eq!(runtime.task_backend_max_queued_bytes, 1024 * 1024 * 1024);
+        assert_eq!(runtime.task_backend_max_queued_bytes, 512 * 1024 * 1024);
         assert_eq!(
             runtime.task_max_tasks_per_context,
             frozen.max_tasks_per_context()
@@ -4951,56 +4889,29 @@ mod frontend_constant_policy_tests {
 }
 
 #[cfg(test)]
-mod frontend_joint_policy_config_tests {
+mod frontend_workload_runtime_config_tests {
     use super::*;
     #[test]
-    fn explicit_smaller_native_and_dependency_bounds_are_not_upgraded_to_defaults() {
-        let configured: RuntimeConfig = toml::from_str(
-            "task_backend_max_queued_bytes = 536870912\n\
-             [frontend_workload.dependency_custody]\n\
-             retained_payload_bytes = 4294967296\n",
-        )
-        .unwrap();
-        assert_eq!(configured.task_backend_max_queued_bytes, 512 * 1024 * 1024);
-        assert_eq!(
-            configured
-                .frontend_workload
-                .dependency_custody
-                .retained_payload_bytes,
-            4 << 30
-        );
-        assert_eq!(configured.task_operation_max_batch_items, 32);
+    fn actual_global_scope_and_native_queue_configuration_are_preserved() {
+        let configured: RuntimeConfig=toml::from_str("task_backend_max_queued_bytes = 268435456\n[frontend_workload]\nscope_records_limit = 5000\n").unwrap();
+        assert_eq!(configured.task_backend_max_queued_bytes, 256 * 1024 * 1024);
+        assert_eq!(configured.frontend_workload.scope_records_limit, 5000);
+        let defaults = RuntimeConfig::default();
+        assert_eq!(defaults.frontend_workload.scope_records_limit, 8192);
+        assert_eq!(defaults.task_backend_max_queued_bytes, 512 * 1024 * 1024);
     }
-
     #[test]
-    fn named_shares_and_independent_custody_policy_parse_without_a_solver_matrix() {
-        let configured: FrontendWorkloadRuntimeConfig = toml::from_str(
-            "[scope_slots]\nquery = 20\nmaterialized_view = 6\nstatistics = 7\n\
-             table_maintenance = 8\nmanagement = 9\n\
-             [dependency_custody]\nunreceived_productions = 4\npublications = 5\n\
-             residuals = 6\nretained_payload_bytes = 1073741824\n",
-        )
-        .unwrap();
-        assert_eq!(configured.scope_slots.declared(), [20, 6, 7, 8, 9]);
-        assert_eq!(configured.dependency_custody.unreceived_productions, 4);
-        assert_eq!(configured.dependency_custody.publications, 5);
-        assert_eq!(configured.dependency_custody.residuals, 6);
-        assert_eq!(
-            configured.dependency_custody.retained_payload_bytes,
-            1 << 30
-        );
-        let defaults = FrontendWorkloadRuntimeConfig::default();
-        assert_eq!(
-            defaults.scope_slots.declared(),
-            [4096, 1024, 1024, 1024, 1024]
-        );
-        assert_eq!(defaults.dependency_custody.retained_payload_bytes, 12 << 30);
+    fn retired_class_and_dependency_quota_tables_are_rejected() {
         for document in [
-            "scope_records_limit = 8192",
+            "[scope_slots]\nquery = 20\n",
+            "[dependency_custody]\npublications = 5\n",
             "max_claims = 99",
             "work_per_turn = 7",
         ] {
-            assert!(toml::from_str::<FrontendWorkloadRuntimeConfig>(document).is_err());
+            assert!(
+                toml::from_str::<FrontendWorkloadRuntimeConfig>(document).is_err(),
+                "{document}"
+            );
         }
     }
 }

@@ -34,11 +34,10 @@ use novarocks_frontend_application::task_protocol_config::{
     CoordinationBudgets, DispatchBudget, TaskUpdateRetryPolicy,
 };
 use novarocks_frontend_application::{
-    ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendDependencyCustodyLimits,
-    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig,
-    FrontendNativeCapacityInputs, FrontendQueryControlTimeouts, FrontendResultCapacityProfile,
-    FrontendServingConfig, FrontendStatementIngress, FrontendWorkloadCapacityConfig,
-    FrontendWorkloadCapacityProfile,
+    ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
+    FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendNativeCapacityInputs,
+    FrontendQueryControlTimeouts, FrontendResultCapacityProfile, FrontendServingConfig,
+    FrontendStatementIngress, FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -594,8 +593,7 @@ pub fn compose_frontend_role_config(
     let task_execution_budgets = compose_task_execution_budgets(config)?;
     let (logical_supervisor, workload, abort_capacity, result_profile, capacity_inputs) =
         compose_frontend_workload_runtime(runtime_config)?;
-    // Pure facts come from the same sealed Provider and Native budget used
-    // below. No lease, selected dependency, or physical source is fabricated.
+    // Runtime settings come from the same original ingress and Native owners.
     let ingress = compose_frontend_statement_ingress()?;
     let capacity_profile = FrontendWorkloadCapacityProfile::try_for_native(
         capacity_inputs,
@@ -603,8 +601,6 @@ pub fn compose_frontend_role_config(
         result_profile,
         task_execution_budgets.transport,
         ingress,
-        provider_manifest.statement_io_geometry()?,
-        provider_manifest.staged_create_source_bytes()?,
     )
     .context("compose frontend original-source workload capacity profile")?;
     // The fifth input and the actual pool consume one frozen configuration.
@@ -809,20 +805,13 @@ fn compose_frontend_capacity_config(
     runtime: &crate::app_config::RuntimeConfig,
 ) -> anyhow::Result<FrontendWorkloadCapacityConfig> {
     let input = &runtime.frontend_workload;
-    let custody = &input.dependency_custody;
     FrontendWorkloadCapacityConfig::try_new(
-        input.scope_slots.declared(),
-        FrontendDependencyCustodyLimits {
-            unreceived_productions: custody.unreceived_productions,
-            publications: custody.publications,
-            residuals: custody.residuals,
-            retained_payload_bytes: custody.retained_payload_bytes,
-        },
+        input.scope_records_limit,
         NonZeroUsize::new(input.joint_progress_turn_budget)
-            .ok_or_else(|| anyhow!("frontend joint progress turn budget must be nonzero"))?,
+            .ok_or_else(|| anyhow!("frontend responsibility turn budget must be nonzero"))?,
         Duration::from_millis(input.retired_backing_recheck_ms),
     )
-    .context("construct frontend finite workload policy")
+    .context("construct frontend workload runtime configuration")
 }
 
 fn compose_frontend_workload_policy(
@@ -871,13 +860,16 @@ fn compose_frontend_result_profile(
     FrontendResultCapacityProfile::try_new(capacity).context("construct frontend result capacity")
 }
 
-/// Pure load-time check over the same policy projection used by composition.
+/// Pure validation of the actual runtime configuration used by composition.
 pub(crate) fn validate_frontend_joint_startup(
     runtime: &crate::app_config::RuntimeConfig,
-) -> anyhow::Result<crate::joint_startup_report::JointStartupReport> {
+) -> anyhow::Result<()> {
     let workload = compose_frontend_workload_policy(runtime)?;
-    let profile = compose_frontend_result_profile(runtime)?;
-    crate::joint_startup_report::validate_profile(&workload, profile.declared())
+    let result = compose_frontend_result_profile(runtime)?;
+    if workload.query_concurrency_limit > result.declared().client_compute_positions {
+        anyhow::bail!("frontend query concurrency exceeds its actual Client result positions");
+    }
+    Ok(())
 }
 
 fn compose_frontend_statement_ingress() -> anyhow::Result<FrontendStatementIngress> {
@@ -907,12 +899,7 @@ fn compose_frontend_workload_runtime(
     let input = &runtime.frontend_workload;
     let workload = compose_frontend_workload_policy(runtime)?;
     let result_profile = compose_frontend_result_profile(runtime)?;
-    let report =
-        crate::joint_startup_report::validate_profile(&workload, result_profile.declared())?;
-    tracing::debug!(
-        ?report,
-        "Frontend joint startup number checks completed; owner projections remain open"
-    );
+    validate_frontend_joint_startup(runtime)?;
     let nonzero = |field: &'static str, value: usize| {
         NonZeroUsize::new(value)
             .ok_or_else(|| anyhow::anyhow!("runtime.frontend_workload.{field} must be nonzero"))
@@ -1434,76 +1421,34 @@ mod tests {
     }
 
     #[test]
-    fn frontend_profile_consumes_sealed_metadata_and_native_source_facts() {
-        let config = crate::app_config::NovaRocksConfig::default();
+    fn frontend_configuration_with_one_worker_does_not_derive_a_topology_limit() {
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config.runtime.query_blocking_worker_threads = 1;
+        config.runtime.query_blocking_queue_capacity = 1;
         let (_, workload, _, result, inputs) =
             compose_frontend_workload_runtime(&config.runtime).unwrap();
         let transport = compose_task_execution_budgets(&config).unwrap().transport;
-        let providers = ServerProviderManifest::seal().unwrap();
         let profile = FrontendWorkloadCapacityProfile::try_for_native(
             inputs,
             &workload,
             result,
             transport,
             compose_frontend_statement_ingress().unwrap(),
-            providers.statement_io_geometry().unwrap(),
-            providers.staged_create_source_bytes().unwrap(),
         )
-        .expect("original configured action bounds compose without a role or lease");
-        let facts = profile.composition_facts().unwrap();
-        assert!(facts.maximum_dependencies > 0);
-        assert!(facts.maximum_native_owned_increment > 0);
-        assert!(
-            facts.maximum_protected_payload_increment >= result.internal_initial_payload_bytes()
+        .unwrap();
+        assert_eq!(
+            profile
+                .inputs()
+                .query_blocking_capacity()
+                .worker_threads()
+                .get(),
+            1
         );
-        // This is an explicit default capability policy in dependency domains,
-        // not a backend count or a promise about every graph's complete union.
-        assert!(facts.maximum_dependencies >= 8);
-        assert!(transport.max_batch_items() >= 32);
-        assert!(facts.metadata_source_bytes > 0);
-        assert_eq!(facts.proposals_per_slot, 6);
-        assert_eq!(profile.policy().scope_limit(), workload.scope_records_limit);
-    }
-
-    #[test]
-    fn explicit_smaller_custody_and_native_queue_retain_a_smaller_full_domain_bound() {
-        let mut config = crate::app_config::NovaRocksConfig::default();
-        config
-            .runtime
-            .frontend_workload
-            .dependency_custody
-            .retained_payload_bytes = 4 << 30;
-        config.runtime.task_backend_max_queued_bytes = 512 * 1024 * 1024;
-        let (_, workload, _, result, inputs) =
-            compose_frontend_workload_runtime(&config.runtime).unwrap();
-        let transport = compose_task_execution_budgets(&config).unwrap().transport;
+        assert_eq!(profile.policy().scope_limit(), 8192);
         assert_eq!(transport.max_backend_queued_bytes(), 512 * 1024 * 1024);
         assert_eq!(
-            inputs.policy().dependency_custody().retained_payload_bytes,
-            4 << 30
-        );
-        let providers = ServerProviderManifest::seal().unwrap();
-        let profile = FrontendWorkloadCapacityProfile::try_for_native(
-            inputs,
-            &workload,
-            result,
-            transport,
-            compose_frontend_statement_ingress().unwrap(),
-            providers.statement_io_geometry().unwrap(),
-            providers.staged_create_source_bytes().unwrap(),
-        )
-        .expect("the smaller explicit policy retains bounded source support");
-        let facts = profile.composition_facts().unwrap();
-        assert!(
-            facts.maximum_dependencies < 8,
-            "explicit limits cannot silently inherit the larger default capability"
-        );
-        assert!(
-            facts.maximum_protected_payload_increment >= result.internal_initial_payload_bytes()
-        );
-        assert_eq!(
-            profile.policy().dependency_custody().retained_payload_bytes,
-            4 << 30
+            profile.statement_ingress(),
+            Some(compose_frontend_statement_ingress().unwrap())
         );
     }
 
@@ -1517,10 +1462,7 @@ mod tests {
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
         assert_eq!(abort_capacity.get(), 16);
-        assert_eq!(
-            inputs.policy().slots_per_class(),
-            [4096, 1024, 1024, 1024, 1024]
-        );
+        assert_eq!(inputs.policy().scope_limit(), 8192);
         assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
         assert_eq!(
             inputs.query_blocking_capacity().worker_threads().get(),
@@ -1670,93 +1612,51 @@ fn remote_effect_guarantee(
 }
 
 #[cfg(test)]
-mod joint_startup_policy_tests {
+mod frontend_runtime_policy_tests {
     use super::*;
-
     #[test]
-    fn configured_internal_capacity_reaches_the_original_startup_and_runtime_projection() {
+    fn configured_internal_capacity_reaches_the_actual_runtime_projection() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.internal_result_positions = 1;
         runtime.frontend_workload.internal_result_all_objects_bytes = 2 * 1024 * 1024 * 1024;
-        let report = validate_frontend_joint_startup(&runtime).unwrap();
+        validate_frontend_joint_startup(&runtime).unwrap();
         let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
-        assert_eq!(report.result_class_positions[2], 1);
         assert_eq!(installed.declared().positions[2], 1);
         assert_eq!(
-            report.result_class_all_objects_bytes[2],
+            installed.declared().all_objects_bytes[2],
             2 * 1024 * 1024 * 1024
         );
-        assert_eq!(
-            installed.declared().all_objects_bytes[2],
-            report.result_class_all_objects_bytes[2]
-        );
-        for positions in [0, 5] {
-            runtime.frontend_workload.internal_result_positions = positions;
-            assert!(validate_frontend_joint_startup(&runtime).is_err());
-            assert!(compose_frontend_workload_runtime(&runtime).is_err());
-        }
-        runtime.frontend_workload.internal_result_positions = 1;
-        runtime.frontend_workload.internal_result_all_objects_bytes = 1;
+        runtime.frontend_workload.internal_result_positions = 0;
         assert!(validate_frontend_joint_startup(&runtime).is_err());
         assert!(compose_frontend_workload_runtime(&runtime).is_err());
     }
-
     #[test]
-    fn load_check_and_composition_use_the_same_original_workload_projection() {
-        let mut runtime = crate::app_config::RuntimeConfig::default();
-        runtime.frontend_workload.concurrency_limit = 16;
-        let projected = compose_frontend_workload_policy(&runtime).expect("original workload");
-        let report = validate_frontend_joint_startup(&runtime).expect("joint number check");
-        let (_, composed, _, _, _) =
-            compose_frontend_workload_runtime(&runtime).expect("pure composition");
-        assert_eq!(projected.query_concurrency_limit, 16);
-        assert_eq!(
-            composed.query_concurrency_limit,
-            projected.query_concurrency_limit
-        );
-        assert_eq!(report.computation_positions, 16);
-        assert_eq!(report.result_plus_native_declared_bytes, None);
-    }
-
-    #[test]
-    fn original_policy_projection_failure_preserves_the_owner_error() {
+    fn original_invalid_workload_configuration_preserves_the_owner_error() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.waiting_limit = 0;
-        let error = validate_frontend_joint_startup(&runtime).expect_err("invalid actual policy");
+        let error = validate_frontend_joint_startup(&runtime).unwrap_err();
         assert!(
             error
                 .downcast_ref::<novarocks_workload_control::WorkError>()
                 .is_some()
         );
     }
-
     #[test]
-    fn beyond_supported_compute_is_rejected_by_both_pure_callers() {
+    fn actual_client_result_positions_still_bound_query_concurrency() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.concurrency_limit = 257;
         assert!(validate_frontend_joint_startup(&runtime).is_err());
         assert!(compose_frontend_workload_runtime(&runtime).is_err());
     }
-}
-
-#[cfg(test)]
-mod frontend_capacity_input_tests {
-    use super::*;
     #[test]
-    fn checked_class_sum_is_the_only_scope_total_and_reaches_the_fifth_input() {
+    fn global_scope_inventory_reaches_the_original_workload() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
-        runtime.frontend_workload.scope_slots.query = 5000;
+        runtime.frontend_workload.scope_records_limit = 5000;
         let (_, workload, _, _, inputs) = compose_frontend_workload_runtime(&runtime).unwrap();
-        assert_eq!(workload.scope_records_limit, 5000 + 4 * 1024);
-        assert_eq!(workload.root_limit, workload.scope_records_limit);
-        assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
-        assert_eq!(
-            inputs.policy().dependency_custody().retained_payload_bytes,
-            12 << 30
-        );
-        runtime.frontend_workload.scope_slots.management = 0;
-        assert!(compose_frontend_workload_runtime(&runtime).is_err());
-        runtime.frontend_workload.scope_slots.management = usize::MAX;
+        assert_eq!(workload.scope_records_limit, 5000);
+        assert_eq!(workload.root_limit, 5000);
+        assert_eq!(inputs.policy().scope_limit(), 5000);
+        runtime.frontend_workload.scope_records_limit = 0;
         assert!(compose_frontend_workload_runtime(&runtime).is_err());
     }
 }
