@@ -5600,3 +5600,5 @@ fn resolve_drop_target(
         table,
     })
 }
+
+pub(crate) mod async_preparation;

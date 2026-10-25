@@ -18,6 +18,9 @@
 //! Same metadata Source and dynamically retained original request cells.
 //! Provider I/O never owns the WorkOwner. Every foreign poll/Drop/wake occurs
 //! after the metadata mutex is released, with original custody restored on unwind.
+mod existing_obligation;
+pub(crate) use existing_obligation::ExistingMetadataObligation;
+
 use futures::task::AtomicWaker;
 use novarocks_resource_contract::SharedDependency;
 use novarocks_spi::connector::{
@@ -1279,6 +1282,18 @@ impl MetadataIoAdmission {
             &body.root, &body.root, body.payload.as_ref().ok_or(WorkError::NotReady)?)
     }
 
+    /// Borrow the same positive metadata Root and original operation control.
+    /// This does not create an owner, budget, or computation permission.
+    pub(crate) fn original_result_scope(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorOriginalResultScope,
+        novarocks_spi::connector::OriginalResultCheckError,
+    > {
+        super::rewrite_capture::borrow_positive_capture(self, context)
+    }
+
     /// Capture only from the same already-positive Root after its original
     /// Provider journal recorded an existing publication obligation.
     pub(crate) fn metadata_cpu_continuation_source(
@@ -1312,6 +1327,16 @@ impl MetadataIoAdmission {
             return Err(WorkError::Conflict);
         }
         self.check_existing_metadata_obligation(root)
+    }
+
+    /// Borrow only the already registered obligation's own finite control.
+    /// This neither proves Applied nor retains a new payload or Root owner.
+    pub(crate) fn existing_metadata_obligation(
+        self: &Arc<Self>,
+        root: &WorkScope,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ExistingMetadataObligation, novarocks_failure_contract::SharedFailureCause> {
+        ExistingMetadataObligation::capture(self, root, context)
     }
 
     pub(crate) fn settlement_result_scope(

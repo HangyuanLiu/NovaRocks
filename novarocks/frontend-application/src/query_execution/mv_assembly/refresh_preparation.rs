@@ -21,6 +21,10 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
+pub(crate) mod async_original;
+pub(crate) mod driver;
+pub(crate) mod io_gate;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -1960,3 +1964,7 @@ fn prepare_frontend_incremental_write(
     .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
     .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
 }
+
+pub(crate) mod async_facts;
+
+pub(crate) mod pure_reader;

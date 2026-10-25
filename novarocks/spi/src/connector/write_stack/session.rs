@@ -1500,6 +1500,16 @@ pub trait ConnectorWriteControl: Send + Sync {
         commit: &ConnectorWriteCommitHandle,
     ) -> Result<crate::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>;
 
+    /// Observe only a finite finalization context already received by this
+    /// exact original session. This must never begin a grant or derive a new
+    /// deadline/stop. None is absence, not permission to use business control.
+    fn existing_finalization_context(
+        &self,
+        _commit: &ConnectorWriteCommitHandle,
+    ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Direct asynchronous control I/O. The original caller retains the
     /// operation future; dropping a waiter is not a cancellation or exit fact.
     fn begin_write_async(

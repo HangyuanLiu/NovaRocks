@@ -17,6 +17,7 @@
 
 //! Closed Statistics preparation in the original InternalResultCpu factory.
 use super::*;
+pub(crate) mod scoped_mv_refresh;
 use crate::query_execution::statistics::preparation::{
     StatisticsPlanCpuInput, StatisticsPreparationCustody, StatisticsPreparationFailure,
     StatisticsPreparationOutcome,
@@ -26,6 +27,7 @@ use crate::query_execution::statistics::preparation::{
 // Any input or caller-selected factory enters the finite worker.
 pub(super) enum ClosedCreatorInput {
     Read(super::super::provider_read_facts::ProviderReadCreatorInput),
+    MvRefresh(scoped_mv_refresh::MvRefreshCpuTurn),
     StatisticsPlan(StatisticsPlanCpuInput),
     StatisticsProvider(novarocks_spi::connector::StatisticsCpuInput),
     ProviderMetadata(novarocks_spi::connector::ProviderMetadataCpuInput),
@@ -35,6 +37,7 @@ impl ClosedCreatorInput {
     pub(super) fn run_once(&mut self) {
         match self {
             Self::Read(input) => input.run_once(),
+            Self::MvRefresh(input) => input.run_once(),
             Self::StatisticsPlan(input) => input.run_once(),
             Self::StatisticsProvider(input) => input.run_original_phase(),
             Self::ProviderMetadata(input) => input.run_original_phase(),

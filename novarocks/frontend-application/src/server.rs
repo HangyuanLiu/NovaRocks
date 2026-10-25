@@ -190,6 +190,7 @@ struct FrontendRoleProducts {
     query_execution: crate::query_execution::service::QueryExecutionService,
     logical_execution_launcher:
         Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    mv_execution_services: crate::query::mv_action::MvExecutionServices,
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
@@ -238,6 +239,7 @@ impl FrontendRoleProducts {
                     self.constant_policy,
                 ),
                 Arc::clone(&self.maintenance_engine),
+                self.mv_execution_services.clone(),
             ))
             .map_err(|error| {
                 FrontendApplicationError::server(format!(
@@ -615,7 +617,27 @@ async fn build_frontend_role_products(
     // cleanup path, while a serving role owns the catalog lifecycle and its
     // MV product.
     let catalog_runtime = host.take_catalog_role_runtime()?;
+    let mv_execution_services = crate::query::mv_action::MvExecutionServices {
+        client: host.logical_execution_client(),
+        launcher: logical_execution_launcher.clone(),
+        completion: crate::query_execution::completion_facts::CompletionFactOwners::new(
+            catalog_service.clone(),
+            Some(catalog_application.clone()),
+            typed_connector_control.clone(),
+            unified_statistics.clone(),
+            mv_candidate_reader.clone(),
+            mv_storage_observation.clone(),
+            host.connector_blocking_io_supervisor(),
+        ),
+        connector_control: typed_connector_control.clone(),
+        blocking: host.connector_blocking_io_supervisor(),
+        data: host.write_data_runtime(),
+        state_store: host.state_store_original_binding(),
+        #[cfg(novarocks_dev_controls)]
+        controls: mv_readiness.test_controls_owner(),
+    };
     Ok(FrontendRoleProducts {
+        mv_execution_services,
         catalog_runtime,
         catalog_service,
         unified_statistics,
@@ -745,7 +767,8 @@ fn build_frontend_query_session_factory_from_role_products(
             products.mv_product_service.management_continuation(),
             host.mv_management_audit_sink(),
             host.constant_policy(),
-        ));
+        ))
+        .with_execution_services(products.mv_execution_services.clone());
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
     > = Arc::new(crate::mv::command::FrontendMvCommandConsumer::new(
@@ -2106,12 +2129,19 @@ mod tests {
         host.install_statement_control_for_test();
         let serving = host.serving_snapshot_reader();
         assert!(!serving.frontend_serving_snapshot().base_ready());
-        host.mark_workload_ready().expect("open internal governed startup work");
+        host.mark_workload_ready()
+            .expect("open internal governed startup work");
         let snapshot = serving.frontend_serving_snapshot();
-        assert_eq!(snapshot.serving_state,
-            novarocks_query_application::serving_admission::FrontendServingState::Starting);
-        assert!(!snapshot.base_ready(), "internal authority cannot expose public readiness");
-        let management = host.workload_root_admission()
+        assert_eq!(
+            snapshot.serving_state,
+            novarocks_query_application::serving_admission::FrontendServingState::Starting
+        );
+        assert!(
+            !snapshot.base_ready(),
+            "internal authority cannot expose public readiness"
+        );
+        let management = host
+            .workload_root_admission()
             .try_begin_root(WorkRequest::new(WorkClass::Management))
             .expect("mandatory startup may use a real Management Root");
         drop(management.business);

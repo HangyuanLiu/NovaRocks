@@ -69,6 +69,8 @@ pub(crate) trait MvBackgroundEngine: Send + Sync {
 /// owns worker threads after it receives this value.
 #[derive(Clone)]
 pub(crate) struct MvBackgroundBindings {
+    pub(crate) ports: crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
+    pub(crate) execution: crate::query::mv_action::MvExecutionServices,
     pub(crate) engine: Arc<dyn MvBackgroundEngine>,
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 }

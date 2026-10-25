@@ -1515,3 +1515,313 @@ async fn bootstrap_read_owner_cannot_export_business_write_requests() {
     drop(owner);
     shutdown(&mut workers).await;
 }
+
+// The same original MIO author supplies a positive payload; this helper does
+// not infer a publication verdict or synthesize a settlement grant.
+fn admitted_metadata(
+    root: &novarocks_workload_control::WorkOwner,
+    driver: &mut novarocks_workload_control::joint_admission::JointProgressDriver,
+) -> Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission> {
+    use crate::query_execution::native_execution_adapter::source_cohort::tests::drive;
+    let io = crate::query_execution::maintenance::io_admission::MetadataIoAdmission::for_original_source(
+        root, vec![novarocks_resource_contract::SharedDependency::LocalHost],
+    ).unwrap();
+    for _ in 0..256 {
+        if io
+            .poll_progress(root, &mut Context::from_waker(Waker::noop()))
+            .unwrap()
+        {
+            return io;
+        }
+        drive(driver);
+    }
+    panic!("original metadata payload did not become ready");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn existing_metadata_obligation_uses_same_root_queue_and_receives_post_stop_footer() {
+    use crate::query_execution::native_execution_adapter::source_cohort::tests as cohort;
+    use novarocks_spi::connector::{
+        ConnectorIoAdmissionPort, ConnectorOperationControl, ConnectorRequestContext,
+        ConnectorStopOwner,
+    };
+    let (control, mut driver, _) = cohort::fixture();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let io = admitted_metadata(&root.owner, &mut driver);
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let policy = novarocks_state_store_runtime::StateStoreRunPolicy::default();
+    let mut owner = StateStoreOriginalOwner::for_root(
+        &executor,
+        vocabulary(),
+        instance,
+        root.owner.scope(),
+        policy,
+    )
+    .unwrap();
+    let ordinary = owner
+        .execution_requests(Duration::from_secs(31), None)
+        .unwrap();
+    let business_stop = ConnectorStopOwner::new();
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        business_stop.view(),
+        1024,
+        4096,
+    )
+    .unwrap()
+    .with_io_admission(io.clone());
+    assert!(
+        io.existing_metadata_obligation(&root.owner.scope(), &context)
+            .is_err(),
+        "positive bytes alone are not a registered obligation"
+    );
+    io.publication_obligation_started();
+    let foreign_context =
+        ConnectorRequestContext::try_new(context.deadline(), business_stop.view(), 1024, 4096)
+            .unwrap();
+    assert!(
+        io.existing_metadata_obligation(&root.owner.scope(), &foreign_context)
+            .is_err(),
+        "the context must name this same original MIO"
+    );
+    let expired = context.clone().with_earlier_deadline(Instant::now());
+    assert!(
+        io.existing_metadata_obligation(&root.owner.scope(), &expired)
+            .is_err(),
+        "capture cannot renew an expired obligation deadline"
+    );
+    let obligation_stop = ConnectorStopOwner::new();
+    let obligation = context.for_existing_obligation(context.deadline(), obligation_stop.view());
+    let token = io
+        .existing_metadata_obligation(&root.owner.scope(), &obligation)
+        .unwrap();
+    let foreign_root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let foreign_owner = StateStoreOriginalOwner::for_root(
+        &executor,
+        vocabulary(),
+        instance,
+        foreign_root.owner.scope(),
+        policy,
+    )
+    .unwrap();
+    assert!(
+        foreign_owner
+            .existing_obligation_requests(Duration::from_secs(31), token.clone())
+            .is_err()
+    );
+    assert!(
+        foreign_owner
+            .port
+            .inventory
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    drop(foreign_owner);
+    foreign_root.owner.complete();
+    foreign_root.business.release();
+    let requests = owner
+        .existing_obligation_requests(Duration::from_secs(31), token)
+        .unwrap();
+    let read = requests.read_transaction_context().unwrap();
+    assert_eq!(read.deadline(), obligation.deadline());
+    let before = Instant::now();
+    let write = requests.write_operation_context().unwrap();
+    assert!(write.deadline() >= before + policy.operation_timeout());
+    assert!(write.deadline() <= obligation.deadline());
+    assert!(read.shares_owner(&write), "one stable request wrapper");
+    assert_eq!(
+        read.read_transaction_context().unwrap().deadline(),
+        read.deadline()
+    );
+
+    root.owner.cancel(CancellationReason::Requested);
+    business_stop.request_stop();
+    assert!(ordinary.read_transaction_context().is_err());
+    assert!(ordinary.write_operation_context().is_err());
+    assert!(requests.read_transaction_context().is_ok());
+    assert!(requests.write_operation_context().is_ok());
+    let run_gate = Gate::new();
+    let footer = Gate::new();
+    let _run_rescue = Rescue(run_gate.clone());
+    let _footer_rescue = Rescue(footer.clone());
+    let source = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::Get,
+        Some(run_gate.clone()),
+    );
+    let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+    let mut slot = None;
+    read.bind_original_in(&original, &mut slot).unwrap();
+    *source.slot.lock().unwrap() = slot;
+    read.request_progress();
+    let wake = Waker::from(Arc::new(PauseWake {
+        once: AtomicBool::new(false),
+        gate: footer.clone(),
+    }));
+    assert!(
+        !owner
+            .poll_progress(&mut Context::from_waker(&wake))
+            .unwrap()
+    );
+    run_gate.reached().await;
+    assert_eq!(
+        source.interrupted.load(Ordering::Acquire),
+        0,
+        "Root cancellation cannot interrupt the admitted obligation"
+    );
+    run_gate.release();
+    footer.reached().await;
+    assert!(
+        !owner
+            .poll_actual_quiescent(&mut Context::from_waker(Waker::noop()))
+            .unwrap()
+    );
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true)]
+    );
+    obligation_stop.request_stop();
+    assert!(!poll_once(&owner).unwrap());
+    assert!(!poll_once(&owner).unwrap());
+    assert_eq!(source.interrupted.load(Ordering::Acquire), 1);
+    let refusal = match requests.write_operation_context() {
+        Err(cause) => cause,
+        Ok(_) => panic!("the original obligation stop must refuse another operation"),
+    };
+    assert_eq!(
+        refusal.failure_fact(),
+        obligation.check_active().unwrap_err().failure_fact()
+    );
+    assert!(owner.local_health_failure().is_none());
+    assert!(!source.is_complete());
+    footer.release();
+    closed(&mut owner).await;
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[Event::Result(true), Event::Exit(Exit::ActualExited)]
+    );
+    assert_eq!(source.runs.load(Ordering::Acquire), 1);
+    drop(owner);
+    assert!(
+        requests.read_transaction_context().is_err(),
+        "wrapper cannot retain the Port"
+    );
+    drop((requests, ordinary, read, write, io));
+    cohort::finish(control, root, driver);
+    shutdown(&mut workers).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn obligation_stop_wakes_full_queue_and_normally_returns_same_unpublished_input() {
+    use crate::query_execution::native_execution_adapter::source_cohort::tests as cohort;
+    use novarocks_spi::connector::{
+        ConnectorIoAdmissionPort, ConnectorOperationControl, ConnectorRequestContext,
+        ConnectorStopOwner,
+    };
+    struct Notified(AtomicUsize);
+    impl TaskWake for Notified {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    let (control, mut driver, _) = cohort::fixture();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let io = admitted_metadata(&root.owner, &mut driver);
+    let (mut workers, executor) = worker();
+    let instance = InstanceScope::new();
+    let mut owner = StateStoreOriginalOwner::for_root(
+        &executor,
+        vocabulary(),
+        instance,
+        root.owner.scope(),
+        Default::default(),
+    )
+    .unwrap();
+    let stop = ConnectorStopOwner::new();
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        stop.view(),
+        1024,
+        4096,
+    )
+    .unwrap()
+    .with_io_admission(io.clone());
+    io.publication_obligation_started();
+    let token = io
+        .existing_metadata_obligation(&root.owner.scope(), &context)
+        .unwrap();
+    let requests = owner
+        .existing_obligation_requests(Duration::from_secs(31), token)
+        .unwrap();
+    let request = requests.write_operation_context().unwrap();
+    let held = owner.port.executor.try_reserve().unwrap();
+    let source = TestOriginal::new(
+        StateStoreBlockingOrigin::Instance(instance),
+        Phase::Put,
+        None,
+    );
+    let original: Arc<dyn StateStoreBlockingOriginal> = source.clone();
+    let input = source.input.as_ptr();
+    let mut slot = None;
+    request.bind_original_in(&original, &mut slot).unwrap();
+    *source.slot.lock().unwrap() = slot;
+    request.request_progress();
+    root.owner.cancel(CancellationReason::Requested);
+    let notice = Arc::new(Notified(AtomicUsize::new(0)));
+    let wake = Waker::from(notice.clone());
+    assert!(
+        !owner
+            .poll_progress(&mut Context::from_waker(&wake))
+            .unwrap()
+    );
+    assert_eq!(source.prepared.load(Ordering::Acquire), 0);
+    assert!(source.events.lock().unwrap().is_empty());
+    let before_stop = notice.0.load(Ordering::Acquire);
+    stop.request_stop();
+    assert!(
+        notice.0.load(Ordering::Acquire) > before_stop,
+        "the same control wakes the existing queue waiter without a retry timer"
+    );
+    assert!(poll_once(&owner).unwrap());
+    assert_eq!(
+        source.events.lock().unwrap().as_slice(),
+        &[
+            Event::Result(false),
+            Event::Exit(Exit::NeverPublishedReturned)
+        ]
+    );
+    assert_eq!(source.runs.load(Ordering::Acquire), 0);
+    assert_eq!(source.prepared.load(Ordering::Acquire), 0);
+    assert_eq!(source.input.as_ptr(), input);
+    let first = source.result_failure.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        first.failure_fact(),
+        context.check_active().unwrap_err().failure_fact()
+    );
+    assert!(owner.local_health_failure().is_none());
+    assert!(
+        owner.port.executor.try_reserve().is_err(),
+        "no new physical capacity"
+    );
+    drop(held);
+    closed(&mut owner).await;
+    let mut refused = None;
+    assert!(request.bind_original_in(&original, &mut refused).is_err());
+    assert!(refused.is_none());
+    drop(owner);
+    drop((requests, request, io));
+    cohort::finish(control, root, driver);
+    shutdown(&mut workers).await;
+}

@@ -1,0 +1,1465 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError as RefreshError;
+use crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo;
+use novarocks_spi::connector::ConnectorOperationControl;
+pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &MvRefreshRequest,
+    target: MvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefreshPlan, RefreshError> {
+    let iceberg_target =
+        resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)
+            .map_err(RefreshError::from)?;
+    connector_context
+        .original_operation_control()
+        .check_active()
+        .map_err(RefreshError::from)?;
+    // Preparation normally only observes the currently admitted catalog and
+    // MV facts. A snapshot fence may rebuild sealed Current only as a
+    // read-only candidate; this path has no authority to readmit management
+    // readiness and therefore still fails the refresh.
+    // Metadata maintenance may renew an existing admission only while its
+    // carrier facts remain identical. This observation cannot recover an old
+    // document format or reopen management without explicit readmission.
+    if reobserve_current_management_before_refresh(io, source, &iceberg_target, connector_context)
+        .await
+        .map_err(RefreshError::from)?
+    {
+        return Err(RefreshError::user(
+            "MV Current marker names another process incarnation; management is closed".to_string(),
+        ));
+    }
+    let mv_definition = io
+        .definition(source, &iceberg_target)
+        .await
+        .map_err(RefreshError::from)?;
+    let target_binding = io
+        .target_binding(source, &iceberg_target, connector_context)
+        .await
+        .map_err(RefreshError::from)?;
+    if let Err(snapshot_error) = validate_target_snapshot(
+        &iceberg_target,
+        &mv_definition,
+        &target_binding,
+        source.management_entrance()?.as_ref(),
+        connector_context,
+    ) {
+        reconcile_published_lake_projection(
+            io,
+            source,
+            &iceberg_target,
+            &target_binding,
+            connector_context,
+        )
+        .await
+        .map_err(|recovery_error| {
+            recovery_error.with_context(format!(
+                "{snapshot_error}; sealed Current read-only recovery failed",
+            ))
+        })?;
+        return Err(RefreshError::user(format!(
+            "{snapshot_error}; sealed Current was installed as a read-only MV candidate; management Current readmission is required before refresh",
+        )));
+    }
+    // D's own occurrence inventory is the base-locator authority now; the
+    // retired projection copy of the resolved FQN list is gone.
+    let base_refs = definition_base_refs(&mv_definition).map_err(RefreshError::from)?;
+    let (mv_definition, refresh_query_source) = io
+        .rebind_definition(
+            source,
+            &mv_definition,
+            &base_refs,
+            &iceberg_target,
+            None,
+            connector_context,
+        )
+        .await
+        .map_err(RefreshError::from)?;
+    // One exact target generation serves the whole plan: the snapshot fence
+    // above, the state baseline, the L bindings, and the typed partition facts
+    // every sub-planner reads. Re-resolving `latest` per fact could split one
+    // attempt across two generations.
+    let target_schema_observation =
+        crate::mv::domain::storage_observation::observe_schema_validation(
+            source.storage_observation(),
+            target_binding.lease(),
+            target_binding.metadata(),
+            connector_context.clone(),
+        )
+        .map_err(RefreshError::from)?;
+    let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)
+        .map_err(RefreshError::from)?;
+    let resolution = &mv_definition.facts.definition().query.resolution;
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&refresh_query_source).map_err(RefreshError::from)?,
+        Some(resolution.default_catalog.as_str()),
+        &resolution.default_namespace,
+    );
+    // Driver dispatch: plan-side dispatch is capability-driven, matching the
+    // execute path. The capabilities come from L plus the exact target
+    // observation L was validated against, never from a persisted contract.
+    let runtime_bindings = validate_projection_target(&mv_definition, &target_schema_observation)
+        .map_err(RefreshError::from)?;
+    let caps = RefreshCapabilities::from_canonical_facts(
+        mv_definition.facts.interpretation(),
+        &runtime_bindings,
+        mv_definition.facts.definition().relation_occurrences.len(),
+        definition_has_join(&canonical_select_query),
+    )
+    .map_err(RefreshError::from)?;
+    let is_join = matches!(
+        caps.snapshot_policy,
+        BaseSnapshotPolicy::JoinPairPartialInitialSkip
+    );
+    match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
+        // UNION ALL of projection/filter branches.
+        (false, BaseSnapshotPolicy::AllBasesRequired, _) => {
+            // The query's own branch count; L's branch interpretations are the
+            // persisted counterpart the per-base validator compares it against.
+            let branch_count = union_branch_count(&canonical_select_query) as usize;
+            return plan_iceberg_union_projection_mv_refresh(
+                io,
+                source,
+                &iceberg_target,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &mv_definition,
+                &base_refs,
+                branch_count,
+                &target_binding,
+                &target_schema_observation,
+                &refresh_state_baseline,
+                connector_context,
+            )
+            .await;
+        }
+        // Aggregate shapes: single-base, fan-in, branch-union, and join
+        // aggregate all route through the aggregate planner, which selects the
+        // per-shape plan by capability. The branch-union sub-path sources its
+        // branch count + first-branch aggregate calls from the focused extractor
+        // (not the union classifier), so composed branches are supported.
+        (true, _, _) => {
+            return plan_iceberg_aggregate_mv_refresh(
+                io,
+                source,
+                &iceberg_target,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &mv_definition,
+                &base_refs,
+                &caps,
+                &canonical_select_query,
+                &target_binding,
+                &target_schema_observation,
+                &refresh_state_baseline,
+                connector_context,
+            )
+            .await;
+        }
+        // Join / single-base projection-filter: fall through to the inline
+        // paths below.
+        (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _)
+        | (false, BaseSnapshotPolicy::SingleBase, _) => {}
+    }
+    if is_join {
+        // The join projection/filter plan path resolves left/right from D's own
+        // effective SQL. There is no persisted join lineage and no contract
+        // version to compare: the canonical documents carry their own revisions
+        // and were already verified when the projection was reconstructed.
+        let occurrences = definition_occurrences_for_base_refs(&mv_definition, &base_refs)
+            .map_err(RefreshError::from)?;
+        let base_occurrences =
+            base_relation_occurrences(&mv_definition, &base_refs).map_err(RefreshError::from)?;
+        let (left_occurrence, right_occurrence) = join_base_refs_for_definition(
+            &mv_definition,
+            &canonical_select_query,
+            &base_occurrences,
+        )
+        .map_err(RefreshError::from)?;
+        let left_refresh = io
+            .current_base(source, &left_occurrence.table, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        let right_refresh = io
+            .current_base(source, &right_occurrence.table, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        let left_observation = io
+            .schema(source, &left_occurrence.table, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        let right_observation = io
+            .schema(source, &right_occurrence.table, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        // The join validator demands D occurrence order, which is not the
+        // join's own left/right order, so the observations are re-paired with
+        // their occurrences rather than with the join sides. By occurrence, not
+        // by table: in a self-join both sides read the same table.
+        let bases = occurrences
+            .iter()
+            .copied()
+            .map(|occurrence| {
+                if occurrence.occurrence_id == left_occurrence.occurrence_id.get() {
+                    Ok((occurrence, &left_observation))
+                } else if occurrence.occurrence_id == right_occurrence.occurrence_id.get() {
+                    Ok((occurrence, &right_observation))
+                } else {
+                    Err(RefreshError::user(format!(
+                        "iceberg join MV D occurrence {} is neither join side",
+                        occurrence.occurrence_id
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>, RefreshError>>()?;
+        let renames =
+            validate_join_schema_contract(&mv_definition, &bases, &target_schema_observation)
+                .map_err(RefreshError::from)?;
+        require_no_occurrence_rebind(&renames).map_err(RefreshError::from)?;
+        let left_current = left_refresh.current_snapshot_id();
+        let right_current = right_refresh.current_snapshot_id();
+        // Each side is pinned as the occurrence it is. A join of one table
+        // with itself has two occurrences of one name, and keying by name
+        // would let the second side overwrite the first.
+        let mut snapshot_pins = BTreeMap::new();
+        snapshot_pins.insert(left_occurrence.occurrence_id, left_current);
+        snapshot_pins.insert(right_occurrence.occurrence_id, right_current);
+        let mut current_snapshots = BTreeMap::new();
+        current_snapshots.insert(left_occurrence.occurrence_id, left_current);
+        current_snapshots.insert(right_occurrence.occurrence_id, right_current);
+        let previous = previous_refresh_locators(
+            io,
+            &refresh_state_baseline,
+            source.connector_control(),
+            connector_context,
+        )
+        .await
+        .map_err(RefreshError::from)?;
+        let previous_snapshots = &previous.snapshots;
+        let refresh_label = format!(
+            "iceberg join MV {}.{}.{}",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        );
+        let refresh_statuses = base_snapshot_statuses_for_plan(
+            &base_occurrences,
+            previous_snapshots,
+            &current_snapshots,
+        );
+        let decision = decide_requested_refresh_plan(
+            &RefreshPlanningInput {
+                snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                base_snapshots: &refresh_statuses,
+                label: &refresh_label,
+            },
+            stmt.full,
+        )
+        .map_err(RefreshError::from)?;
+        let has_previous = base_occurrences
+            .iter()
+            .any(|base| previous_snapshots.contains_key(&base.occurrence_id));
+        if has_previous {
+            for base in &base_occurrences {
+                let named = base.display();
+                if previous_snapshots.contains_key(&base.occurrence_id)
+                    && current_snapshots
+                        .get(&base.occurrence_id)
+                        .copied()
+                        .flatten()
+                        .is_none()
+                {
+                    return Err(RefreshError::user(format!(
+                        "cannot refresh iceberg join materialized view {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                        iceberg_target.catalog,
+                        iceberg_target.namespace,
+                        iceberg_target.table,
+                        named
+                    )));
+                }
+            }
+            for base in &base_occurrences {
+                let named = base.display();
+                previous_snapshots
+                    .get(&base.occurrence_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        RefreshError::user(format!(
+                            "iceberg join MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                            iceberg_target.catalog,
+                            iceberg_target.namespace,
+                            iceberg_target.table
+                        ))
+                    })?;
+                current_snapshots
+                    .get(&base.occurrence_id)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        RefreshError::user(format!(
+                            "cannot refresh iceberg join materialized view {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                            iceberg_target.catalog,
+                            iceberg_target.namespace,
+                            iceberg_target.table,
+                            named
+                        ))
+                    })?;
+            }
+        }
+        let affected_partitions = unknown_join_affected_partitions();
+        log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
+        return Ok(RefreshPlan {
+            contract: RefreshPlanContract {
+                mv_id: Some(mv_definition.mv_id),
+                target,
+                storage_engine: MvStorageEngine::Iceberg,
+                decision: decision.refresh,
+                state_baseline: refresh_state_baseline.clone(),
+                base_refs: base_occurrences.clone(),
+                snapshot_pins,
+                affected_partitions,
+            },
+        });
+    }
+    // The capability dispatch above (has_agg=false, SingleBase, non-join) routes only
+    // single-base projection/filter MVs to this point. No classify guard needed.
+    let [base_ref] = base_refs.as_slice() else {
+        return Err(RefreshError::user(
+            "iceberg materialized view refresh requires exactly one base table reference",
+        ));
+    };
+    let occurrences = definition_occurrences_for_base_refs(&mv_definition, &base_refs)
+        .map_err(RefreshError::from)?;
+    let [occurrence] = occurrences.as_slice() else {
+        return Err(RefreshError::user(
+            "iceberg materialized view refresh requires exactly one D relation occurrence",
+        ));
+    };
+    let base_occurrences =
+        base_relation_occurrences(&mv_definition, &base_refs).map_err(RefreshError::from)?;
+    let [base_occurrence] = base_occurrences.as_slice() else {
+        return Err(RefreshError::user(
+            "iceberg materialized view refresh requires exactly one base relation occurrence",
+        ));
+    };
+    let current_snapshot_id_before_pin = io
+        .current_base(source, base_ref, connector_context)
+        .await
+        .map_err(RefreshError::from)?
+        .current_snapshot_id();
+    let previous = previous_refresh_locators(
+        io,
+        &refresh_state_baseline,
+        source.connector_control(),
+        connector_context,
+    )
+    .await
+    .map_err(RefreshError::from)?;
+    let previous_snapshot_id = previous
+        .snapshots
+        .get(&base_occurrence.occurrence_id)
+        .copied();
+    let refresh_label = format!(
+        "iceberg materialized view {}.{}.{}",
+        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+    );
+    let pre_pin_statuses = [base_snapshot_status_for_refresh(
+        base_occurrence,
+        previous_snapshot_id,
+        current_snapshot_id_before_pin,
+    )];
+    let pre_pin_decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            base_snapshots: &pre_pin_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
+    .map_err(RefreshError::from)?;
+    let base_observation = io
+        .schema(source, base_ref, connector_context)
+        .await
+        .map_err(RefreshError::from)?;
+    let renames = validate_schema_contract(
+        &mv_definition,
+        occurrence,
+        &base_observation,
+        &target_schema_observation,
+    )
+    .map_err(RefreshError::from)?;
+    require_no_occurrence_rebind(&renames).map_err(RefreshError::from)?;
+    match pre_pin_decision.refresh {
+        ExecutableRefreshDecision::SkipEmpty => {
+            let mut snapshot_pins = BTreeMap::new();
+            snapshot_pins.insert(base_occurrence.occurrence_id, None);
+            let affected_partitions = noop_affected_partitions(target_binding.partition());
+            log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
+            return Ok(RefreshPlan {
+                contract: RefreshPlanContract {
+                    mv_id: Some(mv_definition.mv_id),
+                    target,
+                    storage_engine: MvStorageEngine::Iceberg,
+                    decision: pre_pin_decision.refresh,
+                    state_baseline: refresh_state_baseline.clone(),
+                    base_refs: base_occurrences.clone(),
+                    snapshot_pins,
+                    affected_partitions,
+                },
+            });
+        }
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
+    }
+
+    let current_snapshot_id = current_snapshot_id_before_pin;
+
+    let refresh_statuses = [base_snapshot_status_for_refresh(
+        base_occurrence,
+        previous_snapshot_id,
+        current_snapshot_id,
+    )];
+    let decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
+    .map_err(RefreshError::from)?;
+    let mode = decision.mode();
+    let mut snapshot_pins = BTreeMap::new();
+    snapshot_pins.insert(base_occurrence.occurrence_id, current_snapshot_id);
+    let affected_partitions = plan_aggregate_mv_affected_partitions(
+        io,
+        source,
+        connector_context,
+        base_occurrence,
+        &refresh_state_baseline,
+        &mv_definition,
+        target_binding.partition(),
+        mode,
+        previous_snapshot_id,
+        current_snapshot_id,
+    )
+    .await;
+    log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
+    Ok(RefreshPlan {
+        contract: RefreshPlanContract {
+            mv_id: Some(mv_definition.mv_id),
+            target,
+            storage_engine: MvStorageEngine::Iceberg,
+            decision: decision.refresh,
+            state_baseline: refresh_state_baseline,
+            base_refs: base_occurrences.clone(),
+            snapshot_pins,
+            affected_partitions,
+        },
+    })
+}
+
+pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    iceberg_target: &IcebergMvTarget,
+    target: MvTarget,
+    stmt: &MvRefreshRequest,
+    _current_catalog: Option<&str>,
+    _current_database: &str,
+    mv_definition: &StoredKeyedMvProjection,
+    base_refs: &[TableIdentity],
+    branch_count: usize,
+    target_binding: &MvTargetBinding,
+    target_observation: &MvSchemaValidationObservation,
+    state_baseline: &RefreshStateBaseline,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefreshPlan, RefreshError> {
+    // The resolved bases ARE D's occurrences, in D's own order; the retired
+    // contract base set that used to be compared here no longer exists.
+    let occurrences = definition_occurrences_for_base_refs(mv_definition, base_refs)
+        .map_err(RefreshError::from)?;
+    let base_occurrences =
+        base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::from)?;
+
+    let mut current_snapshots = BTreeMap::new();
+    let mut current_table_object_ids = BTreeMap::new();
+    let mut snapshot_pins = BTreeMap::new();
+    for (occurrence, base) in occurrences.iter().copied().zip(&base_occurrences) {
+        let base_ref = &base.table;
+        let refresh = io
+            .current_base(source, base_ref, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        let base_observation = io
+            .schema(source, base_ref, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        validate_union_projection_schema_contract_for_base(
+            iceberg_target,
+            mv_definition,
+            branch_count,
+            occurrence,
+            &base_observation,
+            target_observation,
+        )
+        .map_err(RefreshError::from)?;
+        let current = refresh.current_snapshot_id();
+        snapshot_pins.insert(base.occurrence_id, current);
+        current_snapshots.insert(base.occurrence_id, current);
+        current_table_object_ids.insert(base.occurrence_id, refresh.object_id().clone());
+    }
+
+    let previous = previous_refresh_locators(
+        io,
+        state_baseline,
+        source.connector_control(),
+        connector_context,
+    )
+    .await
+    .map_err(RefreshError::from)?;
+    let previous_snapshots = &previous.snapshots;
+    let previous_table_object_ids = &previous.table_object_ids;
+    let has_previous_snapshots = base_occurrences
+        .iter()
+        .any(|base| previous_snapshots.contains_key(&base.occurrence_id));
+    let has_previous_table_object_ids = base_occurrences
+        .iter()
+        .any(|base| previous_table_object_ids.contains_key(&base.occurrence_id));
+    let has_previous = has_previous_snapshots || has_previous_table_object_ids;
+    let all_previous_snapshots = base_occurrences
+        .iter()
+        .all(|base| previous_snapshots.contains_key(&base.occurrence_id));
+    let all_previous_table_object_ids = base_occurrences
+        .iter()
+        .all(|base| previous_table_object_ids.contains_key(&base.occurrence_id));
+
+    if has_previous && (!all_previous_snapshots || !all_previous_table_object_ids) {
+        return Err(RefreshError::user(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )));
+    }
+    let refresh_label = format!(
+        "iceberg UNION ALL projection/filter MV {}.{}.{}",
+        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+    );
+    let refresh_statuses =
+        base_snapshot_statuses_for_plan(&base_occurrences, previous_snapshots, &current_snapshots);
+    let decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
+    .map_err(RefreshError::from)?;
+    let mode = decision.mode();
+    if has_previous {
+        for base in &base_occurrences {
+            let named = base.display();
+            if let Some(previous_object_id) = previous_table_object_ids.get(&base.occurrence_id) {
+                let current_object_id = current_table_object_ids
+                    .get(&base.occurrence_id)
+                    .ok_or_else(|| {
+                        RefreshError::user(format!(
+                            "refresh observation missing object ID for base {named} (this should not happen)"
+                        ))
+                    })?;
+                if previous_object_id != current_object_id {
+                    return Err(RefreshError::user(format!(
+                        "iceberg MV base table identity changed for {named}; incremental refresh is unsafe, rebuild or recreate the MV"
+                    )));
+                }
+            }
+            previous_snapshots
+                .get(&base.occurrence_id)
+                .copied()
+                .ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                    ))
+                })?;
+            current_snapshots
+                .get(&base.occurrence_id)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                        iceberg_target.catalog,
+                        iceberg_target.namespace,
+                        iceberg_target.table,
+                        named
+                    ))
+                })?;
+        }
+    }
+
+    let affected_partitions = plan_multi_base_affected_partitions_original(
+        io,
+        source,
+        state_baseline,
+        connector_context,
+        mv_definition,
+        target_binding.partition(),
+        mode,
+        &base_occurrences,
+        previous_snapshots,
+        &current_snapshots,
+        "UNION ALL MV affected partition planning",
+    )
+    .await;
+    log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+    Ok(RefreshPlan {
+        contract: RefreshPlanContract {
+            mv_id: Some(mv_definition.mv_id),
+            target,
+            storage_engine: MvStorageEngine::Iceberg,
+            decision: decision.refresh,
+            state_baseline: state_baseline.clone(),
+            base_refs: base_occurrences.clone(),
+            snapshot_pins,
+            affected_partitions,
+        },
+    })
+}
+
+pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    iceberg_target: &IcebergMvTarget,
+    target: MvTarget,
+    stmt: &MvRefreshRequest,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredKeyedMvProjection,
+    base_refs: &[TableIdentity],
+    caps: &RefreshCapabilities,
+    canonical_select_query: &ast::Query,
+    target_binding: &MvTargetBinding,
+    target_observation: &MvSchemaValidationObservation,
+    state_baseline: &RefreshStateBaseline,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefreshPlan, RefreshError> {
+    // The branch-union variant validates the branch count (off the AST, so a
+    // composed branch union is supported) + the resolved base-ref set; the
+    // fan-in variant validates the resolved base-ref set directly (the resolved
+    // bases ARE the fan-in base set now that the classifier is retired).
+    let is_branch_union = matches!(caps.identity, RefreshIdentity::BranchScoped(_));
+    let is_composed_join_aggregate =
+        !is_branch_union && !from_clause_is_fan_in_union(canonical_select_query);
+    let occurrences = definition_occurrences_for_base_refs(mv_definition, base_refs)
+        .map_err(RefreshError::from)?;
+    if is_branch_union {
+        let branch_count = union_branch_count(canonical_select_query) as usize;
+        validate_branch_union_contract(
+            iceberg_target,
+            mv_definition,
+            branch_count,
+            target_observation,
+        )
+        .map_err(RefreshError::from)?;
+        // Nothing more to check about the bases here: whether they correspond
+        // one-for-one to D's occurrences is settled by
+        // `definition_occurrences_for_base_refs` above, and each one is checked
+        // against the persisted schema contract per occurrence below. Both
+        // paths used to also require the bases to be distinct by table name,
+        // which was never the invariant -- a union whose branches read one
+        // table twice is two occurrences of it, not a duplicate.
+    } else if is_composed_join_aggregate {
+        validate_composed_aggregate_fallback_query(canonical_select_query)
+            .map_err(RefreshError::from)?;
+    }
+    let base_occurrences =
+        base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::from)?;
+    let mut current_snapshots = BTreeMap::new();
+    let mut snapshot_pins = BTreeMap::new();
+    for (occurrence, base) in occurrences.iter().copied().zip(&base_occurrences) {
+        let base_ref = &base.table;
+        let refresh = io
+            .current_base(source, base_ref, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        let base_observation = io
+            .schema(source, base_ref, connector_context)
+            .await
+            .map_err(RefreshError::from)?;
+        let renames = validate_aggregate_schema_contract_for_base(
+            mv_definition,
+            occurrence,
+            &base_observation,
+            target_observation,
+        )
+        .map_err(RefreshError::from)?;
+        require_no_occurrence_rebind(&renames).map_err(RefreshError::from)?;
+        let current = refresh.current_snapshot_id();
+        current_snapshots.insert(base.occurrence_id, current);
+        snapshot_pins.insert(base.occurrence_id, current);
+    }
+    let previous = previous_refresh_locators(
+        io,
+        state_baseline,
+        source.connector_control(),
+        connector_context,
+    )
+    .await
+    .map_err(RefreshError::from)?;
+    let previous_snapshots = &previous.snapshots;
+    let refresh_kind_label = if is_branch_union {
+        "branch UNION ALL aggregate"
+    } else if is_composed_join_aggregate {
+        "composed join aggregate"
+    } else {
+        "aggregate-over-UNION-ALL"
+    };
+    let refresh_label = format!(
+        "iceberg {refresh_kind_label} MV {}.{}.{}",
+        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+    );
+    let refresh_statuses =
+        base_snapshot_statuses_for_plan(&base_occurrences, previous_snapshots, &current_snapshots);
+    let decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
+    .map_err(RefreshError::from)?;
+    let mode = decision.mode();
+    let has_previous = base_occurrences
+        .iter()
+        .any(|base| previous_snapshots.contains_key(&base.occurrence_id));
+    if has_previous {
+        for base in &base_occurrences {
+            let named = base.display();
+            previous_snapshots
+                .get(&base.occurrence_id)
+                .copied()
+                .ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "iceberg {refresh_kind_label} MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                    ))
+                })?;
+            current_snapshots
+                .get(&base.occurrence_id)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                        iceberg_target.catalog,
+                        iceberg_target.namespace,
+                        iceberg_target.table,
+                        named
+                    ))
+                })?;
+        }
+    }
+    let affected_partition_context =
+        format!("iceberg {refresh_kind_label} MV affected partition planning");
+    let affected_partitions = plan_multi_base_affected_partitions_original(
+        io,
+        source,
+        state_baseline,
+        connector_context,
+        mv_definition,
+        target_binding.partition(),
+        mode,
+        &base_occurrences,
+        previous_snapshots,
+        &current_snapshots,
+        &affected_partition_context,
+    )
+    .await;
+    log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+    Ok(build_iceberg_refresh_plan(
+        mv_definition,
+        target,
+        stmt,
+        current_catalog,
+        current_database,
+        &base_occurrences,
+        snapshot_pins,
+        decision.refresh,
+        state_baseline.clone(),
+        affected_partitions,
+    ))
+}
+
+pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    iceberg_target: &IcebergMvTarget,
+    target: MvTarget,
+    stmt: &MvRefreshRequest,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredKeyedMvProjection,
+    base_refs: &[TableIdentity],
+    caps: &RefreshCapabilities,
+    canonical_select_query: &ast::Query,
+    target_binding: &MvTargetBinding,
+    target_observation: &MvSchemaValidationObservation,
+    state_baseline: &RefreshStateBaseline,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefreshPlan, RefreshError> {
+    // L is the only aggregate authority; there is no persisted contract version
+    // to compare against any more.
+    validate_aggregate_schema_contract_metadata(iceberg_target, mv_definition)
+        .map_err(RefreshError::from)?;
+    // Aggregate plan dispatch (Phase 3 / B2): selected by capability.
+    //   SingleBase                 -> single-base aggregate
+    //   AllBasesRequired           -> fan-in (GroupRowId) or branch-union
+    //                                 (BranchScoped), gated on the row identity
+    //   JoinPairPartialInitialSkip -> join aggregate
+    match &caps.snapshot_policy {
+        BaseSnapshotPolicy::SingleBase | BaseSnapshotPolicy::AllBasesRequired => {
+            // AllBasesRequired (fan-in `GroupRowId` / branch-union
+            // `BranchScoped`) is planned by a dedicated helper (I2) mirroring
+            // the execute-side `refresh_fan_in_aggregate_iceberg_mv` fold.
+            if matches!(caps.snapshot_policy, BaseSnapshotPolicy::AllBasesRequired) {
+                return plan_iceberg_all_bases_aggregate_mv_refresh(
+                    io,
+                    source,
+                    iceberg_target,
+                    target,
+                    stmt,
+                    current_catalog,
+                    current_database,
+                    mv_definition,
+                    base_refs,
+                    caps,
+                    canonical_select_query,
+                    target_binding,
+                    target_observation,
+                    state_baseline,
+                    connector_context,
+                )
+                .await;
+            }
+            let [base_ref] = base_refs else {
+                return Err(RefreshError::user(
+                    "iceberg aggregate materialized view refresh requires exactly one base table reference",
+                ));
+            };
+            let occurrences = definition_occurrences_for_base_refs(mv_definition, base_refs)
+                .map_err(RefreshError::from)?;
+            let [occurrence] = occurrences.as_slice() else {
+                return Err(RefreshError::user(
+                    "iceberg aggregate materialized view refresh requires exactly one D relation occurrence",
+                ));
+            };
+            let base_occurrences =
+                base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::from)?;
+            let [base_occurrence] = base_occurrences.as_slice() else {
+                return Err(RefreshError::user(
+                    "iceberg aggregate materialized view refresh requires exactly one base relation occurrence",
+                ));
+            };
+            let refresh = io
+                .current_base(source, base_ref, connector_context)
+                .await
+                .map_err(RefreshError::from)?;
+            let base_observation = io
+                .schema(source, base_ref, connector_context)
+                .await
+                .map_err(RefreshError::from)?;
+            let renames = validate_schema_contract(
+                mv_definition,
+                occurrence,
+                &base_observation,
+                target_observation,
+            )
+            .map_err(RefreshError::from)?;
+            require_no_occurrence_rebind(&renames).map_err(RefreshError::from)?;
+            let current = refresh.current_snapshot_id();
+            let previous_locators = previous_refresh_locators(
+                io,
+                state_baseline,
+                source.connector_control(),
+                connector_context,
+            )
+            .await
+            .map_err(RefreshError::from)?;
+            let previous = previous_locators
+                .snapshots
+                .get(&base_occurrence.occurrence_id)
+                .copied();
+            let refresh_label = format!(
+                "iceberg aggregate materialized view {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses = [base_snapshot_status_for_refresh(
+                base_occurrence,
+                previous,
+                current,
+            )];
+            let decision = decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                    base_snapshots: &refresh_statuses,
+                    label: &refresh_label,
+                },
+                stmt.full,
+            )
+            .map_err(RefreshError::from)?;
+            let mode = decision.mode();
+            let mut snapshot_pins = BTreeMap::new();
+            snapshot_pins.insert(base_occurrence.occurrence_id, current);
+            let affected_partitions = plan_aggregate_mv_affected_partitions(
+                io,
+                source,
+                connector_context,
+                base_occurrence,
+                state_baseline,
+                mv_definition,
+                target_binding.partition(),
+                mode,
+                previous,
+                current,
+            )
+            .await;
+            log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+            Ok(build_iceberg_refresh_plan(
+                mv_definition,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &base_occurrences,
+                snapshot_pins,
+                decision.refresh,
+                state_baseline.clone(),
+                affected_partitions,
+            ))
+        }
+        BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
+            // The join-aggregate plan resolves left/right from D's own effective
+            // SQL (FROM-side only); the join ON keys are never read by the plan
+            // path.
+            let occurrences = definition_occurrences_for_base_refs(mv_definition, base_refs)
+                .map_err(RefreshError::from)?;
+            let base_occurrences =
+                base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::from)?;
+            let (left_occurrence, right_occurrence) = join_base_refs_for_definition(
+                mv_definition,
+                canonical_select_query,
+                &base_occurrences,
+            )
+            .map_err(RefreshError::from)?;
+            let left_refresh = io
+                .current_base(source, &left_occurrence.table, connector_context)
+                .await
+                .map_err(RefreshError::from)?;
+            let right_refresh = io
+                .current_base(source, &right_occurrence.table, connector_context)
+                .await
+                .map_err(RefreshError::from)?;
+            let left_observation = io
+                .schema(source, &left_occurrence.table, connector_context)
+                .await
+                .map_err(RefreshError::from)?;
+            let right_observation = io
+                .schema(source, &right_occurrence.table, connector_context)
+                .await
+                .map_err(RefreshError::from)?;
+            // The join validator demands D occurrence order, which is not the
+            // join's own left/right order, so the observations are re-paired
+            // with their occurrences rather than with the join sides. By
+            // occurrence, not by table: in a self-join both sides read the
+            // same table.
+            let bases = occurrences
+                .iter()
+                .copied()
+                .map(|occurrence| {
+                    if occurrence.occurrence_id == left_occurrence.occurrence_id.get() {
+                        Ok((occurrence, &left_observation))
+                    } else if occurrence.occurrence_id == right_occurrence.occurrence_id.get() {
+                        Ok((occurrence, &right_observation))
+                    } else {
+                        Err(RefreshError::user(format!(
+                            "iceberg join aggregate MV D occurrence {} is neither join side",
+                            occurrence.occurrence_id
+                        )))
+                    }
+                })
+                .collect::<Result<Vec<_>, RefreshError>>()?;
+            let renames = validate_join_schema_contract(mv_definition, &bases, target_observation)
+                .map_err(RefreshError::from)?;
+            require_no_occurrence_rebind(&renames).map_err(RefreshError::from)?;
+
+            let mut snapshot_pins = BTreeMap::new();
+            let mut current_snapshots = BTreeMap::new();
+            current_snapshots.insert(
+                left_occurrence.occurrence_id,
+                left_refresh.current_snapshot_id(),
+            );
+            current_snapshots.insert(
+                right_occurrence.occurrence_id,
+                right_refresh.current_snapshot_id(),
+            );
+            for base in &base_occurrences {
+                snapshot_pins.insert(
+                    base.occurrence_id,
+                    current_snapshots
+                        .get(&base.occurrence_id)
+                        .copied()
+                        .flatten(),
+                );
+            }
+            let previous_locators = previous_refresh_locators(
+                io,
+                state_baseline,
+                source.connector_control(),
+                connector_context,
+            )
+            .await
+            .map_err(RefreshError::from)?;
+            let previous_snapshots = &previous_locators.snapshots;
+            let refresh_label = format!(
+                "iceberg join aggregate MV {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses = base_snapshot_statuses_for_plan(
+                &base_occurrences,
+                previous_snapshots,
+                &current_snapshots,
+            );
+            let decision = decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                    base_snapshots: &refresh_statuses,
+                    label: &refresh_label,
+                },
+                stmt.full,
+            )
+            .map_err(RefreshError::from)?;
+            let has_previous = base_occurrences
+                .iter()
+                .any(|base| previous_snapshots.contains_key(&base.occurrence_id));
+            if has_previous {
+                for base in &base_occurrences {
+                    let named = base.display();
+                    previous_snapshots
+                        .get(&base.occurrence_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            RefreshError::user(format!(
+                                "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                                iceberg_target.catalog,
+                                iceberg_target.namespace,
+                                iceberg_target.table
+                            ))
+                        })?;
+                    current_snapshots
+                        .get(&base.occurrence_id)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| {
+                            RefreshError::user(format!(
+                                "cannot refresh iceberg join aggregate MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                                iceberg_target.catalog,
+                                iceberg_target.namespace,
+                                iceberg_target.table,
+                                named
+                            ))
+                        })?;
+                }
+            }
+            let affected_partitions = unknown_join_affected_partitions();
+            log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+            Ok(build_iceberg_refresh_plan(
+                mv_definition,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &base_occurrences,
+                snapshot_pins,
+                decision.refresh,
+                state_baseline.clone(),
+                affected_partitions,
+            ))
+        }
+    }
+}
+
+pub(crate) async fn previous_refresh_locators(
+    io: &MvRefreshPreparationIo,
+    baseline: &RefreshStateBaseline,
+    connector_control: &dyn ConnectorControlRegistry,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreviousRefreshLocators, RefreshError> {
+    let previous_sources = match baseline {
+        RefreshStateBaseline::SnapshotBacked {
+            previous_sources, ..
+        } => previous_sources.as_slice(),
+    };
+    let predecessors = crate::mv::domain::refresh::planning::baseline_predecessors_original(
+        io,
+        previous_sources,
+        connector_control,
+        connector_context,
+    )
+    .await?;
+    Ok(PreviousRefreshLocators {
+        snapshots: predecessors.snapshots,
+        table_object_ids: predecessors.table_object_ids,
+    })
+}
+
+pub(crate) async fn plan_aggregate_mv_affected_partitions(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    base: &RefreshBaseRelationOccurrence,
+    state_baseline: &RefreshStateBaseline,
+    projection: &StoredKeyedMvProjection,
+    target_partition: &mv_schema::MvPartitionContract,
+    mode: RefreshMode,
+    previous_snapshot_id: Option<i64>,
+    current_snapshot_id: Option<i64>,
+) -> crate::mv::domain::model::AffectedTargetPartitions {
+    match mode {
+        RefreshMode::Noop => noop_affected_partitions(target_partition),
+        RefreshMode::Incremental => {
+            if is_unpartitioned_mv_target(target_partition) {
+                crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned
+            } else {
+                let Some(previous) = previous_snapshot_id else {
+                    return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                        "incremental aggregate MV affected partition planning missing previous snapshot",
+                    );
+                };
+                let Some(current) = current_snapshot_id else {
+                    return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                        "incremental aggregate MV affected partition planning missing current snapshot",
+                    );
+                };
+                let previous_revision =
+                    match crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(
+                        state_baseline,
+                        base,
+                    ) {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                                error,
+                            );
+                        }
+                    };
+                match crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(io, source.connector_control(), source.storage_observation(), &base.table, previous_revision, previous, current, connector_context).await {
+                    Ok((
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        _,
+                    )) => crate::mv::domain::model::AffectedTargetPartitions::known(
+                        std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
+                    ),
+                    Ok((
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
+                            partition_impact,
+                            ..
+                        },
+                        observation,
+                    )) => crate::mv::domain::partition::planner::plan_affected_partitions(
+                        &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
+                            projection,
+                            source_occurrence_id: base.occurrence_id.get(),
+                            target_partition,
+                            partition_impact: Some(&partition_impact),
+                            schema_observation: Some(&observation),
+                        },
+                    ),
+                    Ok((
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_),
+                        _,
+                    )) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                        "connector change-window admission requires a full rebuild",
+                    ),
+                    Err(err) => {
+                        let message = format!("failed to admit connector changes for affected partitions: {err}");
+                        io.retain_optional_failure(err.0);
+                        crate::mv::domain::model::AffectedTargetPartitions::not_derived(message)
+                    },
+                }
+            }
+        }
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            if is_unpartitioned_mv_target(target_partition) {
+                crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned
+            } else {
+                crate::mv::domain::partition::planner::plan_affected_partitions(
+                    &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
+                        projection,
+                        source_occurrence_id: base.occurrence_id.get(),
+                        target_partition,
+                        partition_impact: None,
+                        schema_observation: None,
+                    },
+                )
+            }
+        }
+    }
+}
+
+async fn plan_multi_base_affected_partitions_original(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    baseline: &RefreshStateBaseline,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    projection: &StoredKeyedMvProjection,
+    target_partition: &mv_schema::MvPartitionContract,
+    mode: RefreshMode,
+    bases: &[RefreshBaseRelationOccurrence],
+    previous: &BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    current: &BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
+    context: &str,
+) -> crate::mv::domain::model::AffectedTargetPartitions {
+    match mode {
+        RefreshMode::Noop => noop_affected_partitions(target_partition),
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            if is_unpartitioned_mv_target(target_partition) {
+                crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned
+            } else {
+                crate::mv::domain::model::AffectedTargetPartitions::not_derived(format!(
+                    "{context}: full refresh affected partition planning is not implemented"
+                ))
+            }
+        }
+        RefreshMode::Incremental => {
+            if is_unpartitioned_mv_target(target_partition) {
+                return crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned;
+            }
+
+            let mut results = Vec::with_capacity(bases.len());
+            for base in bases {
+                let result = match (
+                    previous.get(&base.occurrence_id).copied(),
+                    current
+                        .get(&base.occurrence_id)
+                        .copied()
+                        .flatten(),
+                ) {
+                    (Some(previous), Some(current)) if previous == current => {
+                        crate::mv::domain::model::AffectedTargetPartitions::known(
+                            std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
+                        )
+                    }
+                    (Some(previous), Some(current)) => {
+                        match match crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(baseline,base) {
+                            Ok(revision) => crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(
+                                io,source.connector_control(),source.storage_observation(),&base.table,revision,previous,current,connector_context).await,
+                            Err(error) => Err(RefreshError::from(error)),
+                        } {
+                            Ok((
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                                _,
+                            )) => crate::mv::domain::model::AffectedTargetPartitions::known(
+                                std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
+                            ),
+                            Ok((
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
+                                    partition_impact,
+                                    ..
+                                },
+                                observation,
+                            )) => crate::mv::domain::partition::planner::plan_affected_partitions(
+                                &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
+                                    projection,
+                                    source_occurrence_id: base.occurrence_id.get(),
+                                    target_partition,
+                                    partition_impact: Some(&partition_impact),
+                                    schema_observation: Some(&observation),
+                                },
+                            ),
+                            Ok((
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_),
+                                _,
+                            )) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                                "connector change-window admission requires a full rebuild",
+                            ),
+                            Err(err) => {
+                                let message = format!("failed to admit connector changes for affected partitions: {err}");
+                                io.retain_optional_failure(err.0);
+                                crate::mv::domain::model::AffectedTargetPartitions::not_derived(message)
+                            },
+                        }
+                    }
+                    (None, _) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                        "incremental affected partition planning missing previous snapshot",
+                    ),
+                    (_, None) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                        "incremental affected partition planning missing current snapshot",
+                    ),
+                };
+                let stop = matches!(
+                    result,
+                    crate::mv::domain::model::AffectedTargetPartitions::NotDerived { .. }
+                );
+                results.push((base.display(), result));
+                if stop {
+                    break;
+                }
+            }
+
+            merge_affected_partition_results(context, results)
+        }
+    }
+}
+
+async fn reobserve_current_management_before_refresh(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<bool, RefreshError> {
+    let instance = ConnectorInstanceId::parse(&target.catalog).map_err(|e| e.to_string())?;
+    let table = novarocks_spi::connector::ConnectorTableIdentity {
+        instance_id: instance.clone(),
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    if !source
+        .management_entrance()?
+        .management_phase(&table)
+        .is_manageable()
+    {
+        return Ok(false);
+    }
+    let lease =
+        crate::connector::metadata_binding_typed(source.connector_control(), &target.catalog)?;
+    let metadata = io
+        .metadata(
+            &lease,
+            context.clone(),
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .await?;
+    let schema = crate::mv::domain::storage_observation::observe_schema_validation(
+        source.storage_observation(),
+        &lease,
+        &metadata,
+        context.clone(),
+    )?;
+    crate::mv::domain::refresh::observation::validate_observed_schema_locator(&schema, &table)?;
+    let documents = lease.derive_document_storage_lease()?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        table,
+        schema.table_object_id().clone(),
+        context.clone(),
+    );
+    let observed = io
+        .observe_current(source, &documents, request.clone())
+        .await?;
+    let closed = io
+        .close_mismatch(source, &documents, request.clone())
+        .await?;
+    if closed {
+        tracing::warn!(catalog=%target.catalog,database=%target.namespace,name=%target.table,
+            "fresh Current MV management slot names another writer; management closed");
+    } else if let Some(ready) = io
+        .load_ready(
+            source,
+            MvTarget {
+                catalog: Some(target.catalog.clone()),
+                database: target.namespace.clone(),
+                name: target.table.clone(),
+            },
+        )
+        .await?
+    {
+        let expected = &ready.projection.facts;
+        if expected.metadata_version() != &observed.view.metadata_version
+            && crate::mv::domain::staged_create::metadata_only_current_matches(expected, &observed)
+        {
+            io.install_current(
+                source,
+                request.catalog_handle.clone(),
+                Arc::new(expected.clone()),
+                context.clone(),
+            )
+            .await?;
+        }
+    }
+    Ok(closed)
+}
+async fn reconcile_published_lake_projection(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), RefreshError> {
+    let catalog = binding.lease().binding().catalog_handle()?.clone();
+    let target_identity = novarocks_mv_application::product::MvTarget::try_new(
+        Some(target.catalog.clone()),
+        target.namespace.clone(),
+        target.table.clone(),
+    )
+    .map_err(|error| RefreshError::user(error.to_string()))?;
+    // Capture the read-only Source's exact table before lending it to the
+    // readiness operation; only that operation performs the document read.
+    let metadata = io
+        .metadata(
+            binding.lease(),
+            context.clone(),
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .await?;
+    let schema = crate::mv::domain::storage_observation::observe_schema_validation(
+        source.storage_observation(),
+        binding.lease(),
+        &metadata,
+        context.clone(),
+    )?;
+    crate::mv::domain::refresh::observation::validate_observed_schema_locator(
+        &schema,
+        &metadata.identity,
+    )?;
+    io.rebuild_read_only(
+        source,
+        binding.lease().clone(),
+        catalog,
+        target_identity,
+        metadata.identity.clone(),
+        schema.table_object_id().clone(),
+        context.clone(),
+    )
+    .await?;
+    Ok(())
+}

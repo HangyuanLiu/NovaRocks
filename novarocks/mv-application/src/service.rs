@@ -18,6 +18,7 @@
 //! Product-owned process lifecycle for materialized-view activity and workers.
 
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use crate::activity::{
@@ -51,6 +52,52 @@ pub struct MvKeyedProductService {
     readiness: Option<MvKeyedReadinessService>,
     management: Option<Arc<crate::management::ManagementEntrance>>,
     continuation: Option<Arc<crate::management::ManagementContinuationService>>,
+}
+
+/// One product refresh transition stored in the original Action's step slot.
+/// Dropping a borrowed polling future does not drop this state or its port.
+/// On a foreign unwind the original Source retains it, including the lease;
+/// the query application's existing health/loan kernel owns the raw panic.
+pub struct MvRefreshTransition {
+    target: MvTarget,
+    attempt: MvRefreshAttemptIdentity,
+    publication: Option<MvRuntimePublicationLease>,
+    phase: RefreshPhase,
+    result: Option<Result<MvProductResult, MvProductError>>,
+}
+
+#[derive(Clone, Copy)]
+enum RefreshPhase {
+    New,
+    Executing,
+    Projecting,
+    Finished,
+    Poisoned,
+}
+
+impl MvRefreshTransition {
+    pub fn new(target: MvTarget, attempt: MvRefreshAttemptIdentity) -> Self {
+        Self {
+            target,
+            attempt,
+            publication: None,
+            phase: RefreshPhase::New,
+            result: None,
+        }
+    }
+
+    pub fn result(&self) -> Option<&Result<MvProductResult, MvProductError>> {
+        self.result.as_ref()
+    }
+
+    fn finish(&mut self, result: Result<MvProductResult, MvProductError>) {
+        // Stable business classification precedes the original lease's Drop.
+        // No Source lock is held. A destructor unwind leaves this poisoned.
+        self.result = Some(result);
+        self.phase = RefreshPhase::Poisoned;
+        drop(self.publication.take());
+        self.phase = RefreshPhase::Finished;
+    }
 }
 
 impl Default for MvKeyedProductService {
@@ -152,6 +199,83 @@ impl MvKeyedProductService {
         Ok(MvProductResult::Acknowledged)
     }
 
+    /// Advance the original refresh capability without consuming its owner.
+    /// Target and attempt are frozen in the stable transition before any poll.
+    /// Foreign polls/getters run outside locks and are fenced against replay
+    /// after unwind. Independent GC remains with the original residual.
+    pub fn poll_refresh(
+        &self,
+        cx: &mut Context<'_>,
+        transition: &mut MvRefreshTransition,
+        execution: &mut dyn crate::ports::MvRefreshProgressPort,
+    ) -> Poll<()> {
+        loop {
+            match transition.phase {
+                RefreshPhase::New => {
+                    transition.phase = RefreshPhase::Poisoned;
+                    match self.begin_refresh_publication(&transition.target, &transition.attempt) {
+                        Ok(publication) => {
+                            // Install the original lease before crossing the port.
+                            transition.publication = Some(publication);
+                            transition.phase = RefreshPhase::Executing;
+                        }
+                        Err(error) => {
+                            transition.finish(Err(error));
+                            return Poll::Ready(());
+                        }
+                    }
+                }
+                RefreshPhase::Executing => {
+                    transition.phase = RefreshPhase::Poisoned;
+                    if execution
+                        .poll_execute_refresh(cx, &transition.target, &transition.attempt)
+                        .is_pending()
+                    {
+                        transition.phase = RefreshPhase::Executing;
+                        return Poll::Pending;
+                    }
+                    let result = match execution.execution_outcome() {
+                        Some(Ok(published)) => validate_published_refresh(
+                            &transition.target,
+                            &transition.attempt,
+                            published,
+                        ),
+                        Some(Err(error)) => Err(error.clone().into_product_error()),
+                        None => {
+                            panic!("MV refresh execution is Ready without its original outcome")
+                        }
+                    };
+                    if let Err(error) = result {
+                        transition.finish(Err(error));
+                        return Poll::Ready(());
+                    }
+                    transition.phase = RefreshPhase::Projecting;
+                }
+                RefreshPhase::Projecting => {
+                    transition.phase = RefreshPhase::Poisoned;
+                    if execution
+                        .poll_project_known_committed(cx, &transition.target)
+                        .is_pending()
+                    {
+                        transition.phase = RefreshPhase::Projecting;
+                        return Poll::Pending;
+                    }
+                    let result = match execution.projection_outcome() {
+                        Some(Ok(())) => Ok(MvProductResult::Acknowledged),
+                        Some(Err(error)) => Err(known_committed_finalize_failure(error.clone())),
+                        None => {
+                            panic!("MV refresh projection is Ready without its original outcome")
+                        }
+                    };
+                    transition.finish(result);
+                    return Poll::Ready(());
+                }
+                RefreshPhase::Finished => return Poll::Ready(()),
+                RefreshPhase::Poisoned => return Poll::Pending,
+            }
+        }
+    }
+
     /// Execute the product-owned CREATE state machine. The outer adapter owns
     /// SQL lowering and provider capabilities, while this product owns the
     /// effect order and the distinction between pre-commit cleanup and a
@@ -248,6 +372,19 @@ impl MvKeyedProductService {
     ) -> Result<MvActivityLease, MvActivityAdmissionError> {
         self.activity_gate
             .acquire_foreground(target, owner, cancelled)
+    }
+
+    /// Async migration entry on the same product FIFO. Legacy synchronous
+    /// consumers keep the original method until their actual Action migrates.
+    pub async fn acquire_foreground_async(
+        &self,
+        target: MvTarget,
+        owner: MvActivityOwner,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+        self.activity_gate
+            .acquire_foreground_async(target, owner, cancelled)
+            .await
     }
 
     /// Register background work with the shared product FIFO gate. The host
@@ -426,5 +563,41 @@ mod original_failure_tests {
                 .and_then(|cause| cause.downcast_ref::<SharedFailureCause>()),
             Some(&source),
         );
+    }
+}
+
+#[cfg(test)]
+mod incremental_admission_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn product_async_entry_uses_the_original_legacy_product_fifo() {
+        let service = MvKeyedProductService::default();
+        let target = MvTarget::from_parts(Some("ice"), "db", "mv");
+        let first = service
+            .acquire_foreground(target.clone(), MvActivityOwner::Create, || false)
+            .unwrap();
+        let mut waiting = Box::pin(service.acquire_foreground_async(
+            target.clone(),
+            MvActivityOwner::Alter,
+            std::future::pending(),
+        ));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let mut later = service
+            .request_activity(target, MvActivityOwner::Drop)
+            .unwrap();
+        drop(first);
+        assert!(later.try_acquire().unwrap().is_none());
+        let lease = waiting.await.unwrap();
+        assert!(later.try_acquire().unwrap().is_none());
+        drop(lease);
+        drop(later.try_acquire().unwrap().unwrap());
     }
 }

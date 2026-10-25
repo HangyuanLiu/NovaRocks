@@ -259,6 +259,34 @@ pub trait MvDropProjectionPort<G = MvKeyedProjectionDeleteGuard>: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 }
 
+/// One request-local refresh capability borrowed by the product transition.
+///
+/// The outer original Source retains prepared/admitted inputs, the concrete
+/// known-committed continuation, raw outcomes and actual-exit custody. A Ready
+/// poll means its corresponding outcome is stable before foreign F Drop.
+/// Polling runs outside Source locks; an unwind retains the same Source and is
+/// never permission to dispatch another execution or projection.
+pub trait MvRefreshProgressPort: Send {
+    fn poll_execute_refresh(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        target: &MvTarget,
+        attempt: &MvRefreshAttemptIdentity,
+    ) -> std::task::Poll<()>;
+
+    fn execution_outcome(
+        &self,
+    ) -> Option<Result<&MvRefreshPublicationFinalizationFacts, &MvProviderFailure>>;
+
+    fn poll_project_known_committed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        target: &MvTarget,
+    ) -> std::task::Poll<()>;
+
+    fn projection_outcome(&self) -> Option<&Result<(), MvProviderFailure>>;
+}
+
 /// One consumed refresh execution capability. The adapter may retain only the
 /// request-local query, connector, and prepared-work carriers required for
 /// this operation; it cannot retain MV product lifecycle state.

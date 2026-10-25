@@ -113,6 +113,70 @@ impl PreparedMvRefreshWrite {
         }
     }
 
+    /// Borrow the caller-owned artifact and receiving Source for Provider begin.
+    /// The exact target binding is retained by that same caller; incremental
+    /// input fields are projected from it without another Provider observation.
+    pub(crate) async fn begin_session_in(
+        &self,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        typed_connector_control: &std::sync::Arc<
+            novarocks_catalog_application::ConnectorControlHost,
+        >,
+        target: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+        receiving: &crate::query_execution::write_session::WriteBeginReceiving,
+    ) -> Result<
+        std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        match &self.artifact {
+            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => {
+                super::iceberg_activation::begin_first_refresh_connector_write_session_async_in(
+                    write,
+                    context,
+                    exact_lease,
+                    planning_lease,
+                    typed_connector_control,
+                    receiving,
+                )
+                .await
+            }
+            PreparedMvRefreshWriteArtifact::Incremental(write) => {
+                let request = write.request();
+                if !exact_lease.matches_provider_binding_key(&request.observed_binding)
+                    || exact_lease.control_runtime_id() != planning_lease.control_runtime_id()
+                    || !std::sync::Arc::ptr_eq(target.lease().binding(), planning_lease.binding())
+                    || target.handle() != request.target_table()
+                {
+                    return Err(novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                        "MV incremental begin differs from its prepared target generation",
+                    ));
+                }
+                let fields = target.write_input_fields().map_err(|error| {
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                        error,
+                    )
+                })?;
+                super::iceberg_activation::begin_incremental_connector_write_session_async_in(
+                    request,
+                    target.handle(),
+                    write.publication_intent(),
+                    write.mode(),
+                    &fields,
+                    context,
+                    exact_lease,
+                    planning_lease,
+                    typed_connector_control,
+                    receiving,
+                )
+                .await
+            }
+        }
+    }
+
     pub(crate) fn into_assembly_artifact(self) -> PreparedMvRefreshWriteArtifact {
         self.artifact
     }

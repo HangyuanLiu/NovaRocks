@@ -201,12 +201,21 @@ impl PreparedRestMutation {
 
     /// Starts no new session/auth request and serializes no request data.
     pub(crate) async fn dispatch(self, context: EvidenceContext) -> PreparedRestOutcome {
-        // No statement cancellation is consulted after the original journal
-        // enters dispatch. Its same Source grants the Settlement phase.
-        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        // First publication is independent of statement cancellation after
+        // dispatch. A nested necessary publication retains its phase's own
+        // stop and the deadline already bounded by the original journal.
+        let stop = if self
+            .original
+            .necessary_finalization_deadline_cap()
+            .is_some()
+        {
+            self.original.stop().clone()
+        } else {
+            novarocks_spi::connector::ConnectorStopOwner::new().view()
+        };
         let original = self
             .original
-            .for_existing_obligation(context.deadline().into(), stop.view());
+            .for_existing_obligation(context.deadline(), stop);
         let request_context = RequestContext::from_connector(&original);
         let (stage, body) = self
             .owner

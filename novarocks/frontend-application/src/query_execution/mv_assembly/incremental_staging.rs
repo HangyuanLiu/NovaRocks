@@ -43,14 +43,14 @@ use novarocks_mv_application::product::{
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RewriteMergeRefreshEvidence {
+pub(crate) enum RewriteMergeRefreshEvidence {
     None,
     Aggregate,
     JoinAggregate,
     BranchUnionAggregate,
 }
 
-fn sql_imv_planning_input_from_rewrite(
+pub(crate) fn sql_imv_planning_input_from_rewrite(
     rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
     target_binding: novarocks_sql::binding::SqlTableBindingId,
     evidence: RewriteMergeRefreshEvidence,
@@ -110,7 +110,7 @@ fn change_stream_routed_targets(
 }
 
 /// Project the session's sealed branches into the routes SQL compiles against.
-fn incremental_change_stream_routes(
+pub(crate) fn incremental_change_stream_routes(
     write_session: &ConnectorWriteSession,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_bindings: &QueryTableBindingStore,
@@ -169,7 +169,7 @@ fn incremental_change_stream_routes(
     Ok(routes)
 }
 
-fn incremental_change_stream_statistics_targets(
+pub(crate) fn incremental_change_stream_statistics_targets(
     write_session: &ConnectorWriteSession,
 ) -> Result<Vec<novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget>, String> {
     write_session

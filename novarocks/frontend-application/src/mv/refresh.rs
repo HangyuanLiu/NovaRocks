@@ -332,15 +332,15 @@ fn execute_data(
 /// and the admitted prior publication.
 /// Building P here and binding it before finish is what makes the document and
 /// the rows it describes one commit rather than two.
-fn bind_publication_documents(
+pub(crate) fn bind_publication_documents(
     intent: &MvRefreshPublicationIntent,
     admitted: &crate::mv::domain::staged_create::AdmittedMvDataPublication,
     session: &crate::query_execution::write_session::ConnectorWriteSession,
     logical_result_rows: Option<u64>,
 ) -> Result<(), MvApplicationError> {
-    let declaration = session
-        .pending_publication_declaration()
-        .map_err(|error| invalid(error.to_string()))?;
+    let declaration = session.pending_publication_declaration().map_err(|error| {
+        MvApplicationError::from_connector(MvApplicationErrorKind::InvalidRequest, error)
+    })?;
     let documents = admitted
         .publication_document_set(intent.publication_id(), logical_result_rows)
         .map_err(invalid)?;
@@ -350,7 +350,9 @@ fn bind_publication_documents(
     };
     session
         .bind_keyed_document_publication(publication)
-        .map_err(|e| invalid(e.to_string()))
+        .map_err(|error| {
+            MvApplicationError::from_connector(MvApplicationErrorKind::InvalidRequest, error)
+        })
 }
 
 /// The one commit authority of one MV data write.

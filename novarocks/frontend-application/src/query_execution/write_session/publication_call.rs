@@ -37,14 +37,71 @@ enum CallCompletion {
 }
 type PublicationFuture = Pin<Box<dyn Future<Output = CallCompletion> + Send>>;
 
+/// The original receiving allocation outlives every borrowed Provider child.
+/// The Context result is independent of the business verdict and actual exit.
+#[derive(Default)]
+struct CallReceiving {
+    outcome: Mutex<Option<CallCompletion>>,
+    finalization_context:
+        std::sync::OnceLock<Result<Option<ConnectorRequestContext>, ConnectorError>>,
+}
+impl CallReceiving {
+    fn receive_finalization_context(
+        &self,
+        session: &ConnectorWriteSession,
+        effect: novarocks_spi::connector::ExternalMutationEffect,
+    ) {
+        if self.finalization_context.get().is_some() {
+            return;
+        }
+        // The single original poll author serializes this with early NeededReady.
+        // Invoke the foreign getter outside the outcome mutex, and retain None
+        // or an ordinary error just as permanently as a successful observation.
+        let received = match effect {
+            novarocks_spi::connector::ExternalMutationEffect::Applied => {
+                session.existing_finalization_context()
+            }
+            novarocks_spi::connector::ExternalMutationEffect::NoOp => Ok(None),
+        };
+        let _ = self.finalization_context.set(received);
+    }
+
+    fn receive_completion(
+        &self,
+        session: &ConnectorWriteSession,
+        outcome: CallCompletion,
+        needed_receiving: Option<&ConnectorWriteNeededReadyReceiving>,
+    ) {
+        let effect = needed_receiving
+            .and_then(|receiving| receiving.observed())
+            .map(|needed| needed.effect())
+            .or_else(|| match &outcome {
+            CallCompletion::Publication(Ok(
+                novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. },
+            )) => Some(needed.effect()),
+            CallCompletion::Abort(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. })) => {
+                Some(needed.effect())
+            }
+            _ => None,
+        });
+        {
+            let mut receiving = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(receiving.is_none(), "original completion is received once");
+            *receiving = Some(outcome);
+        }
+        // The canonical result is stable before the getter can fail or panic.
+        // Both observations precede the actual Provider child destructor.
+        if let Some(effect) = effect {
+            self.receive_finalization_context(session, effect);
+        }
+    }
+}
+
 pub(super) struct PublicationInput {
-    pub(super) prepared: ConnectorPreparedWriteSet,
-    pub(super) statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+    pub(super) received: Arc<ReceivedWriteInput>,
     pub(super) publication: ConnectorWriteFinishPublication,
     pub(super) context: ConnectorRequestContext,
     pub(super) production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction,
-    pub(super) _retention:
-        Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 struct AbortInput {
     context: ConnectorRequestContext,
@@ -73,7 +130,7 @@ pub(crate) struct WritePublicationCall {
     close_needed_ready: Option<Arc<ConnectorWriteNeededReady>>,
     needed_polled: bool,
     outcome: Option<Outcome>,
-    inflight_outcome: Arc<Mutex<Option<CallCompletion>>>,
+    inflight_outcome: Arc<CallReceiving>,
     secondary_outcome: Option<Outcome>,
     abort_outcome: Option<AbortOutcome>,
     abort_input: Option<Arc<AbortInput>>,
@@ -90,7 +147,7 @@ pub(crate) struct WritePublicationCall {
 }
 impl WritePublicationCall {
     pub(super) fn new(session: Arc<ConnectorWriteSession>, input: Arc<PublicationInput>) -> Self {
-        let slot = Arc::new(Mutex::new(None));
+        let slot = Arc::new(CallReceiving::default());
         let needed_receiving = ConnectorWriteNeededReadyReceiving::new();
         let future = Box::pin(finish_future((
             Arc::clone(&session),
@@ -111,7 +168,7 @@ impl WritePublicationCall {
             production,
             received,
         });
-        let slot = Arc::new(Mutex::new(None));
+        let slot = Arc::new(CallReceiving::default());
         let future = Box::pin(abort_future((
             Arc::clone(&session),
             Arc::clone(&input),
@@ -128,7 +185,7 @@ impl WritePublicationCall {
     fn from_future(
         session: Arc<ConnectorWriteSession>,
         future: PublicationFuture,
-        slot: Arc<Mutex<Option<CallCompletion>>>,
+        slot: Arc<CallReceiving>,
         abort_input: Option<Arc<AbortInput>>,
         needed_receiving: Arc<ConnectorWriteNeededReadyReceiving>,
     ) -> Self {
@@ -185,6 +242,7 @@ impl WritePublicationCall {
                     CallCompletion::Publication(outcome) => self.outcome = Some(outcome),
                     CallCompletion::Abort(outcome) => self.abort_outcome = Some(outcome),
                 }
+                self.receive_finalization_context();
                 // The business cause already belongs to this fixed Call. A
                 // destructor unwind cannot erase it or manufacture local exit.
                 let completed = self.future.take();
@@ -283,6 +341,31 @@ impl WritePublicationCall {
         }
         Poll::Ready(())
     }
+    fn receive_finalization_context(&mut self) {
+        if self.inflight_outcome.finalization_context.get().is_some() {
+            return;
+        }
+        let needed = self.needed_receiving.observed().or_else(|| {
+            match (self.secondary_outcome.as_ref().or(self.outcome.as_ref()), self.abort_outcome.as_ref()) {
+                (Some(Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. })), _) => Some(Arc::clone(needed)),
+                (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }))) => Some(Arc::clone(needed)),
+                _ => None,
+            }
+        });
+        let Some(needed) = needed else { return };
+        self.inflight_outcome
+            .receive_finalization_context(&self.session, needed.effect());
+    }
+    pub(crate) fn existing_finalization_context(
+        &self,
+    ) -> Result<Option<&ConnectorRequestContext>, ConnectorError> {
+        match self.inflight_outcome.finalization_context.get() {
+            Some(Ok(context)) => Ok(context.as_ref()),
+            Some(Err(error)) => Err(error.clone()),
+            None => Ok(None),
+        }
+    }
+
     fn retain_needed_for_close(&mut self) -> Result<(), ConnectorError> {
         if self.needed_receiving.observed().is_none()
             || self.needed_receiving.cleanup_is_permitted()
@@ -290,6 +373,7 @@ impl WritePublicationCall {
             return Ok(());
         }
         self.poll_poisoned = true;
+        self.receive_finalization_context();
         let notice = self
             .needed_receiving
             .handoff_in(&mut self.close_needed_ready)?;
@@ -332,6 +416,7 @@ impl WritePublicationCall {
             }
         }
         self.poll_poisoned = true;
+        self.receive_finalization_context();
         if self.settle_actual_productions().is_pending() {
             return Poll::Pending;
         }
@@ -377,6 +462,7 @@ impl WritePublicationCall {
     #[cfg(test)]
     pub(super) fn retains_unreceived_outcome(&self) -> bool {
         self.inflight_outcome
+            .outcome
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_some()
@@ -408,6 +494,7 @@ impl WritePublicationCall {
         }
         let pending = self
             .inflight_outcome
+            .outcome
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if let Some(outcome) = pending.as_ref() {
@@ -421,6 +508,52 @@ impl WritePublicationCall {
             .or(self.outcome.as_ref())
             .map(publication)
             .or_else(|| self.abort_outcome.as_ref().map(abort))
+    }
+
+    /// Observe only the canonical received effect, even if child Drop or
+    /// handoff notification panicked. This grants no cleanup or replay right.
+    pub(crate) fn received_committed_effect(
+        &self,
+    ) -> Option<novarocks_spi::connector::ExternalMutationEffect> {
+        fn publication(
+            outcome: &Outcome,
+        ) -> Option<novarocks_spi::connector::ExternalMutationEffect> {
+            match outcome {
+                Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) => Some(needed.effect()),
+                _ => None,
+            }
+        }
+        fn abort(
+            outcome: &AbortOutcome,
+        ) -> Option<novarocks_spi::connector::ExternalMutationEffect> {
+            match outcome {
+                Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }) => {
+                    Some(needed.effect())
+                }
+                _ => None,
+            }
+        }
+        if let Some(needed) = self.needed_receiving.observed() {
+            return Some(needed.effect());
+        }
+        {
+            let pending = self
+                .inflight_outcome
+                .outcome
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(outcome) = pending.as_ref() {
+                return match outcome {
+                    CallCompletion::Publication(outcome) => publication(outcome),
+                    CallCompletion::Abort(outcome) => abort(outcome),
+                };
+            }
+        }
+        self.secondary_outcome
+            .as_ref()
+            .or(self.outcome.as_ref())
+            .and_then(publication)
+            .or_else(|| self.abort_outcome.as_ref().and_then(abort))
     }
 
     pub(crate) fn local_health_failure(
@@ -521,7 +654,7 @@ impl WritePublicationCall {
             arc_layout(std::alloc::Layout::new::<PublicationInput>())?,
             arc_layout(std::alloc::Layout::new::<ReconciliationInput>())?,
             arc_layout(std::alloc::Layout::new::<PublicationExitUnproven>())?,
-            arc_layout(std::alloc::Layout::new::<Mutex<Option<CallCompletion>>>())?,
+            arc_layout(std::alloc::Layout::new::<CallReceiving>())?,
             arc_layout(std::alloc::Layout::new::<AbortInput>())?,
             returned(abort_future),
             returned(finish_future),
@@ -534,7 +667,7 @@ async fn finish_future(
     (session, input, slot, needed_receiving): (
         Arc<ConnectorWriteSession>,
         Arc<PublicationInput>,
-        Arc<Mutex<Option<CallCompletion>>>,
+        Arc<CallReceiving>,
         Arc<ConnectorWriteNeededReadyReceiving>,
     ),
 ) -> CallCompletion {
@@ -543,8 +676,8 @@ async fn finish_future(
     let mut original = control.finish_write_with_needed_ready_async(
         novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef {
             commit: session.plan.commit_handle(),
-            prepared: &input.prepared,
-            statistics: &input.statistics,
+            prepared: &input.received.prepared,
+            statistics: &input.received.statistics,
             publication: &input.publication,
             context: &input.context,
             production: input.production,
@@ -554,10 +687,15 @@ async fn finish_future(
     // Await a borrow of the actual child F. Awaiting it by value would Drop
     // that child before its original outcome could enter this stable slot.
     let outcome = std::future::poll_fn(|cx| original.as_mut().poll(cx)).await;
-    *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(CallCompletion::Publication(outcome));
+    slot.receive_completion(
+        &session,
+        CallCompletion::Publication(outcome),
+        Some(&needed_receiving),
+    );
     drop(original);
     drop(control);
     let outcome = slot
+        .outcome
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()
@@ -568,7 +706,7 @@ async fn reconcile_future(
     (session, input, slot, needed_receiving): (
         Arc<ConnectorWriteSession>,
         Arc<ReconciliationInput>,
-        Arc<Mutex<Option<CallCompletion>>>,
+        Arc<CallReceiving>,
         Arc<ConnectorWriteNeededReadyReceiving>,
     ),
 ) -> CallCompletion {
@@ -582,10 +720,15 @@ async fn reconcile_future(
         &needed_receiving,
     );
     let outcome = std::future::poll_fn(|cx| original.as_mut().poll(cx)).await;
-    *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(CallCompletion::Publication(outcome));
+    slot.receive_completion(
+        &session,
+        CallCompletion::Publication(outcome),
+        Some(&needed_receiving),
+    );
     drop(original);
     drop(control);
     let outcome = slot
+        .outcome
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()
@@ -596,7 +739,7 @@ async fn abort_future(
     (session, input, slot): (
         Arc<ConnectorWriteSession>,
         Arc<AbortInput>,
-        Arc<Mutex<Option<CallCompletion>>>,
+        Arc<CallReceiving>,
     ),
 ) -> CallCompletion {
     let control = session.lease.session();
@@ -604,13 +747,17 @@ async fn abort_future(
         commit: session.plan.commit_handle(),
         context: input.context.clone(),
         production: input.production,
-        received: input.received.as_ref().map(|input| &input.prepared),
+        received: input
+            .received
+            .as_ref()
+            .map(|input| &input.received.prepared),
     });
     let outcome = std::future::poll_fn(|cx| original.as_mut().poll(cx)).await;
-    *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(CallCompletion::Abort(outcome));
+    slot.receive_completion(&session, CallCompletion::Abort(outcome), None);
     drop(original);
     drop(control);
     let outcome = slot
+        .outcome
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()

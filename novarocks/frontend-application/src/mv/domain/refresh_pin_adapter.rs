@@ -115,7 +115,7 @@ fn invalid_pin(message: String) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, message)
 }
 
-fn finish_pin_occurrence(
+pub(crate) fn finish_pin_occurrence(
     occurrence_id: u32,
     expected_object: &novarocks_mv_application::persistence::identity::ObjectIdentity,
     base_ref: TableIdentity,

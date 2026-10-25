@@ -289,7 +289,7 @@ pub(crate) async fn load_mv_target_binding_with_lease_and_ports_async(
     )
 }
 
-fn validate_target_lease(
+pub(crate) fn validate_target_lease(
     table: &TableIdentity,
     exact_lease: &ConnectorControlPlanningLease,
 ) -> Result<(), ConnectorError> {
@@ -308,7 +308,7 @@ fn validate_target_lease(
     Ok(())
 }
 
-fn complete_target_binding(
+pub(crate) fn complete_target_binding(
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     exact_lease: ConnectorControlPlanningLease,
     metadata: ConnectorTableMetadata,

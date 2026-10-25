@@ -441,6 +441,10 @@ pub struct ConnectorRequestContext {
     // Design: ADR-0156. Operation control and authorized access do not imply
     // task memory admission; the BE factory receives that separately.
     deadline: Instant,
+    // A restriction inherited from an already-positive necessary finalization.
+    // It grants no dispatch, source or capacity. Independent cleanup retains
+    // this restriction for later publications without shortening its own phase.
+    necessary_finalization_deadline_cap: Option<Instant>,
     stop: ConnectorStopView,
     max_handle_payload_bytes: usize,
     max_total_payload_bytes: usize,
@@ -535,6 +539,7 @@ impl ConnectorRequestContext {
         }
         Ok(Self {
             deadline,
+            necessary_finalization_deadline_cap: None,
             stop,
             max_handle_payload_bytes,
             max_total_payload_bytes,
@@ -588,6 +593,22 @@ impl ConnectorRequestContext {
         context.deadline = deadline;
         context.stop = stop;
         context
+    }
+
+    /// Preserve the upper bound of an already-authorized necessary finalization.
+    /// This is only a restriction, never evidence of Applied or new authority.
+    /// The phase owner still chooses the actual control deadline: independent
+    /// cleanup must not inherit this deadline as its own time budget.
+    pub fn with_necessary_finalization_deadline_cap(mut self, deadline: Instant) -> Self {
+        self.necessary_finalization_deadline_cap = Some(
+            self.necessary_finalization_deadline_cap
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
+        self
+    }
+
+    pub const fn necessary_finalization_deadline_cap(&self) -> Option<Instant> {
+        self.necessary_finalization_deadline_cap
     }
 
     /// A nested preparation budget may only shorten the admitted deadline.

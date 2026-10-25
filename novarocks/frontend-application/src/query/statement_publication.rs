@@ -256,6 +256,36 @@ impl StatementPublication {
                 _ => None,
             })
     }
+    /// Clone only the same received fact's Arc; this does not settle the Call
+    /// or mint another publication/cleanup authority.
+    pub(crate) fn committed_needed_arc(&self) -> Option<Arc<ConnectorWriteNeededReady>> {
+        self.needed
+            .clone()
+            .or_else(|| match (&self.outcome, &self.abort_outcome) {
+                (
+                    Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
+                        needed, ..
+                    })),
+                    _,
+                ) => Some(needed.clone()),
+                (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }))) => {
+                    Some(needed.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Borrow the original Provider's already-received finite context. This
+    /// observation grants no work and does not extend its absolute deadline.
+    pub(crate) fn existing_finalization_context(
+        &self,
+    ) -> Result<Option<&ConnectorRequestContext>, ConnectorError> {
+        match self.call.as_ref() {
+            Some(call) => call.existing_finalization_context(),
+            None => Ok(None),
+        }
+    }
+
     /// None means no committed fact; only actual NoOp proves no external effect.
     pub(crate) fn committed_effect(&self) -> Option<CommittedWriteEffect<'_>> {
         self.committed_needed().map(|needed| match needed.effect() {
@@ -265,6 +295,26 @@ impl StatementPublication {
             novarocks_spi::connector::ExternalMutationEffect::NoOp => CommittedWriteEffect::NoOp,
         })
     }
+    /// Same canonical effect before a borrowed child/notice has actually exited.
+    /// This observation is independent of custody transfer and cleanup permission.
+    pub(crate) fn received_committed_effect(
+        &self,
+    ) -> Option<novarocks_spi::connector::ExternalMutationEffect> {
+        self.committed_effect()
+            .map(|effect| match effect {
+                CommittedWriteEffect::Applied(_) => {
+                    novarocks_spi::connector::ExternalMutationEffect::Applied
+                }
+                CommittedWriteEffect::NoOp => {
+                    novarocks_spi::connector::ExternalMutationEffect::NoOp
+                }
+            })
+            .or_else(|| {
+                self.call
+                    .as_ref()
+                    .and_then(WritePublicationCall::received_committed_effect)
+            })
+    }
     pub(crate) fn committed(&self) -> bool {
         self.disposition() == Some(LakePublicationDisposition::KnownCommitted)
     }
@@ -273,7 +323,7 @@ impl StatementPublication {
         cancellation: Option<QueryCancellationReason>,
     ) -> Result<(), QueryServiceError> {
         if let Some(error) = &self.refusal {
-            return Err(internal_error(error.to_string()));
+            return Err(super::write_action::publication_failure(error));
         }
         if let Some(needed) = &self.needed {
             return select_needed_publication(
@@ -289,9 +339,9 @@ impl StatementPublication {
             return Err(internal_error(error.clone()));
         }
         match &self.abort_outcome {
-            Some(Err(error)) => Err(internal_error(error.to_string())),
+            Some(Err(error)) => Err(super::write_action::publication_failure(error)),
             Some(Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. })) => {
-                Err(internal_error(failure.message()))
+                Err(super::write_action::publication_failure(failure))
             }
             Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. })) => {
                 select_needed_publication(needed, self.local_finalization.as_ref(), cancellation)
@@ -514,6 +564,10 @@ mod tests {
             ))
             .unwrap();
         fixture.recorded.lock().unwrap().defer_finish_cleanup = true;
+        let context = request_context();
+        struct OriginalFinalizationScope;
+        let scope = context.request_scope_extension_or_insert_with(|| OriginalFinalizationScope);
+        fixture.recorded.lock().unwrap().finalization_context = Some(Ok(Some(context.clone())));
         let mut publication = StatementPublication::new(original_attempt());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(
@@ -526,6 +580,23 @@ mod tests {
             "whole Call is still owned and pending"
         );
         let ready = publication.needed.as_ref().unwrap().clone();
+        let received = publication
+            .existing_finalization_context()
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.deadline(), context.deadline());
+        assert!(Arc::ptr_eq(
+            &scope,
+            &received.request_scope_extension_or_insert_with(|| OriginalFinalizationScope)
+        ));
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+        fixture.recorded.lock().unwrap().finalization_context = Some(Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Internal,
+            "a second finalization-context lookup must not occur",
+        )));
         assert_eq!(fixture.recorded.lock().unwrap().cleanup_started, 0);
         assert_eq!(fixture.recorded.lock().unwrap().finish_future_drops, 0);
         publication.freeze_terminal().unwrap();
@@ -549,6 +620,18 @@ mod tests {
         }
         assert!(publication.poll_retirement(&mut cx).is_ready());
         assert_eq!(fixture.recorded.lock().unwrap().finish_future_drops, 1);
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+        let received = publication
+            .existing_finalization_context()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &scope,
+            &received.request_scope_extension_or_insert_with(|| OriginalFinalizationScope)
+        ));
         let Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup })) =
             publication.outcome.as_ref()
         else {

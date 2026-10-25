@@ -49,7 +49,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .as_ref()
             .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
         let entry_ref = JournalEntryRef(claim.key);
-        let (descriptor, generation) = {
+        let (descriptor, generation, recorded_cap) = {
             let state = self
                 .state
                 .lock()
@@ -61,7 +61,18 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             (
                 entry.checked.descriptor.clone(),
                 entry.checked.evidence.incarnation(),
+                entry.finalization_deadline_cap,
             )
+        };
+        // A nested publication cannot use a later invocation or an independent
+        // cleanup projection to restart its necessary preparation budget.
+        let preparation = match recorded_cap {
+            Some(cap) => preparation.with_necessary_finalization_deadline_cap(cap),
+            None => preparation,
+        };
+        let preparation = match preparation.necessary_finalization_deadline_cap() {
+            Some(cap) => preparation.with_earlier_deadline(cap),
+            None => preparation,
         };
         if let Err(error) = preparation.check_active() {
             let failure = super::super::before_dispatch_failure(
@@ -973,6 +984,144 @@ mod tests {
         assert_eq!(snapshot.events.evidence_expired, 1);
         assert_eq!(snapshot.events.pre_dispatch_cancelled, 0);
         assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 1);
+    }
+
+    struct CapturedGrantDispatch {
+        journal: PublicationJournal<String>,
+        grants: Arc<std::sync::Mutex<Vec<EvidenceContext>>>,
+    }
+    struct CapturedGrantFinalization(CapturedGrantDispatch);
+    #[async_trait]
+    impl PreparedCatalogDispatch for CapturedGrantDispatch {
+        async fn dispatch_once(self: Box<Self>, context: EvidenceContext) -> DispatchCompletion {
+            self.grants.lock().unwrap().push(context);
+            DispatchCompletion {
+                evidence: DispatchEvidence::Applied {
+                    proof: CommitProof::applied(None),
+                },
+                finalization: Some(Box::new(CapturedGrantFinalization(*self))),
+            }
+        }
+    }
+    #[async_trait]
+    impl FinalizationWork for CapturedGrantFinalization {
+        async fn run(self: Box<Self>, context: EvidenceContext) -> ExternalMutationFinalization {
+            assert!(matches!(self.0.journal.phase(), Phase::Committed(_, _, _)));
+            self.0.grants.lock().unwrap().push(context);
+            ExternalMutationFinalization::Complete
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_publication_cannot_extend_the_original_positive_finalization() {
+        let (parent, preparation) = super::super::tests::catalog_journal();
+        let business_stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let preparation = preparation.with_additional_stop(business_stop.view());
+        let parent_grants = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch = CapturedGrantDispatch {
+            journal: parent.clone(),
+            grants: parent_grants,
+        };
+        let parent_entry = parent
+            .publish_once(
+                preparation.clone(),
+                CatalogEvidencePolicy::default(),
+                move |_, _, _| async move {
+                    Ok(PreparedPublication::Mutation {
+                        binding: None,
+                        dispatch: Box::new(dispatch),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        let grant = parent
+            .finalization_context(parent_entry, CatalogEvidencePolicy::default())
+            .unwrap();
+        let necessary = grant.for_io(&preparation).unwrap();
+        business_stop.request_stop();
+        assert!(necessary.check_active().is_ok());
+
+        let (nested, _) = super::super::tests::catalog_journal();
+        let grants = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch = CapturedGrantDispatch {
+            journal: nested.clone(),
+            grants: grants.clone(),
+        };
+        let longer = CatalogEvidencePolicy {
+            evidence: std::time::Duration::from_secs(600),
+            finalization: std::time::Duration::from_secs(600),
+            ..Default::default()
+        };
+        let cap = grant.deadline();
+        let entry = nested
+            .publish_once(necessary, longer, move |_, _, context| async move {
+                assert_eq!(
+                    context.deadline(),
+                    cap,
+                    "preparation uses the same upper bound"
+                );
+                Ok(PreparedPublication::Mutation {
+                    binding: None,
+                    dispatch: Box::new(dispatch),
+                })
+            })
+            .await
+            .unwrap();
+        let observed = grants.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            2,
+            "one dispatch and one actual finalization"
+        );
+        assert_eq!(observed[0].deadline(), cap);
+        assert_eq!(observed[1].deadline(), cap);
+        let cached = nested.finalization_context(entry, longer).unwrap();
+        assert_eq!(cached.started(), observed[1].started());
+        assert_eq!(cached.deadline(), cap);
+        assert!(matches!(
+            nested.commit_outcome(entry),
+            CatalogOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_parent_cap_refuses_nested_preparation_even_from_cleanup_projection() {
+        let (journal, original) = super::super::tests::catalog_journal();
+        let cap = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let necessary = original.with_necessary_finalization_deadline_cap(cap);
+        let cleanup = CatalogEvidencePolicy::default()
+            .begin_reclamation()
+            .unwrap()
+            .for_io(&necessary)
+            .unwrap();
+        assert!(
+            cleanup.check_active().is_ok(),
+            "cleanup retains its independent budget"
+        );
+        let entry = journal
+            .publish_once(cleanup, CatalogEvidencePolicy::default(), |_, _, _| async {
+                panic!("expired parent cap must refuse before preparation I/O");
+                #[allow(unreachable_code)]
+                Ok(PreparedPublication::NoOp)
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(journal.commit_outcome(entry), CatalogOutcome::KnownUncommitted { failure }
+            if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded)
+        );
+        assert!(
+            journal
+                .entry_descriptor(entry)
+                .unwrap()
+                .first_dispatch_ms
+                .is_none()
+        );
     }
 
     struct BudgetDispatch {

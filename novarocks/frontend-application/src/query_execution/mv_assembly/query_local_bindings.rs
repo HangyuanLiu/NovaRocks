@@ -63,141 +63,13 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
         &target.table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    let selector = frozen_snapshot_id
-        .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
-        .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
-    let target_read = QueryScanMaterialization {
-        table: metadata.table.clone(),
-        selector,
-        mv_partition_selection: None,
-        planning_lease: planning_lease.clone(),
-    };
-    let selection = affected_partitions
-        .and_then(|affected| match affected {
-            AffectedTargetPartitions::Known { partitions } => Some(partitions),
-            AffectedTargetPartitions::Unpartitioned | AffectedTargetPartitions::NotDerived { .. } => None,
-        })
-        // A bounded carrier is an optimization. When the exact Known set is
-        // too large to carry, read the whole pinned snapshot instead.
-        .filter(|partitions| {
-            partitions.len() <= MAX_MV_TARGET_PARTITION_KEYS
-                && partitions.iter().flat_map(|key| &key.fields).all(|field| {
-                    !matches!(&field.value, MvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
-                })
-        })
-        .zip(frozen_snapshot_id)
-        .map(|(partitions, snapshot_id)| {
-            let target = &rewrite.mv_definition.facts.interpretation().target;
-            let fields = target.partition_fields.iter().map(|field| {
-                let transform = match field.transform {
-                    TargetPartitionTransform::Identity => MvExactPartitionTransform::Identity,
-                    TargetPartitionTransform::Year => MvExactPartitionTransform::Year,
-                    TargetPartitionTransform::Month => MvExactPartitionTransform::Month,
-                    TargetPartitionTransform::Day => MvExactPartitionTransform::Day,
-                    TargetPartitionTransform::Hour => MvExactPartitionTransform::Hour,
-                    TargetPartitionTransform::Bucket { num_buckets } => MvExactPartitionTransform::Bucket { num_buckets },
-                    TargetPartitionTransform::Truncate { width } => MvExactPartitionTransform::Truncate { width },
-                    TargetPartitionTransform::Void => MvExactPartitionTransform::Void,
-                };
-                MvExactPartitionField::try_new(
-                    bytes::Bytes::copy_from_slice(field.partition_field_id.as_bytes()),
-                    bytes::Bytes::copy_from_slice(field.source_target_field_id.as_bytes()),
-                    transform,
-                ).map_err(|error| error.to_string())
-            }).collect::<Result<Vec<_>, String>>()?;
-            let keys = partitions.iter().map(|partition| {
-                if partition.spec_version != target.partition_spec_version
-                    || partition.fields.len() != target.partition_fields.len() {
-                    return Err("MV affected partition key disagrees with canonical target spec".to_string());
-                }
-                partition.fields.iter().zip(&target.partition_fields).map(|(value, field)| {
-                    if value.partition_field_id != field.partition_field_id {
-                        return Err("MV affected partition field order disagrees with canonical target".to_string());
-                    }
-                    Ok(match &value.value {
-                        MvPartitionValue::Null => ConnectorMvPartitionValue::Null,
-                        MvPartitionValue::String(value) => ConnectorMvPartitionValue::String(value.as_str().into()),
-                    })
-                }).collect::<Result<Vec<_>, String>>()
-            }).collect::<Result<Vec<_>, String>>()?;
-            ConnectorMvTargetPartitionSelection::try_new(
-                rewrite.mv_definition.facts.source_revision().target_object_id.clone(),
-                bytes::Bytes::copy_from_slice(target.partition_spec_version.as_bytes()),
-                fields,
-                keys,
-                snapshot_id,
-            ).map_err(|error| error.to_string())
-        }).transpose()?;
-    let mut affected_read = target_read.clone();
-    affected_read.mv_partition_selection = selection;
-    let mv_target_read = MvTargetReadAdmission {
-        full: target_read.clone(),
-        affected_partitions: affected_read,
-        target_table_uuid: target_table_uuid.clone(),
-        target_object_id: rewrite
-            .mv_definition
-            .facts
-            .source_revision()
-            .target_object_id
-            .clone(),
-        frozen_snapshot_id,
-    };
-    let key = QueryTableBindingKey::mv_target(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        &target_table_uuid,
-        frozen_snapshot_id,
-    );
-    let [apply_key] = rewrite.runtime_bindings.apply_key.as_slice() else {
-        return Err("MV target binding requires one exact apply-key field".to_string());
-    };
-    let branch_column = match rewrite.runtime_bindings.branches.as_slice() {
-        [] => None,
-        [(_, first), rest @ ..] => {
-            if rest
-                .iter()
-                .any(|(_, field)| field.field_id != first.field_id || field.name != first.name)
-            {
-                return Err(
-                    "MV target binding has conflicting exact branch discriminator fields"
-                        .to_string(),
-                );
-            }
-            Some(first.name.clone())
-        }
-    };
-    let apply_key_column = apply_key.name.clone();
-    store.resolve_or_insert_with_id(key, |binding| {
-        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
-            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
-                target.catalog.clone(),
-                target.namespace.clone(),
-                target.table.clone(),
-                target_table_uuid.clone(),
-                frozen_snapshot_id,
-                apply_key_column.clone(),
-                branch_column.clone(),
-                binding,
-            )?,
-        )
-        .into_resolved_table();
-        Ok(QueryTableBinding {
-            resolved,
-            statistics_pin: None,
-            admission:
-                crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
-                    planning_lease,
-                ),
-            source_metadata: None,
-            scan_materialization: Some(mv_target_read.full.clone()),
-            mv_target_read: Some(mv_target_read),
-            write_target_admission: None,
-            frozen_cohort_read: None,
-            frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
-        })
-    })
+    bind_imv_target_query_table_from_metadata(
+        rewrite,
+        store,
+        planning_lease,
+        metadata,
+        affected_partitions,
+    )
 }
 
 /// Materialize every pinned IMV base immediately after capture. The returned
@@ -388,6 +260,322 @@ fn validate_source_revisions<'a>(
                 "MV source revision drifted for D occurrence {}",
                 source.occurrence_id.get()
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Binding projection is pure over the original exact metadata value.
+pub(crate) fn bind_imv_target_query_table_from_metadata(
+    rewrite: &IcebergMvRewriteContext,
+    store: &Arc<QueryTableBindingStore>,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    metadata: novarocks_spi::connector::ConnectorTableMetadata,
+    affected_partitions: Option<&AffectedTargetPartitions>,
+) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
+    let target = &rewrite.target;
+    let target_table_uuid = rewrite.target_table_uuid.clone();
+    let frozen_snapshot_id = rewrite.target_snapshot_id;
+    let selector = frozen_snapshot_id
+        .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
+        .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
+    let target_read = QueryScanMaterialization {
+        table: metadata.table.clone(),
+        selector,
+        mv_partition_selection: None,
+        planning_lease: planning_lease.clone(),
+    };
+    let selection = affected_partitions
+        .and_then(|affected| match affected {
+            AffectedTargetPartitions::Known { partitions } => Some(partitions),
+            AffectedTargetPartitions::Unpartitioned | AffectedTargetPartitions::NotDerived { .. } => None,
+        })
+        // A bounded carrier is an optimization. When the exact Known set is
+        // too large to carry, read the whole pinned snapshot instead.
+        .filter(|partitions| {
+            partitions.len() <= MAX_MV_TARGET_PARTITION_KEYS
+                && partitions.iter().flat_map(|key| &key.fields).all(|field| {
+                    !matches!(&field.value, MvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
+                })
+        })
+        .zip(frozen_snapshot_id)
+        .map(|(partitions, snapshot_id)| {
+            let target = &rewrite.mv_definition.facts.interpretation().target;
+            let fields = target.partition_fields.iter().map(|field| {
+                let transform = match field.transform {
+                    TargetPartitionTransform::Identity => MvExactPartitionTransform::Identity,
+                    TargetPartitionTransform::Year => MvExactPartitionTransform::Year,
+                    TargetPartitionTransform::Month => MvExactPartitionTransform::Month,
+                    TargetPartitionTransform::Day => MvExactPartitionTransform::Day,
+                    TargetPartitionTransform::Hour => MvExactPartitionTransform::Hour,
+                    TargetPartitionTransform::Bucket { num_buckets } => MvExactPartitionTransform::Bucket { num_buckets },
+                    TargetPartitionTransform::Truncate { width } => MvExactPartitionTransform::Truncate { width },
+                    TargetPartitionTransform::Void => MvExactPartitionTransform::Void,
+                };
+                MvExactPartitionField::try_new(
+                    bytes::Bytes::copy_from_slice(field.partition_field_id.as_bytes()),
+                    bytes::Bytes::copy_from_slice(field.source_target_field_id.as_bytes()),
+                    transform,
+                ).map_err(|error| error.to_string())
+            }).collect::<Result<Vec<_>, String>>()?;
+            let keys = partitions.iter().map(|partition| {
+                if partition.spec_version != target.partition_spec_version
+                    || partition.fields.len() != target.partition_fields.len() {
+                    return Err("MV affected partition key disagrees with canonical target spec".to_string());
+                }
+                partition.fields.iter().zip(&target.partition_fields).map(|(value, field)| {
+                    if value.partition_field_id != field.partition_field_id {
+                        return Err("MV affected partition field order disagrees with canonical target".to_string());
+                    }
+                    Ok(match &value.value {
+                        MvPartitionValue::Null => ConnectorMvPartitionValue::Null,
+                        MvPartitionValue::String(value) => ConnectorMvPartitionValue::String(value.as_str().into()),
+                    })
+                }).collect::<Result<Vec<_>, String>>()
+            }).collect::<Result<Vec<_>, String>>()?;
+            ConnectorMvTargetPartitionSelection::try_new(
+                rewrite.mv_definition.facts.source_revision().target_object_id.clone(),
+                bytes::Bytes::copy_from_slice(target.partition_spec_version.as_bytes()),
+                fields,
+                keys,
+                snapshot_id,
+            ).map_err(|error| error.to_string())
+        }).transpose()?;
+    let mut affected_read = target_read.clone();
+    affected_read.mv_partition_selection = selection;
+    let mv_target_read = MvTargetReadAdmission {
+        full: target_read.clone(),
+        affected_partitions: affected_read,
+        target_table_uuid: target_table_uuid.clone(),
+        target_object_id: rewrite
+            .mv_definition
+            .facts
+            .source_revision()
+            .target_object_id
+            .clone(),
+        frozen_snapshot_id,
+    };
+    let key = QueryTableBindingKey::mv_target(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        &target_table_uuid,
+        frozen_snapshot_id,
+    );
+    let [apply_key] = rewrite.runtime_bindings.apply_key.as_slice() else {
+        return Err("MV target binding requires one exact apply-key field".to_string());
+    };
+    let branch_column = match rewrite.runtime_bindings.branches.as_slice() {
+        [] => None,
+        [(_, first), rest @ ..] => {
+            if rest
+                .iter()
+                .any(|(_, field)| field.field_id != first.field_id || field.name != first.name)
+            {
+                return Err(
+                    "MV target binding has conflicting exact branch discriminator fields"
+                        .to_string(),
+                );
+            }
+            Some(first.name.clone())
+        }
+    };
+    let apply_key_column = apply_key.name.clone();
+    store.resolve_or_insert_with_id(key, |binding| {
+        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
+            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
+                target.catalog.clone(),
+                target.namespace.clone(),
+                target.table.clone(),
+                target_table_uuid.clone(),
+                frozen_snapshot_id,
+                apply_key_column.clone(),
+                branch_column.clone(),
+                binding,
+            )?,
+        )
+        .into_resolved_table();
+        Ok(QueryTableBinding {
+            resolved,
+            statistics_pin: None,
+            admission:
+                crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
+                    planning_lease,
+                ),
+            source_metadata: None,
+            scan_materialization: Some(mv_target_read.full.clone()),
+            mv_target_read: Some(mv_target_read),
+            write_target_admission: None,
+            frozen_cohort_read: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
+        })
+    })
+}
+
+pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
+    rewrite: &IcebergMvRewriteContext,
+    store: &Arc<QueryTableBindingStore>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    connector_context: &ConnectorRequestContext,
+    affected_partitions: Option<&AffectedTargetPartitions>,
+) -> Result<
+    novarocks_sql::binding::SqlTableBindingId,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let metadata = io
+        .metadata(
+            planning_lease,
+            connector_context.clone(),
+            &rewrite.target.namespace,
+            &rewrite.target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .await?;
+    bind_imv_target_query_table_from_metadata(
+        rewrite,
+        store,
+        planning_lease.clone(),
+        metadata,
+        affected_partitions,
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
+    connector_control: &dyn ConnectorControlRegistry,
+    connector_context: &ConnectorRequestContext,
+    rewrite: &IcebergMvRewriteContext,
+) -> Result<
+    Vec<QueryLocalTableOverlay>,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let source_groups = group_sources_by_locator(rewrite)?;
+    let mut overlays = Vec::with_capacity(source_groups.len());
+    for SourceGroup {
+        base,
+        current,
+        previous,
+    } in source_groups.into_values()
+    {
+        let snapshot_id = current
+            .first()
+            .ok_or("MV query binding source group has no current snapshot")?
+            .snapshot_id;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&base.catalog)
+            .map_err(|error| error.to_string())?;
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            connector_control,
+            &instance_id,
+        )?;
+        let metadata = io
+            .metadata(
+                &planning_lease,
+                connector_context.clone(),
+                &base.namespace,
+                &base.table,
+                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            )
+            .await?;
+        let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
+            metadata,
+            planning_lease,
+        )?;
+        validate_source_revisions_original(
+            &materialization,
+            current.iter().chain(previous.values()),
+            &base,
+        )?;
+        materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot_id);
+        let mut frozen_snapshot_ids = current
+            .iter()
+            .map(|source| source.snapshot_id)
+            .collect::<BTreeSet<_>>();
+        let mut admitted_change_scans = BTreeMap::new();
+        for source in &current {
+            let Some(previous_source) = previous.get(&source.occurrence_id) else {
+                continue;
+            };
+            frozen_snapshot_ids.insert(previous_source.snapshot_id);
+            let window = novarocks_spi::connector::ConnectorChangeWindow::new(
+                previous_source.snapshot_id,
+                source.snapshot_id,
+            );
+            let admitted_scan = io
+                .change_window(
+                    &materialization.planning_lease,
+                    &materialization.read_table,
+                    Arc::clone(&materialization.read_schema),
+                    connector_context.clone(),
+                    window,
+                )
+                .await?;
+            admitted_change_scans.insert(
+                (previous_source.snapshot_id, source.snapshot_id),
+                admitted_scan,
+            );
+        }
+
+        let catalog = base.catalog.clone();
+        let namespace = base.namespace.clone();
+        let table = base.table.clone();
+        let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &table, snapshot_id);
+        overlays.push(QueryLocalTableOverlay::new(
+            namespace.clone(),
+            table.clone(),
+            key,
+            move |binding| {
+                let mut result = connector_query_binding_from_materialization(
+                    materialization.clone(),
+                    &catalog,
+                    &namespace,
+                    &table,
+                    binding,
+                )?;
+                result.admitted_change_scans = admitted_change_scans.clone();
+                for frozen_snapshot_id in frozen_snapshot_ids.iter().copied() {
+                    result.frozen_snapshot_materializations.insert(
+                        frozen_snapshot_id,
+                        QueryScanMaterialization {
+                            table: materialization.read_table.clone(),
+                            selector: ConnectorReadSelector::SnapshotId(frozen_snapshot_id),
+                            mv_partition_selection: None,
+                            planning_lease: materialization.planning_lease.clone(),
+                        },
+                    );
+                }
+                Ok(result)
+            },
+        ));
+    }
+    Ok(overlays)
+}
+
+fn validate_source_revisions_original<'a>(
+    materialization: &crate::catalog_application::query_catalog::ConnectorQueryTableMaterialization,
+    sources: impl Iterator<Item = &'a MvRewriteSourceSnapshot>,
+    base: &TableIdentity,
+) -> Result<
+    (),
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    for source in sources {
+        let observed = materialization
+            .planning_lease
+            .binding()
+            .metadata()
+            .exact_semantic_revision(
+                &materialization.read_table,
+                ConnectorReadSelector::SnapshotId(source.snapshot_id),
+            )?;
+        if observed != source.semantic_revision {
+            return Err(format!(
+                "MV source revision drifted for D occurrence {}",
+                source.occurrence_id.get()
+            )
+            .into());
         }
     }
     Ok(())

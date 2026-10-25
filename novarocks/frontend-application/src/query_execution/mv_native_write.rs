@@ -59,23 +59,15 @@ impl PreparedMvNativeWriteAssembly {
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Result<Self, String> {
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
-        let description =
-            novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
-                novarocks_query_application::api::QueryExecutionKind::Write,
-                candidate,
-                template.attempt_scheduling_facts()?.fragments.iter()
-                    .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan)).collect(),
-                novarocks_query_application::preparation::OutputContract::CompletionOnly,
-                novarocks_coordination_contract::ExecutionEffect::External,
-                novarocks_coordination_contract::RecoveryMode::NoRecovery,
-                Vec::new(),
-                novarocks_query_application::preparation::FrozenCostEstimate::unknown(
-                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-                ),
-                novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
-                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-                ),
-            )?;
+        let description = mv_write_description(
+            candidate,
+            template
+                .attempt_scheduling_facts()?
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+        )?;
         Ok(Self {
             description,
             template,
@@ -136,6 +128,76 @@ impl crate::query::statement_computation::StatementComputationAssembly
             runtime,
         )
     }
+}
+
+/// Validate every static-plan check while the actual read capability set is
+/// still held by the original activation Source. The final bind only moves it.
+pub(crate) struct PreparedMvNativeWriteParts {
+    encoded: crate::query_execution::physical_encoding::PreparedStaticPlan,
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    version: novarocks_physical_plan::PlanVersionId,
+    query_options: Option<QueryOptions>,
+}
+impl PreparedMvNativeWriteParts {
+    pub(crate) fn try_new(
+        encoded: crate::query_execution::physical_encoding::PreparedStaticPlan,
+        version: novarocks_physical_plan::PlanVersionId,
+        query_options: Option<QueryOptions>,
+    ) -> Result<Self, String> {
+        let scheduling = encoded.scheduling_facts(version)?;
+        let description = mv_write_description(
+            encoded.candidate().clone(),
+            scheduling
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+        )?;
+        Ok(Self {
+            encoded,
+            description,
+            version,
+            query_options,
+        })
+    }
+    pub(crate) fn bind_access(
+        self,
+        access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+            crate::query_execution::provider_read_facts::FrozenProviderRead,
+        >,
+        session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ) -> PreparedMvNativeWriteAssembly {
+        let template = self
+            .encoded
+            .bind_access(access)
+            .into_attempt_template(self.version);
+        PreparedMvNativeWriteAssembly {
+            description: self.description,
+            template,
+            query_options: self.query_options,
+            session,
+        }
+    }
+}
+fn mv_write_description(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    scan_identities: Vec<novarocks_query_application::api::PlanScanIdentity>,
+) -> Result<novarocks_query_application::preparation::FrozenExecutionDescription, String> {
+    novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+        novarocks_query_application::api::QueryExecutionKind::Write,
+        candidate,
+        scan_identities,
+        novarocks_query_application::preparation::OutputContract::CompletionOnly,
+        novarocks_coordination_contract::ExecutionEffect::External,
+        novarocks_coordination_contract::RecoveryMode::NoRecovery,
+        Vec::new(),
+        novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+            novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+        ),
+        novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+            novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+        ),
+    )
 }
 
 /// A session-driven MV write, one step away from dispatch.
@@ -286,6 +348,13 @@ pub(crate) fn encode_compile_error(
 /// the port returns only an exact sealed encoding carrier after the lease is
 /// retained.
 pub trait MvRefreshProviderActivation: Send + Sync {
+    /// Install one original write-preparation source from already received
+    /// facts. Construction performs no Provider I/O, polling or execution.
+    fn prepare_write_source(
+        &self,
+        request: crate::query_execution::mv_assembly::OriginalMvWritePreparationRequest,
+    ) -> crate::query_execution::mv_assembly::MvWritePreparationCustody;
+
     fn activate_write(
         &self,
         prepared: PreparedMvRefreshWrite,

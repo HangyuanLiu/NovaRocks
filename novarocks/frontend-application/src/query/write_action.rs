@@ -551,13 +551,37 @@ pub(super) fn disposition(outcome: &WriteOutcome) -> LakePublicationDisposition 
         }
     }
 }
+/// Keep the originating provider fact and same shared source. A Provider
+/// refusal is not a compiler-control result, even when its cause is control.
+pub(super) fn publication_failure<E>(error: &E) -> QueryServiceError
+where
+    E: novarocks_failure_contract::FailureProjection
+        + std::error::Error
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(actual) = source {
+        if let Some(cause) = actual.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+        {
+            return QueryServiceError::from_failure_cause(cause.clone());
+        }
+        source = actual.source();
+    }
+    QueryServiceError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+        error.clone(),
+    ))
+}
+
 pub(super) fn select_needed_publication(
     needed: &ConnectorWriteNeededReady,
     finalization: Option<&Result<(), String>>,
     cancellation: Option<QueryCancellationReason>,
 ) -> Result<(), QueryServiceError> {
     if let ExternalMutationFinalization::Failed(failure) = needed.finalization() {
-        return Err(internal_error(failure.message()));
+        return Err(publication_failure(failure));
     }
     if let Some(Err(error)) = finalization {
         return Err(internal_error(error.clone()));
@@ -578,9 +602,9 @@ pub(super) fn select_publication(
         }
         Ok(ConnectorWritePublicationCompletion::KnownUncommitted { failure, .. })
         | Ok(ConnectorWritePublicationCompletion::CommitUnknown { failure, .. }) => {
-            Err(internal_error(failure.message()))
+            Err(publication_failure(failure))
         }
-        Err(error) => Err(internal_error(error.to_string())),
+        Err(error) => Err(publication_failure(error)),
     }
 }
 impl<P: WriteStatementFamily> GovernedStatementAction for WriteStatementAction<P> {
@@ -872,5 +896,36 @@ mod tests {
             same.upgrade().is_none(),
             "actual same session exited after its author reported disposed"
         );
+    }
+}
+
+#[cfg(test)]
+mod original_publication_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorMutationFailure};
+
+    #[test]
+    fn selected_publication_refusal_preserves_the_actual_provider_source() {
+        let error = ConnectorError::from_domain(
+            ConnectorErrorKind::ResourceExhausted,
+            novarocks_workload_control::WorkError::Capacity("original publication resource"),
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let selected = select_publication(&Err(error.clone()), None, None).unwrap_err();
+        assert_eq!(selected.failure_cause(), Some(&source));
+        assert_eq!(
+            selected.failure_cause().unwrap().failure_fact(),
+            error.failure_fact()
+        );
+        assert!(selected.compile_control_error().is_none());
+        let failure = ConnectorMutationFailure::from_connector(error);
+        let selected = publication_failure(&failure);
+        assert_eq!(selected.failure_cause(), Some(&source));
+        assert!(selected.compile_control_error().is_none());
     }
 }

@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
@@ -1110,6 +1111,20 @@ impl ManagementEntrance {
             .ok_or(ManagementAdmissionError::Cancelled)
     }
 
+    /// Async admission on the same management/activity FIFO. The caller lends
+    /// its original cancellation/deadline future; no synchronous wait occurs.
+    pub async fn acquire_async(
+        &self,
+        request: ManagementRequest,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        let owner = activity_owner(request.operation);
+        self.request(request, owner)?
+            .acquire_waiting_async(cancelled)
+            .await?
+            .ok_or(ManagementAdmissionError::Cancelled)
+    }
+
     /// Acquire one automatic action through the same FIFO as every other MV
     /// management effect. The action carrier is intentionally consumed here so
     /// callers must construct a fresh exact observation and operation identity
@@ -1124,6 +1139,22 @@ impl ManagementEntrance {
             MvActivityOwner::AutomaticMaintenance,
         )?
         .acquire_waiting(cancelled)?
+        .ok_or(ManagementAdmissionError::Cancelled)
+    }
+
+    /// The actual migrated automatic runner uses the same immutable effect
+    /// and activity owner as the temporary legacy entry above.
+    pub async fn acquire_automatic_maintenance_async(
+        &self,
+        effect: AutomaticMaintenanceEffect,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        self.request(
+            ManagementRequest::for_automatic_maintenance(effect),
+            MvActivityOwner::AutomaticMaintenance,
+        )?
+        .acquire_waiting_async(cancelled)
+        .await?
         .ok_or(ManagementAdmissionError::Cancelled)
     }
 
@@ -1397,6 +1428,23 @@ impl ManagementEntranceTicket {
         let Some(activity) = self
             .activity
             .acquire_waiting(cancelled)
+            .map_err(ManagementAdmissionError::from)?
+        else {
+            return Ok(None);
+        };
+        self.finish_acquire(activity).map(Some)
+    }
+
+    /// Borrow the same queued ticket without moving its request. Cancelling
+    /// only this borrow leaves ownership with the original ticket.
+    pub async fn acquire_waiting_async(
+        &mut self,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<Option<ManagementEntranceLease>, ManagementAdmissionError> {
+        let Some(activity) = self
+            .activity
+            .acquire_waiting_async(cancelled)
+            .await
             .map_err(ManagementAdmissionError::from)?
         else {
             return Ok(None);

@@ -1034,6 +1034,7 @@ impl MvBackgroundPorts {
 pub(crate) fn mv_background_bindings(
     ports: MvBackgroundPorts,
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
+    execution: crate::query::mv_action::MvExecutionServices,
 ) -> crate::mv::background::MvBackgroundBindings {
     let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
         ports.functions,
@@ -1046,6 +1047,8 @@ pub(crate) fn mv_background_bindings(
     )
     .with_management_entrance(ports.management_entrance);
     crate::mv::background::MvBackgroundBindings {
+        ports: iceberg_ports.clone(),
+        execution,
         engine: Arc::new(
             crate::mv::background_engine::FrontendMvBackgroundEngine::new_with_ports(
                 iceberg_ports,

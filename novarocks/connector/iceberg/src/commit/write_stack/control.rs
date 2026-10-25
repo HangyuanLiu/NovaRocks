@@ -1719,10 +1719,13 @@ impl IcebergWriteSessionControl {
         // Once a positive verdict exists, reload is optional finalization and
         // consumes the original entry's one finite grant.
         let read_context = if known.is_some() {
-            match journal
-                .finalization_context(entry, self.runtime.novarocks_catalog().evidence_policy())
-                .and_then(|grant| grant.for_io(context))
-            {
+            match receive_existing_finalization_context(
+                handle,
+                &journal,
+                entry,
+                context,
+                self.runtime.novarocks_catalog().evidence_policy(),
+            ) {
                 Ok(context) => context,
                 Err(error) => {
                     return Ok(reconciled_known_committed_outcome(
@@ -1846,9 +1849,13 @@ impl IcebergWriteSessionControl {
         {
             return Ok(journal.catalog_entry_outcome(entry));
         }
-        let projection = journal
-            .finalization_context(entry, self.runtime.novarocks_catalog().evidence_policy())
-            .and_then(|grant| grant.for_io(context));
+        let projection = receive_existing_finalization_context(
+            handle,
+            &journal,
+            entry,
+            context,
+            self.runtime.novarocks_catalog().evidence_policy(),
+        );
         let _finalizing = projection
             .as_ref()
             .ok()
@@ -1861,6 +1868,29 @@ impl IcebergWriteSessionControl {
             projection.map(|_| metadata),
         ))
     }
+}
+
+fn receive_existing_finalization_context(
+    handle: &IcebergCommitHandle,
+    journal: &crate::commit::attempt::observation::PublicationJournal<ConnectorWriteReceipt>,
+    entry: crate::commit::attempt::observation::JournalEntryRef,
+    original: &ConnectorRequestContext,
+    policy: crate::catalog::publication::CatalogEvidencePolicy,
+) -> Result<ConnectorRequestContext, ConnectorError> {
+    // This is the original positive-entry author, not the public getter.
+    // Rechecking its cached finite grant never restarts the deadline.
+    let grant = journal.finalization_context(entry, policy)?;
+    if let Some(context) = handle.finalization_context_for_entry(entry)? {
+        if context.deadline() != grant.deadline() {
+            return Err(invalid(
+                "Iceberg finalization context and original finite grant differ",
+            ));
+        }
+        validate_context(&context)?;
+        return Ok(context);
+    }
+    let context = grant.for_io(original)?;
+    handle.receive_finalization_context(entry, context)
 }
 
 fn retained_committed_completion(
@@ -3726,6 +3756,15 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         Ok(self.adapter.commit_handle(commit)?.cleanup_responsibility())
     }
 
+    fn existing_finalization_context(
+        &self,
+        commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+    ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
+        self.adapter
+            .commit_handle(commit)?
+            .existing_finalization_context()
+    }
+
     fn begin_write_async(
         &self,
         request: ConnectorWriteBeginRequest,
@@ -5235,6 +5274,239 @@ mod terminal_finalization_tests {
         .unwrap()
         .0
     }
+    #[tokio::test]
+    async fn original_finalization_context_is_received_once_and_expiry_never_regrants() {
+        use crate::catalog::publication::CatalogEvidencePolicy;
+        use crate::commit::attempt::observation::{
+            DispatchEvidence, MemoryDispatchBarrier, PublicationJournal,
+        };
+        use crate::commit::model::OperationToken;
+        use novarocks_spi::connector::{ConnectorOperationControl, ConnectorStopOwner};
+        let handle = handle();
+        let token = OperationToken::from_write(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
+                handle.session_id().to_bytes(),
+            ),
+        );
+        let business_stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            business_stop.view(),
+            65536,
+            262144,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
+        );
+        let operation = crate::commit::operation::IcebergCommitOperation::new(
+            token,
+            handle.table().table_location(),
+            binding,
+            context.clone(),
+            crate::resources::IcebergCatalogRuntime::new(runtime),
+            crate::commit::operation::OperationLimits::default(),
+        )
+        .unwrap();
+        let journal = PublicationJournal::new(token);
+        handle
+            .retain_publication(operation, journal.clone())
+            .unwrap();
+        let receipt =
+            crate::write_codec::connector_write_receipt_with_partitioning(77, None, None).unwrap();
+        let evidence = ExternalMutationEvidence::try_new(
+            2,
+            ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("terminal-test")
+                    .unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([1; 16]),
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "write_session",
+            bytes::Bytes::from_static(b"original finite-context fixture"),
+        )
+        .unwrap();
+        let entry = journal
+            .prepare_catalog(
+                evidence,
+                receipt.clone(),
+                vec!["db.table".into()],
+                b"same original publication".to_vec(),
+                crate::commit::publication_descriptor::AttributionPlan::ObserveOnly,
+                context.clone(),
+            )
+            .unwrap();
+        assert!(handle.existing_finalization_context().unwrap().is_none());
+        assert!(
+            handle
+                .finalization_context_for_entry(entry)
+                .unwrap()
+                .is_none()
+        );
+        // The actual journal refuses a context before positive dispatch proof.
+        assert!(
+            receive_existing_finalization_context(
+                &handle,
+                &journal,
+                entry,
+                &context,
+                CatalogEvidencePolicy::default()
+            )
+            .is_err()
+        );
+        assert!(
+            handle
+                .finalization_context_for_entry(entry)
+                .unwrap()
+                .is_none()
+        );
+        journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&context, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Applied {
+                proof: CommitProof::applied(Some(77)),
+            },
+        );
+        let policy = CatalogEvidencePolicy {
+            finalization: std::time::Duration::from_millis(100),
+            ..Default::default()
+        };
+        let first =
+            receive_existing_finalization_context(&handle, &journal, entry, &context, policy)
+                .unwrap();
+        let deadline = first.deadline();
+        struct ReceivedFinalizationScope;
+        let scope = first.request_scope_extension_or_insert_with(|| ReceivedFinalizationScope);
+        business_stop.request_stop();
+        assert!(context.is_cancelled());
+        first.check_active().unwrap();
+        let second = receive_existing_finalization_context(
+            &handle,
+            &journal,
+            entry,
+            &context,
+            CatalogEvidencePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(second.deadline(), deadline);
+        assert!(!second.is_cancelled());
+        assert!(Arc::ptr_eq(
+            &scope,
+            &second.request_scope_extension_or_insert_with(|| ReceivedFinalizationScope)
+        ));
+        handle
+            .settle(IcebergWriteSessionState::KnownCommitted {
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        ExternalMutationEffect::Applied,
+                        receipt,
+                        ExternalMutationFinalization::Complete,
+                    ),
+                ),
+            })
+            .unwrap();
+        assert_eq!(
+            handle
+                .existing_finalization_context()
+                .unwrap()
+                .unwrap()
+                .deadline(),
+            deadline
+        );
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        let refused = receive_existing_finalization_context(
+            &handle,
+            &journal,
+            entry,
+            &context,
+            CatalogEvidencePolicy::default(),
+        )
+        .err()
+        .expect("the same original finalization grant expired");
+        assert_eq!(refused.kind(), ConnectorErrorKind::DeadlineExceeded);
+        let observed = handle.existing_finalization_context().unwrap().unwrap();
+        assert_eq!(observed.deadline(), deadline);
+        assert!(Arc::ptr_eq(
+            &scope,
+            &observed.request_scope_extension_or_insert_with(|| ReceivedFinalizationScope)
+        ));
+        assert_eq!(
+            observed
+                .original_operation_control()
+                .check_active()
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::DeadlineExceeded
+        );
+        let failed = reconciled_known_committed_outcome(&handle, &journal, entry, 77, Err(refused));
+        assert!(matches!(
+            failed,
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                finalization: ExternalMutationFinalization::Failed(_),
+                ..
+            }
+        ));
+        assert!(
+            matches!(handle.state().unwrap(), IcebergWriteSessionState::KnownCommitted { needed } if needed.effect() == ExternalMutationEffect::Applied)
+        );
+    }
+
+    #[test]
+    fn finalization_context_getter_does_not_initialize_for_absent_noop_or_unknown() {
+        for state in [
+            IcebergWriteSessionState::Active,
+            IcebergWriteSessionState::KnownCommitted {
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        ExternalMutationEffect::NoOp,
+                        crate::write_codec::connector_write_receipt_with_partitioning(
+                            77, None, None,
+                        )
+                        .unwrap(),
+                        ExternalMutationFinalization::Complete,
+                    ),
+                ),
+            },
+            IcebergWriteSessionState::KnownCommitted {
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        ExternalMutationEffect::Applied,
+                        crate::write_codec::connector_write_receipt_with_partitioning(
+                            77, None, None,
+                        )
+                        .unwrap(),
+                        ExternalMutationFinalization::Complete,
+                    ),
+                ),
+            },
+            IcebergWriteSessionState::CommitUnknown {
+                message: "same unknown publication".into(),
+                staging_dir: "same-stage".into(),
+            },
+        ] {
+            let handle = handle();
+            if !matches!(state, IcebergWriteSessionState::Active) {
+                handle.settle(state).unwrap();
+            }
+            for _ in 0..2 {
+                assert!(handle.existing_finalization_context().unwrap().is_none());
+            }
+            assert!(handle.retained_publication().unwrap().is_none());
+        }
+    }
+
     #[test]
     fn rejected_release_retains_partial_cleanup_verdict() {
         let handle = handle();

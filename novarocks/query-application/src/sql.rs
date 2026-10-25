@@ -113,6 +113,20 @@ pub trait SpecializedStatementRoute: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Build a data refresh action under the already admitted statement.
+    fn prepare_materialized_view_statement_action(
+        &self,
+        _statement: novarocks_parser::ast::MaterializedViewStatement,
+        _context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        Err(crate::api::CommandError::new(
+            crate::api::CommandErrorKind::Unsupported,
+            "materialized view action route is unavailable",
+        ))
+    }
+
     /// Executes the deliberately specialized, complete MV parser input.
     /// MV must not acquire a second semantic command mirror.
     fn execute_materialized_view(

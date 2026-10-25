@@ -59,6 +59,7 @@ pub use metadata_geometry::InternalCpuActionQuote;
 pub use metadata_geometry::InternalCpuMetadataGeometry;
 use scoped_statistics::ClosedCreatorInput;
 pub(crate) use scoped_statistics::StatisticsPlanCpuJob;
+pub(crate) use scoped_statistics::scoped_mv_refresh::{MvRefreshCpuJob, MvRefreshCpuTurn};
 
 // Historical COW coexistence envelope. This is not a generic Root, Statistics
 // or CPU factory minimum; actual domain byte receipts are separate.

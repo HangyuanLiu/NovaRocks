@@ -91,7 +91,7 @@ pub(crate) async fn observe_schema_validation_for_table_async(
     Ok(observed)
 }
 
-fn validate_observed_schema_locator(
+pub(crate) fn validate_observed_schema_locator(
     observed: &MvSchemaValidationObservation,
     identity: &novarocks_spi::connector::ConnectorTableIdentity,
 ) -> Result<(), String> {
@@ -239,7 +239,7 @@ pub(crate) async fn observe_refresh_schema_async(
     Ok((bindings, renames))
 }
 
-fn validate_occurrence_locator(
+pub(crate) fn validate_occurrence_locator(
     occurrence: &novarocks_mv_application::persistence::codec::RelationOccurrence,
     table: &TableIdentity,
 ) -> Result<(), String> {
@@ -308,7 +308,9 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
     ))
 }
 
-fn require_occurrence_rewriter(renames: &[MvOccurrenceFieldRebind]) -> Result<(), String> {
+pub(crate) fn require_occurrence_rewriter(
+    renames: &[MvOccurrenceFieldRebind],
+) -> Result<(), String> {
     if renames.is_empty() {
         Ok(())
     } else {

@@ -166,6 +166,9 @@ struct JournalEntry<R> {
     cleanup_report: Option<IcebergCleanupReport>,
     finalization_grant:
         Option<std::result::Result<crate::catalog::publication::EvidenceContext, ConnectorError>>,
+    // The original entry captures its caller's necessary-finalization cap
+    // before dispatch. It never uses the ordinary business deadline as a cap.
+    finalization_deadline_cap: Option<std::time::Instant>,
     positive_proof: Option<CommitProof>,
 }
 struct JournalState<R> {
@@ -427,6 +430,10 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         state.entries.insert(
             key,
             JournalEntry {
+                finalization_deadline_cap: checked
+                    .preparation
+                    .as_ref()
+                    .and_then(ConnectorRequestContext::necessary_finalization_deadline_cap),
                 checked,
                 phase: EntryPhase::Prepared,
                 finalization: ExternalMutationFinalization::Complete,
@@ -561,6 +568,13 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 ErrorKind::DataInvalid,
                 "Publication preparation is closed",
             ));
+        }
+        if let Some(cap) = preparation.necessary_finalization_deadline_cap() {
+            entry.finalization_deadline_cap = Some(
+                entry
+                    .finalization_deadline_cap
+                    .map_or(cap, |original| original.min(cap)),
+            );
         }
         entry.checked.preparation = Some(preparation);
         Ok(())
@@ -756,9 +770,14 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 "Publication finalization requires positive applied evidence",
             ));
         }
+        let cap = entry.finalization_deadline_cap;
         let grant = entry
             .finalization_grant
-            .get_or_insert_with(|| policy.begin_finalization())
+            .get_or_insert_with(|| {
+                policy
+                    .begin_finalization()
+                    .map(|grant| grant.with_finalization_deadline_cap(cap))
+            })
             .clone()?;
         if grant.expired() {
             return Err(ConnectorError::new(
@@ -1504,6 +1523,13 @@ impl<R> DispatchClaim<R> {
             matches!(entry.phase, EntryPhase::Claimed),
             "Dispatch claim lost its entry"
         );
+        if let Some(cap) = preparation.necessary_finalization_deadline_cap() {
+            entry.finalization_deadline_cap = Some(
+                entry
+                    .finalization_deadline_cap
+                    .map_or(cap, |original| original.min(cap)),
+            );
+        }
         entry.phase = EntryPhase::Dispatching;
         self.completed = true;
         Ok(JournalEntryRef(self.key))

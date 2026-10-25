@@ -291,7 +291,7 @@ pub(crate) async fn observe_current_refresh_revision_with_ports_async(
 }
 
 // This inspector is pure over the sealed metadata; only its load above awaits I/O.
-fn observe_loaded_refresh_base(
+pub(crate) fn observe_loaded_refresh_base(
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,

@@ -25,6 +25,7 @@ pub(crate) mod maintenance_worker;
 pub mod management_audit;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
+pub(crate) use refresh::bind_publication_documents;
 pub mod scheduler;
 mod service;
 #[allow(dead_code)]

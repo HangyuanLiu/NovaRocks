@@ -65,6 +65,42 @@ impl IcebergMvRefreshProviderActivation {
 }
 
 impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
+    fn prepare_write_source(
+        &self,
+        request: super::activation_request::OriginalMvWritePreparationRequest,
+    ) -> super::activation_source::MvWritePreparationCustody {
+        let super::activation_request::OriginalMvWritePreparationRequest {
+            prepared,
+            target,
+            planning,
+            execution,
+            context,
+            session,
+            io,
+            turn,
+            owners,
+            capacity,
+            requests,
+        } = request;
+        super::activation_source::MvWritePreparationCustody::new(
+            super::activation_preparation::MvWriteAnalysisPreparationInput {
+                kernel: self.query_kernel.clone(),
+                ports: self.ports.clone(),
+                prepared,
+                target,
+                planning,
+                execution,
+                context,
+                session,
+            },
+            io,
+            turn,
+            owners,
+            capacity,
+            requests,
+        )
+    }
+
     fn activate_write(
         &self,
         prepared: PreparedMvRefreshWrite,

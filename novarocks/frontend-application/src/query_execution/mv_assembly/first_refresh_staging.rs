@@ -218,7 +218,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
 /// plan is compiled against that branch's ordinal, so a session that sealed a
 /// different number of them is refused here rather than having its extra
 /// branches written by nobody.
-fn sole_publication_write_target(
+pub(crate) fn sole_publication_write_target(
     write_session: &ConnectorWriteSession,
 ) -> Result<&novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan, String> {
     match write_session.targets() {
@@ -444,6 +444,32 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
     planning_lease: &ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>, String> {
+    let target_identity =
+        validate_frozen_mv_rewrite_identity(target_catalog, target_namespace, target_name, facts)?;
+    let target_binding =
+        crate::mv::domain::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
+            ports.storage_observation(),
+            &target_identity,
+            planning_lease.clone(),
+            connector_context,
+        )?;
+    finish_frozen_mv_rewrite_context(
+        ports,
+        expected_target_snapshot_id,
+        facts,
+        &target_binding,
+        connector_context,
+    )
+}
+
+/// Pure request validation shared by synchronous retirement callers and the
+/// original asynchronous activation. This cannot resolve a new generation.
+pub(crate) fn validate_frozen_mv_rewrite_identity(
+    target_catalog: &str,
+    target_namespace: &str,
+    target_name: &str,
+    facts: &MvFirstRefreshLogicalContext,
+) -> Result<novarocks_types::naming::TableIdentity, String> {
     let persisted_target = facts.mv_definition.facts.target();
     let target_identity = novarocks_types::naming::TableIdentity {
         catalog: persisted_target
@@ -465,22 +491,51 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         );
     }
     validate_frozen_join_base_facts(facts)?;
-    let target_binding =
-        crate::mv::domain::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
-            ports.storage_observation(),
-            &target_identity,
-            planning_lease.clone(),
-            connector_context,
-        )?;
+    Ok(target_identity)
+}
+
+/// Resume the same frozen activation after its exact metadata observation.
+/// The binding is retained by the caller; all observations here inspect only
+/// that sealed metadata through the original provider fact author.
+pub(crate) fn finish_frozen_mv_rewrite_context(
+    ports: &IcebergMvCorePorts,
+    expected_target_snapshot_id: Option<i64>,
+    facts: &MvFirstRefreshLogicalContext,
+    target_binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>, String> {
+    finish_frozen_mv_rewrite_context_original(
+        ports,
+        expected_target_snapshot_id,
+        facts,
+        target_binding,
+        connector_context,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Preserve the original Provider failure in governed activation; only the
+/// retiring synchronous wrapper projects it to its legacy String boundary.
+pub(crate) fn finish_frozen_mv_rewrite_context_original(
+    ports: &IcebergMvCorePorts,
+    expected_target_snapshot_id: Option<i64>,
+    facts: &MvFirstRefreshLogicalContext,
+    target_binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>,
+    crate::mv::domain::application::MvApplicationError,
+> {
+    use super::refresh_preparation::io_gate::{contract_error, provider_error};
     if target_binding.table_uuid() != facts.target_table_uuid {
-        return Err(
-            "MV refresh logical artifact target UUID drifted after preparation".to_string(),
-        );
+        return Err(contract_error(
+            "MV refresh logical artifact target UUID drifted after preparation",
+        ));
     }
     if target_binding.current_snapshot_id() != expected_target_snapshot_id {
-        return Err(
-            "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
-        );
+        return Err(contract_error(
+            "MV refresh logical artifact target snapshot drifted after preparation",
+        ));
     }
     let target_schema = crate::mv::domain::storage_observation::observe_schema_validation(
         ports.storage_observation(),
@@ -488,22 +543,27 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         target_binding.metadata(),
         connector_context.clone(),
     )
-    .map_err(|error| format!("observe exact MV target schema for activation: {error}"))?;
+    .map_err(provider_error)?;
     if target_schema.table() != target_binding.identity() {
-        return Err(
-            "MV first-refresh target schema and retained target binding differ".to_string(),
-        );
+        return Err(contract_error(
+            "MV first-refresh target schema and retained target binding differ",
+        ));
     }
     crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context(
         Arc::new(facts.mv_definition.clone()),
         facts.pin.clone(),
         facts.previous.clone(),
         facts.target_table_uuid.clone(),
-        target_binding.physical_write_schema()?,
-        target_binding.write_input_fields()?,
+        target_binding
+            .physical_write_schema()
+            .map_err(contract_error)?,
+        target_binding
+            .write_input_fields()
+            .map_err(contract_error)?,
         target_schema.exact_schema().clone(),
         facts.analysis.clone(),
     )
+    .map_err(contract_error)
 }
 
 fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Result<(), String> {

@@ -50,6 +50,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct MvCommandExecutor {
+    execution_services: Option<crate::query::mv_action::MvExecutionServices>,
     ports: IcebergMvCorePorts,
     refresh_service: Arc<FrontendMvProductAdapter>,
     mv_backend: Arc<IcebergMvBackend>,
@@ -76,12 +77,87 @@ impl MvCommandExecutor {
         >,
     ) -> Self {
         Self {
+            execution_services: None,
             ports,
             refresh_service,
             mv_backend,
             continuation,
             management_audit,
         }
+    }
+
+    pub(crate) fn with_execution_services(
+        mut self,
+        services: crate::query::mv_action::MvExecutionServices,
+    ) -> Self {
+        self.execution_services = Some(services);
+        self
+    }
+
+    fn prepare_statement_action(
+        &self,
+        statement: &MaterializedViewStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
+        use crate::query::mv_action::{MvCommandRequest, prepare};
+        let catalog = context.session().current_catalog();
+        let database = context.session().current_database();
+        let request = match statement {
+            MaterializedViewStatement::Refresh(refresh) => {
+                let statement = lower_typed_refresh(refresh)?;
+                let requested =
+                    resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Refresh {
+                    statement,
+                    requested,
+                }
+            }
+            MaterializedViewStatement::Alter(alter)
+                if matches!(&alter.action, TypedAlterAction::Repartition(_)) =>
+            {
+                let alter = lower_typed_alter(alter)?;
+                let MvAlterAction::Repartition(fields) = alter.action else {
+                    unreachable!()
+                };
+                let target = resolve_refresh_mv_target(catalog, database, &alter.name_parts)?;
+                MvCommandRequest::Repartition {
+                    statement: MvRefreshRequest {
+                        name_parts: alter.name_parts,
+                        full: false,
+                    },
+                    target,
+                    fields: fields.iter().map(IcebergPartitionFieldExpr::from).collect(),
+                }
+            }
+            _ => {
+                return Err(novarocks_query_application::api::CommandError::new(
+                    novarocks_query_application::api::CommandErrorKind::Unsupported,
+                    "MV asynchronous data action requires REFRESH or REPARTITION",
+                ));
+            }
+        };
+        let services = self.execution_services.clone().ok_or_else(|| {
+            novarocks_query_application::api::CommandError::new(
+                novarocks_query_application::api::CommandErrorKind::Unsupported,
+                "MV execution services are unavailable",
+            )
+        })?;
+        let (product, activation) = self.refresh_service.original_refresh_ports();
+        prepare(
+            catalog.map(str::to_owned),
+            database.to_owned(),
+            self.ports.clone(),
+            activation,
+            product,
+            services,
+            request,
+            context.execution().clone(),
+            command_context.connector_context().clone(),
+        )
     }
 
     /// Executes one parser-admitted MV command through explicit ports. Refresh
@@ -399,7 +475,7 @@ impl MvCommandExecutor {
     }
 }
 
-fn mv_application_command_error(
+pub(crate) fn mv_application_command_error(
     error: crate::mv::domain::application::MvApplicationError,
 ) -> novarocks_query_application::api::CommandError {
     use crate::mv::domain::application::MvApplicationErrorKind;
@@ -460,6 +536,19 @@ impl FrontendMvCommandConsumer {
 }
 
 impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
+    fn prepare_statement_action(
+        &self,
+        command: MaterializedViewCommand,
+        context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
+        self.executor
+            .prepare_statement_action(command.statement(), &context, &command_context)
+    }
+
     fn execute(
         &self,
         command: &MaterializedViewCommand,

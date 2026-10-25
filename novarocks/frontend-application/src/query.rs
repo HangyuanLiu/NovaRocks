@@ -76,8 +76,8 @@ use novarocks_query_application::session::{
     QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
 };
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementBeginError, QueryControlService, QuerySessionLease, SessionIdentity,
-    SessionToken, StatementToken,
+    GovernedQueryStatementBeginError, GovernedStatementAction, QueryControlService,
+    QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::session_outcome::{
@@ -121,6 +121,7 @@ mod explain_action;
 pub(crate) mod insert_action;
 mod maintenance_action;
 pub(crate) mod mutation_action;
+pub(crate) mod mv_action;
 pub(crate) mod read_action;
 mod statement_action;
 pub(crate) mod statement_computation;
@@ -844,6 +845,19 @@ impl SpecializedStatementRoute for TypedCommandRoute {
                     command_context.connector_context(),
                 )
             },
+        )
+    }
+
+    fn prepare_materialized_view_statement_action(
+        &self,
+        statement: novarocks_parser::ast::MaterializedViewStatement,
+        context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
+        self.mv.prepare_statement_action(
+            MaterializedViewCommand::new(statement),
+            context,
+            command_context,
         )
     }
 
@@ -2448,6 +2462,33 @@ impl FrontendQuerySession {
                     .product_command_router
                     .prepare_maintenance_statement_action(command, context, command_context)
                 {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return Ok(self.governed_typed_error(
+                            routed_execution_service_error(product_command_error(error)),
+                            statement,
+                        ));
+                    }
+                };
+                return self
+                    .execute_observed_statement_action(statement, action)
+                    .await;
+            }
+        }
+        if let ParsedStatement::MaterializedView(mv) = &parsed_statement {
+            use novarocks_parser::ast::{MaterializedViewAlterAction, MaterializedViewStatement};
+            if matches!(mv, MaterializedViewStatement::Refresh(_))
+                || matches!(mv, MaterializedViewStatement::Alter(alter)
+                    if matches!(&alter.action, MaterializedViewAlterAction::Repartition(_)))
+            {
+                let action = match self
+                    .service
+                    .command_executor
+                    .prepare_materialized_view_statement_action(
+                        mv.clone(),
+                        context,
+                        command_context,
+                    ) {
                     Ok(action) => action,
                     Err(error) => {
                         return Ok(self.governed_typed_error(
@@ -6208,13 +6249,13 @@ mod mv_guard_application_cause_tests {
 #[cfg(test)]
 mod mv_command_original_route_tests {
     use super::*;
-    use novarocks_sql::compiler::SessionOptimizerSettings;
-    use novarocks_workload_control::ResourceConfig;
     use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
     use novarocks_query_application::{
         api::StatementExternalEffectDisposition,
         session_control::{SessionToken, StatementToken},
     };
+    use novarocks_sql::compiler::SessionOptimizerSettings;
+    use novarocks_workload_control::ResourceConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct OriginalCommandRoute {

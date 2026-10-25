@@ -162,8 +162,17 @@ pub(crate) struct ConnectorWriteSession {
 /// them per query would let a statement hold an unbounded amount before commit
 /// while every individual query looked well inside its limit -- and the limits
 /// exist to bound exactly what the frontend holds.
+/// One immutable received union, shared by pure projection and publication.
+/// Actual buffers and their receipts stay together until the last borrower exits.
+struct ReceivedWriteInput {
+    prepared: ConnectorPreparedWriteSet,
+    statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+    _retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
+}
+
 #[derive(Default)]
 struct AccumulatedWriteSet {
+    received: Option<Arc<ReceivedWriteInput>>,
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<(
@@ -204,13 +213,14 @@ impl ConnectorWriteSession {
     /// Fixed allocations of the original receiving session. Variable target,
     /// schema and artifact payloads retain their separate original invoices.
     pub(crate) fn fixed_receiving_layouts() -> Result<
-        [std::alloc::Layout; 3],
+        [std::alloc::Layout; 4],
         novarocks_type_contract::owned_resources::layout::LayoutResourceError,
     > {
         use novarocks_type_contract::owned_resources::layout::arc_layout;
         use std::alloc::Layout;
         Ok([
             arc_layout(Layout::new::<Self>())?,
+            arc_layout(Layout::new::<ReceivedWriteInput>())?,
             arc_layout(Layout::new::<()>())?,
             arc_layout(Layout::new::<
                 std::collections::BTreeSet<(
@@ -463,6 +473,7 @@ impl ConnectorWriteSession {
             && union.statistics_body_bytes == 0
             && union.statistics_property_bytes == 0
             && union.retention.is_none()
+            && union.received.is_none()
             && publication.is_none())
     }
 
@@ -488,6 +499,7 @@ impl ConnectorWriteSession {
             if union.rows.get() == 0
                 && union.fragments.is_empty()
                 && union.statistics.is_empty()
+                && union.received.is_none()
                 && publication.is_none()
             {
                 P::NotStarted
@@ -495,6 +507,16 @@ impl ConnectorWriteSession {
                 P::Unproven
             },
         )
+    }
+
+    /// Pure observation from the exact session/control that owns publication.
+    /// The provider returns no context until its positive finite source exists.
+    pub(super) fn existing_finalization_context(
+        &self,
+    ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
+        self.lease
+            .session()
+            .existing_finalization_context(self.plan.commit_handle())
     }
 
     /// Settle the original begin on preparation or Native refusal. The same
@@ -573,24 +595,12 @@ impl ConnectorWriteSession {
         publication: ConnectorWriteFinishPublication,
         production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction,
     ) -> Result<Arc<publication_call::PublicationInput>, ConnectorError> {
-        let (rows, fragments, statistics, retention) = {
-            let mut union = self.lock_accumulated()?;
-            (
-                union.rows.get(),
-                std::mem::take(&mut union.fragments),
-                std::mem::take(&mut union.statistics),
-                union.retention.take(),
-            )
-        };
-        let prepared =
-            ConnectorPreparedWriteSet::try_new(rows, fragments, &self.expected_targets())?;
+        let received = self.freeze_received_input()?;
         let input = Arc::new(publication_call::PublicationInput {
-            prepared,
-            statistics,
+            received,
             publication,
             context,
             production,
-            _retention: retention,
         });
         {
             let mut slot = self.publication_input.lock().map_err(|_| {
@@ -1030,6 +1040,52 @@ impl ConnectorWriteSession {
         }
     }
 
+    /// Project the exact already-received union without decoding it again.
+    /// The caller's original CPU Source owns actual call/exit and panic health.
+    pub(crate) fn logical_rows_after_received_write(
+        &self,
+        previous: Option<u64>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<u64>, ConnectorError> {
+        ensure_finish_context_active(context)?;
+        let received = {
+            let terminal = self.lock_terminal()?;
+            if terminal.is_some() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write row projection must precede the terminal decision",
+                ));
+            }
+            self.require_received_productions()?;
+            self.freeze_received_input()?
+        };
+        // No terminal, production, accumulation or publication mutex crosses
+        // the Provider callback. A panic leaves the same packet in the session.
+        self.logical_rows_after_prepared(&received.prepared, previous, context)
+    }
+
+    fn freeze_received_input(&self) -> Result<Arc<ReceivedWriteInput>, ConnectorError> {
+        let mut union = self.lock_accumulated()?;
+        if let Some(received) = &union.received {
+            return Ok(Arc::clone(received));
+        }
+        // Validate while all payload/statistics/receipts still occupy their
+        // original slots. A typed refusal moves none of that inventory.
+        let rows = union.rows.get();
+        let prepared = ConnectorPreparedWriteSet::try_new_in(
+            rows,
+            &mut union.fragments,
+            &self.expected_targets(),
+        )?;
+        let received = Arc::new(ReceivedWriteInput {
+            prepared,
+            statistics: std::mem::take(&mut union.statistics),
+            _retention: union.retention.take(),
+        });
+        union.received = Some(Arc::clone(&received));
+        Ok(received)
+    }
+
     /// Collect one query's complete prepared write set into this session.
     ///
     /// A statement that drives several queries against one session -- a
@@ -1068,6 +1124,12 @@ impl ConnectorWriteSession {
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         ensure_finish_context_active(&context)?;
         self.require_received_productions()?;
+        if self.lock_accumulated()?.received.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "sealed received input requires its borrowed publication call",
+            ));
+        }
         let publication = self.finish_publication_for_commit()?;
         self.claim_terminal(TerminalDecision::Committed)?;
         let outcome = self.commit_accumulated(context, publication);
@@ -1099,6 +1161,12 @@ impl ConnectorWriteSession {
         self.require_received_productions()?;
         let (row_count, fragments, statistics, _retention) = {
             let mut accumulated = self.lock_accumulated()?;
+            if accumulated.received.is_some() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "sealed received input requires its borrowed publication call",
+                ));
+            }
             (
                 accumulated.rows.get(),
                 std::mem::take(&mut accumulated.fragments),
@@ -1254,7 +1322,7 @@ impl ConnectorWriteSession {
                     commit: self.plan.commit_handle(),
                     context,
                     production,
-                    received: received.as_ref().map(|input| &input.prepared),
+                    received: received.as_ref().map(|input| &input.received.prepared),
                 })
         });
         // An aborted session can reach nothing else, whether the provider's
@@ -1773,7 +1841,7 @@ pub(crate) mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct FakeHandle(u32);
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct FakeFragment(u32);
+    struct FakeFragment(u32, Option<bytes::Bytes>);
 
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
@@ -1850,6 +1918,9 @@ pub(crate) mod tests {
         capture_begin_context: bool,
         begin_context: Option<ConnectorRequestContext>,
         pub(crate) finish_future_drops: usize,
+        pub(crate) finalization_context:
+            Option<Result<Option<ConnectorRequestContext>, ConnectorError>>,
+        pub(crate) finalization_context_reads: usize,
         begin_future_drops: usize,
         panic_begin_future_drop: bool,
         source_drops: usize,
@@ -1879,6 +1950,13 @@ pub(crate) mod tests {
         pub(crate) publication: Option<ConnectorWriteFinishPublication>,
         row_change: Option<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>>,
         row_change_queries: usize,
+        row_change_session: Option<std::sync::Weak<ConnectorWriteSession>>,
+        row_change_failure: Option<ConnectorError>,
+        panic_row_change: bool,
+        row_change_prepared_address: Option<usize>,
+        finish_prepared_address: Option<usize>,
+        retain_decoded_payload: bool,
+        row_change_payload: Option<bytes::Bytes>,
         /// What the last terminal request could actually read object storage
         /// with. A real provider resolves this before it reloads table metadata
         /// or writes a manifest, so recording it here is recording whether the
@@ -2032,6 +2110,7 @@ pub(crate) mod tests {
                 let mut recorded = self.recorded.lock().expect("recorded");
                 recorded.finish += 1;
                 recorded.finish_rows = prepared.row_count();
+                recorded.finish_prepared_address = Some(prepared as *const _ as usize);
                 if let Some(capacity) = &recorded.expected_finish_capacity {
                     assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
                 }
@@ -2049,6 +2128,14 @@ pub(crate) mod tests {
         }
     }
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSession {
+        fn existing_finalization_context(
+            &self,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+        ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
+            let mut recorded = self.recorded.lock().unwrap();
+            recorded.finalization_context_reads += 1;
+            recorded.finalization_context.clone().unwrap_or(Ok(None))
+        }
         fn begin_write_async<'a>(
             &'a self,
             request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
@@ -2241,12 +2328,35 @@ pub(crate) mod tests {
         > {
             self.adapter.commit_handle(commit)?;
             assert_eq!(prepared.row_count(), 1);
+            let mut original_payload = None;
             for (_, fragment) in prepared.fragments() {
-                self.adapter.commit_fragment(fragment)?;
+                let original = self.adapter.commit_fragment(fragment)?;
+                original_payload = original.1.clone();
             }
-            let mut recorded = self.recorded.lock().unwrap();
-            recorded.row_change_queries += 1;
-            recorded.row_change.ok_or_else(|| {
+            let (session, panic, failure, change) = {
+                let mut recorded = self.recorded.lock().unwrap();
+                recorded.row_change_queries += 1;
+                recorded.row_change_prepared_address = Some(prepared as *const _ as usize);
+                recorded.row_change_payload = original_payload;
+                (
+                    recorded.row_change_session.clone(),
+                    recorded.panic_row_change,
+                    recorded.row_change_failure.take(),
+                    recorded.row_change,
+                )
+            };
+            if let Some(session) = session.and_then(|weak| weak.upgrade()) {
+                assert!(session.terminal.try_lock().is_ok());
+                assert!(session.productions.try_lock().is_ok());
+                assert!(session.accumulated.try_lock().is_ok());
+                assert!(session.publication_input.try_lock().is_ok());
+                assert!(session.finish_publication.try_lock().is_ok());
+            }
+            assert!(!panic, "scripted logical row projection panic");
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            change.ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::Unsupported,
                     "scripted row change is unavailable",
@@ -2471,8 +2581,14 @@ pub(crate) mod tests {
             _fragment: &ConnectorEncodedPayload,
         ) -> Result<ConnectorCommitFragment, novarocks_spi::connector::ConnectorCodecError>
         {
-            self.recorded.lock().unwrap().decoded_fragments += 1;
-            Ok(self.adapter.wrap_commit_fragment(FakeFragment(0)))
+            let retain = {
+                let mut recorded = self.recorded.lock().unwrap();
+                recorded.decoded_fragments += 1;
+                recorded.retain_decoded_payload
+            };
+            Ok(self
+                .adapter
+                .wrap_commit_fragment(FakeFragment(0, retain.then(|| _fragment.payload().clone()))))
         }
     }
 
@@ -3105,6 +3221,315 @@ pub(crate) mod tests {
         let committed = finish_write_session(completion, request_context()).unwrap();
         assert_eq!(committed.affected_rows(), Some(1));
         assert_eq!(fixture.session.finish_invocations(), 1);
+    }
+
+    #[test]
+    fn received_row_projection_and_publication_borrow_one_original_packet() {
+        use novarocks_spi::connector::write_stack::ConnectorWriteRowChange;
+        let fixture = fixture_with_statistics(1);
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let decoded = fixture
+            .session
+            .computation_decode(&[target])
+            .unwrap()
+            .interpret(DecodedPreparedWriteSet::for_test_with_statistics(
+                1,
+                vec![(target, commit_fragment_bytes())],
+                vec![statistics_artifact(0, 1, b"original-statistics")],
+            ))
+            .unwrap();
+        fixture.session.receiving_port().accept(decoded).unwrap();
+        {
+            let mut recorded = fixture.recorded.lock().unwrap();
+            recorded.row_change = Some(Some(ConnectorWriteRowChange::Delta {
+                inserted: 1,
+                deleted: 0,
+            }));
+            recorded.row_change_session = Some(Arc::downgrade(&fixture.session));
+        }
+        assert_eq!(
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
+                .unwrap(),
+            Some(3)
+        );
+        let received = fixture
+            .session
+            .lock_accumulated()
+            .unwrap()
+            .received
+            .clone()
+            .unwrap();
+        assert_eq!(received.prepared.row_count(), 1);
+        assert_eq!(received.prepared.fragments().len(), 1);
+        assert_eq!(
+            received.statistics[0].draft().body().as_ref(),
+            b"original-statistics"
+        );
+        assert!(fixture.session.lock_terminal().unwrap().is_none());
+        assert_eq!(fixture.recorded.lock().unwrap().decoded_fragments, 1);
+        assert!(
+            fixture
+                .session
+                .accumulate(DecodedPreparedWriteSet::for_test(1, Vec::new()))
+                .is_err()
+        );
+        assert!(
+            fixture
+                .session
+                .finish_accumulated(request_context())
+                .is_err()
+        );
+        assert!(fixture.session.lock_terminal().unwrap().is_none());
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .unwrap();
+        {
+            let input = fixture.session.publication_input.lock().unwrap();
+            assert!(Arc::ptr_eq(&received, &input.as_ref().unwrap().received));
+        }
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.poll_completed(&mut cx).is_ready());
+        let recorded = fixture.recorded.lock().unwrap();
+        assert_eq!(recorded.decoded_fragments, 1);
+        assert_eq!(recorded.row_change_queries, 1);
+        assert_eq!(
+            recorded.row_change_prepared_address,
+            recorded.finish_prepared_address
+        );
+        assert_eq!(
+            recorded.statistics[0].draft().body().as_ref(),
+            b"original-statistics"
+        );
+        assert_eq!(recorded.finish, 1);
+    }
+
+    #[test]
+    fn received_projection_refusal_or_panic_keeps_original_payload_for_abort() {
+        use novarocks_failure_contract::SharedFailureCause;
+        for panic in [false, true] {
+            let fixture = fixture_with_outcome(1, 16, known_committed());
+            let target = WriteTargetOrdinal::try_new(0).unwrap();
+            fixture
+                .session
+                .accumulate(DecodedPreparedWriteSet::for_test(
+                    1,
+                    vec![(target, commit_fragment_bytes())],
+                ))
+                .unwrap();
+            let failure = ConnectorError::from_domain(
+                ConnectorErrorKind::ResourceExhausted,
+                novarocks_workload_control::WorkError::Capacity("original row projection refusal"),
+            );
+            let original = std::error::Error::source(&failure)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap()
+                .clone();
+            {
+                let mut recorded = fixture.recorded.lock().unwrap();
+                recorded.row_change_failure = Some(failure);
+                recorded.panic_row_change = panic;
+                recorded.row_change_session = Some(Arc::downgrade(&fixture.session));
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fixture
+                    .session
+                    .logical_rows_after_received_write(Some(2), &request_context())
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                let failure = result.unwrap().unwrap_err();
+                assert_eq!(failure.kind(), ConnectorErrorKind::ResourceExhausted);
+                assert_eq!(
+                    std::error::Error::source(&failure)
+                        .unwrap()
+                        .downcast_ref::<SharedFailureCause>()
+                        .unwrap(),
+                    &original
+                );
+            }
+            let received = fixture
+                .session
+                .lock_accumulated()
+                .unwrap()
+                .received
+                .clone()
+                .unwrap();
+            assert_eq!(received.prepared.fragments().len(), 1);
+            assert!(fixture.session.lock_terminal().unwrap().is_none());
+            let mut call = fixture
+                .session
+                .prepare_abort_call(request_context())
+                .unwrap();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(call.poll_completed(&mut cx).is_ready());
+            assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 1);
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+            assert_eq!(received.prepared.fragments().len(), 1);
+        }
+    }
+
+    #[test]
+    fn received_input_validation_refusal_moves_no_original_inventory() {
+        let (_control, _root, binding, _capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let fixture = fixture_with_statistics(1);
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        fixture
+            .session
+            .accumulate(
+                DecodedPreparedWriteSet::for_test_with_statistics(
+                    1,
+                    vec![(target, commit_fragment_bytes())],
+                    vec![statistics_artifact(0, 1, b"retained-statistics")],
+                )
+                .with_test_capacity(&binding),
+            )
+            .unwrap();
+        let original_address = {
+            let mut union = fixture.session.lock_accumulated().unwrap();
+            // Exercise the SPI receiving validator on the original unique Vec;
+            // a foreign target cannot make it consume the deletion inventory.
+            union.fragments[0].0 = WriteTargetOrdinal::try_new(1).unwrap();
+            union.fragments.as_ptr() as usize
+        };
+        let failure = fixture
+            .session
+            .logical_rows_after_received_write(Some(2), &request_context())
+            .unwrap_err();
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        let mut union = fixture.session.lock_accumulated().unwrap();
+        assert!(union.received.is_none());
+        assert_eq!(union.fragments.as_ptr() as usize, original_address);
+        assert_eq!(union.fragments.len(), 1);
+        assert_eq!(
+            union.statistics[0].draft().body().as_ref(),
+            b"retained-statistics"
+        );
+        assert!(union.retention.is_some());
+        assert_eq!(union.rows.get(), 1);
+        union.fragments[0].0 = target;
+        assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 0);
+    }
+
+    #[test]
+    fn unknown_publication_retains_the_same_projected_packet() {
+        let fixture = fixture_with_outcome(1, 16, commit_unknown());
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test(
+                1,
+                vec![(target, commit_fragment_bytes())],
+            ))
+            .unwrap();
+        fixture.recorded.lock().unwrap().row_change = Some(None);
+        assert_eq!(
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
+                .unwrap(),
+            None
+        );
+        let original = fixture
+            .session
+            .lock_accumulated()
+            .unwrap()
+            .received
+            .clone()
+            .unwrap();
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.poll_completed(&mut cx).is_ready());
+        assert!(matches!(call.outcome(), Some(Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { .. }))));
+        assert!(call.retains_original_unknown());
+        assert!(Arc::ptr_eq(
+            &original,
+            &fixture
+                .session
+                .lock_accumulated()
+                .unwrap()
+                .received
+                .as_ref()
+                .unwrap()
+        ));
+        assert_eq!(original.prepared.fragments().len(), 1);
+        assert_eq!(fixture.recorded.lock().unwrap().decoded_fragments, 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        assert!(
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
+                .is_err()
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 1);
+    }
+
+    #[test]
+    fn received_packet_and_last_buffer_alias_keep_only_the_original_receipts() {
+        let (_control, root, legacy_binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        drop(legacy_binding);
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(&root.owner).unwrap();
+        let observed = binding.window_alias();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let encoded = commit_fragment_bytes();
+        let encoded_bytes = encoded.len() as u64;
+        fixture.recorded.lock().unwrap().retain_decoded_payload = true;
+        fixture
+            .session
+            .accumulate(
+                DecodedPreparedWriteSet::for_test(1, vec![(target, encoded)])
+                    .with_test_capacity(&binding),
+            )
+            .unwrap();
+        // The canonical backing exited. Its one real outer copy remains in
+        // the Provider's actual Bytes, together with only that copy's receipt.
+        assert_eq!(observed.retained_payload_bytes(), encoded_bytes);
+        fixture.recorded.lock().unwrap().row_change = Some(None);
+        assert_eq!(
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
+                .unwrap(),
+            None
+        );
+        let received = fixture
+            .session
+            .lock_accumulated()
+            .unwrap()
+            .received
+            .clone()
+            .unwrap();
+        let payload = fixture
+            .recorded
+            .lock()
+            .unwrap()
+            .row_change_payload
+            .take()
+            .unwrap();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        let weak = Arc::downgrade(&fixture.session);
+        drop(fixture);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        drop(received);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(observed.retained_payload_bytes(), encoded_bytes);
+        drop(payload);
+        assert_eq!(observed.retained_payload_bytes(), 0);
     }
 
     #[test]
@@ -4235,7 +4660,13 @@ pub(crate) mod tests {
     }
 
     fn publication_fixture() -> Fixture {
-        let fixture = fixture_with_outcome(1, 16, known_committed());
+        publication_fixture_with_outcome(known_committed())
+    }
+
+    fn publication_fixture_with_outcome(
+        outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+    ) -> Fixture {
+        let fixture = fixture_with_outcome(1, 16, outcome);
         let target = WriteTargetOrdinal::try_new(0).unwrap();
         fixture
             .session
@@ -4263,6 +4694,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
+                .received
                 .prepared
                 .row_count(),
             7
@@ -4275,6 +4707,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
+                .received
                 .prepared
                 .fragments()
                 .len(),
@@ -4438,7 +4871,14 @@ pub(crate) mod tests {
     #[test]
     fn child_drop_panic_retains_original_result_and_forbids_repoll_or_transfer() {
         let fixture = publication_fixture();
-        fixture.recorded.lock().unwrap().panic_finish_future_drop = true;
+        let context = request_context();
+        struct OriginalFinalizationScope;
+        let scope = context.request_scope_extension_or_insert_with(|| OriginalFinalizationScope);
+        {
+            let mut recorded = fixture.recorded.lock().unwrap();
+            recorded.panic_finish_future_drop = true;
+            recorded.finalization_context = Some(Ok(Some(context.clone())));
+        }
         let mut call = fixture
             .session
             .prepare_finish_call(request_context())
@@ -4457,11 +4897,171 @@ pub(crate) mod tests {
             Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
         );
         assert!(call.local_health_failure().is_some());
+        assert_eq!(
+            call.received_committed_effect(),
+            Some(novarocks_spi::connector::ExternalMutationEffect::Applied)
+        );
+        // The getter ran before the actual child destructor, not lazily after
+        // this unwind. Its original context is still observable with no repoll.
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+        let received = call.existing_finalization_context().unwrap().unwrap();
+        assert_eq!(received.deadline(), context.deadline());
+        assert!(Arc::ptr_eq(
+            &scope,
+            &received.request_scope_extension_or_insert_with(|| OriginalFinalizationScope)
+        ));
         assert!(call.poll_completed(&mut cx).is_pending());
         let mut result = None;
         assert!(call.take_outcome_in(&mut result).is_err());
         assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
         assert_eq!(fixture.recorded.lock().unwrap().finish_future_drops, 1);
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+    }
+
+    #[test]
+    fn finalization_getter_refusal_keeps_commit_and_original_cause_without_health_failure() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let fixture = publication_fixture();
+        let error = ConnectorError::from_domain(
+            ConnectorErrorKind::Unavailable,
+            novarocks_workload_control::WorkError::Released,
+        );
+        let fact = error.failure_fact();
+        let original = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .downcast_ref::<novarocks_workload_control::WorkError>()
+            .unwrap();
+        fixture.recorded.lock().unwrap().finalization_context = Some(Err(error.clone()));
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.poll_completed(&mut cx).is_ready());
+        assert!(call.local_health_failure().is_none());
+        assert_eq!(
+            call.publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
+        );
+        fixture.recorded.lock().unwrap().finalization_context = Some(Ok(None));
+        for _ in 0..2 {
+            let observed = match call.existing_finalization_context() {
+                Err(error) => error,
+                Ok(_) => panic!("the original getter refusal remains independent of commit"),
+            };
+            assert_eq!(observed.failure_fact(), fact);
+            let actual = std::error::Error::source(&observed)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap()
+                .downcast_ref::<novarocks_workload_control::WorkError>()
+                .unwrap();
+            assert!(std::ptr::eq(actual, original));
+        }
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish_future_drops, 1);
+        let mut result = None;
+        call.take_outcome_in(&mut result).unwrap();
+        assert!(matches!(result, Some(Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { .. }))));
+    }
+
+    #[test]
+    fn no_op_child_drop_panic_keeps_the_canonical_absence_of_effect() {
+        let mut outcome = known_committed();
+        let ExternalMutationOutcome::KnownCommitted { effect, .. } = &mut outcome else {
+            unreachable!()
+        };
+        *effect = novarocks_spi::connector::ExternalMutationEffect::NoOp;
+        let fixture = publication_fixture_with_outcome(outcome);
+        fixture.recorded.lock().unwrap().panic_finish_future_drop = true;
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call.poll_completed(&mut cx)))
+                .is_err()
+        );
+        assert_eq!(
+            call.publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
+        );
+        assert_eq!(
+            call.received_committed_effect(),
+            Some(novarocks_spi::connector::ExternalMutationEffect::NoOp)
+        );
+        assert!(call.local_health_failure().is_some());
+        assert!(call.poll_completed(&mut cx).is_pending());
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+
+    #[test]
+    fn committed_abort_receives_context_before_its_actual_child_drop_panics() {
+        let fixture = publication_fixture();
+        let context = request_context();
+        struct OriginalAbortFinalizationScope;
+        let scope =
+            context.request_scope_extension_or_insert_with(|| OriginalAbortFinalizationScope);
+        let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup } =
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome(known_committed())
+        else { unreachable!() };
+        {
+            let mut recorded = fixture.recorded.lock().unwrap();
+            recorded.abort_outcome =
+                Some(ConnectorWriteAbortOutcome::KnownCommitted { needed, cleanup });
+            recorded.finalization_context = Some(Ok(Some(context.clone())));
+            recorded.panic_abort_future_drop = true;
+        }
+        let mut call = fixture
+            .session
+            .prepare_abort_call(request_context())
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call.poll_completed(&mut cx)))
+                .is_err()
+        );
+        assert!(call.retains_unreceived_outcome());
+        assert_eq!(
+            call.publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
+        );
+        assert!(call.local_health_failure().is_some());
+        assert_eq!(
+            call.received_committed_effect(),
+            Some(novarocks_spi::connector::ExternalMutationEffect::Applied)
+        );
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+        let received = call.existing_finalization_context().unwrap().unwrap();
+        assert_eq!(received.deadline(), context.deadline());
+        assert!(Arc::ptr_eq(
+            &scope,
+            &received.request_scope_extension_or_insert_with(|| OriginalAbortFinalizationScope)
+        ));
+        assert!(call.poll_completed(&mut cx).is_pending());
+        let mut result = None;
+        assert!(call.take_abort_outcome_in(&mut result).is_err());
+        assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
+        assert_eq!(fixture.recorded.lock().unwrap().abort_future_drops, 1);
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
     }
 
     #[test]
@@ -4678,6 +5278,7 @@ pub(crate) mod tests {
             Some(novarocks_spi::connector::LakePublicationDisposition::KnownUncommitted)
         );
         assert!(call.local_health_failure().is_some());
+        assert_eq!(call.received_committed_effect(), None);
         assert!(call.poll_completed(&mut cx).is_pending());
         let mut result = None;
         assert!(call.take_abort_outcome_in(&mut result).is_err());

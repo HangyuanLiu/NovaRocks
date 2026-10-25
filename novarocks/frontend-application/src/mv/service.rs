@@ -123,6 +123,18 @@ impl FrontendMvProductAdapter {
         Arc::clone(&self.readiness)
     }
 
+    pub(crate) fn original_refresh_ports(
+        &self,
+    ) -> (
+        Arc<MvKeyedProductService>,
+        Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation>,
+    ) {
+        (
+            self.product_service.clone(),
+            self.refresh.provider_activation.clone(),
+        )
+    }
+
     pub(crate) fn product_service(&self) -> &MvKeyedProductService {
         self.product_service.as_ref()
     }

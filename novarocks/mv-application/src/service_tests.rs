@@ -15,15 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
-use super::MvKeyedProductService;
+use super::{MvKeyedProductService, MvRefreshTransition};
 use crate::activity::{CanonicalMvTarget, MvActivityGateError, MvActivityOwner};
 use crate::persistence::definition::CreateMvDefinitionRequest;
 use crate::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
     MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvProviderFailureKind,
-    MvRefreshExecutionPort, MvRefreshKnownCommittedPort,
+    MvRefreshProgressPort,
 };
 use crate::process_runtime::ProcessRuntime;
 use crate::product::{
@@ -177,44 +180,136 @@ impl MvDropCatalogRegistrationPort for CreateEffects {
 struct RefreshExecutionEffects {
     effects: Arc<CreateEffects>,
     published: MvRefreshPublicationFinalizationFacts,
+    execution: Option<Result<(), MvProviderFailure>>,
+    projection: Option<Result<(), MvProviderFailure>>,
+    execute_released: bool,
+    projection_released: bool,
+    execution_started: bool,
+    projection_started: bool,
+    dispatches: usize,
+    projections: usize,
+    execution_polls: usize,
+    projection_polls: usize,
+    drops: Arc<AtomicUsize>,
+    observed: Option<(MvTarget, crate::product::MvRefreshAttemptIdentity)>,
+    execution_panic: Option<Arc<&'static str>>,
+    projection_panic: Option<Arc<&'static str>>,
 }
 
-struct KnownCommittedEffects {
-    effects: Arc<CreateEffects>,
-    published: MvRefreshPublicationFinalizationFacts,
-}
-
-impl MvRefreshExecutionPort for RefreshExecutionEffects {
-    fn execute_refresh(
-        self: Box<Self>,
-        _target: &MvTarget,
-        _attempt: &crate::product::MvRefreshAttemptIdentity,
-    ) -> Result<Box<dyn MvRefreshKnownCommittedPort>, MvProviderFailure> {
-        Ok(Box::new(KnownCommittedEffects {
-            effects: self.effects,
-            published: self.published,
-        }))
+impl RefreshExecutionEffects {
+    fn new(effects: Arc<CreateEffects>, published: MvRefreshPublicationFinalizationFacts) -> Self {
+        Self {
+            effects,
+            published,
+            execution: None,
+            projection: None,
+            execute_released: true,
+            projection_released: true,
+            execution_started: false,
+            projection_started: false,
+            dispatches: 0,
+            projections: 0,
+            execution_polls: 0,
+            projection_polls: 0,
+            drops: Arc::new(AtomicUsize::new(0)),
+            observed: None,
+            execution_panic: None,
+            projection_panic: None,
+        }
     }
 }
 
-impl MvRefreshKnownCommittedPort for KnownCommittedEffects {
-    fn finalization_facts(&self) -> &MvRefreshPublicationFinalizationFacts {
-        &self.published
+impl Drop for RefreshExecutionEffects {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl MvRefreshProgressPort for RefreshExecutionEffects {
+    fn poll_execute_refresh(
+        &mut self,
+        _cx: &mut Context<'_>,
+        target: &MvTarget,
+        attempt: &crate::product::MvRefreshAttemptIdentity,
+    ) -> Poll<()> {
+        self.execution_polls += 1;
+        if !self.execution_started {
+            self.execution_started = true;
+            self.dispatches += 1;
+            self.observed = Some((target.clone(), attempt.clone()));
+        }
+        assert_eq!(
+            self.observed.as_ref(),
+            Some(&(target.clone(), attempt.clone()))
+        );
+        if !self.execute_released {
+            return Poll::Pending;
+        }
+        if self.execution.is_none() {
+            self.execution = Some(Ok(()));
+        }
+        if let Some(cause) = &self.execution_panic {
+            std::panic::panic_any(Arc::clone(cause));
+        }
+        Poll::Ready(())
     }
 
-    fn project_known_committed(
-        self: Box<Self>,
+    fn execution_outcome(
+        &self,
+    ) -> Option<Result<&MvRefreshPublicationFinalizationFacts, &MvProviderFailure>> {
+        self.execution.as_ref().map(|result| match result {
+            Ok(()) => Ok(&self.published),
+            Err(error) => Err(error),
+        })
+    }
+
+    fn poll_project_known_committed(
+        &mut self,
+        _cx: &mut Context<'_>,
         _target: &MvTarget,
-    ) -> Result<(), MvProviderFailure> {
-        self.effects.record("project_known_committed");
-        if self.effects.fail_known_committed_projection {
-            return Err(MvProviderFailure::new(
+    ) -> Poll<()> {
+        self.projection_polls += 1;
+        if !self.projection_started {
+            self.projection_started = true;
+            self.projections += 1;
+            self.effects.record("project_known_committed");
+        }
+        if !self.projection_released {
+            return Poll::Pending;
+        }
+        self.projection = Some(if self.effects.fail_known_committed_projection {
+            Err(MvProviderFailure::new(
                 MvProviderFailureKind::Unavailable,
                 "known-committed projection failed",
-            ));
+            ))
+        } else {
+            Ok(())
+        });
+        if let Some(cause) = &self.projection_panic {
+            std::panic::panic_any(Arc::clone(cause));
         }
-        Ok(())
+        Poll::Ready(())
     }
+
+    fn projection_outcome(&self) -> Option<&Result<(), MvProviderFailure>> {
+        self.projection.as_ref()
+    }
+}
+
+fn finish_refresh(
+    service: &MvKeyedProductService,
+    target: MvTarget,
+    attempt: crate::product::MvRefreshAttemptIdentity,
+    execution: &mut dyn MvRefreshProgressPort,
+) -> Result<MvProductResult, crate::product::MvProductError> {
+    let mut transition = MvRefreshTransition::new(target, attempt);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(
+        service
+            .poll_refresh(&mut cx, &mut transition, execution)
+            .is_ready()
+    );
+    transition.result().expect("stable refresh result").clone()
 }
 
 fn finalization_facts(
@@ -445,16 +540,9 @@ async fn known_committed_refresh_projection_is_product_finalization() {
     let attempt = service.reserve_refresh_attempt();
     let published = finalization_facts(&target, &attempt);
 
-    let result = service
-        .execute_refresh(
-            &target,
-            &attempt,
-            Box::new(RefreshExecutionEffects {
-                effects: Arc::clone(&effects),
-                published,
-            }),
-        )
-        .expect("projection succeeds");
+    let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
+    let result =
+        finish_refresh(&service, target, attempt, &mut execution).expect("projection succeeds");
 
     assert!(matches!(result, MvProductResult::Acknowledged));
     assert_eq!(effects.events(), ["project_known_committed"]);
@@ -469,15 +557,8 @@ async fn known_committed_refresh_rejects_a_different_publication_before_projecti
     let other_attempt = service.reserve_refresh_attempt();
     let published = finalization_facts(&target, &other_attempt);
 
-    let error = service
-        .execute_refresh(
-            &target,
-            &attempt,
-            Box::new(RefreshExecutionEffects {
-                effects: Arc::clone(&effects),
-                published,
-            }),
-        )
+    let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
+    let error = finish_refresh(&service, target, attempt, &mut execution)
         .expect_err("different publication identity must be rejected");
 
     assert_eq!(error.kind(), MvProductErrorKind::Corruption);
@@ -519,15 +600,8 @@ async fn known_committed_refresh_keeps_external_commit_when_projection_fails() {
     let attempt = service.reserve_refresh_attempt();
     let published = finalization_facts(&target, &attempt);
 
-    let error = service
-        .execute_refresh(
-            &target,
-            &attempt,
-            Box::new(RefreshExecutionEffects {
-                effects: Arc::clone(&effects),
-                published,
-            }),
-        )
+    let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
+    let error = finish_refresh(&service, target, attempt, &mut execution)
         .expect_err("projection finalization fails");
 
     assert_eq!(
@@ -758,4 +832,173 @@ fn a_committed_finalization_failure_cannot_become_a_pure_admission_refusal() {
     );
     assert_eq!(failure.unavailable_implementation(), None);
     assert_eq!(failure.message(), message);
+}
+
+#[tokio::test]
+async fn cancelling_a_borrowed_refresh_wait_retains_the_original_execution_and_lease() {
+    let service = service_with_refresh_readiness().await;
+    let readiness = service.keyed_readiness_service().expect("keyed readiness");
+    let effects = Arc::new(CreateEffects::default());
+    let target = MvTarget::from_parts(Some("iceberg"), "db", "borrowed");
+    let attempt = service.reserve_refresh_attempt();
+    let published = finalization_facts(&target, &attempt);
+    let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
+    execution.execute_released = false;
+    let drops = Arc::clone(&execution.drops);
+    let mut transition = MvRefreshTransition::new(target.clone(), attempt.clone());
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    {
+        let mut borrowed = Box::pin(std::future::poll_fn(|cx| {
+            service.poll_refresh(cx, &mut transition, &mut execution)
+        }));
+        assert!(borrowed.as_mut().poll(&mut cx).is_pending());
+        // Only the borrowing wait is cancelled; the original Action slots remain.
+        drop(borrowed);
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(transition.result().is_none());
+    assert!(readiness.ensure_no_active_publications().is_err());
+    let second = service.reserve_refresh_attempt();
+    let Err(error) = service.begin_refresh_publication(&target, &second) else {
+        panic!("the first borrowed execution still owns publication admission");
+    };
+    assert_eq!(error.kind(), MvProductErrorKind::Conflict);
+    assert!(
+        service
+            .poll_refresh(&mut cx, &mut transition, &mut execution)
+            .is_pending()
+    );
+    assert_eq!(execution.dispatches, 1);
+    assert_eq!(execution.observed.as_ref(), Some(&(target, attempt)));
+    assert!(effects.events().is_empty());
+    execution.execute_released = true;
+    assert!(
+        service
+            .poll_refresh(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    assert!(matches!(
+        transition.result(),
+        Some(Ok(MvProductResult::Acknowledged))
+    ));
+    readiness.ensure_no_active_publications().unwrap();
+    let polls = (execution.execution_polls, execution.projection_polls);
+    assert!(
+        service
+            .poll_refresh(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    assert_eq!(
+        (execution.execution_polls, execution.projection_polls),
+        polls
+    );
+    assert_eq!(execution.dispatches, 1);
+    assert_eq!(execution.projections, 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(execution);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelling_a_projection_wait_retains_the_same_known_commit_without_reexecution() {
+    let service = service_with_refresh_readiness().await;
+    let readiness = service.keyed_readiness_service().expect("keyed readiness");
+    let effects = Arc::new(CreateEffects::default());
+    let target = MvTarget::from_parts(Some("iceberg"), "db", "projection_wait");
+    let attempt = service.reserve_refresh_attempt();
+    let published = finalization_facts(&target, &attempt);
+    let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
+    execution.projection_released = false;
+    let original_facts = &execution.published as *const _;
+    let drops = Arc::clone(&execution.drops);
+    let mut transition = MvRefreshTransition::new(target, attempt);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    {
+        let mut borrowed = Box::pin(std::future::poll_fn(|cx| {
+            service.poll_refresh(cx, &mut transition, &mut execution)
+        }));
+        assert!(borrowed.as_mut().poll(&mut cx).is_pending());
+        drop(borrowed);
+    }
+    assert_eq!(execution.dispatches, 1);
+    assert_eq!(execution.projections, 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(transition.result().is_none());
+    assert!(readiness.ensure_no_active_publications().is_err());
+    assert_eq!(
+        execution.execution_outcome().unwrap().unwrap() as *const _,
+        original_facts
+    );
+    let execution_polls = execution.execution_polls;
+    assert!(
+        service
+            .poll_refresh(&mut cx, &mut transition, &mut execution)
+            .is_pending()
+    );
+    assert_eq!(execution.execution_polls, execution_polls);
+    execution.projection_released = true;
+    assert!(
+        service
+            .poll_refresh(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    assert!(matches!(
+        transition.result(),
+        Some(Ok(MvProductResult::Acknowledged))
+    ));
+    assert_eq!(execution.dispatches, 1);
+    assert_eq!(execution.projections, 1);
+    assert_eq!(effects.events(), ["project_known_committed"]);
+    readiness.ensure_no_active_publications().unwrap();
+}
+
+#[tokio::test]
+async fn a_foreign_refresh_unwind_retains_the_received_fact_and_never_repolls_or_finishes() {
+    for during_projection in [false, true] {
+        let service = service_with_refresh_readiness().await;
+        let readiness = service.keyed_readiness_service().expect("keyed readiness");
+        let effects = Arc::new(CreateEffects::default());
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "poisoned");
+        let attempt = service.reserve_refresh_attempt();
+        let published = finalization_facts(&target, &attempt);
+        let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
+        let cause = Arc::new("original foreign refresh panic");
+        if during_projection {
+            execution.projection_panic = Some(Arc::clone(&cause));
+        } else {
+            execution.execution_panic = Some(Arc::clone(&cause));
+        }
+        let drops = Arc::clone(&execution.drops);
+        let mut transition = MvRefreshTransition::new(target, attempt);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.poll_refresh(&mut cx, &mut transition, &mut execution)
+        }))
+        .expect_err("the original Source receives the foreign panic");
+        let raw = raw
+            .downcast::<Arc<&'static str>>()
+            .expect("same raw cause type");
+        assert!(Arc::ptr_eq(raw.as_ref(), &cause));
+        assert!(execution.execution_outcome().unwrap().is_ok());
+        assert_eq!(execution.projection.is_some(), during_projection);
+        assert!(transition.result().is_none());
+        assert!(readiness.ensure_no_active_publications().is_err());
+        let polls = (execution.execution_polls, execution.projection_polls);
+        assert!(
+            service
+                .poll_refresh(&mut cx, &mut transition, &mut execution)
+                .is_pending()
+        );
+        assert_eq!(
+            (execution.execution_polls, execution.projection_polls),
+            polls
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // This fixture owns no physical request. Explicit disposal ends the test;
+        // production retains the same poisoned Action through the existing QA owner.
+        drop(execution);
+        drop(transition);
+        readiness.ensure_no_active_publications().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 }

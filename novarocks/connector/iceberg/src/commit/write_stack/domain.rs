@@ -1773,6 +1773,12 @@ struct IcebergWritePublication {
     // Rejection can precede the first dispatch entry. Preserve its actual
     // report here; reports after dispatch stay in the SAME original journal.
     early_cleanup: Option<crate::commit::model::IcebergCleanupReport>,
+    // The same positive entry's finite context, received before necessary
+    // awaits. It is neither a new grant nor a restartable deadline.
+    finalization_context: Option<(
+        crate::commit::attempt::observation::JournalEntryRef,
+        novarocks_spi::connector::ConnectorRequestContext,
+    )>,
 }
 impl std::fmt::Debug for IcebergWritePublication {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2386,8 +2392,96 @@ impl IcebergCommitHandle {
             operation,
             journal,
             early_cleanup: None,
+            finalization_context: None,
         });
         Ok(())
+    }
+
+    pub(crate) fn finalization_context_for_entry(
+        &self,
+        entry: crate::commit::attempt::observation::JournalEntryRef,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorRequestContext>, ConnectorError> {
+        let original = self
+            .publication
+            .lock()
+            .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+        match original
+            .as_ref()
+            .and_then(|source| source.finalization_context.as_ref())
+        {
+            Some((actual, context)) if *actual == entry => Ok(Some(context.clone())),
+            Some(_) => Err(invalid(
+                "Iceberg finalization context belongs to another journal entry",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn receive_finalization_context(
+        &self,
+        entry: crate::commit::attempt::observation::JournalEntryRef,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, ConnectorError> {
+        // A competing unused projection, including its retained capabilities,
+        // must be dropped outside the original receiving lock.
+        let mut context = Some(context);
+        let received = {
+            let mut original = self
+                .publication
+                .lock()
+                .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+            let source = original
+                .as_mut()
+                .ok_or_else(|| invalid("Iceberg finalization requires its original publication"))?;
+            match source.finalization_context.as_ref() {
+                Some((actual, existing)) if *actual == entry => existing.clone(),
+                Some(_) => {
+                    return Err(invalid(
+                        "Iceberg finalization context belongs to another journal entry",
+                    ));
+                }
+                None => {
+                    let received = context.take().expect("first original finalization context");
+                    source.finalization_context = Some((entry, received));
+                    source.finalization_context.as_ref().unwrap().1.clone()
+                }
+            }
+        };
+        drop(context);
+        Ok(received)
+    }
+
+    /// Pure observation: neither absence nor an expired cached context creates
+    /// another finalization grant. Positive evidence and same entry are exact.
+    pub(crate) fn existing_finalization_context(
+        &self,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorRequestContext>, ConnectorError> {
+        if !matches!(self.state()?, IcebergWriteSessionState::KnownCommitted { needed }
+            if needed.effect() == novarocks_spi::connector::ExternalMutationEffect::Applied)
+        {
+            return Ok(None);
+        }
+        let received = {
+            let original = self
+                .publication
+                .lock()
+                .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+            original.as_ref().and_then(|source| {
+                source
+                    .finalization_context
+                    .as_ref()
+                    .map(|(entry, context)| (source.journal.clone(), *entry, context.clone()))
+            })
+        };
+        let Some((journal, entry, context)) = received else {
+            return Ok(None);
+        };
+        if journal.current_entry() != Some(entry) {
+            return Err(invalid(
+                "Iceberg finalization context lost its original journal entry",
+            ));
+        }
+        Ok(Some(context))
     }
 
     /// Same retained publication owner, borrowed out of its lock before any

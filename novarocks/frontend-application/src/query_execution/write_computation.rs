@@ -238,6 +238,12 @@ impl ConnectorWriteSession {
                 "connector write session already reached a terminal decision",
             ));
         }
+        if self.lock_accumulated()?.received.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write receiving union is already sealed",
+            ));
+        }
         Ok(terminal)
     }
     pub(super) fn accept_interpreted(

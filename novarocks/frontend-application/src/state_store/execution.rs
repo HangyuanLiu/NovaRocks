@@ -19,6 +19,7 @@
 //! Borrowers never own a physical call. The same owner polls this inventory
 //! after its product future ends and keeps it through rollback and evidence.
 
+use crate::query_execution::maintenance::io_admission::ExistingMetadataObligation;
 use futures::task::AtomicWaker;
 use novarocks_failure_contract::FailureProjection;
 use novarocks_query_application::cpu::{
@@ -264,6 +265,42 @@ impl StateStoreOriginalOwner {
             policy: self.policy,
         })
     }
+
+    /// The same physical inventory borrows a previously registered metadata
+    /// obligation. The request wrapper retains neither this owner nor MIO.
+    pub(crate) fn existing_obligation_requests(
+        &self,
+        transaction_deadline: std::time::Duration,
+        obligation: ExistingMetadataObligation,
+    ) -> Result<Arc<dyn StateStoreExecutionRequests>, Failure> {
+        if transaction_deadline.is_zero() {
+            return Err(protocol(
+                "StateStore read transaction deadline must be positive",
+            ));
+        }
+        let control = RequestControl::ExistingObligation(obligation);
+        if let Some(cause) = control.stop(&self.port, control.deadline().unwrap()) {
+            return Err(cause);
+        }
+        if !self
+            .port
+            .inventory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .accepting
+        {
+            return Err(protocol("original StateStore request custody is closing"));
+        }
+        let requests: Arc<ExistingObligationRequests> =
+            Arc::new_cyclic(|weak| ExistingObligationRequests {
+                this: weak.clone(),
+                port: Arc::downgrade(&self.port),
+                control,
+                transaction_deadline,
+                policy: self.policy,
+            });
+        Ok(requests)
+    }
     pub(crate) fn request_close(&self) {
         let entries = {
             let mut inventory = self
@@ -433,6 +470,140 @@ impl StateStoreExecutionRequests for StateStoreOriginalRequests {
         self.read.context_for(self.policy.operation_timeout())
     }
 }
+
+/// One borrowed wrapper backs both request factories and their weak contexts.
+/// Its self-reference and physical Port reference are weak; Cells retain only
+/// the captured control, never a second owner or inventory.
+struct ExistingObligationRequests {
+    this: Weak<Self>,
+    port: Weak<Port>,
+    control: RequestControl,
+    transaction_deadline: std::time::Duration,
+    policy: novarocks_state_store_runtime::StateStoreRunPolicy,
+}
+impl ExistingObligationRequests {
+    fn context_for(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<StateStoreExecutionContext, Failure> {
+        let port = self
+            .port
+            .upgrade()
+            .ok_or_else(|| protocol("original StateStore obligation custody is unavailable"))?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| protocol("StateStore operation deadline is not representable"))?
+            .min(self.control.deadline().expect("same obligation control"));
+        if let Some(cause) = self.control.stop(&port, deadline) {
+            return Err(cause);
+        }
+        if !port
+            .inventory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .accepting
+        {
+            return Err(protocol("original StateStore request custody is closing"));
+        }
+        let wrapper: Arc<dyn StateStoreExecutionPort> = self
+            .this
+            .upgrade()
+            .ok_or_else(|| protocol("original StateStore request wrapper is unavailable"))?;
+        Ok(StateStoreExecutionContext::new(&wrapper, deadline))
+    }
+}
+impl StateStoreReadExecution for ExistingObligationRequests {
+    fn read_transaction_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+        self.context_for(self.transaction_deadline)
+    }
+}
+impl StateStoreExecutionRequests for ExistingObligationRequests {
+    fn write_operation_context(&self) -> Result<StateStoreExecutionContext, Failure> {
+        self.context_for(self.policy.operation_timeout())
+    }
+}
+impl StateStoreExecutionPort for ExistingObligationRequests {
+    fn bind_original_in(
+        &self,
+        original: &Arc<dyn StateStoreBlockingOriginal>,
+        deadline: Instant,
+        target: &mut Option<Box<dyn StateStoreBlockingSlot>>,
+    ) -> Result<(), Failure> {
+        let port = self
+            .port
+            .upgrade()
+            .ok_or_else(|| protocol("original StateStore obligation custody is unavailable"))?;
+        port.bind_original_with_control_in(original, deadline, self.control.clone(), target)
+    }
+    fn request_progress(&self) {
+        if let Some(port) = self.port.upgrade() {
+            port.wake.notify();
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RequestControl {
+    Business,
+    ExistingObligation(ExistingMetadataObligation),
+}
+impl RequestControl {
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Business => None,
+            Self::ExistingObligation(token) => Some(token.deadline()),
+        }
+    }
+    fn stop(&self, port: &Port, deadline: Instant) -> Option<Failure> {
+        match self {
+            Self::Business => port.business_stop(deadline),
+            Self::ExistingObligation(token) => {
+                let Purpose::Instance { root, .. } = &port.purpose else {
+                    return Some(protocol("metadata obligation requires the same Root port"));
+                };
+                token
+                    .check_active(root)
+                    .err()
+                    .or_else(|| deadline_failure(deadline))
+            }
+        }
+    }
+    fn wait(&self, port: &Port, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let root = match (self, &port.purpose) {
+            (Self::Business, Purpose::Instance { root, .. }) => Some(root.clone()),
+            _ => None,
+        };
+        let control = self.clone();
+        Box::pin(async move {
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+            let stopped = async move {
+                match control {
+                    Self::ExistingObligation(token) => token.stopped().await,
+                    Self::Business => match root {
+                        Some(root) => match root.cancellation() {
+                            Ok(cancel) => {
+                                cancel.cancelled().await;
+                            }
+                            Err(_) => {}
+                        },
+                        None => std::future::pending().await,
+                    },
+                }
+            };
+            tokio::select! { _ = sleep => {}, _ = stopped => {} }
+        })
+    }
+}
+
+fn deadline_failure(deadline: Instant) -> Option<Failure> {
+    (Instant::now() >= deadline).then(|| {
+        StateStoreError::new(
+            StateStoreErrorKind::DeadlineExceeded,
+            "state store original deadline exceeded",
+        )
+        .into_original_failure()
+    })
+}
 /// Cooperative batches bound one turn's observation cost, never admission
 /// or retained responsibility. All callers poll this same original inventory.
 fn poll_originals(port: &Arc<Port>, cx: &mut Context<'_>) -> Result<bool, Failure> {
@@ -572,22 +743,18 @@ impl Port {
                 return Some(failure(error));
             }
         }
-        (Instant::now() >= deadline).then(|| {
-            StateStoreError::new(
-                StateStoreErrorKind::DeadlineExceeded,
-                "state store original deadline exceeded",
-            )
-            .into_original_failure()
-        })
+        deadline_failure(deadline)
     }
 }
-impl StateStoreExecutionPort for Port {
-    fn bind_original_in(
+impl Port {
+    fn bind_original_with_control_in(
         &self,
         original: &Arc<dyn StateStoreBlockingOriginal>,
         deadline: Instant,
+        control: RequestControl,
         target: &mut Option<Box<dyn StateStoreBlockingSlot>>,
     ) -> Result<(), Failure> {
+        let deadline = control.deadline().map_or(deadline, |cap| deadline.min(cap));
         if target.is_some() {
             return Err(protocol("state store original borrower slot is occupied"));
         }
@@ -598,13 +765,14 @@ impl StateStoreExecutionPort for Port {
             self.purpose,
             Purpose::ClosingInstance { .. } | Purpose::InstanceEvidence { .. }
         ) {
-            if let Some(error) = self.business_stop(deadline) {
+            if let Some(error) = control.stop(self, deadline) {
                 return Err(error);
             }
         }
         let cell = Arc::new(Cell {
             original: original.clone(),
             deadline,
+            control,
             observer: AtomicWaker::new(),
             body: Mutex::new(Some(Body {
                 phase: None,
@@ -632,6 +800,16 @@ impl StateStoreExecutionPort for Port {
         }
         Ok(()) // Caller calls request_progress after stable provider installation.
     }
+}
+impl StateStoreExecutionPort for Port {
+    fn bind_original_in(
+        &self,
+        original: &Arc<dyn StateStoreBlockingOriginal>,
+        deadline: Instant,
+        target: &mut Option<Box<dyn StateStoreBlockingSlot>>,
+    ) -> Result<(), Failure> {
+        self.bind_original_with_control_in(original, deadline, RequestControl::Business, target)
+    }
     fn request_progress(&self) {
         self.wake.notify();
     }
@@ -639,6 +817,7 @@ impl StateStoreExecutionPort for Port {
 struct Cell {
     original: Arc<dyn StateStoreBlockingOriginal>,
     deadline: Instant,
+    control: RequestControl,
     observer: AtomicWaker,
     body: Mutex<Option<Body>>,
 }
@@ -780,30 +959,7 @@ impl Cell {
                 if replace {
                     let executor = port.executor.clone();
                     let reserve = Box::pin(async move { executor.reserve().await });
-                    let deadline = self.deadline;
-                    let root = match &port.purpose {
-                        Purpose::Opening
-                        | Purpose::BootstrapRead { .. }
-                        | Purpose::ClosingInstance { .. }
-                        | Purpose::InstanceEvidence { .. } => None,
-                        Purpose::Instance { root, .. } => Some(root.clone()),
-                    };
-                    let gate = Box::pin(async move {
-                        let sleep =
-                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-                        let cancelled = async move {
-                            match root {
-                                Some(root) => match root.cancellation() {
-                                    Ok(cancel) => {
-                                        cancel.cancelled().await;
-                                    }
-                                    Err(_) => {}
-                                },
-                                None => std::future::pending().await,
-                            }
-                        };
-                        tokio::select! { _ = sleep => {}, _ = cancelled => {} }
-                    });
+                    let gate = self.control.wait(port, self.deadline);
                     body.phase = Some(PhysicalPhase {
                         request,
                         call: Arc::new(PhaseCall {
@@ -910,8 +1066,9 @@ impl Cell {
                     phase.gate.take();
                 }
             }
-            if let Some(error) = port
-                .business_stop(self.deadline)
+            if let Some(error) = self
+                .control
+                .stop(port, self.deadline)
                 .or_else(|| self.original.publication_refusal(phase.request))
             {
                 if !phase.interrupted {
@@ -948,7 +1105,7 @@ impl Cell {
                 if let Some(error) = self
                     .original
                     .publication_refusal(phase.request)
-                    .or_else(|| port.business_stop(self.deadline))
+                    .or_else(|| self.control.stop(port, self.deadline))
                 {
                     return self.withdraw(phase, error);
                 }
@@ -969,7 +1126,7 @@ impl Cell {
                     if let Some(error) = self
                         .original
                         .publication_refusal(phase.request)
-                        .or_else(|| port.business_stop(self.deadline))
+                        .or_else(|| self.control.stop(port, self.deadline))
                     {
                         return self.withdraw(phase, error);
                     }
