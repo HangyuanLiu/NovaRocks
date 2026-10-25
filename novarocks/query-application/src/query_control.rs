@@ -1186,6 +1186,92 @@ mod tests {
         assert_eq!(workload.snapshot().root_responsibilities, 0);
     }
 
+    // A statement's retained data is not an executing computation. Keep the
+    // real Internal position occupied by an independent producer to prove both
+    // statement admission paths do not wait for or consume that position.
+    #[tokio::test]
+    async fn internal_statement_custody_does_not_take_another_compute_position() {
+        use futures::FutureExt;
+        use novarocks_workload_control::{
+            ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+        };
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new_counted(WorkloadConfig {
+            query_concurrency_limit: 1,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                all_objects_bytes: [64; 4],
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let (busy, physical) = workload
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let session = register(&control, 71, 1, "root");
+        let queued = service
+            .begin_queued_governed_query_statement_with_result(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+                ResultWindowClass::Internal,
+            )
+            .now_or_never()
+            .expect("Root retention must not wait for a compute position")
+            .unwrap();
+        assert_eq!(workload.snapshot().admitted_queries, 1);
+        let other = register(&control, 72, 2, "root");
+        let nonqueued = service
+            .begin_governed_statement_with_result(
+                other,
+                &workload.root_admission(),
+                WorkClass::Management,
+                None,
+                None,
+                None,
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let data = queued.result_window_alias().unwrap();
+        assert!(data.is_root_backed_internal());
+        assert!(data.internal_manifest_binding().unwrap().is_none());
+        assert!(data.native_action_authority().is_err());
+        let receipt = data.reserve_payload_bytes(40).unwrap();
+        let backing = vec![0u8; 40];
+        assert!(data.reserve_payload_bytes(25).is_err());
+        drop(queued);
+        drop(nonqueued);
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(physical);
+        busy.business.release();
+        busy.owner.complete();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        drop(data);
+        drop(backing);
+        drop(receipt);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
     #[tokio::test]
     async fn result_statement_takes_its_window_with_the_permit_and_keeps_it_for_aliases() {
         use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};

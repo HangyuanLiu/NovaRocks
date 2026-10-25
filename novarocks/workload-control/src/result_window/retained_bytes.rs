@@ -110,7 +110,8 @@ impl ResultWindowAlias {
     fn retained_bytes(&self) -> &RetainedBytes {
         match &self.backing {
             AliasBacking::Window { holder, .. } => &holder.retained_bytes,
-            AliasBacking::InternalRoot { budget, .. } => budget,
+            AliasBacking::InternalRoot { budget, .. }
+            | AliasBacking::RootRetention { budget, .. } => budget,
         }
     }
 

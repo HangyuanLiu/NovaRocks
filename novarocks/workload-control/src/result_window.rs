@@ -101,18 +101,12 @@ impl ResultCapacityConfig {
                 "client result computation and short-tail capacity",
             ));
         }
-        let mut total = 0u64;
+        // Positions count actual holders; each holder or Internal Root uses
+        // its own byte budget. No product of these declarations is reserved.
         for (positions, bytes) in self.positions.into_iter().zip(self.all_objects_bytes) {
-            if positions == 0 || positions > 1_000_000 || bytes == 0 {
+            if positions == 0 || bytes == 0 {
                 return Err(WorkError::InvalidConfig("result owner capacity"));
             }
-            total = total
-                .checked_add(
-                    bytes
-                        .checked_mul(positions as u64)
-                        .ok_or(WorkError::ArithmeticOverflow)?,
-                )
-                .ok_or(WorkError::ArithmeticOverflow)?;
         }
         Ok(self)
     }
@@ -420,8 +414,9 @@ impl ResultWindowGrant {
         }
     }
 }
-/// A view of one already-paid result backing. Internal Root pins do not
-/// acquire a delegated Node/control holder for the execution scope.
+/// A view of the original result owner's data budget and retained lifetime.
+/// Internal Root pins do not acquire a delegated Node/control holder for an
+/// attributed execution scope, nor does retention take a computation position.
 pub struct ResultWindowAlias {
     backing: AliasBacking,
 }
@@ -435,6 +430,11 @@ enum AliasBacking {
             crate::joint_admission::RetainedPayloadAlias,
         )>,
     },
+    RootRetention {
+        budget: Arc<RetainedBytes>,
+        pin: Arc<WindowExecutionScope>,
+        execution: WorkScope,
+    },
     InternalRoot {
         budget: Arc<RetainedBytes>,
         payload: crate::joint_admission::RetainedPayloadAlias,
@@ -444,7 +444,8 @@ enum AliasBacking {
     },
 }
 
-// Legacy Client/Local/Closing attribution retains its original actual holder.
+// One existing scope resource pin. Root data and legacy window attribution
+// keep this original scope live independently of any computation position.
 struct WindowExecutionScope {
     scope: WorkScope,
 }
@@ -454,7 +455,7 @@ impl Drop for WindowExecutionScope {
             let node = state
                 .nodes
                 .get_mut(&self.scope.id)
-                .expect("delegated window alias retains its child scope");
+                .expect("result retention keeps its original scope");
             node.resource_holders -= 1;
             state.collect(self.scope.id);
         });
@@ -503,7 +504,55 @@ impl NativeCapacityFence {
         }
     }
 }
+fn internal_root_budget(state: &mut State, root: WorkId) -> Result<Arc<RetainedBytes>, WorkError> {
+    let limit = state
+        .result_capacity
+        .ok_or(WorkError::NotReady)?
+        .all_objects_bytes[ResultWindowClass::Internal.index()];
+    let node = state.nodes.get_mut(&root).ok_or(WorkError::Released)?;
+    Ok(match node.internal_result_bytes.upgrade() {
+        Some(budget) => budget,
+        None => {
+            let budget = Arc::new(RetainedBytes::new(limit));
+            node.internal_result_bytes = Arc::downgrade(&budget);
+            budget
+        }
+    })
+}
+
 impl ResultWindowAlias {
+    /// Retain actual data under this unique active Root owner. This borrows
+    /// the installed per-Root byte budget without taking a computation/window
+    /// position, payload grant, manifest binding or physical execution source.
+    pub fn from_root_owner(owner: &crate::WorkOwner) -> Result<Self, WorkError> {
+        let root = owner.scope();
+        root.inner.update(|state| {
+            let node = state.nodes.get(&root.id).ok_or(WorkError::Released)?;
+            node.check(&state.cancellations)?;
+            if node.owner != crate::OwnerState::Active
+                || node.parent.is_some()
+                || node.root != root.id
+            {
+                return Err(WorkError::Conflict);
+            }
+            let holders = node
+                .resource_holders
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let budget = internal_root_budget(state, root.id)?;
+            state.nodes.get_mut(&root.id).unwrap().resource_holders = holders;
+            Ok(Self {
+                backing: AliasBacking::RootRetention {
+                    budget,
+                    pin: Arc::new(WindowExecutionScope {
+                        scope: root.clone(),
+                    }),
+                    execution: root.clone(),
+                },
+            })
+        })
+    }
+
     pub(crate) fn client_computation_window(
         &self,
         root: &WorkScope,
@@ -547,6 +596,7 @@ impl ResultWindowAlias {
                     NativeCapacityFence::Window(Arc::downgrade(holder))
                 }
             }
+            AliasBacking::RootRetention { .. } => return Err(WorkError::Conflict),
             AliasBacking::InternalRoot { payload, .. } => {
                 NativeCapacityFence::InternalPayload(payload.native_source_key()?)
             }
@@ -586,6 +636,7 @@ impl ResultWindowAlias {
                     NativeCapacityFence::Window(Arc::downgrade(holder))
                 }
             }
+            AliasBacking::RootRetention { .. } => return Err(WorkError::Conflict),
             AliasBacking::InternalRoot { payload, .. } => {
                 NativeCapacityFence::InternalPayload(payload.native_source_key()?)
             }
@@ -630,19 +681,7 @@ impl ResultWindowAlias {
         }
         let budget = {
             let mut state = root.inner.state.lock().unwrap();
-            let limit = state
-                .result_capacity
-                .ok_or(WorkError::NotReady)?
-                .all_objects_bytes[2];
-            let node = state.nodes.get_mut(&root.id).ok_or(WorkError::Released)?;
-            match node.internal_result_bytes.upgrade() {
-                Some(budget) => budget,
-                None => {
-                    let budget = Arc::new(RetainedBytes::new(limit));
-                    node.internal_result_bytes = Arc::downgrade(&budget);
-                    budget
-                }
-            }
+            internal_root_budget(&mut state, root.id)?
         };
         let payload = grant.retain_alias().map_err(internal_pin_error)?;
         Ok(Self {
@@ -767,12 +806,16 @@ impl ResultWindowAlias {
         )
     }
     pub fn is_root_backed_internal(&self) -> bool {
-        matches!(self.backing, AliasBacking::InternalRoot { .. })
+        matches!(
+            self.backing,
+            AliasBacking::InternalRoot { .. } | AliasBacking::RootRetention { .. }
+        )
     }
     /// The physical payload owner remains the statement/job Root.
     pub fn root_scope(&self) -> &WorkScope {
         match &self.backing {
             AliasBacking::Window { holder, .. } => &holder.scope,
+            AliasBacking::RootRetention { pin, .. } => &pin.scope,
             AliasBacking::InternalRoot { root, .. } => root,
         }
     }
@@ -784,20 +827,25 @@ impl ResultWindowAlias {
     /// The completed computation's identity is no longer an execution scope;
     /// dropping its manifest capability cannot mint another computation grant.
     pub fn into_root_retention(mut self) -> Result<Self, WorkError> {
-        let AliasBacking::InternalRoot {
-            payload,
-            root,
-            execution,
-            binding,
-            ..
-        } = &mut self.backing
-        else {
-            return Err(WorkError::Conflict);
-        };
-        root.check()?;
-        payload.check_backing_total(0)?;
-        *execution = root.clone();
-        *binding = None;
+        match &mut self.backing {
+            AliasBacking::RootRetention { pin, execution, .. } => {
+                pin.scope.check()?;
+                *execution = pin.scope.clone();
+            }
+            AliasBacking::InternalRoot {
+                payload,
+                root,
+                execution,
+                binding,
+                ..
+            } => {
+                root.check()?;
+                payload.check_backing_total(0)?;
+                *execution = root.clone();
+                *binding = None;
+            }
+            AliasBacking::Window { .. } => return Err(WorkError::Conflict),
+        }
         Ok(self)
     }
 
@@ -813,9 +861,11 @@ impl ResultWindowAlias {
                 Arc::ptr_eq(a, b)
             }
             (
-                AliasBacking::InternalRoot { payload: a, .. },
-                AliasBacking::InternalRoot { payload: b, .. },
-            ) => a.shares_payload_with(b),
+                AliasBacking::InternalRoot { budget: a, .. }
+                | AliasBacking::RootRetention { budget: a, .. },
+                AliasBacking::InternalRoot { budget: b, .. }
+                | AliasBacking::RootRetention { budget: b, .. },
+            ) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -831,7 +881,8 @@ impl ResultWindowAlias {
             } => execution_scope
                 .as_ref()
                 .map_or(&holder.scope, |value| &value.scope),
-            AliasBacking::InternalRoot { execution, .. } => execution,
+            AliasBacking::InternalRoot { execution, .. }
+            | AliasBacking::RootRetention { execution, .. } => execution,
         }
     }
     pub fn try_clone(&self) -> Result<Self, WorkError> {
@@ -855,6 +906,15 @@ impl ResultWindowAlias {
                     })
                     .transpose()?,
             },
+            AliasBacking::RootRetention {
+                budget,
+                pin,
+                execution,
+            } => AliasBacking::RootRetention {
+                budget: Arc::clone(budget),
+                pin: Arc::clone(pin),
+                execution: execution.clone(),
+            },
             AliasBacking::InternalRoot {
                 budget,
                 payload,
@@ -872,7 +932,8 @@ impl ResultWindowAlias {
         Ok(Self { backing })
     }
     /// Move this exact original payload pin to SPI without allocating a holder.
-    /// A legacy window is returned unchanged instead of erasing its policy.
+    /// Legacy windows and Root-only retention have no such payload record and
+    /// are returned unchanged instead of inventing a payload lease.
     pub fn into_internal_retention(
         self,
     ) -> Result<novarocks_resource_contract::ExistingOwnerRetentionLease, Self> {
@@ -888,6 +949,25 @@ impl ResultWindowAlias {
         }
         if self.class() == ResultWindowClass::Closing {
             return Err(WorkError::Conflict);
+        }
+        if let AliasBacking::RootRetention { budget, pin, .. } = &self.backing {
+            {
+                let state = parent.inner.state.lock().unwrap();
+                let original = state.nodes.get(&parent.id).ok_or(WorkError::Released)?;
+                original.check(&state.cancellations)?;
+                let current = state.nodes.get(&child.id).ok_or(WorkError::Released)?;
+                current.check(&state.cancellations)?;
+                if current.parent != Some(parent.id) || current.class != original.class {
+                    return Err(WorkError::Conflict);
+                }
+            }
+            return Ok(Self {
+                backing: AliasBacking::RootRetention {
+                    budget: Arc::clone(budget),
+                    pin: Arc::clone(pin),
+                    execution: child.clone(),
+                },
+            });
         }
         if let AliasBacking::InternalRoot {
             budget,
@@ -959,7 +1039,9 @@ impl ResultWindowAlias {
     pub fn class(&self) -> ResultWindowClass {
         match &self.backing {
             AliasBacking::Window { holder, .. } => holder.class,
-            AliasBacking::InternalRoot { .. } => ResultWindowClass::Internal,
+            AliasBacking::InternalRoot { .. } | AliasBacking::RootRetention { .. } => {
+                ResultWindowClass::Internal
+            }
         }
     }
     pub fn check_backing_total(&self, simultaneously_live_bytes: u64) -> Result<(), WorkError> {
@@ -970,7 +1052,8 @@ impl ResultWindowAlias {
                 Err(WorkError::Capacity("result backing envelope"))
             }
             AliasBacking::Window { .. } => Ok(()),
-            AliasBacking::InternalRoot { budget, .. } => {
+            AliasBacking::InternalRoot { budget, .. }
+            | AliasBacking::RootRetention { budget, .. } => {
                 if simultaneously_live_bytes > budget.limit() {
                     Err(WorkError::Capacity("result backing envelope"))
                 } else {
@@ -1591,6 +1674,54 @@ mod tests {
     }
 
     #[test]
+    fn large_position_configuration_only_charges_actual_holder_and_bytes() {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        // Independent finite configuration, not a request to allocate this
+        // many holders or prepay their hypothetical combined payload.
+        let positions = 1_000_001;
+        let budget = 1u64 << 50;
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [320, 16, positions, 64],
+                all_objects_bytes: [8 << 20, 96 << 20, budget, 8 << 20],
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let alias = window.retain_alias();
+        let receipt = alias.reserve_payload_bytes(64).unwrap();
+        let backing = vec![0u8; 64];
+        assert_eq!(receipt.bytes(), backing.capacity() as u64);
+        assert_eq!(window.all_objects_bytes(), budget);
+        assert_eq!(alias.retained_payload_bytes(), 64);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        assert!(matches!(
+            alias.reserve_payload_bytes(budget),
+            Err(WorkError::Capacity("retained result bytes"))
+        ));
+        assert_eq!(alias.retained_payload_bytes(), 64);
+        drop(window);
+        drop(backing);
+        drop(receipt);
+        assert_eq!(alias.retained_payload_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(alias);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
     fn capacity_is_explicit_startup_only_and_foreign_scopes_reject() {
         let (owner, capacity) = control();
         assert!(
@@ -1616,7 +1747,7 @@ mod tests {
         assert_eq!(other_capacity.snapshot().held_positions, [0; 4]);
         assert!(
             ResultCapacityConfig {
-                all_objects_bytes: [u64::MAX; 4],
+                all_objects_bytes: [0; 4],
                 ..ResultCapacityConfig::V1
             }
             .validate()

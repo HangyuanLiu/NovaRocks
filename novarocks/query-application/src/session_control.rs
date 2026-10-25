@@ -507,10 +507,9 @@ impl QueryControlService {
         .await
     }
 
-    /// Like [`Self::begin_queued_governed_query_statement`], but the warehouse
-    /// dequeue also takes one complete result window of `class` together with
-    /// the computation permit, before any dispatch. The owner retains the
-    /// window through the protocol's terminal outcome and its last alias.
+    /// Acquire the declared result custody with the query permit. Client and
+    /// local results retain their original window. Internal statements retain
+    /// the Root's actual byte budget; only a later computation takes a position.
     pub async fn begin_queued_governed_query_statement_with_result(
         &self,
         session: SessionToken,
@@ -569,11 +568,25 @@ impl QueryControlService {
                 Box::pin(async move { admission.await.map(|permit| (permit, None)) })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
             }),
+            Some(ResultWindowClass::Internal) => ResultWindowAlias::from_root_owner(&root.owner)
+                .and_then(|retention| {
+                    scope.admit_query().map(|admission| {
+                        Box::pin(async move {
+                            admission.await.map(|permit| {
+                                (
+                                    permit,
+                                    Some(StatementResultCapacity::RootRetention(retention)),
+                                )
+                            })
+                        })
+                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+                    })
+                }),
             Some(class) => scope.admit_query_with_result(class).map(|admission| {
                 Box::pin(async move {
-                    admission
-                        .await
-                        .map(|(permit, window)| (permit, Some(window)))
+                    admission.await.map(|(permit, window)| {
+                        (permit, Some(StatementResultCapacity::Window(window)))
+                    })
                 }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
             }),
         };
@@ -641,8 +654,8 @@ impl QueryControlService {
         )
     }
 
-    /// Acquire the complete result position together with nonqueued business
-    /// admission, before registering or starting the statement's producer.
+    /// Acquire declared result custody with nonqueued business admission.
+    /// Internal statement custody does not take a computation position.
     pub fn begin_governed_statement_with_result(
         &self,
         session: SessionToken,
@@ -678,9 +691,24 @@ impl QueryControlService {
         request.deadline = deadline;
         let (root, result_window) = match window {
             None => admission.try_begin_root(request).map(|root| (root, None)),
+            Some(ResultWindowClass::Internal) => {
+                admission.try_begin_root(request).and_then(|root| {
+                    match ResultWindowAlias::from_root_owner(&root.owner) {
+                        Ok(retention) => Ok((
+                            root,
+                            Some(StatementResultCapacity::RootRetention(retention)),
+                        )),
+                        Err(error) => {
+                            root.owner.complete_after_terminal_cancel_settled();
+                            root.business.release();
+                            Err(error)
+                        }
+                    }
+                })
+            }
             Some(window) => admission
                 .try_begin_root_with_result(request, window)
-                .map(|(root, window)| (root, Some(window))),
+                .map(|(root, window)| (root, Some(StatementResultCapacity::Window(window)))),
         }
         .map_err(GovernedQueryStatementBeginError::Admission)?;
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
@@ -912,6 +940,19 @@ impl<'a> GovernedActionContext<'a> {
     }
 }
 
+enum StatementResultCapacity {
+    Window(ResultWindowGrant),
+    RootRetention(ResultWindowAlias),
+}
+impl StatementResultCapacity {
+    fn retain_alias(&self) -> ResultWindowAlias {
+        match self {
+            Self::Window(window) => window.retain_alias(),
+            Self::RootRetention(retention) => retention.clone(),
+        }
+    }
+}
+
 pub struct GovernedQueryStatementOwner {
     service: GovernedControlLink,
     registration: GovernedStatementRegistration,
@@ -919,9 +960,9 @@ pub struct GovernedQueryStatementOwner {
     execution_owner: Option<WorkOwner>,
     business: Option<BusinessPermit>,
     query_concurrency: Option<QueryConcurrencyPermit>,
-    /// The complete result window taken with the permit, when the statement
-    /// declared one. Its position follows the last alias, not this owner.
-    result_window: Option<ResultWindowGrant>,
+    /// The original result policy. Root data retention carries the configured
+    /// byte budget without occupying the later computation's position.
+    result_window: Option<StatementResultCapacity>,
     accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
@@ -974,12 +1015,12 @@ impl GovernedQueryStatementOwner {
         self.timeout_ms
     }
 
-    /// An alias of the statement's result window for one relay or delivery
-    /// owner; `None` when the statement took no window at admission.
+    /// Retain the statement's original result author. Internal retention alone
+    /// cannot create computation, manifest, or Native action authority.
     pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
         self.result_window
             .as_ref()
-            .map(ResultWindowGrant::retain_alias)
+            .map(StatementResultCapacity::retain_alias)
     }
 
     pub(crate) fn release_transferred_result_window(&mut self) {

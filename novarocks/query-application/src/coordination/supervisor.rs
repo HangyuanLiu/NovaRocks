@@ -963,37 +963,6 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
             payload.as_ref(),
         )
         .map_err(work_error)?;
-        // Actual dyn pointee Layout, never a guessed or caller-declared size.
-        // FA separately authors the real variable backing of this action.
-        let action_layout = std::alloc::Layout::for_value(action.as_ref().unwrap().as_ref());
-        let source_bytes = StatementActionSource::background_geometry()
-            .fixed_source_bytes()
-            .map_err(work_error)?
-            .checked_add(action_layout.size())
-            .ok_or_else(|| work_error(WorkError::ArithmeticOverflow))?;
-        context
-            .as_ref()
-            .unwrap()
-            .result_capacity()
-            .unwrap()
-            .window_alias()
-            .check_backing_total(
-                u64::try_from(source_bytes)
-                    .map_err(|_| work_error(WorkError::ArithmeticOverflow))?,
-            )
-            .map_err(work_error)?;
-        if let Some(payload) = payload.as_ref() {
-            if payload
-                .capacity_bytes()
-                .map_err(|_| work_error(WorkError::Conflict))?
-                < u64::try_from(source_bytes)
-                    .map_err(|_| work_error(WorkError::ArithmeticOverflow))?
-            {
-                return Err(work_error(WorkError::Capacity(
-                    "background original payload backing",
-                )));
-            }
-        }
         let requester = owner.cancellation_requester();
         // Allocate all fixed shared headers while the caller's original slots
         // remain intact. There is no callback or asynchronous work here.

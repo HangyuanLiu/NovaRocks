@@ -29,6 +29,11 @@ use std::{
     task::{Context, Poll, Waker},
 };
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_positions(4)
+}
+fn fixture_with_positions(
+    positions: usize,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new(count, &[]);
     let config = ResponsibilityConfig {
@@ -46,6 +51,7 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     control
         .configure_result_capacity(ResultCapacityConfig {
             all_objects_bytes: [8 * 1024 * 1024, 96 * 1024 * 1024, 64, 8 * 1024 * 1024],
+            positions: [320, 16, positions, 64],
             ..ResultCapacityConfig::V1
         })
         .unwrap();
@@ -317,4 +323,203 @@ fn actual_root_buffer_receipts_share_the_original_budget_independently_of_record
     drop(driver);
     control.close_admission();
     assert!(control.shutdown().is_ok());
+}
+
+fn stage_request(
+    payload: &RetainedPayloadGrant,
+    root: &WorkScope,
+    stage: &WorkOwner,
+) -> RootStageAdmission {
+    let mut proposal = payload
+        .root_stage_source(root, stage)
+        .unwrap()
+        .begin(0, JointLane::Foreground)
+        .unwrap();
+    proposal.end_payload().unwrap();
+    proposal.end_stage().unwrap();
+    proposal.submit().unwrap()
+}
+fn install_stage(
+    admission: &mut RootStageAdmission,
+    root: &WorkScope,
+    payload: &RetainedPayloadGrant,
+    stage: &WorkOwner,
+) -> InternalComputationGrant {
+    let mut ready = match Pin::new(admission).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(ready)) => ready,
+        _ => panic!("original RootStage must have its actual position"),
+    };
+    let mut compute = None;
+    ready
+        .install_in(root, payload, stage, &mut compute)
+        .unwrap()
+        .notify();
+    compute.unwrap()
+}
+
+#[test]
+fn root_owner_data_does_not_occupy_single_compute_and_last_buffer_keeps_root() {
+    let (control, handle, mut driver) = fixture_with_positions(1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let original = ResultWindowAlias::from_root_owner(&work.owner).unwrap();
+    let peer = ResultWindowAlias::from_root_owner(&work.owner).unwrap();
+    assert!(original.shares_capacity_with(&peer));
+    assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+    assert!(original.internal_manifest_binding().unwrap().is_none());
+    assert!(matches!(
+        original.native_action_authority(),
+        Err(WorkError::Conflict)
+    ));
+    assert!(
+        original
+            .try_clone()
+            .unwrap()
+            .into_internal_retention()
+            .is_err()
+    );
+    struct ActualBuffer {
+        _data: Vec<u8>,
+        _receipt: ResultPayloadBytes,
+    }
+    let receipt = original.reserve_payload_bytes(40).unwrap();
+    let buffer = Arc::new(ActualBuffer {
+        _data: vec![0; 40],
+        _receipt: receipt,
+    });
+    let tail = Arc::clone(&buffer);
+    bind(&scope, &[fact("local")], &mut driver);
+    let mut raw = Some(claim(
+        &handle,
+        &work.owner,
+        &[fact("local")],
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 8),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    let payload = payload.unwrap();
+    let old = ResultWindowAlias::from_internal_payload(&scope, &scope, &payload).unwrap();
+    assert!(old.shares_capacity_with(&original));
+    assert_eq!(old.retained_payload_bytes(), 40);
+    assert!(matches!(
+        old.reserve_payload_bytes(25),
+        Err(WorkError::Capacity(_))
+    ));
+    let transient = old.reserve_payload_bytes(24).unwrap();
+    assert_eq!(peer.retained_payload_bytes(), 64);
+    drop(transient);
+
+    let first = joint_child(&scope, &mut driver);
+    let first_scope = first.scope();
+    let first_exit = first.retirement_observer().unwrap();
+    let attributed = original.for_child(&first_scope).unwrap();
+    let mut admission = stage_request(&payload, &scope, &first);
+    drive(&mut driver);
+    let computation = install_stage(&mut admission, &scope, &payload, &first);
+    drop(admission);
+    let live_compute = computation.retain_alias().unwrap();
+    drop(computation);
+    first.complete();
+    drive(&mut driver);
+    assert!(!first_exit.is_reclaimed().unwrap());
+    assert_eq!(control.snapshot().result_windows.held_positions[2], 1);
+    let second = joint_child(&scope, &mut driver);
+    let mut waiting = stage_request(&payload, &scope, &second);
+    drive(&mut driver);
+    assert!(
+        Pin::new(&mut waiting)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    // The payload tail cannot release a still-used computation position.
+    drop(attributed);
+    assert_eq!(control.snapshot().result_windows.held_positions[2], 1);
+    drop(live_compute);
+    drive(&mut driver);
+    assert!(first_exit.is_reclaimed().unwrap());
+    let next_compute = install_stage(&mut waiting, &scope, &payload, &second);
+    drop(waiting);
+    assert_eq!(peer.retained_payload_bytes(), 40);
+    drop(next_compute);
+    second.complete();
+    drive(&mut driver);
+    assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+    assert_eq!(old.retained_payload_bytes(), 40);
+    drop(old);
+    drop(payload);
+    drop(original);
+    drop(peer);
+    finish(work, &mut driver);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&scope.id())
+    );
+    drop(buffer);
+    drive(&mut driver);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&scope.id())
+    );
+    drop(tail);
+    drive(&mut driver);
+    assert!(control.inner.state.lock().unwrap().nodes.is_empty());
+}
+
+#[test]
+fn root_owner_retention_rejects_child_cancel_and_missing_result_author() {
+    let (control, _, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("local")], &mut driver);
+    let child = joint_child(&scope, &mut driver);
+    let child_scope = child.scope();
+    let held = control.inner.state.lock().unwrap().nodes[&child_scope.id()].resource_holders;
+    assert!(matches!(
+        ResultWindowAlias::from_root_owner(&child),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes[&child_scope.id()].resource_holders,
+        held
+    );
+    assert!(
+        control.inner.state.lock().unwrap().nodes[&scope.id()]
+            .internal_result_bytes
+            .upgrade()
+            .is_none()
+    );
+    child.complete();
+    work.owner.cancel(crate::CancellationReason::Requested);
+    assert!(matches!(
+        ResultWindowAlias::from_root_owner(&work.owner),
+        Err(WorkError::Cancelled(_))
+    ));
+    work.business.release();
+    work.owner.complete_after_terminal_cancel_settled();
+    drive(&mut driver);
+    let unconfigured = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    unconfigured.mark_ready().unwrap();
+    let work = root(&unconfigured);
+    assert!(matches!(
+        ResultWindowAlias::from_root_owner(&work.owner),
+        Err(WorkError::NotReady)
+    ));
+    work.business.release();
+    work.owner.complete();
 }

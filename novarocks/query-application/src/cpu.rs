@@ -965,6 +965,20 @@ impl QueryBlockingExecutor {
             .map(|inner| QueryBlockingReservation { inner })
     }
 
+    /// Await space in this exact original physical queue without constructing
+    /// or taking the caller's input. Dropping the future withdraws its wait.
+    /// Registered finite factories require their separate bound entry point.
+    pub async fn reserve(&self) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        if self.handle.closed_factory_descriptor().is_some() {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
+        let inner = self.handle.reserve().await?;
+        if self.handle.closed_factory_descriptor().is_some() {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
+        Ok(QueryBlockingReservation { inner })
+    }
+
     /// Nonwaiting original reservation, bound to both the WC composition
     /// decision and this exact physical pool allocation epoch.
     pub fn try_reserve_internal_result_closed_factory(
@@ -1647,6 +1661,10 @@ mod joint_queue_tests {
             .bind_internal_result_closed_factory_for_composition(fixture_closed_work)
             .unwrap();
         let executor = owner.executor();
+        assert!(matches!(
+            executor.reserve().await,
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
         let mut control = WorkloadControl::try_new_counted(WorkloadConfig::default())
             .unwrap()
             .owner;
@@ -1684,6 +1702,91 @@ mod joint_queue_tests {
             waiting.as_mut().poll(&mut cx),
             Poll::Ready(Err(QueryBlockingReserveRefusal::Closed))
         ));
+        drop(waiting);
+        drop(held);
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_queue_wait_preserves_input_and_withdraws_before_original_capacity_reuse() {
+        struct QueueWake(AtomicBool);
+        impl Wake for QueueWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let (mut owner, executor) = worker();
+        let mut held: Vec<_> = (0..3).map(|_| executor.try_reserve().unwrap()).collect();
+        assert!(matches!(
+            executor.try_reserve(),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let input = Some(Box::new(DropCount(Arc::clone(&drops))));
+        let input_pointer = input.as_deref().unwrap() as *const DropCount;
+        let wake = Arc::new(QueueWake(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut cancelled = Box::pin(executor.reserve());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        drop(cancelled);
+        drop(held.pop().unwrap());
+        // A cancelled semaphore waiter must not consume newly available space.
+        held.push(executor.try_reserve().unwrap());
+        wake.0.store(false, Ordering::SeqCst);
+        let mut waiting = Box::pin(executor.reserve());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert!(!wake.0.load(Ordering::SeqCst));
+        assert_eq!(input.as_deref().unwrap() as *const DropCount, input_pointer);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        assert_eq!(executor.handle.snapshot().running, 0);
+        drop(held.pop().unwrap());
+        assert!(wake.0.load(Ordering::SeqCst));
+        let Poll::Ready(Ok(acquired)) = waiting.as_mut().poll(&mut cx) else {
+            panic!("the same ordinary waiter must acquire the original released slot")
+        };
+        drop(waiting);
+        assert!(matches!(
+            executor.try_reserve(),
+            Err(QueryBlockingReserveRefusal::Full)
+        ));
+        assert_eq!(input.as_deref().unwrap() as *const DropCount, input_pointer);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        assert_eq!(executor.handle.snapshot().running, 0);
+        drop(acquired);
+        drop(held);
+        drop(input);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        shutdown(&mut owner).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_queue_close_wakes_pending_reservation_without_creating_work() {
+        struct QueueWake(AtomicBool);
+        impl Wake for QueueWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let (mut owner, executor) = worker();
+        let held: Vec<_> = (0..3).map(|_| executor.try_reserve().unwrap()).collect();
+        let wake = Arc::new(QueueWake(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = Box::pin(executor.reserve());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert!(!wake.0.load(Ordering::SeqCst));
+        owner.request_shutdown_for_process_exit();
+        assert!(wake.0.load(Ordering::SeqCst));
+        assert!(matches!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Err(QueryBlockingReserveRefusal::Closed))
+        ));
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        assert_eq!(executor.handle.snapshot().running, 0);
         drop(waiting);
         drop(held);
         shutdown(&mut owner).await;

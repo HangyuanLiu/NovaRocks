@@ -166,7 +166,7 @@ impl WorkloadConfig {
             ("control_inflight_limit", self.control_inflight_limit),
             ("control_ready_limit", self.control_ready_limit),
         ] {
-            if value == 0 || value > 1_000_000 {
+            if value == 0 {
                 return Err(WorkError::InvalidConfig(name));
             }
         }
@@ -1737,6 +1737,30 @@ mod tests {
                 "Wake callback ran under the work owner lock"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn configured_query_count_above_million_uses_one_original_permit() {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            query_concurrency_limit: 1_000_001,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let permit = root.owner.scope().admit_query().unwrap().await.unwrap();
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.admitted_queries, 1);
+        assert_eq!(snapshot.root_responsibilities, 1);
+        assert_eq!(snapshot.scopes.len(), 1);
+        drop(permit);
+        assert_eq!(control.snapshot().admitted_queries, 0);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 
     fn controller() -> WorkloadControl {

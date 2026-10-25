@@ -388,3 +388,91 @@ fn joint_child(scope: &WorkScope, driver: &mut JointProgressDriver) -> WorkOwner
 }
 
 mod client_computation_tests;
+
+#[test]
+fn root_owner_binding_is_retention_only_and_preserves_same_root_budget() {
+    let (control, handle, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let original = QueryResultCapacityBinding::from_root_owner(&work.owner).unwrap();
+    let peer = QueryResultCapacityBinding::from_root_owner(&work.owner).unwrap();
+    assert!(original.is_root_backed_internal());
+    assert_eq!(original.class(), ResultWindowClass::Internal);
+    assert!(original.native_action_authority().is_err());
+    assert!(original.begin_result_activity().is_err());
+    let alias = original.try_window_alias().unwrap();
+    assert!(alias.internal_manifest_binding().unwrap().is_none());
+    let receipt = alias.reserve_payload_bytes(8).unwrap();
+    let bytes = vec![0u8; 8];
+    assert_eq!(peer.window.retained_payload_bytes(), 8);
+    assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+    let execution = QueryExecutionContext::new(
+        novarocks_types::ClusterRole::Fe,
+        crate::api::BackendTopologySnapshot::try_new(1, Vec::new()).unwrap(),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        crate::cancellation::QueryCancellationSource::new().view(),
+        novarocks_sql::compiler::SessionOptimizerSettings::default(),
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+    .with_result_capacity(original.try_clone().unwrap())
+    .unwrap();
+    bind(&scope, &[fact("local")], &mut driver);
+    let child = joint_child(&scope, &mut driver);
+    assert!(matches!(
+        execution.for_internal_computation(original.for_child(&child.scope()).unwrap()),
+        Err(WorkError::Conflict)
+    ));
+    let mut raw = Some(claim(
+        &handle,
+        &work.owner,
+        &[fact("local")],
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 8),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    let admitted = QueryResultCapacityBinding::from_internal_payload(
+        &scope,
+        &scope,
+        payload.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert!(admitted.window.shares_capacity_with(&alias));
+    let retained = peer.into_statement_retention().unwrap();
+    let continued = execution.for_statement_retention(retained).unwrap();
+    assert_eq!(
+        continued
+            .result_capacity()
+            .unwrap()
+            .window
+            .retained_payload_bytes(),
+        8
+    );
+    let (foreign, _, mut foreign_driver) = fixture();
+    let foreign_work = root(&foreign);
+    assert!(matches!(
+        alias.for_child(&foreign_work.owner.scope()),
+        Err(WorkError::ForeignAuthority)
+    ));
+    assert!(matches!(
+        continued.for_statement_retention(
+            QueryResultCapacityBinding::from_root_owner(&foreign_work.owner).unwrap()
+        ),
+        Err(WorkError::Conflict)
+    ));
+    finish(foreign_work, &mut foreign_driver);
+    drop(bytes);
+    drop(receipt);
+    assert_eq!(admitted.window.retained_payload_bytes(), 0);
+    drop(continued);
+    drop(execution);
+    drop(admitted);
+    drop(payload);
+    drop(alias);
+    drop(original);
+    child.complete();
+    finish(work, &mut driver);
+}

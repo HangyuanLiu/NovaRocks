@@ -401,6 +401,18 @@ impl QueryResultCapacityBinding {
             activity: std::sync::Arc::new(ResultCapacityActivity::default()),
         })
     }
+    /// Retain the original active Root's data budget without reserving any
+    /// computation position or deriving Native/manifest execution authority.
+    pub fn from_root_owner(
+        owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<Self, WorkError> {
+        let window = ResultWindowAlias::from_root_owner(owner)?;
+        Ok(Self {
+            scope: window.root_scope().clone(),
+            window,
+            activity: std::sync::Arc::new(ResultCapacityActivity::default()),
+        })
+    }
     pub fn from_internal_payload(
         root: &WorkScope,
         execution: &WorkScope,
