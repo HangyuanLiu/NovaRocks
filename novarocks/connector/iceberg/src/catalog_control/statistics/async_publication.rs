@@ -367,6 +367,8 @@ pub(super) fn geometry(
             )
         })
         .and_then(|n| n.checked_add(future_bytes))
+        // This is an independent Box pointee held by the outer prepare F.
+        .and_then(|n| n.checked_add(publication::preparation_future_bytes()))
         .and_then(|n| {
             fn bytes<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
                 std::mem::size_of::<F>()

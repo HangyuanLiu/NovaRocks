@@ -61,7 +61,13 @@ impl ConnectorOriginalResultScopeCheck for ReadOriginalCheck {
         self.capacity
             .window_alias()
             .check_backing_total(upper)
-            .map_err(|e| ScopeFailure::new(Class::Coverage, e))
+            .map_err(|e| {
+                tracing::debug!(
+                    requested_upper = upper,
+                    "Statistics original payload invoice refused"
+                );
+                ScopeFailure::new(Class::Coverage, e)
+            })
     }
 }
 struct StatisticsReadAction {

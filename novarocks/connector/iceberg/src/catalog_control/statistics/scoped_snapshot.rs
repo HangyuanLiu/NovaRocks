@@ -132,6 +132,13 @@ impl SnapshotIoGate {
         budget: Option<&CaptureBudget<'_>>,
     ) -> Result<Bytes, ReadFailure> {
         if let Some(budget) = budget {
+            // The previous raw read may have used its exact paid total. Even
+            // the next path copy must obtain the same original Root's growth
+            // before it can be formed; a borrowed path is not a reservation.
+            let required = crate::read_snapshot::cow_capture::recipe(
+                crate::read_snapshot::cow_capture::geometry::add(budget.upper(), path.len() as u64),
+            )?;
+            self.reserve(required).await?;
             budget.charge(path.len() as u64)?;
         }
         std::future::poll_fn(|_| {
@@ -506,6 +513,61 @@ mod tests {
                     SNAPSHOT_RAW_DETAIL
                 )
                 .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod invoice_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorOriginalResultScopeCheck, OriginalResultCheckClass, OriginalResultCheckError,
+    };
+
+    struct ExactOriginalEnvelope(u64);
+    impl ConnectorOriginalResultScopeCheck for ExactOriginalEnvelope {
+        fn original_deadline(&self) -> std::time::Instant {
+            std::time::Instant::now() + std::time::Duration::from_secs(30)
+        }
+        fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+            Ok(())
+        }
+        fn check_before_growth(&self, upper: u64) -> Result<(), OriginalResultCheckError> {
+            if upper <= self.0 {
+                Ok(())
+            } else {
+                Err(OriginalResultCheckError::new(
+                    OriginalResultCheckClass::Coverage,
+                    std::io::Error::other("original exact envelope"),
+                ))
+            }
+        }
+    }
+    #[test]
+    fn next_raw_path_waits_for_its_invoice_before_copy_or_charge() {
+        let original =
+            ConnectorOriginalResultScope::from_original(Arc::new(ExactOriginalEnvelope(40)));
+        let budget = CaptureBudget::new(&original, 40).unwrap();
+        let gate = SnapshotIoGate::new();
+        let path = "memory:///next-original-manifest.avro";
+        let mut read = Box::pin(gate.read(path, Some(&budget)));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // The old ordering returned Coverage here, before it could expose the
+        // new prospective amount to the original MIO. No test grant is minted.
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(budget.upper(), 40);
+        {
+            let state = gate.state.lock().unwrap();
+            assert!(
+                matches!(state.as_ref(), Some(IoState::Owned(total)) if *total == 40 + path.len() as u64)
+            );
+        }
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(budget.upper(), 40, "re-poll cannot repeat the increment");
+        drop(read);
+        assert!(
+            matches!(gate.state.lock().unwrap().as_ref(), Some(IoState::Owned(_))),
+            "borrowed waiter Drop does not erase the original pending intent"
         );
     }
 }

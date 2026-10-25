@@ -107,9 +107,15 @@ impl<'a> CaptureBudget<'a> {
             self.upper.load(Ordering::Relaxed),
             additional,
         ))?;
-        self.scope
-            .check_before_growth(upper)
-            .map_err(|e| ReadFailure::Original(e.into()))?;
+        self.scope.check_before_growth(upper).map_err(|e| {
+            tracing::debug!(
+                retained_upper = self.upper.load(Ordering::Relaxed),
+                additional,
+                prospective_total = upper,
+                "original snapshot constructor invoice refused"
+            );
+            ReadFailure::Original(e.into())
+        })?;
         self.upper.store(upper, Ordering::Relaxed);
         Ok(())
     }

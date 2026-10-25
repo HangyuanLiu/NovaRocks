@@ -270,11 +270,12 @@ impl Drop for CreatorPortLoan<'_> {
         state.busy = false;
     }
 }
+const CPU_REFUSAL_DETAIL: &str = "Statistics CPU original action refused";
 #[derive(Debug)]
 struct StatisticsCpuRefusal(novarocks_failure_contract::FailureFact);
 impl std::fmt::Display for StatisticsCpuRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Statistics CPU original action refused")
+        f.write_str(CPU_REFUSAL_DETAIL)
     }
 }
 impl std::error::Error for StatisticsCpuRefusal {}
@@ -283,6 +284,15 @@ impl novarocks_failure_contract::FailureProjection for StatisticsCpuRefusal {
         self.0
     }
 }
+fn original_cpu_refusal(error: &ExecutionFailureInput) -> ConnectorError {
+    ConnectorError::from_domain_static(
+        statistics_failure_kind(error.fact()),
+        StatisticsCpuRefusal(error.fact()),
+        CPU_REFUSAL_DETAIL,
+    )
+    .map_message(|_| error.detail().as_str().to_owned())
+}
+
 fn statistics_failure_kind(fact: novarocks_failure_contract::FailureFact) -> ConnectorErrorKind {
     use novarocks_failure_contract::FailureClass;
     match fact.class() {
@@ -456,6 +466,25 @@ impl InternalResultCpu {
             .map_err(|_| WorkError::ArithmeticOverflow)?
             .size()
             .checked_add(if cfg!(target_os = "macos") { 64 } else { 0 })
+            // Marker remains live while map_message forms the new bounded
+            // copy. Its old static message and original cause detail also
+            // coexist until replacement; no payload graph is copied.
+            .and_then(|n| {
+                n.checked_add(
+                    metadata_geometry::geometry()
+                        .ok()?
+                        .action_detail_backing_bytes(),
+                )
+            })
+            .and_then(|n| n.checked_add(CPU_ACTION_DETAIL_BYTES))
+            .and_then(|n| {
+                n.checked_add(
+                    ConnectorError::static_domain_backing_bytes::<StatisticsCpuRefusal>(
+                        CPU_REFUSAL_DETAIL,
+                    )
+                    .ok()?,
+                )
+            })
             .ok_or(WorkError::ArithmeticOverflow)?;
         NonZeroU64::new(u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?)
             .ok_or(WorkError::ArithmeticOverflow)
@@ -504,10 +533,7 @@ impl ScopedProviderCreatorCpu {
             return Poll::Ready(Err(port_unproven()));
         }
         let projected = match original.marker.as_ref() {
-            Some(Err(error)) if !closing => Some(ConnectorError::from_domain(
-                statistics_failure_kind(error.fact()),
-                StatisticsCpuRefusal(error.fact()),
-            )),
+            Some(Err(error)) if !closing => Some(original_cpu_refusal(error)),
             _ => None,
         };
         // Same named original source destruction algorithm, lock-free, only
@@ -731,5 +757,34 @@ impl novarocks_spi::connector::ProviderMetadataCpuPort for ScopedProviderCreator
             .job
             .as_ref()
             .and_then(ProviderReadCpuJob::health_failure)
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn original_cpu_marker_keeps_safe_detail_and_neutral_class() {
+        for (work, kind) in [
+            (
+                WorkError::Capacity("fixed proposal and reply cells"),
+                ConnectorErrorKind::ResourceExhausted,
+            ),
+            (WorkError::Closed, ConnectorErrorKind::Interrupted),
+            (WorkError::Conflict, ConnectorErrorKind::Internal),
+        ] {
+            let marker = ExecutionFailureInput::new(
+                work.failure_fact(),
+                cpu_action_failure_detail(CpuActionFailureSite::Begin, &work),
+                ExecutionFailureSite::Coordinator,
+            );
+            let error = original_cpu_refusal(&marker);
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.failure_fact(), marker.fact());
+            assert_eq!(error.message(), marker.detail().as_str());
+            assert!(error.message().contains("Begin"));
+            assert!(std::error::Error::source(&error).is_some());
+        }
     }
 }

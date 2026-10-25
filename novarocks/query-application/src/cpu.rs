@@ -954,9 +954,8 @@ impl QueryBlockingExecutor {
         output_layout(preserving_call::<T, F>)
     }
 
-    /// Nonwaiting reservation in this exact original physical queue. New
-    /// Internal CPU composition must enforce all jobs jointly charged, L<=P
-    /// and Q>=P. This transport seam does not certify arbitrary FnOnce jobs.
+    /// Nonwaiting reservation in this exact original physical queue. A full
+    /// queue is ordinary backpressure, independent of logical result retention.
     pub fn try_reserve(&self) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
         if self.handle.closed_factory_descriptor().is_some() {
             return Err(QueryBlockingReserveRefusal::FactoryMismatch);
@@ -981,6 +980,28 @@ impl QueryBlockingExecutor {
         self.handle
             .try_reserve()
             .map(|inner| QueryBlockingReservation { inner })
+    }
+
+    /// Await space in the original physical queue without constructing a job.
+    /// The caller owns cancellation/deadline selection and retains its input.
+    /// Factory identity is checked both before and after the wait.
+    pub async fn reserve_internal_result_closed_factory(
+        &self,
+        binding: &novarocks_workload_control::joint_admission::InternalCpuFactoryBinding,
+    ) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        let matches = || {
+            self.handle
+                .closed_factory_descriptor()
+                .is_some_and(|descriptor| binding.matches_descriptor(&descriptor))
+        };
+        if !matches() {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
+        let inner = self.handle.reserve().await?;
+        if !matches() {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
+        Ok(QueryBlockingReservation { inner })
     }
 
     /// The original caller supplies an empty stable receipt slot before any
@@ -1608,6 +1629,65 @@ mod joint_queue_tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::{Context, Poll, Wake, Waker},
     };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_factory_queue_wait_wakes_on_original_capacity_and_withdraws_on_cancel() {
+        struct QueueWake(AtomicBool);
+        impl Wake for QueueWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let mut owner = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ))
+        .unwrap();
+        let descriptor = owner
+            .bind_internal_result_closed_factory_for_composition(fixture_closed_work)
+            .unwrap();
+        let executor = owner.executor();
+        let mut control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        let binding = control
+            .bind_internal_result_closed_factory_for_composition(descriptor)
+            .unwrap();
+        let held = executor
+            .try_reserve_internal_result_closed_factory(&binding)
+            .unwrap();
+        let wake = Arc::new(QueueWake(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut cancelled = Box::pin(executor.reserve_internal_result_closed_factory(&binding));
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        drop(cancelled);
+        let mut waiting = Box::pin(executor.reserve_internal_result_closed_factory(&binding));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        assert_eq!(executor.handle.snapshot().running, 0);
+        drop(held);
+        assert!(wake.0.load(Ordering::SeqCst));
+        let Poll::Ready(Ok(acquired)) = waiting.as_mut().poll(&mut cx) else {
+            panic!("original queue capacity must wake its surviving waiter")
+        };
+        drop(waiting);
+        drop(acquired);
+
+        let held = executor
+            .try_reserve_internal_result_closed_factory(&binding)
+            .unwrap();
+        let mut waiting = Box::pin(executor.reserve_internal_result_closed_factory(&binding));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        owner.request_shutdown_for_process_exit();
+        assert!(matches!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Err(QueryBlockingReserveRefusal::Closed))
+        ));
+        drop(waiting);
+        drop(held);
+        shutdown(&mut owner).await;
+    }
 
     fn joint_fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
         let fixture = joint_fixture_before_ready(JointResource::BlockingJobs);

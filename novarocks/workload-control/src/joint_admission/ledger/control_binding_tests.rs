@@ -357,7 +357,7 @@ fn delegated_binding_rechecks_active_owner_at_original_queue_publication() {
 }
 
 #[test]
-fn delegated_silent_install_survives_real_wake_panic_and_body_actual_reclamation() {
+fn delegated_silent_install_survives_real_wake_panic_without_pinning_consumed_body() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{
         Arc,
@@ -398,8 +398,8 @@ fn delegated_silent_install_survives_real_wake_panic_and_body_actual_reclamation
     drive(&mut driver);
     assert_eq!(
         observer.is_reclaimed(),
-        Ok(false),
-        "original reply still retains its paid body"
+        Ok(true),
+        "an installed reply has no remaining proposal borrow or physical claim"
     );
     drop(reply);
     drive(&mut driver);

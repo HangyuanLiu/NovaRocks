@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original control-slot backing for request construction and late reply aliases.
+//! Original control-slot backing for request construction and active receipt borrows.
 
 use super::*;
 use crate::scope::ReclaimWakeOnExit;
@@ -480,11 +480,11 @@ pub(crate) fn finish_reap_proposal(
     storage.retired_proposals -= 1;
 }
 
-/// The container's allocation cannot escape its original proposal custody.
-/// Popped physical guards retain their own original claim/Work custody.
+/// Owned installed claims, independent of temporary proposal construction.
+/// Each guard retains its original ledger/Work custody; neither this Vec nor
+/// its owning iterator borrows the request's ChangeRecord backing.
 pub struct JointGrantedClaims {
     claims: Vec<JointClaim>,
-    _body: ChangeBody,
     _exit: ReclaimWakeOnExit,
 }
 impl std::fmt::Debug for JointGrantedClaims {
@@ -506,9 +506,14 @@ impl JointGrantedClaims {
         self.claims.remove(index)
     }
     pub(super) fn new(claims: Vec<JointClaim>, body: ChangeBody, inner: &Arc<Inner>) -> Self {
+        // Installed ClaimRecords own their active facts, and each JointClaim
+        // owns its exact ledger identity. The consumed reply no longer reads
+        // ChangeRecords. Release only this raw body alias: active proof/receipt
+        // aliases still prevent the original cell from being reclaimed.
+        // ChangeBody Drop never invokes callbacks, including under State.
+        drop(body);
         Self {
             claims,
-            _body: body,
             _exit: ReclaimWakeOnExit::observe(&Arc::downgrade(inner)),
         }
     }
@@ -522,7 +527,6 @@ impl std::ops::DerefMut for JointGrantedClaims {
 
 pub struct JointGrantedClaimsIter {
     claims: std::vec::IntoIter<JointClaim>,
-    _body: ChangeBody,
     _exit: ReclaimWakeOnExit,
 }
 impl IntoIterator for JointGrantedClaims {
@@ -531,7 +535,6 @@ impl IntoIterator for JointGrantedClaims {
     fn into_iter(self) -> Self::IntoIter {
         JointGrantedClaimsIter {
             claims: self.claims.into_iter(),
-            _body: self._body,
             _exit: self._exit,
         }
     }

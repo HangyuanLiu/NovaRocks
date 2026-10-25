@@ -1008,6 +1008,14 @@ impl MetadataIoAdmission {
                 .capacity_bytes()
                 .map_err(|_| WorkError::Conflict)?;
             let bytes = required.saturating_sub(capacity);
+            if required != 0 {
+                tracing::debug!(
+                    requested_total = required,
+                    paid_payload = capacity,
+                    positive_growth = bytes,
+                    "Original metadata payload invoice observed"
+                );
+            }
             if required != 0 && bytes == 0 {
                 body.provider_owned_floor = body.provider_owned_floor.max(required);
                 let cell = cells[i].body.as_mut().unwrap();
@@ -1725,6 +1733,83 @@ mod original_governor_tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn original_root_alias_observes_owned_growth_only_after_positive_install() {
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        // Borrow exactly the same API as Statistics ReadOriginalCheck BEFORE
+        // either prospective request; no fresh alias can conceal a stale cap.
+        let original = source.root_capacity().unwrap();
+        original.window_alias().check_backing_total(128).unwrap();
+        for required in [768, 1536] {
+            assert!(matches!(
+                original.window_alias().check_backing_total(required),
+                Err(WorkError::Capacity(_))
+            ));
+            let mut request = Box::pin(
+                source
+                    .request_owned(NonZeroU64::new(required).unwrap())
+                    .unwrap()
+                    .admitted(),
+            );
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            assert!(
+                original
+                    .window_alias()
+                    .check_backing_total(required)
+                    .is_err()
+            );
+            let mut permit = None;
+            for _ in 0..256 {
+                source.poll_progress(&root.owner, &mut cx).unwrap();
+                drive_original(&mut driver);
+                if let Poll::Ready(result) = request.as_mut().poll(&mut cx) {
+                    permit = Some(result.unwrap());
+                    break;
+                }
+            }
+            let permit = permit.expect("same original Root positive growth installed");
+            original
+                .window_alias()
+                .check_backing_total(required)
+                .unwrap();
+            assert!(
+                original
+                    .window_alias()
+                    .check_backing_total(required + 1)
+                    .is_err()
+            );
+            drop((request, permit));
+            assert!(source.poll_quiescent(&root.owner, &mut cx).is_ready());
+            drive_original(&mut driver);
+        }
+        assert_original_healthy(&source);
+        drop((original, source));
+        root.business.release();
+        root.owner.complete();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
     }
 
     #[test]

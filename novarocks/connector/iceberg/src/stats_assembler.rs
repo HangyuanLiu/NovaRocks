@@ -134,6 +134,40 @@ pub(crate) fn statistics_publication_owned_bytes(
 /// Per-table switch for collect-on-write statistics.
 pub const COLLECT_ON_WRITE_PROPERTY: &str = "novarocks.statistics.collect-on-write";
 
+// Scoped CPU failures retain their exact Connector fact and cause through
+// the shared writer. Legacy callers still receive their original String API.
+#[derive(Debug)]
+enum PuffinWriteFailure {
+    Legacy(String),
+    Scoped(novarocks_spi::connector::ConnectorError),
+}
+impl From<String> for PuffinWriteFailure {
+    fn from(message: String) -> Self {
+        Self::Legacy(message)
+    }
+}
+impl std::fmt::Display for PuffinWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(message) => f.write_str(message),
+            Self::Scoped(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl PuffinWriteFailure {
+    fn into_preparation_error(self) -> crate::iceberg::Error {
+        let error = match self {
+            Self::Legacy(message) => novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                message,
+            ),
+            Self::Scoped(error) => error,
+        };
+        crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, error.message())
+            .with_source(error)
+    }
+}
+
 /// Write already-computed long-form artifact drafts to one Puffin file.
 /// Snapshot and sequence provenance are bound here, after execution, and are
 /// never carried in the generic Root relation.
@@ -153,6 +187,7 @@ pub async fn write_puffin_artifacts(
         None,
     )
     .await
+    .map_err(|error| error.to_string())
 }
 async fn write_puffin_artifacts_original(
     file_io: &FileIO,
@@ -166,7 +201,7 @@ async fn write_puffin_artifacts_original(
         novarocks_spi::connector::ProviderBindingEpoch,
         &std::sync::Arc<[StatisticsArtifactDraft]>,
     )>,
-) -> Result<Option<StatisticsFile>, String> {
+) -> Result<Option<StatisticsFile>, PuffinWriteFailure> {
     if artifacts.is_empty() {
         return Ok(None);
     }
@@ -192,7 +227,7 @@ async fn write_puffin_artifacts_original(
                 );
             crate::catalog_control::statistics::scoped_cpu::run_artifacts(cpu, &source)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(PuffinWriteFailure::Scoped)?;
             source.take_blob()
         } else {
             // Explicit legacy caller, not a fallback from scoped refusal.
@@ -331,17 +366,15 @@ pub(crate) async fn write_puffin_artifacts_allocated_scoped(
     cpu: std::sync::Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
     descriptor: &novarocks_spi::connector::ConnectorInstanceDescriptor,
     incarnation: novarocks_spi::connector::ProviderBindingEpoch,
-) -> Result<Option<StatisticsFile>, String> {
-    writer.check_active().map_err(|e| e.to_string())?;
+) -> crate::iceberg::Result<Option<StatisticsFile>> {
+    writer.check_active()?;
     if drafts.is_empty() {
         return Ok(None);
     }
-    let object = writer
-        .allocate(
-            crate::commit::model::ArtifactClass::Attempt,
-            crate::commit::model::ArtifactKind::Statistics,
-        )
-        .map_err(|e| e.to_string())?;
+    let object = writer.allocate(
+        crate::commit::model::ArtifactClass::Attempt,
+        crate::commit::model::ArtifactKind::Statistics,
+    )?;
     let result = write_puffin_artifacts_original(
         writer.file_io(),
         object.path(),
@@ -350,7 +383,72 @@ pub(crate) async fn write_puffin_artifacts_allocated_scoped(
         &drafts,
         Some((&cpu, descriptor, incarnation, &drafts)),
     )
-    .await?;
-    writer.check_active().map_err(|e| e.to_string())?;
+    .await
+    .map_err(PuffinWriteFailure::into_preparation_error)?;
+    writer.check_active()?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod scoped_refusal_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureFact, FailureProjection};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorMutationFailureKind,
+    };
+
+    #[derive(Debug)]
+    struct OriginalRefusal(ConnectorErrorKind);
+    impl std::fmt::Display for OriginalRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original bounded CPU marker")
+        }
+    }
+    impl std::error::Error for OriginalRefusal {}
+    impl FailureProjection for OriginalRefusal {
+        fn failure_fact(&self) -> FailureFact {
+            self.0.failure_fact()
+        }
+    }
+
+    #[test]
+    fn scoped_puffin_refusal_reaches_original_publication_fact_and_cause() {
+        for (kind, expected) in [
+            (
+                ConnectorErrorKind::ResourceExhausted,
+                ConnectorMutationFailureKind::ResourceExhausted,
+            ),
+            (
+                ConnectorErrorKind::Interrupted,
+                ConnectorMutationFailureKind::Interrupted,
+            ),
+            (
+                ConnectorErrorKind::Internal,
+                ConnectorMutationFailureKind::Internal,
+            ),
+        ] {
+            let original =
+                ConnectorError::from_domain(kind, OriginalRefusal(kind)).map_message(|_| {
+                    "internal CPU action Begin refused: original bounded detail".into()
+                });
+            let error = PuffinWriteFailure::Scoped(original.clone()).into_preparation_error();
+            let failure = crate::commit::attempt::before_dispatch_failure(&error);
+            assert_eq!(failure.kind(), expected);
+            assert_eq!(failure.failure_fact(), original.failure_fact());
+            assert_eq!(failure.connector_source(), Some(&original));
+            assert!(failure.message().contains("original bounded detail"));
+        }
+    }
+
+    #[test]
+    fn legacy_puffin_io_failure_keeps_original_unavailable_projection() {
+        let error = PuffinWriteFailure::Legacy("original Puffin storage error".into())
+            .into_preparation_error();
+        let failure = crate::commit::attempt::before_dispatch_failure(&error);
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
+        assert_eq!(
+            failure.connector_source().unwrap().message(),
+            "original Puffin storage error"
+        );
+    }
 }

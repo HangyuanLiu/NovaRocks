@@ -1239,13 +1239,71 @@ impl Drop for CpuActionLease<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CpuActionFailureSite {
+    Begin,
+    LocalOffer,
+    PreparePublication,
+    Publish,
+}
+
+const CPU_ACTION_DETAIL_BYTES: usize = novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES;
+
+fn cpu_action_failure_detail(site: CpuActionFailureSite, error: &WorkError) -> SafeDetail {
+    struct Bounded {
+        bytes: [u8; CPU_ACTION_DETAIL_BYTES],
+        len: usize,
+    }
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let mut end = value.len().min(self.bytes.len() - self.len);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.bytes[self.len..self.len + end].copy_from_slice(&value.as_bytes()[..end]);
+            self.len += end;
+            if end == value.len() {
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    let mut output = Bounded {
+        bytes: [0; CPU_ACTION_DETAIL_BYTES],
+        len: 0,
+    };
+    // Only the closed local governance vocabulary is rendered. Stack formatting
+    // has no geometric heap growth; str::to_owned below requests one <=512B copy.
+    let _ = std::fmt::write(
+        &mut output,
+        format_args!("internal CPU action {site:?} refused: {error}"),
+    );
+    SafeDetail::truncating(std::str::from_utf8(&output.bytes[..output.len]).expect("UTF-8 prefix"))
+}
+
 fn action_failure(
     packet: &InternalCpuRetirement<OperationOutput>,
+    site: CpuActionFailureSite,
     error: WorkError,
 ) -> ExecutionFailureInput {
+    // Only this paid serial Statistics port extends the original diagnostic.
+    // Other closed CPU families keep their pre-existing fixed text budget.
+    let statistics_provider = {
+        let state = packet.state.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            state.provider_input.as_deref(),
+            Some(ClosedCreatorInput::StatisticsProvider(_))
+        )
+    };
+    let detail = if statistics_provider {
+        cpu_action_failure_detail(site, &error)
+    } else {
+        SafeDetail::truncating("internal CPU action admission failed")
+    };
     let projected = ExecutionFailureInput::new(
         error.failure_fact(),
-        SafeDetail::truncating("internal CPU action admission failed"),
+        detail,
         ExecutionFailureSite::Coordinator,
     );
     let mut state = packet.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1341,8 +1399,9 @@ fn poll_cpu_offer(
     packet: &InternalCpuRetirement<OperationOutput>,
     executor: &QueryBlockingExecutor,
     factory: &InternalCpuFactoryBinding,
+    original: &mut Option<QueryBlockingReservation>,
     cx: &mut std::task::Context<'_>,
-) -> std::task::Poll<Result<(), ExecutionFailureInput>> {
+) -> std::task::Poll<Result<bool, ExecutionFailureInput>> {
     use std::task::Poll;
     let mut lease = CpuActionLease::take(packet);
     let mut notification = None;
@@ -1362,29 +1421,31 @@ fn poll_cpu_offer(
             Poll::Ready(Err(failure)) => return Poll::Ready(Err(failure.error)),
             Poll::Ready(Ok(offer)) => offer,
         };
-        let mut original = match executor.try_reserve_internal_result_closed_factory(factory) {
-            Ok(original) => Some(original),
-            Err(reason) => {
-                reserve_refusal = Some(reason);
-                let mut absent: Option<QueryBlockingReservation> = None;
-                notification = Some(offer.reobserve_after_drop(&mut absent)?);
-                return Poll::Ready(Err(match reason {
-                    QueryBlockingReserveRefusal::Full => {
-                        WorkError::Capacity("original CPU physical queue")
+        if original.is_none() {
+            match executor.try_reserve_internal_result_closed_factory(factory) {
+                Ok(reservation) => *original = Some(reservation),
+                Err(reason) => {
+                    notification = Some(offer.reobserve_after_drop(original)?);
+                    if reason == QueryBlockingReserveRefusal::Full {
+                        return Poll::Ready(Ok(false));
                     }
-                    QueryBlockingReserveRefusal::Closed => WorkError::Closed,
-                    QueryBlockingReserveRefusal::FactoryMismatch => WorkError::Conflict,
-                }));
+                    reserve_refusal = Some(reason);
+                    return Poll::Ready(Err(match reason {
+                        QueryBlockingReserveRefusal::Closed => WorkError::Closed,
+                        QueryBlockingReserveRefusal::FactoryMismatch => WorkError::Conflict,
+                        QueryBlockingReserveRefusal::Full => unreachable!("handled backpressure"),
+                    }));
+                }
             }
-        };
-        match offer.accept_in(&mut original, physical) {
+        }
+        match offer.accept_in(original, physical) {
             Ok(notify) => notification = Some(notify),
             Err(error) => {
-                notification = Some(offer.reobserve_after_drop(&mut original)?);
+                notification = Some(offer.reobserve_after_drop(original)?);
                 return Poll::Ready(Err(error));
             }
         }
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(true))
     })();
     drop(lease);
     if let Some(reason) = reserve_refusal {
@@ -1398,7 +1459,41 @@ fn poll_cpu_offer(
     if let Some(notification) = notification {
         notification.notify();
     }
-    result.map(|result| result.map_err(|error| action_failure(packet, error)))
+    result.map(|result| {
+        result.map_err(|error| action_failure(packet, CpuActionFailureSite::LocalOffer, error))
+    })
+}
+
+async fn acquire_cpu_offer(
+    packet: &InternalCpuRetirement<OperationOutput>,
+    executor: &QueryBlockingExecutor,
+    factory: &InternalCpuFactoryBinding,
+) -> Result<(), ExecutionFailureInput> {
+    // This is an unstarted queue reservation, not an executing job. Dropping
+    // the outer cancellation select withdraws the same semaphore wait/permit.
+    let mut original = None;
+    loop {
+        if std::future::poll_fn(|cx| poll_cpu_offer(packet, executor, factory, &mut original, cx))
+            .await?
+        {
+            return Ok(());
+        }
+        original = Some(
+            executor
+                .reserve_internal_result_closed_factory(factory)
+                .await
+                .map_err(|reason| {
+                    let error = match reason {
+                        QueryBlockingReserveRefusal::Closed => WorkError::Closed,
+                        QueryBlockingReserveRefusal::FactoryMismatch => WorkError::Conflict,
+                        QueryBlockingReserveRefusal::Full => {
+                            unreachable!("waiting reservation cannot refuse temporary fullness")
+                        }
+                    };
+                    action_failure(packet, CpuActionFailureSite::LocalOffer, error)
+                })?,
+        );
+    }
 }
 
 // Publication borrows only the physical field: the original receipt must
@@ -1459,7 +1554,11 @@ fn publish_cpu_work(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .publication_refusal = Some(reason);
-            return Err(action_failure(packet, WorkError::Conflict));
+            return Err(action_failure(
+                packet,
+                CpuActionFailureSite::PreparePublication,
+                WorkError::Conflict,
+            ));
         }
     };
     // Restore the receipt to the original packet before making its row
@@ -1494,6 +1593,7 @@ fn publish_cpu_work(
                 .publication_refusal = Some(reason);
             Err(action_failure(
                 packet,
+                CpuActionFailureSite::Publish,
                 match reason {
                     QueryBlockingPublishRefusal::Closed
                     | QueryBlockingPublishRefusal::ReceiptClosed => WorkError::Closed,
@@ -1592,7 +1692,7 @@ fn make_operation_forwarder(
             Ok::<(), WorkError>(())
         })();
         if let Err(error) = setup {
-            let error = action_failure(&packet, error);
+            let error = action_failure(&packet, CpuActionFailureSite::Begin, error);
             finish_unpublished(&packet);
             if let Err(original) = completed.send(Err(error)) {
                 packet
@@ -1611,7 +1711,7 @@ fn make_operation_forwarder(
             biased;
             reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
             _ = completed.closed() => Err(cpu_execution_failure("internal CPU consumer closed before publication")),
-            result = std::future::poll_fn(|cx| poll_cpu_offer(&packet, &executor, factory, cx)) => result,
+            result = acquire_cpu_offer(&packet, &executor, factory) => result,
         };
         let admission =
             admission.and_then(|()| publish_cpu_work(&packet, &executor, &cancellation));
@@ -1856,6 +1956,77 @@ mod tests {
         })
         .await
         .expect("CPU outcome watchdog")
+    }
+
+    #[test]
+    fn statistics_action_detail_requests_one_bounded_utf8_backing() {
+        const TEXT: &str = concat!(
+            "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+            "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+            "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+        );
+        let detail =
+            cpu_action_failure_detail(CpuActionFailureSite::Begin, &WorkError::Capacity(TEXT));
+        assert!(detail.as_str().contains("Begin"));
+        assert!(detail.as_str().len() <= CPU_ACTION_DETAIL_BYTES);
+        assert!(detail.as_str().len() > CPU_ACTION_DETAIL_BYTES - 4);
+        assert!(std::str::from_utf8(detail.as_str().as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn original_action_refusal_keeps_typed_axis_detail_and_first_packet_error() {
+        use novarocks_workload_control::joint_admission::{
+            JointCapacityConstraint, JointCapacityFailure, JointCapacityProjection, JointLane,
+            JointResource,
+        };
+        let (control, capacity) = control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let packet = InternalCpuRetirement::<OperationOutput>::new(window.retain_alias(), None);
+        let refusal = WorkError::JointCapacity(JointCapacityFailure {
+            resource: JointResource::PhysicalQueueBytes,
+            projection: JointCapacityProjection::Lane(JointLane::Foreground),
+            constraint: JointCapacityConstraint::Dependency,
+        });
+        let marker = action_failure(&packet, CpuActionFailureSite::LocalOffer, refusal.clone());
+        assert_eq!(marker.fact(), refusal.failure_fact());
+        assert_eq!(
+            marker.detail().as_str(),
+            "internal CPU action admission failed"
+        );
+        let detail = cpu_action_failure_detail(CpuActionFailureSite::LocalOffer, &refusal);
+        assert!(detail.as_str().contains("LocalOffer"));
+        assert!(detail.as_str().contains("PhysicalQueueBytes"));
+        assert!(detail.as_str().contains("Foreground"));
+        assert!(detail.as_str().contains("Dependency"));
+        assert!(
+            !packet.has_failure(),
+            "ordinary capacity is not process health"
+        );
+        let later = action_failure(
+            &packet,
+            CpuActionFailureSite::Begin,
+            WorkError::Capacity("fixed proposal and reply cells"),
+        );
+        assert_eq!(
+            later.detail().as_str(),
+            "internal CPU action admission failed"
+        );
+        assert_eq!(
+            packet.state.lock().unwrap().admission_failure,
+            Some(refusal)
+        );
+        drop(window);
+        assert_eq!(capacity.snapshot().held_positions[2], 1);
+        drop(packet);
+        assert_eq!(capacity.snapshot().held_positions[2], 0);
+        root.owner.complete();
+        root.business.release();
     }
 
     #[tokio::test]

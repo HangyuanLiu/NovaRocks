@@ -1073,11 +1073,20 @@ impl FrontendStatisticsAttemptExecutor {
             }
             current = cause.source();
         }
-        novarocks_statistics_application::StatisticsPublicationFailure::capture(
+        let observation = novarocks_statistics_application::StatisticsPublicationFailure::capture(
             error.failure_fact(),
             compile_control,
             error,
-        )
+        );
+        // Reuse the already captured bounded local detail. No second Provider
+        // formatting or source traversal is performed for logging.
+        tracing::debug!(
+            fact = ?observation.fact(),
+            compile_control = ?observation.compile_control(),
+            diagnostic = observation.local_diagnostic(),
+            "Statistics original publication failed",
+        );
+        observation
     }
     fn finalization_failure(
         value: &ExternalMutationFinalization,

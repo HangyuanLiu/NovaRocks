@@ -276,6 +276,33 @@ impl FrontendWorkloadCapacityProfile {
             )
             .with_process_source_backing(self.process_sources),
         )?;
+        tracing::debug!(
+            dependency_limit = self.capacity.max_dependencies_per_claim,
+            publication_global = self.capacity.global.global.get(JointResource::Publications),
+            publication_per_dependency = self
+                .capacity
+                .global
+                .per_dependency
+                .get(JointResource::Publications),
+            publication_protected_progress = self
+                .capacity
+                .global
+                .protected_progress
+                .get(JointResource::Publications),
+            unreceived_global = self
+                .capacity
+                .global
+                .global
+                .get(JointResource::UnreceivedProductions),
+            unreceived_per_dependency = self
+                .capacity
+                .global
+                .per_dependency
+                .get(JointResource::UnreceivedProductions),
+            configured_publications = self.policy().dependency_custody().publications,
+            configured_unreceived = self.policy().dependency_custody().unreceived_productions,
+            "Frontend installed original publication capacity",
+        );
         Ok(pair)
     }
 

@@ -58,6 +58,7 @@ pub struct InternalCpuMetadataGeometry {
     // the ordinary job; the subtotal uses max(job, wrapper), not their sum.
     provider_input: Layout,
     provider_job: Layout,
+    action_detail_backing_bytes: usize,
 }
 impl InternalCpuMetadataGeometry {
     pub const fn packet_layout(self) -> Layout {
@@ -97,6 +98,11 @@ impl InternalCpuMetadataGeometry {
     pub const fn provider_creator_job_layout(self) -> Layout {
         self.provider_job
     }
+    /// One original refusal marker's exact bounded heap request. The inline
+    /// String is already in ExecutionFailureInput; this is only its backing.
+    pub const fn action_detail_backing_bytes(self) -> usize {
+        self.action_detail_backing_bytes
+    }
     /// Known additive component, not a complete allocation/task/payload quote.
     /// The diagnostic domain_slot/operation sub-layouts are already represented
     /// in the real packet/factory frame and are not charged a second time.
@@ -114,6 +120,7 @@ impl InternalCpuMetadataGeometry {
             failures,
             self.forwarder_failure.size(),
             self.provider_input.size(),
+            self.action_detail_backing_bytes,
         ]
         .into_iter()
         .try_fold(0usize, |total, bytes| {
@@ -232,6 +239,7 @@ pub(super) fn geometry() -> Result<InternalCpuMetadataGeometry, LayoutResourceEr
         operation: Layout::new::<InternalResultOperation>(),
         provider_input: Layout::new::<super::scoped_statistics::ClosedCreatorInput>(),
         provider_job: Layout::new::<super::ProviderReadCpuJob>(),
+        action_detail_backing_bytes: super::CPU_ACTION_DETAIL_BYTES,
     })
 }
 
@@ -250,6 +258,10 @@ mod tests {
         assert!(actual.packet_layout().align() >= std::mem::align_of::<InternalDomainSlot>());
         assert!(actual.packet_layout().size() >= std::mem::size_of::<InternalResultOperation>());
         assert_eq!(actual.worker_call_layout(), operation_call_layout());
+        assert_eq!(
+            actual.action_detail_backing_bytes(),
+            super::super::CPU_ACTION_DETAIL_BYTES
+        );
         let one = actual.known_metadata_bytes_per_job().unwrap();
         assert!(one > actual.packet_layout().size());
         assert_eq!(actual.known_metadata_bytes_for_jobs(0), Ok(0));

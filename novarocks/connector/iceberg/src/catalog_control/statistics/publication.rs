@@ -49,15 +49,41 @@ pub(super) struct StatisticsDraftPreparer {
     )>,
 }
 
-#[async_trait]
 impl Preparer for StatisticsDraftPreparer {
-    async fn prepare(
-        &self,
-        view: &StagedView<'_>,
-        _intent: &OperationIntent,
-    ) -> crate::iceberg::Result<PreparedChange> {
-        self.prepare_artifacts(view.artifacts()).await
+    fn prepare<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        view: &'life1 StagedView<'life2>,
+        _intent: &'life3 OperationIntent,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = crate::iceberg::Result<PreparedChange>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(make_statistics_preparation(self, view.artifacts()))
     }
+}
+fn make_statistics_preparation<'a>(
+    original: &'a StatisticsDraftPreparer,
+    writer: &'a dyn ArtifactWriter,
+) -> impl std::future::Future<Output = crate::iceberg::Result<PreparedChange>> + Send + 'a {
+    original.prepare_artifacts(writer)
+}
+/// Actual pointee boxed by the Preparer implementation above. Its nested
+/// Puffin/error state is inline in this F, not inferred from the outer caller.
+pub(super) fn preparation_future_bytes() -> usize {
+    fn bytes<A, B, F: std::future::Future>(_: fn(A, B) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    bytes(make_statistics_preparation)
 }
 
 impl StatisticsDraftPreparer {
@@ -90,17 +116,24 @@ impl StatisticsDraftPreparer {
                 &self.drafts,
             )
             .await
+            .map_err(|error| preparation_error(unavailable(error)))
         };
-        // Keep a typed late cancellation even if the writer's String result
-        // also reports it. The operation waits for actual writer exit.
-        writer.check_active()?;
-        let statistics = written
-            .map_err(|error| preparation_error(unavailable(error)))?
-            .ok_or_else(|| {
-                preparation_error(corrupt(
-                    "Non-empty statistics drafts produced no Puffin file",
-                ))
-            })?;
+        let statistics = if self.cpu.is_some() {
+            // The scoped writer already preserves the original typed failure.
+            // A later stop must not replace a refusal selected before real exit.
+            let statistics = written?;
+            writer.check_active()?;
+            statistics
+        } else {
+            // Legacy String I/O needs this original typed late-stop projection.
+            writer.check_active()?;
+            written?
+        };
+        let statistics = statistics.ok_or_else(|| {
+            preparation_error(corrupt(
+                "Non-empty statistics drafts produced no Puffin file",
+            ))
+        })?;
         Ok(PreparedChange {
             requirements: vec![],
             updates: vec![crate::iceberg::TableUpdate::SetStatistics { statistics }],
@@ -986,6 +1019,84 @@ mod tests {
             matches!(outcome, ExternalMutationOutcome::KnownUncommitted { ref failure, cleanup: ExternalMutationFinalization::Complete } if failure.kind() == ConnectorMutationFailureKind::ResourceExhausted),
             "{outcome:?}"
         );
+        assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 0);
+        assert!(rig.operation.artifacts().unwrap().is_empty());
+    }
+
+    struct RefuseCpuThenStop {
+        stop: ConnectorStopOwner,
+        submitted: AtomicUsize,
+    }
+    impl novarocks_spi::connector::StatisticsCpuPort for RefuseCpuThenStop {
+        fn submit_in(
+            &self,
+            source: &mut Option<novarocks_spi::connector::StatisticsCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            assert!(
+                source.is_some(),
+                "refused original input stays with its owner"
+            );
+            self.submitted.fetch_add(1, Ordering::SeqCst);
+            let refusal = ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                "original CPU capacity refusal before later stop",
+            );
+            self.stop.request_stop();
+            Err(refusal)
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            panic!("refused CPU source never accepted a physical job")
+        }
+        fn poll_closed(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+        fn metadata_bytes(&self) -> Result<std::num::NonZeroU64, ConnectorError> {
+            panic!("this boundary regression does not install capacity geometry")
+        }
+    }
+
+    #[test]
+    fn scoped_cpu_refusal_survives_later_stop_and_cleans_without_dispatch() {
+        let rig = Rig::new();
+        let publisher = rig.publisher(rig.metadata.clone(), Behavior::Commit);
+        let refusal = Arc::new(RefuseCpuThenStop {
+            stop: rig.stop.clone(),
+            submitted: AtomicUsize::new(0),
+        });
+        let cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort> = refusal.clone();
+        let preparer = Arc::new(StatisticsDraftPreparer {
+            snapshot_id: 7,
+            sequence_number: 1,
+            drafts: drafts().into(),
+            cpu: Some(Arc::downgrade(&cpu)),
+            cpu_owner: Some((
+                rig.projection.descriptor.clone(),
+                rig.projection.incarnation,
+            )),
+        });
+        let outcome = rig.run(publisher.clone(), preparer);
+        let ExternalMutationOutcome::KnownUncommitted {
+            failure,
+            cleanup: ExternalMutationFinalization::Complete,
+        } = outcome
+        else {
+            panic!("original refused publication must remain uncommitted: {outcome:?}");
+        };
+        assert_eq!(
+            failure.kind(),
+            ConnectorMutationFailureKind::ResourceExhausted
+        );
+        assert!(failure.message().contains("original CPU capacity refusal"));
+        assert_eq!(refusal.submitted.load(Ordering::SeqCst), 1);
         assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 0);
         assert!(rig.operation.artifacts().unwrap().is_empty());
     }

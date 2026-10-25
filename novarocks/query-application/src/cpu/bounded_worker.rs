@@ -721,6 +721,28 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
             _queue_slot: queue_slot,
         })
     }
+
+    /// Wait in the same physical queue used by ordinary submissions. Dropping
+    /// this future withdraws its semaphore waiter; it does not create a job.
+    pub(crate) async fn reserve(&self) -> Result<BoundedWorkerReservation, QueueReserveRefusal> {
+        let queue_slot = Arc::clone(&self.shared.queue_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| QueueReserveRefusal::Closed)?;
+        if self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed
+        {
+            return Err(QueueReserveRefusal::Closed);
+        }
+        Ok(BoundedWorkerReservation {
+            source: self.source(),
+            _queue_slot: queue_slot,
+        })
+    }
     pub(crate) fn same_pool(&self, reservation: &BoundedWorkerReservation) -> bool {
         Weak::ptr_eq(&reservation.source, &self.source())
     }

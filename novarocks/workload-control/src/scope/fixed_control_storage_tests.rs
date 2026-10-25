@@ -2199,7 +2199,7 @@ fn withdrawn_request_cannot_reuse_a_body_still_held_by_the_original_driver() {
 }
 
 #[test]
-fn empty_delivered_container_and_its_iterator_retain_the_original_body_fee() {
+fn empty_delivered_container_and_its_iterator_do_not_retain_proposal_backing() {
     use crate::joint_admission::{JointClaimChange, JointLane};
     let (control, handle, mut driver) = prototype_full(3, 1);
     let dependency = selected_dependency(&handle, "reply");
@@ -2227,22 +2227,100 @@ fn empty_delivered_container_and_its_iterator_retain_the_original_body_fee() {
         panic!("original reply")
     };
     assert!(batch.adjustment.is_none());
-    drop(batch.new_claims.pop().unwrap());
+    let physical = batch.new_claims.pop().unwrap();
+    let scope_id = work.owner.scope().id;
+    drain(&mut driver);
+    {
+        let state = control.inner.state.lock().unwrap();
+        let node = &state.nodes[&scope_id];
+        assert!(
+            state.cancellations.slots[node.cancellation.0]
+                .proposals
+                .iter()
+                .all(|cell| {
+                    cell.phase
+                        == crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
+                }),
+            "consumed reply is not an active proposal borrow"
+        );
+    }
     work.business.release();
     work.owner.complete();
     drain(&mut driver);
-    assert!(
-        control.inner.state.lock().unwrap().nodes.is_empty(),
-        "logical Node has exited"
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes.len(),
+        1,
+        "the original physical claim still retains its Work"
     );
-    assert_eq!(snapshot(&control).3, 1, "old bound control fee remains");
     let mut iter = batch.new_claims.into_iter();
     assert!(iter.next().is_none());
-    let marker = drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 1, "empty iterator still owns backing");
-    drop(iter);
-    assert_ne!(marker, control.progress_revision());
+    drop(physical);
     drain(&mut driver);
+    assert!(
+        control.inner.state.lock().unwrap().nodes.is_empty(),
+        "only actual claim exit permits Work retirement"
+    );
+    assert_eq!(
+        snapshot(&control).3,
+        0,
+        "empty owning iterator cannot pin a retired proposal/control cell"
+    );
+    drop(iter);
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn nonempty_owning_iterator_keeps_claims_without_pinning_constructor_cells() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    let (control, handle, mut driver) = prototype_profile(6, 1, 1, 2);
+    let dependency = selected_dependency(&handle, "iterator");
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let mut binding = first_bind(&handle, &work.owner, &dependency);
+    drain(&mut driver);
+    binding_receipt(&mut binding)
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drain(&mut driver);
+    let change = || JointClaimChange::New {
+        dependencies: vec![dependency.clone()],
+        lane: JointLane::Custody,
+        amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+    };
+    let mut request = handle.request(&scope, vec![change(), change()]).unwrap();
+    drain(&mut driver);
+    let Poll::Ready(Ok(batch)) =
+        std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("original two-claim reply");
+    };
+    assert!(batch.adjustment.is_none());
+    let mut original = batch.new_claims.into_iter();
+    let first = original.next().unwrap();
+    assert_eq!(original.size_hint(), (1, Some(1)));
+    drain(&mut driver);
+    // Both original cells can build new requests while the owning iterator and
+    // its yielded physical claim remain alive.
+    let a = handle.reserve_proposal(&scope).unwrap();
+    let b = handle.reserve_proposal(&scope).unwrap();
+    drop((a, b));
+    drain(&mut driver);
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
+    assert_eq!(first.amounts().unwrap().get(JointResource::ClaimRecords), 1);
+    drop(first);
+    drain(&mut driver);
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes.len(),
+        1,
+        "the unconsumed iterator still owns its remaining physical claim"
+    );
+    drop(original);
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().nodes.is_empty());
     assert_eq!(snapshot(&control).3, 0);
 }
 

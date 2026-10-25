@@ -813,14 +813,7 @@ impl StatisticsJobRepository {
         }
         let job = StatisticsJob::new(request);
         let mut state = self.lock()?;
-        if state.active.len()
-            + state
-                .terminal
-                .iter()
-                .filter(|e| !e.job.convergence.is_complete())
-                .count()
-            >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS
-        {
+        if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
             return Err(StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::Capacity,
                 "statistics runtime active or queued job capacity exhausted",
@@ -890,14 +883,7 @@ impl StatisticsJobRepository {
             test_statement_nomination,
         } = admission;
         let mut state = self.lock()?;
-        if state.active.len()
-            + state
-                .terminal
-                .iter()
-                .filter(|e| !e.job.convergence.is_complete())
-                .count()
-            >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS
-        {
+        if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
             return Err(StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::Capacity,
                 "statistics runtime active or queued job capacity exhausted",
@@ -1495,9 +1481,9 @@ impl StatisticsJobRepository {
     }
 
     fn trim_terminal(state: &mut RuntimeState) {
-        // Do not evict terminal jobs whose work root still owns convergence
-        // responsibility.  Capacity is bounded by refusing later submissions
-        // if an implementation cannot converge old jobs.
+        // Keep unresolved responsibility and actual-exit custody even when
+        // recent history exceeds its retention target. These terminal tails
+        // do not consume active or queued business admission positions.
         while state.terminal.len() > MAX_RECENT_TERMINAL_STATISTICS_JOBS {
             let Some(index) = state.terminal.iter().position(|entry| {
                 entry.job.convergence.is_complete()
@@ -2096,7 +2082,7 @@ mod tests {
         assert!(!record.public_message().contains("private"));
     }
 
-    fn create(at_ms: i64) -> StatisticsJobCreate {
+    pub(super) fn create(at_ms: i64) -> StatisticsJobCreate {
         StatisticsJobCreate {
             target: StatisticsTarget {
                 catalog: Arc::from("iceberg"),
@@ -2109,7 +2095,7 @@ mod tests {
         }
     }
 
-    async fn root() -> StatisticsJobAdmission {
+    pub(super) async fn root() -> StatisticsJobAdmission {
         root_with_capacity().await.0
     }
 
@@ -2145,6 +2131,128 @@ mod tests {
             StatisticsJobAdmission::try_new(root.owner, permit, window).unwrap(),
             capacity,
         )
+    }
+
+    pub(super) async fn retain_unknown_terminal_jobs(
+        repository: &StatisticsJobRepository,
+        count: usize,
+    ) -> Vec<(StatisticsJob, WorkScope)> {
+        let mut retained = Vec::with_capacity(count);
+        for index in 0..count {
+            let admission = root().await;
+            let scope = admission.scope();
+            let job = repository
+                .create_admitted(create(index as i64), admission)
+                .await
+                .unwrap();
+            assert_eq!(repository.claim_next(1).await.unwrap().unwrap().id, job.id);
+            repository
+                .phase(
+                    job.id,
+                    StatisticsJobPhase::Preparing,
+                    StatisticsJobPhase::Collecting,
+                    2,
+                )
+                .await
+                .unwrap();
+            repository
+                .phase(
+                    job.id,
+                    StatisticsJobPhase::Collecting,
+                    StatisticsJobPhase::Publishing,
+                    3,
+                )
+                .await
+                .unwrap();
+            let terminal = repository
+                .conclude(
+                    job.id,
+                    StatisticsJobPhase::Publishing,
+                    StatisticsJobConclusion::CommitUnknown,
+                    StatisticsPublicationFact::CommitUnknown,
+                    Some(StatisticsFailure {
+                        compile_control: None,
+                        message: Arc::from("original publication outcome remains unknown"),
+                    }),
+                    4,
+                )
+                .await
+                .unwrap();
+            assert_eq!(terminal.convergence, StatisticsConvergence::default());
+            scope.check().unwrap();
+            retained.push((terminal, scope));
+        }
+        retained
+    }
+
+    pub(super) async fn close_local_terminal_fixtures(
+        repository: &StatisticsJobRepository,
+        retained: Vec<(StatisticsJob, WorkScope)>,
+    ) {
+        // These repository fixtures installed no Native or Provider operation.
+        // Close their original local holders only after all custody assertions.
+        for (job, scope) in retained {
+            repository
+                .record_convergence(
+                    job.id,
+                    StatisticsConvergence {
+                        collection_stopped: true,
+                        execution_resources_released: true,
+                        provider_session_closed: true,
+                    },
+                    5,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                scope.check(),
+                Err(novarocks_workload_control::WorkError::Released)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_history_trim_retains_unknown_responsibility_without_completing_it() {
+        let repository = StatisticsJobRepository::new();
+        let retained = retain_unknown_terminal_jobs(&repository, 1).await;
+        let (original, scope) = &retained[0];
+        let mut first_completed = None;
+        for index in 0..MAX_RECENT_TERMINAL_STATISTICS_JOBS {
+            let queued = repository
+                .create_admitted(create(index as i64 + 10), root().await)
+                .await
+                .unwrap();
+            first_completed.get_or_insert(queued.id);
+            let cancelled = repository.request_cancel(queued.id, 20).await.unwrap();
+            assert!(cancelled.convergence.is_complete());
+        }
+        assert_eq!(
+            repository.get(original.id).await.unwrap().as_ref(),
+            Some(original)
+        );
+        assert!(
+            repository
+                .get(first_completed.unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository.list().await.unwrap().len(),
+            MAX_RECENT_TERMINAL_STATISTICS_JOBS
+        );
+        scope.check().unwrap();
+        let state = repository.lock().unwrap();
+        let tail = state
+            .terminal
+            .iter()
+            .find(|entry| entry.job.id == original.id)
+            .unwrap();
+        assert!(tail.owner.is_some() && tail.query_concurrency.is_some());
+        assert!(tail.result_capacity.is_some());
+        assert_eq!(tail.job.convergence, StatisticsConvergence::default());
+        drop(state);
+        close_local_terminal_fixtures(&repository, retained).await;
     }
 
     #[tokio::test]

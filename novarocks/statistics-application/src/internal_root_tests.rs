@@ -198,29 +198,31 @@ fn claim(
     result
 }
 
-#[tokio::test]
-async fn original_live_job_receives_the_root_grant_and_transfers_only_exact_stage_compute() {
-    let (control, handle, mut driver) = fixture();
+async fn internal_admission(
+    control: &WorkloadControl,
+    handle: &JointAdmissionHandle,
+    driver: &mut JointProgressDriver,
+) -> (Option<StatisticsJobAdmission>, WorkScope) {
     let work = control
         .root_admission()
         .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
         .unwrap();
-    let root_scope = work.owner.scope();
+    let scope = work.owner.scope();
     let facts = [SharedDependency::LocalHost];
-    bind(&root_scope, &facts, &mut driver);
+    bind(&scope, &facts, driver);
     let mut raw = Some(claim(
-        &handle,
+        handle,
         &work.owner,
         &facts,
         JointLane::Custody,
         amounts(JointResource::PayloadBytes, 8),
-        &mut driver,
+        driver,
     ));
     let mut payload = None;
-    RetainedPayloadGrant::adopt_in(&root_scope, &mut raw, &mut payload)
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
         .unwrap()
         .notify();
-    let mut query = Some(root_scope.admit_query().unwrap().await.unwrap());
+    let mut query = Some(scope.admit_query().unwrap().await.unwrap());
     let mut owner = Some(work.owner);
     let mut admission = None;
     StatisticsJobAdmission::install_internal_in(
@@ -231,6 +233,96 @@ async fn original_live_job_receives_the_root_grant_and_transfers_only_exact_stag
     )
     .unwrap();
     assert!(owner.is_none() && query.is_none() && payload.is_none());
+    (admission, scope)
+}
+
+#[tokio::test]
+async fn terminal_history_does_not_consume_job_admission_but_active_jobs_still_do() {
+    let repository = StatisticsJobRepository::new();
+    let retained =
+        tests::retain_unknown_terminal_jobs(&repository, MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS)
+            .await;
+    let ordinary = repository
+        .create_admitted(tests::create(10), tests::root().await)
+        .await
+        .expect("unconverged terminal history is not active job admission");
+    let (control, handle, mut driver) = fixture();
+    let (mut admission, scope) = internal_admission(&control, &handle, &mut driver).await;
+    let (installed, notification) = repository
+        .install_internal_job_in(tests::create(11), &mut admission)
+        .expect("the original stable Root receiver has an active position");
+    assert!(admission.is_none());
+    assert_eq!(
+        repository.lock().unwrap().active[&installed.id]
+            .owner
+            .as_ref()
+            .unwrap()
+            .scope()
+            .id(),
+        scope.id()
+    );
+    notification.notify();
+    let mut active = vec![ordinary.id, installed.id];
+    for index in active.len()..MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
+        active.push(
+            repository
+                .create_admitted(tests::create(index as i64 + 20), tests::root().await)
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let (mut refused, refused_scope) = internal_admission(&control, &handle, &mut driver).await;
+    let error = match repository.install_internal_job_in(tests::create(30), &mut refused) {
+        Err(error) => error,
+        Ok(_) => panic!("the original active job limit must still refuse another Root"),
+    };
+    assert_eq!(error.kind(), StatisticsRepositoryErrorKind::Capacity);
+    assert_eq!(refused.as_ref().unwrap().scope().id(), refused_scope.id());
+    assert!(refused.as_ref().unwrap().root_payload.is_some());
+    assert_eq!(
+        repository.lock().unwrap().active.len(),
+        MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS
+    );
+    for (original, scope) in &retained {
+        assert_eq!(
+            repository.get(original.id).await.unwrap().as_ref(),
+            Some(original)
+        );
+        scope.check().unwrap();
+    }
+    // Rejected installation did not consume the original source or its permit.
+    let mut original = refused.take().unwrap().into_originals();
+    assert!(original.query_concurrency.is_some());
+    let owner = original.owner.take().unwrap();
+    drop(original);
+    owner.complete_after_terminal_cancel_settled();
+    for id in active {
+        assert!(
+            repository
+                .request_cancel(id, 40)
+                .await
+                .unwrap()
+                .convergence
+                .is_complete()
+        );
+    }
+    drive(&mut driver);
+    assert!(matches!(
+        scope.check(),
+        Err(novarocks_workload_control::WorkError::Released)
+    ));
+    assert!(matches!(
+        refused_scope.check(),
+        Err(novarocks_workload_control::WorkError::Released)
+    ));
+    tests::close_local_terminal_fixtures(&repository, retained).await;
+}
+
+#[tokio::test]
+async fn original_live_job_receives_the_root_grant_and_transfers_only_exact_stage_compute() {
+    let (control, handle, mut driver) = fixture();
+    let (mut admission, root_scope) = internal_admission(&control, &handle, &mut driver).await;
     let repository = StatisticsJobRepository::new();
     let (job, notification) = repository
         .install_internal_job_in(

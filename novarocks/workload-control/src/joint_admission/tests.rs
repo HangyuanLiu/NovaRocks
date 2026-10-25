@@ -2818,7 +2818,7 @@ fn local_physical_drop_unwind_keeps_same_offer_and_cannot_retry_or_refund() {
 }
 
 #[test]
-fn fixed_paid_local_offer_retains_original_body_until_physical_and_reply_exit() {
+fn fixed_paid_local_offer_releases_proposal_body_but_retains_physical_and_reply_claims() {
     let (control, handle, mut driver) =
         crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
     let work = control
@@ -2888,6 +2888,20 @@ fn fixed_paid_local_offer_retains_original_body_until_physical_and_reply_exit() 
         .notify();
     drop(offer);
     assert_eq!(destination.as_ref().unwrap().claims().len(), 1);
+    drive(&mut driver);
+    // accept_in installed the original physical/claim bundle. Its response
+    // lifetime cannot occupy either of the two temporary constructor cells.
+    let a = handle.reserve_proposal(&work.owner.scope()).unwrap();
+    let b = handle.reserve_proposal(&work.owner.scope()).unwrap();
+    assert_eq!(
+        destination.as_ref().unwrap().claims()[0]
+            .amounts()
+            .unwrap()
+            .get(JointResource::ClaimRecords),
+        1
+    );
+    drop((a, b));
+    drive(&mut driver);
     work.business.release();
     work.owner.complete();
     drive(&mut driver);

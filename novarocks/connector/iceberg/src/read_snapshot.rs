@@ -506,6 +506,10 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 novarocks_spi::connector::ConnectorCowBeginCause,
             >(sum, f.name.len() as u64))
         })?;
+        if let Some(io) = io {
+            io.reserve(recipe(cow_capture::geometry::add(budget.upper(), names))?)
+                .await?;
+        }
         budget.charge(names)?;
     }
     let field_id_to_name: HashMap<i32, String> = schema
@@ -532,6 +536,21 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         check_read_control(control)?;
         check_cow_active(budget)?;
         if let Some(budget) = budget {
+            if let Some(io) = io
+                && seen_manifests.len() == seen_manifests.capacity()
+            {
+                let next = seen_manifests
+                    .capacity()
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| ReadFailure::Semantic("manifest set upper overflow".into()))?;
+                let amount = recipe(cow_capture::geometry::hash_max::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                    &str,
+                >(next))?;
+                io.reserve(recipe(cow_capture::geometry::add(budget.upper(), amount))?)
+                    .await?;
+            }
             budget.hash_insert::<&str>(seen_manifests.len(), seen_manifests.capacity())?;
         }
         if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
@@ -576,6 +595,13 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 .partition_type_jsons()
                 .get(&spec.spec_id())
         {
+            if let Some(io) = io {
+                io.reserve(recipe(cow_capture::geometry::add(
+                    budget.upper(),
+                    CaptureBudget::json_working_upper(json.len() as u64)?,
+                ))?)
+                .await?;
+            }
             budget.json_working(json.len() as u64)?;
         }
         let partition_type = domain
@@ -617,7 +643,9 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                     recipe(arc_bytes::<Cause>(df.file_path().len()))?,
                     df.file_path().len() as u64,
                     manifest_file.manifest_path.len() as u64,
-                    df.key_metadata().unwrap_or_default().len() as u64,
+                    recipe(arc_bytes::<Cause>(
+                        df.key_metadata().unwrap_or_default().len(),
+                    ))?,
                 ] {
                     additional = recipe(add::<Cause>(additional, part))?;
                 }
@@ -630,9 +658,15 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 if let Some(ids) = df.equality_ids() {
                     additional = recipe(add::<Cause>(
                         additional,
-                        recipe(mul::<Cause>(
-                            recipe(slots::<Cause, (i32, PrimitiveType)>(ids.len()))?,
-                            3,
+                        recipe(add::<Cause>(
+                            recipe(slots::<Cause, i32>(ids.len()))?,
+                            recipe(add::<Cause>(
+                                recipe(slots::<Cause, (i32, PrimitiveType)>(ids.len()))?,
+                                recipe(cow_capture::geometry::arc_slice::<
+                                    Cause,
+                                    (i32, PrimitiveType),
+                                >(ids.len()))?,
+                            ))?,
                         ))?,
                     ))?;
                 }
@@ -662,6 +696,25 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             additional = recipe(add::<Cause>(
                 additional,
                 recipe(mul::<Cause>(recipe(add::<Cause>(vector, deletes))?, 4))?,
+            ))?;
+            let footer_slots = if delete_manifests.len() == delete_manifests.capacity() {
+                delete_manifests
+                    .capacity()
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        ReadFailure::Semantic("manifest receiver upper overflow".into())
+                    })?
+                    .max(8)
+            } else {
+                0
+            };
+            additional = recipe(add::<Cause>(
+                additional,
+                recipe(slots::<Cause, ManifestDeleteObservation>(footer_slots))?,
+            ))?;
+            additional = recipe(add::<Cause>(
+                additional,
+                recipe(arc_bytes::<Cause>(manifest_file.manifest_path.len()))?,
             ))?;
             let required = recipe(add::<Cause>(budget.upper(), additional))?;
             io.reserve(required).await?;
@@ -925,7 +978,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             >(manifest_file.manifest_path.len()))?)?;
         }
         delete_manifests.push(ManifestDeleteObservation {
-            manifest_path: manifest_file.manifest_path.clone().into(),
+            manifest_path: Arc::from(manifest_file.manifest_path.as_str()),
             entries: delete_entries,
         });
     }
@@ -934,29 +987,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             .iter()
             .try_fold(0usize, |sum, m| sum.checked_add(m.entries.len()))
             .ok_or_else(|| ReadFailure::Semantic("COW delete member upper overflow".into()))?;
-        if let Some(io) = io {
-            use cow_capture::geometry::{add, arc_slice, mul, slots};
-            use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
-            let mut amount =
-                CaptureBudget::delete_structures_upper(delete_manifests.len(), members)?;
-            for manifest in &delete_manifests {
-                for entry in &manifest.entries {
-                    if let DeleteKind::Equality(group) = &entry.file.kind {
-                        let n = group.fields().len();
-                        for part in [
-                            recipe(mul::<Cause>(recipe(slots::<Cause, i32>(n))?, 2))?,
-                            recipe(slots::<Cause, (i32, PrimitiveType)>(n))?,
-                            recipe(arc_slice::<Cause, (i32, PrimitiveType)>(n))?,
-                        ] {
-                            amount = recipe(add::<Cause>(amount, part))?;
-                        }
-                    }
-                }
-            }
-            io.reserve(recipe(add::<Cause>(budget.upper(), amount))?)
-                .await?;
-        }
-        budget.delete_structures(delete_manifests.len(), members)?;
+        let mut amount = CaptureBudget::delete_structures_upper(delete_manifests.len(), members)?;
         for manifest in &delete_manifests {
             for entry in &manifest.entries {
                 budget.active()?;
@@ -983,28 +1014,48 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                             novarocks_spi::connector::ConnectorCowBeginCause,
                         >(fields, arc))?,
                     ))?;
-                    budget.charge(rebound)?;
+                    amount = recipe(cow_capture::geometry::add(amount, rebound))?;
                 }
                 let upper = entry.file.partition.json_owned_upper().ok_or_else(|| {
                     ReadFailure::Semantic("COW partition JSON upper overflow".into())
                 })?;
                 // Prefix descriptions and bounded statistics may construct
                 // the same tuple; retain a conservative constructor sum.
-                budget.charge(recipe(cow_capture::geometry::mul::<
-                    novarocks_spi::connector::ConnectorCowBeginCause,
-                >(upper, 4))?)?;
+                amount = recipe(cow_capture::geometry::add(
+                    amount,
+                    recipe(cow_capture::geometry::mul::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                    >(upper, 4))?,
+                ))?;
             }
         }
-        budget.json_working(domain.endpoint().schema_json().len() as u64)?;
-        budget.schema_indexes(&schema)?;
+        amount = recipe(cow_capture::geometry::add(
+            amount,
+            CaptureBudget::json_working_upper(domain.endpoint().schema_json().len() as u64)?,
+        ))?;
+        amount = recipe(cow_capture::geometry::add(
+            amount,
+            budget.schema_indexes_upper(&schema)?,
+        ))?;
         for json in domain
             .endpoint()
             .partition_spec_jsons()
             .values()
             .chain(domain.endpoint().partition_type_jsons().values())
         {
-            budget.json_working(json.len() as u64)?;
+            amount = recipe(cow_capture::geometry::add(
+                amount,
+                CaptureBudget::json_working_upper(json.len() as u64)?,
+            ))?;
         }
+        // This is one formation segment. Its complete schema/partition and
+        // equality rebound invoice precedes both the original budget charge
+        // and DeleteObservation/DeleteCandidateIndex construction.
+        if let Some(io) = io {
+            io.reserve(recipe(cow_capture::geometry::add(budget.upper(), amount))?)
+                .await?;
+        }
+        budget.charge(amount)?;
     }
     let observation =
         DeleteObservation::from_manifests_checked(delete_manifests, || check_cow_active(budget))
@@ -1021,10 +1072,15 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             ));
         }
         if let Some(budget) = budget {
-            budget.charge(recipe(cow_capture::geometry::slots::<
+            let amount = recipe(cow_capture::geometry::slots::<
                 novarocks_spi::connector::ConnectorCowBeginCause,
                 Arc<crate::delete_semantics::DeleteFact>,
-            >(observation.facts().len()))?)?;
+            >(observation.facts().len()))?;
+            if let Some(io) = io {
+                io.reserve(recipe(cow_capture::geometry::add(budget.upper(), amount))?)
+                    .await?;
+            }
+            budget.charge(amount)?;
         }
         receiving.extend(observation.facts().iter().cloned());
     }
