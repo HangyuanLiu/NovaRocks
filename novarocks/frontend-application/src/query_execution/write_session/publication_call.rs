@@ -669,13 +669,12 @@ async fn finish_future(
     );
     drop(original);
     drop(control);
-    let outcome = slot
-        .outcome
+
+    slot.outcome
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()
-        .expect("same stored publication result");
-    outcome
+        .expect("same stored publication result")
 }
 async fn reconcile_future(
     (session, input, slot, needed_receiving): (
@@ -702,13 +701,12 @@ async fn reconcile_future(
     );
     drop(original);
     drop(control);
-    let outcome = slot
-        .outcome
+
+    slot.outcome
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()
-        .expect("same stored reconciliation result");
-    outcome
+        .expect("same stored reconciliation result")
 }
 async fn abort_future(
     (session, input, slot): (
@@ -731,13 +729,12 @@ async fn abort_future(
     slot.receive_completion(&session, CallCompletion::Abort(outcome), None);
     drop(original);
     drop(control);
-    let outcome = slot
-        .outcome
+
+    slot.outcome
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()
-        .expect("same stored abort result");
-    outcome
+        .expect("same stored abort result")
 }
 fn invalid(detail: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, detail)

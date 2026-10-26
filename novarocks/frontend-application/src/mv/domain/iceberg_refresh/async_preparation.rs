@@ -19,6 +19,24 @@ use super::*;
 use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError as RefreshError;
 use crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo;
 use novarocks_spi::connector::ConnectorOperationControl;
+
+/// Borrowed facts from the same retained refresh generation.
+pub(crate) struct RefreshPlanningFacts<'a> {
+    iceberg_target: &'a IcebergMvTarget,
+    mv_definition: &'a StoredKeyedMvProjection,
+    base_refs: &'a [TableIdentity],
+    target_binding: &'a MvTargetBinding,
+    target_observation: &'a MvSchemaValidationObservation,
+    state_baseline: &'a RefreshStateBaseline,
+}
+
+/// Snapshot observations keyed by the original relation occurrences.
+struct OccurrenceSnapshotWindow<'a> {
+    bases: &'a [RefreshBaseRelationOccurrence],
+    previous: &'a BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    current: &'a BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
+}
+
 pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
@@ -142,17 +160,17 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             return plan_iceberg_union_projection_mv_refresh(
                 io,
                 source,
-                &iceberg_target,
+                RefreshPlanningFacts {
+                    iceberg_target: &iceberg_target,
+                    mv_definition: &mv_definition,
+                    base_refs: &base_refs,
+                    target_binding: &target_binding,
+                    target_observation: &target_schema_observation,
+                    state_baseline: &refresh_state_baseline,
+                },
                 target,
                 stmt,
-                current_catalog,
-                current_database,
-                &mv_definition,
-                &base_refs,
                 branch_count,
-                &target_binding,
-                &target_schema_observation,
-                &refresh_state_baseline,
                 connector_context,
             )
             .await;
@@ -166,18 +184,20 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             return plan_iceberg_aggregate_mv_refresh(
                 io,
                 source,
-                &iceberg_target,
+                RefreshPlanningFacts {
+                    iceberg_target: &iceberg_target,
+                    mv_definition: &mv_definition,
+                    base_refs: &base_refs,
+                    target_binding: &target_binding,
+                    target_observation: &target_schema_observation,
+                    state_baseline: &refresh_state_baseline,
+                },
                 target,
                 stmt,
                 current_catalog,
                 current_database,
-                &mv_definition,
-                &base_refs,
                 &caps,
                 &canonical_select_query,
-                &target_binding,
-                &target_schema_observation,
-                &refresh_state_baseline,
                 connector_context,
             )
             .await;
@@ -480,19 +500,20 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
 pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
-    iceberg_target: &IcebergMvTarget,
+    facts: RefreshPlanningFacts<'_>,
     target: MvTarget,
     stmt: &MvRefreshRequest,
-    _current_catalog: Option<&str>,
-    _current_database: &str,
-    mv_definition: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
     branch_count: usize,
-    target_binding: &MvTargetBinding,
-    target_observation: &MvSchemaValidationObservation,
-    state_baseline: &RefreshStateBaseline,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
+    let RefreshPlanningFacts {
+        iceberg_target,
+        mv_definition,
+        base_refs,
+        target_binding,
+        target_observation,
+        state_baseline,
+    } = facts;
     // The resolved bases ARE D's occurrences, in D's own order; the retired
     // contract base set that used to be compared here no longer exists.
     let occurrences = definition_occurrences_for_base_refs(mv_definition, base_refs)
@@ -620,9 +641,11 @@ pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
         mv_definition,
         target_binding.partition(),
         mode,
-        &base_occurrences,
-        previous_snapshots,
-        &current_snapshots,
+        OccurrenceSnapshotWindow {
+            bases: &base_occurrences,
+            previous: previous_snapshots,
+            current: &current_snapshots,
+        },
         "UNION ALL MV affected partition planning",
     )
     .await;
@@ -644,20 +667,23 @@ pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
 pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
-    iceberg_target: &IcebergMvTarget,
+    facts: RefreshPlanningFacts<'_>,
     target: MvTarget,
     stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
-    mv_definition: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &ast::Query,
-    target_binding: &MvTargetBinding,
-    target_observation: &MvSchemaValidationObservation,
-    state_baseline: &RefreshStateBaseline,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
+    let RefreshPlanningFacts {
+        iceberg_target,
+        mv_definition,
+        base_refs,
+        target_binding,
+        target_observation,
+        state_baseline,
+    } = facts;
     // The branch-union variant validates the branch count (off the AST, so a
     // composed branch union is supported) + the resolved base-ref set; the
     // fan-in variant validates the resolved base-ref set directly (the resolved
@@ -781,9 +807,11 @@ pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
         mv_definition,
         target_binding.partition(),
         mode,
-        &base_occurrences,
-        previous_snapshots,
-        &current_snapshots,
+        OccurrenceSnapshotWindow {
+            bases: &base_occurrences,
+            previous: previous_snapshots,
+            current: &current_snapshots,
+        },
         &affected_partition_context,
     )
     .await;
@@ -805,20 +833,23 @@ pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
 pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
-    iceberg_target: &IcebergMvTarget,
+    facts: RefreshPlanningFacts<'_>,
     target: MvTarget,
     stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
-    mv_definition: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &ast::Query,
-    target_binding: &MvTargetBinding,
-    target_observation: &MvSchemaValidationObservation,
-    state_baseline: &RefreshStateBaseline,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
+    let RefreshPlanningFacts {
+        iceberg_target,
+        mv_definition,
+        base_refs,
+        target_binding,
+        target_observation,
+        state_baseline,
+    } = facts;
     // L is the only aggregate authority; there is no persisted contract version
     // to compare against any more.
     validate_aggregate_schema_contract_metadata(iceberg_target, mv_definition)
@@ -837,18 +868,20 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                 return plan_iceberg_all_bases_aggregate_mv_refresh(
                     io,
                     source,
-                    iceberg_target,
+                    RefreshPlanningFacts {
+                        iceberg_target,
+                        mv_definition,
+                        base_refs,
+                        target_binding,
+                        target_observation,
+                        state_baseline,
+                    },
                     target,
                     stmt,
                     current_catalog,
                     current_database,
-                    mv_definition,
-                    base_refs,
                     caps,
                     canonical_select_query,
-                    target_binding,
-                    target_observation,
-                    state_baseline,
                     connector_context,
                 )
                 .await;
@@ -1219,11 +1252,14 @@ async fn plan_multi_base_affected_partitions_original(
     projection: &StoredKeyedMvProjection,
     target_partition: &mv_schema::MvPartitionContract,
     mode: RefreshMode,
-    bases: &[RefreshBaseRelationOccurrence],
-    previous: &BTreeMap<SqlMvRelationOccurrenceId, i64>,
-    current: &BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
+    window: OccurrenceSnapshotWindow<'_>,
     context: &str,
 ) -> crate::mv::domain::model::AffectedTargetPartitions {
+    let OccurrenceSnapshotWindow {
+        bases,
+        previous,
+        current,
+    } = window;
     match mode {
         RefreshMode::Noop => noop_affected_partitions(target_partition),
         RefreshMode::Full | RefreshMode::Rebuild => {
@@ -1723,9 +1759,11 @@ mod partition_planning_tests {
                 &projection,
                 &partition,
                 RefreshMode::Incremental,
-                &base_refs,
-                &previous_snapshots,
-                &current_snapshots,
+                OccurrenceSnapshotWindow {
+                    bases: &base_refs,
+                    previous: &previous_snapshots,
+                    current: &current_snapshots,
+                },
                 "UNION ALL MV affected partition planning",
             ));
             // Exactly one poll: a requested change window cannot be serviced here.

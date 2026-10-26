@@ -170,18 +170,19 @@ impl MaintenanceActionState {
             .expect("original exact engine installed");
         // Only this borrowed tail is reconstructed: all I/O F/lease/session/
         // outcome live in body.call. The whole Product F/gate is NOT rebuilt.
-        let mut borrowed = std::pin::pin!(super::iceberg::execute_action_with_ports(
-            &mut body.call,
-            engine.kernel.connector_control().as_ref(),
-            &engine.kernel,
-            request,
-            engine.connector_context.clone(),
-        ));
-        let result = borrowed.as_mut().poll(cx);
-        drop(borrowed);
-        // The borrowing F drops before loan restores original call on return/unwind.
-        result
+        // The inner Future drops before the loan restores the original call.
+        {
+            let mut borrowed = std::pin::pin!(super::iceberg::execute_action_with_ports(
+                &mut body.call,
+                engine.kernel.connector_control().as_ref(),
+                &engine.kernel,
+                request,
+                engine.connector_context.clone(),
+            ));
+            borrowed.as_mut().poll(cx)
+        }
     }
+
     pub(super) async fn execute_automatic(
         &self,
         request: MaintenanceActionRequest,

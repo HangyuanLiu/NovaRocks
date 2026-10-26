@@ -423,9 +423,13 @@ pub(crate) async fn run_startup_continuation_pass_async_in(
                         .map_err(startup_connector_failure)?
                         .clone();
                     let mut original = Box::pin(super::staged_create::readmit_declared_target_async_in(
-                        entrance,
-                        readiness,
-                        connector_control,
+                        super::staged_create::CurrentProjectionServices {
+                            entrance,
+                            readiness,
+                            connector_control,
+                            metadata_cpu: factory,
+                            registration: registration.as_ref(),
+                        },
                         catalog,
                         novarocks_mv_application::product::MvTarget::from_parts(
                             Some(revision.target.instance_id.as_str()),
@@ -436,8 +440,6 @@ pub(crate) async fn run_startup_continuation_pass_async_in(
                         previous_incarnation,
                         permits,
                         context.clone(),
-                        factory,
-                        registration.as_ref(),
                     ));
                     std::future::poll_fn(|cx| {
                         if let Some(health) = registration.local_health_failure() { std::panic::panic_any(health); }

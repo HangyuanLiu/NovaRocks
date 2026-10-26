@@ -112,6 +112,11 @@ pub(crate) enum InternalDomainCompletion {
     Cow(ConnectorRowMutationSelection),
 }
 
+pub(crate) struct InternalDomainEof {
+    completion: InternalDomainCompletion,
+    end: RootResultEnd,
+}
+
 pub(crate) enum InternalDomainSlot {
     // Only a closed worker completion marker. Provider facts/capabilities stay
     // in its original packet, never disguised as a result domain payload.
@@ -120,10 +125,7 @@ pub(crate) enum InternalDomainSlot {
         state: Box<InternalDomainState>,
         receipt: Option<u64>,
     },
-    Eof {
-        completion: InternalDomainCompletion,
-        end: RootResultEnd,
-    },
+    Eof(Box<InternalDomainEof>),
     StatisticsFinished(Vec<StatisticsArtifactDraft>),
     WriteAccepted(crate::query_execution::write_session::AcceptedWriteSegment),
 }
@@ -138,7 +140,7 @@ impl InternalDomainSlot {
     #[cfg(test)]
     pub(crate) fn end(&self) -> Option<RootResultEnd> {
         match self {
-            Self::Eof { end, .. } => Some(*end),
+            Self::Eof(eof) => Some(eof.end),
             _ => None,
         }
     }
@@ -200,13 +202,16 @@ impl InternalDomainSlot {
                 InternalDomainCompletion::Cow((*consumer).finish()?)
             }
         };
-        Ok(Self::Eof { completion, end })
+        Ok(Self::Eof(Box::new(InternalDomainEof { completion, end })))
     }
     pub(crate) fn finish_statistics(self) -> Result<Self, InternalDomainFailure> {
-        let Self::Eof {
+        let Self::Eof(eof) = self else {
+            return Err("statistics finalization requires its checked EOF".into());
+        };
+        let InternalDomainEof {
             completion: InternalDomainCompletion::Statistics(mut decoder),
             ..
-        } = self
+        } = *eof
         else {
             return Err("statistics finalization requires its checked EOF".into());
         };
@@ -217,10 +222,13 @@ impl InternalDomainSlot {
         self,
         receiving: crate::query_execution::write_session::WriteReceivingPort,
     ) -> Result<Self, InternalDomainFailure> {
-        let Self::Eof {
+        let Self::Eof(eof) = self else {
+            return Err("write receiving requires its original checked End".into());
+        };
+        let InternalDomainEof {
             completion: InternalDomainCompletion::WriteDecoded(segment),
             ..
-        } = self
+        } = *eof
         else {
             return Err("write receiving requires its original checked End".into());
         };
@@ -236,10 +244,13 @@ impl InternalDomainSlot {
     }
     pub(crate) fn into_cow(self) -> Result<ConnectorRowMutationSelection, String> {
         match self {
-            Self::Eof {
-                completion: InternalDomainCompletion::Cow(selection),
-                ..
-            } => Ok(selection),
+            Self::Eof(eof) => match *eof {
+                InternalDomainEof {
+                    completion: InternalDomainCompletion::Cow(selection),
+                    ..
+                } => Ok(selection),
+                _ => Err("COW lost its CPU-validated selection".into()),
+            },
             _ => Err("COW lost its CPU-validated selection".into()),
         }
     }

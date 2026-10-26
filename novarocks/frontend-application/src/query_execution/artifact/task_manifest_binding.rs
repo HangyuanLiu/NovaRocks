@@ -2577,8 +2577,8 @@ mod tests {
                 });
             }
         }
-        let cohorts = super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>();
-        cohorts
+
+        super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>()
     }
 
     #[test]

@@ -241,7 +241,6 @@ impl CatalogFactPort for FixtureCatalogFacts {
 struct FixtureStatisticsFacts {
     bindings: Arc<QueryTableBindingStore>,
     context: ConnectorRequestContext,
-    blocking: ConnectorBlockingIoSupervisor,
 }
 
 #[async_trait]
@@ -250,24 +249,20 @@ impl StatisticsFactPort for FixtureStatisticsFacts {
         &self,
         needs: &[StatisticsNeed],
     ) -> Result<Vec<StatisticsFact>, String> {
-        let needs = needs.to_vec();
-        let bindings = Arc::clone(&self.bindings);
-        let context = self.context.clone();
-        self.blocking
-            .spawn_ordinary(move || {
-                let resolver = crate::connector::UnifiedStatisticsResolver::default();
-                needs
-                    .iter()
-                    .map(|need| {
-                        crate::query_execution::planning::statistics::resolve_statistics_need(
-                            &resolver, &bindings, need, &context,
-                        )
-                    })
-                    .collect()
-            })
-            .finish()
-            .await
-            .map_err(|error| format!("fixture statistics lane: {error}"))?
+        let resolver = crate::connector::UnifiedStatisticsResolver::default();
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            facts.push(
+                crate::query_execution::planning::statistics::resolve_statistics_need_async(
+                    &resolver,
+                    &self.bindings,
+                    need,
+                    &self.context,
+                )
+                .await?,
+            );
+        }
+        Ok(facts)
     }
 }
 
@@ -400,7 +395,6 @@ impl PaimonFixture {
             Arc::new(FixtureStatisticsFacts {
                 bindings: Arc::clone(&bindings),
                 context: context.clone(),
-                blocking: blocking.clone(),
             }),
             Arc::new(NoMaterializedViews),
             Arc::new(

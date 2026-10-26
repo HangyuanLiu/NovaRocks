@@ -238,22 +238,34 @@ fn install_current_projection(
         .map_err(|error| format!("install the {effect} MV Current projection: {error}"))
 }
 
+/// Borrowed services for one original Current projection; owns no request state.
+pub(crate) struct CurrentProjectionServices<'a, 'readiness> {
+    pub(crate) entrance: &'a ManagementEntrance,
+    pub(crate) readiness: &'a crate::mv::domain::readiness::MvReadinessExecution<'readiness>,
+    pub(crate) connector_control: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
+    pub(crate) metadata_cpu: &'a CurrentProjectionMetadataCpu,
+    pub(crate) registration: &'a CurrentProjectionRegistration,
+}
+
 /// Observe and install through the caller's original request view. The caller
 /// keeps `registration` and this exact F in its stable Action/Management source;
 /// a returned business result does not close the registration child.
 async fn install_current_projection_async_in(
-    entrance: &ManagementEntrance,
-    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    services: CurrentProjectionServices<'_, '_>,
     catalog: CatalogHandle,
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
     published: Option<PublishedOutput>,
     convergence: MvConvergence,
     context: ConnectorRequestContext,
-    metadata_cpu: &CurrentProjectionMetadataCpu,
-    registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
+    let CurrentProjectionServices {
+        entrance,
+        readiness,
+        connector_control,
+        metadata_cpu,
+        registration,
+    } = services;
     let request = novarocks_mv_application::readiness::MvCurrentProjectionRequest::try_new(
         catalog,
         target,
@@ -286,17 +298,19 @@ pub(crate) async fn install_created_current_projection_async_in(
     registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
     install_current_projection_async_in(
-        entrance,
-        readiness,
-        connector_control,
+        CurrentProjectionServices {
+            entrance,
+            readiness,
+            connector_control,
+            metadata_cpu,
+            registration,
+        },
         catalog,
         target,
         operation_id,
         None,
         MvConvergence::CommittedEffect,
         context,
-        metadata_cpu,
-        registration,
     )
     .await
 }
@@ -313,17 +327,19 @@ pub(crate) async fn install_configured_current_projection_async_in(
     registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
     install_current_projection_async_in(
-        entrance,
-        readiness,
-        connector_control,
+        CurrentProjectionServices {
+            entrance,
+            readiness,
+            connector_control,
+            metadata_cpu,
+            registration,
+        },
         catalog,
         target,
         operation_id,
         None,
         MvConvergence::CommittedEffect,
         context,
-        metadata_cpu,
-        registration,
     )
     .await
 }
@@ -340,17 +356,19 @@ pub(crate) async fn install_admitted_current_projection_async_in(
     registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
     install_current_projection_async_in(
-        entrance,
-        readiness,
-        connector_control,
+        CurrentProjectionServices {
+            entrance,
+            readiness,
+            connector_control,
+            metadata_cpu,
+            registration,
+        },
         catalog,
         target,
         operation_id,
         None,
         MvConvergence::AdmittedCurrent,
         context,
-        metadata_cpu,
-        registration,
     )
     .await
 }
@@ -368,17 +386,19 @@ pub(crate) async fn install_published_current_projection_async_in(
     registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
     install_current_projection_async_in(
-        entrance,
-        readiness,
-        connector_control,
+        CurrentProjectionServices {
+            entrance,
+            readiness,
+            connector_control,
+            metadata_cpu,
+            registration,
+        },
         catalog,
         target,
         operation_id,
         Some(published),
         MvConvergence::CommittedEffect,
         context,
-        metadata_cpu,
-        registration,
     )
     .await
 }
@@ -396,38 +416,34 @@ pub(crate) async fn install_metadata_only_current_projection_async_in(
     registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
     install_current_projection_async_in(
-        entrance,
-        readiness,
-        connector_control,
+        CurrentProjectionServices {
+            entrance,
+            readiness,
+            connector_control,
+            metadata_cpu,
+            registration,
+        },
         catalog,
         expected.target(),
         uuid::Uuid::now_v7(),
         None,
         MvConvergence::MetadataOnlyCurrent { expected },
         context,
-        metadata_cpu,
-        registration,
     )
     .await
 }
 
 pub(crate) async fn readmit_declared_target_async_in(
-    entrance: &ManagementEntrance,
-    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    services: CurrentProjectionServices<'_, '_>,
     catalog: CatalogHandle,
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
     previous_incarnation: ProcessIncarnation,
     permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
     context: ConnectorRequestContext,
-    metadata_cpu: &CurrentProjectionMetadataCpu,
-    registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
     install_current_projection_async_in(
-        entrance,
-        readiness,
-        connector_control,
+        services,
         catalog,
         target,
         operation_id,
@@ -437,8 +453,6 @@ pub(crate) async fn readmit_declared_target_async_in(
             permits,
         },
         context,
-        metadata_cpu,
-        registration,
     )
     .await
 }

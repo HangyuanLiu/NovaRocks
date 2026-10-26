@@ -66,22 +66,6 @@ pub(crate) fn freeze_query_mv_rewrite_definition_index(
     )
 }
 
-/// Freeze request-local statistics evidence from the same catalog binding
-/// store used by SQL analysis.  It never resolves a newer connector state.
-pub fn query_statistics_snapshot(
-    query_kernel: &domain::QueryPreparationKernel,
-    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
-        '_,
-    >,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<crate::query_execution::planning::statistics::QueryStatisticsContext, String> {
-    crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        query_kernel,
-        analyzer_catalog.query_table_bindings(),
-        connector_context,
-    )
-}
-
 /// Leaf ports used by admitted asynchronous DML compilation and final encoding.
 pub(crate) trait DmlQueryExecutionKernel:
     CatalogServiceSource

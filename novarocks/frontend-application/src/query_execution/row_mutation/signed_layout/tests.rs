@@ -455,8 +455,8 @@ fn normalization_growth_refuses_before_output_and_preserves_paid_dictionary_last
             &mut |_| Ok(()),
         )
         .unwrap();
-        let bytes = plan
-            .columns
+
+        plan.columns
             .iter()
             .flat_map(|column| {
                 column
@@ -467,8 +467,7 @@ fn normalization_growth_refuses_before_output_and_preserves_paid_dictionary_last
             })
             .find(|layout| layout.size() != 0)
             .unwrap()
-            .size();
-        bytes
+            .size()
     };
     let guard = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::clone(&budget));
     let mut conversions = ValueConversionContext::new(0);

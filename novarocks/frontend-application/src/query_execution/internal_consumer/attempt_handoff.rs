@@ -540,30 +540,31 @@ mod tests {
         let mut old_target = None;
         view.reserve_in(execution(1), &mut old_target).unwrap();
         let original = old_target.take().unwrap();
-        let mut notified = std::pin::pin!(original.cell.changed.notified());
-        let wake = std::task::Waker::from(Arc::new(PanicWake));
-        let mut cx = std::task::Context::from_waker(&wake);
-        assert!(notified.as_mut().poll(&mut cx).is_pending());
         let mut target = None;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            view.reserve_in(execution(2), &mut target)
-        }));
-        let original_panic = result.err().expect("the previous real waiter must panic");
-        assert!(original_panic.is::<WakeFailure>());
-        let next = target
-            .as_ref()
-            .expect("the new original producer survived wake unwind");
-        assert_eq!(next.cell.execution, execution(2));
-        assert!(matches!(*next.cell.state.lock().unwrap(), State::Reserved));
-        assert!(Arc::ptr_eq(
-            offers.mailbox.offer.lock().unwrap().as_ref().unwrap(),
-            &next.cell,
-        ));
-        assert!(matches!(
-            *original.cell.state.lock().unwrap(),
-            State::Closed(Closed::ReplacedBeforeClaim)
-        ));
-        drop(notified);
+        {
+            let mut notified = std::pin::pin!(original.cell.changed.notified());
+            let wake = std::task::Waker::from(Arc::new(PanicWake));
+            let mut cx = std::task::Context::from_waker(&wake);
+            assert!(notified.as_mut().poll(&mut cx).is_pending());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                view.reserve_in(execution(2), &mut target)
+            }));
+            let original_panic = result.err().expect("the previous real waiter must panic");
+            assert!(original_panic.is::<WakeFailure>());
+            let next = target
+                .as_ref()
+                .expect("the new original producer survived wake unwind");
+            assert_eq!(next.cell.execution, execution(2));
+            assert!(matches!(*next.cell.state.lock().unwrap(), State::Reserved));
+            assert!(Arc::ptr_eq(
+                offers.mailbox.offer.lock().unwrap().as_ref().unwrap(),
+                &next.cell,
+            ));
+            assert!(matches!(
+                *original.cell.state.lock().unwrap(),
+                State::Closed(Closed::ReplacedBeforeClaim)
+            ));
+        }
         drop(target);
     }
 

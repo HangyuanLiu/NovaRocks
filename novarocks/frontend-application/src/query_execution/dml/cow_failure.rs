@@ -199,8 +199,8 @@ impl CowFailure {
                 terminal.do_not_retry()
             );
         }
-        let presentation = out.0;
-        presentation
+
+        out.0
     }
     #[cfg(test)]
     pub(crate) fn with_exit_probe(mut self, probe: impl FnOnce() + Send + 'static) -> Self {

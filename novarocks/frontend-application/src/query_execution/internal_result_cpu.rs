@@ -1771,7 +1771,7 @@ fn poll_cpu_actual_exit(
 
 // Execution and geometry use this exact production factory. The original
 // packet already owns input/Operation before the forwarder can first poll.
-fn make_operation_forwarder(
+async fn make_operation_forwarder(
     executor: QueryBlockingExecutor,
     factory: Option<InternalCpuFactoryBinding>,
     source: Option<InternalCpuActionSource>,
@@ -1779,165 +1779,159 @@ fn make_operation_forwarder(
     wake: Arc<dyn StatusIntakeWake>,
     packet: Arc<InternalCpuRetirement<OperationOutput>>,
     mut completed: oneshot::Sender<OperationResult>,
-) -> impl std::future::Future<Output = ()> + Send {
-    async move {
-        let Some(source) = source else {
-            if control.requires_original_source() {
-                finish_unpublished(&packet);
-                let error =
-                    cpu_execution_failure("metadata obligation lost its original CPU source");
-                if let Err(original) = completed.send(Err(error)) {
-                    packet
-                        .state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .outcome = Some(original);
-                }
-                packet.notify(0, wake.as_ref());
-                return;
+) {
+    let Some(source) = source else {
+        if control.requires_original_source() {
+            finish_unpublished(&packet);
+            let error = cpu_execution_failure("metadata obligation lost its original CPU source");
+            if let Err(original) = completed.send(Err(error)) {
+                packet
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .outcome = Some(original);
             }
-            // Ordinary non-Root work consumes the exact same registered closed
-            // factory but receives no joint claim or finite proof exemption.
-            make_closed_legacy_forwarder(executor, control, wake, packet, completed).await;
+            packet.notify(0, wake.as_ref());
             return;
-        };
-        let setup = (|| {
-            let quote = metadata_geometry::operation_action_quote(&executor)?;
-            let admission = source
-                .begin(quote.metadata_bytes, quote.physical_queue_bytes)
-                .map_err(|failure| failure.error)?;
+        }
+        // Ordinary non-Root work consumes the exact same registered closed
+        // factory but receives no joint claim or finite proof exemption.
+        make_closed_legacy_forwarder(executor, control, wake, packet, completed).await;
+        return;
+    };
+    let setup = (|| {
+        let quote = metadata_geometry::operation_action_quote(&executor)?;
+        let admission = source
+            .begin(quote.metadata_bytes, quote.physical_queue_bytes)
+            .map_err(|failure| failure.error)?;
+        packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .action
+            .as_mut()
+            .expect("same original CPU action")
+            .admission = Some(admission);
+        Ok::<(), WorkError>(())
+    })();
+    if let Err(error) = setup {
+        let error = action_failure(&packet, CpuActionFailureSite::Begin, error);
+        finish_unpublished(&packet);
+        if let Err(original) = completed.send(Err(error)) {
             packet
                 .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .action
-                .as_mut()
-                .expect("same original CPU action")
-                .admission = Some(admission);
-            Ok::<(), WorkError>(())
-        })();
-        if let Err(error) = setup {
-            let error = action_failure(&packet, CpuActionFailureSite::Begin, error);
-            finish_unpublished(&packet);
-            if let Err(original) = completed.send(Err(error)) {
-                packet
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .outcome = Some(original);
-            }
-            packet.notify(0, wake.as_ref());
-            return;
+                .outcome = Some(original);
         }
-        let factory = factory
-            .as_ref()
-            .expect("Root source captured from the same bound CPU owner");
-        let admission = tokio::select! {
-            biased;
-            failure = control.stopped() => Err(failure),
-            _ = completed.closed() => Err(cpu_execution_failure("internal CPU consumer closed before publication")),
-            result = acquire_cpu_offer(&packet, &executor, factory) => result,
-        };
-        let admission = admission.and_then(|()| publish_cpu_work(&packet, &executor, &control));
-        if let Err(error) = admission {
-            finish_unpublished(&packet);
-            if let Err(original) = completed.send(Err(error)) {
-                packet
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .outcome = Some(original);
-            }
-            packet.notify(0, wake.as_ref());
-            return;
-        }
-        let early = tokio::select! {
-            biased;
-            failure = control.stopped() => Err(failure),
-            _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
-            result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)) => Ok(result),
-        };
-        match early {
-            Ok(result) => {
-                let result = packet.receive_work(result);
-                if let Err(original) = completed.send(result) {
-                    packet
-                        .state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .outcome = Some(original);
-                }
-                packet.notify(0, wake.as_ref());
-            }
-            Err(error) => {
-                if let Err(Err(original)) = completed.send(Err(error)) {
-                    packet.state.lock().unwrap_or_else(|e| e.into_inner()).early = Some(original);
-                }
-                packet.notify(0, wake.as_ref());
-                let result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)).await;
-                let result = packet.receive_work(result);
-                packet
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .outcome = Some(result);
-                packet.notify(1, wake.as_ref());
-            }
-        }
-        // A result/forwarder receipt alone is not the original worker exit.
-        // FailedUnproven retains the same original carrier in this same packet.
-        std::future::poll_fn(|cx| poll_cpu_actual_exit(&packet, cx)).await;
+        packet.notify(0, wake.as_ref());
+        return;
     }
+    let factory = factory
+        .as_ref()
+        .expect("Root source captured from the same bound CPU owner");
+    let admission = tokio::select! {
+        biased;
+        failure = control.stopped() => Err(failure),
+        _ = completed.closed() => Err(cpu_execution_failure("internal CPU consumer closed before publication")),
+        result = acquire_cpu_offer(&packet, &executor, factory) => result,
+    };
+    let admission = admission.and_then(|()| publish_cpu_work(&packet, &executor, &control));
+    if let Err(error) = admission {
+        finish_unpublished(&packet);
+        if let Err(original) = completed.send(Err(error)) {
+            packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .outcome = Some(original);
+        }
+        packet.notify(0, wake.as_ref());
+        return;
+    }
+    let early = tokio::select! {
+        biased;
+        failure = control.stopped() => Err(failure),
+        _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
+        result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)) => Ok(result),
+    };
+    match early {
+        Ok(result) => {
+            let result = packet.receive_work(result);
+            if let Err(original) = completed.send(result) {
+                packet
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .outcome = Some(original);
+            }
+            packet.notify(0, wake.as_ref());
+        }
+        Err(error) => {
+            if let Err(Err(original)) = completed.send(Err(error)) {
+                packet.state.lock().unwrap_or_else(|e| e.into_inner()).early = Some(original);
+            }
+            packet.notify(0, wake.as_ref());
+            let result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)).await;
+            let result = packet.receive_work(result);
+            packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .outcome = Some(result);
+            packet.notify(1, wake.as_ref());
+        }
+    }
+    // A result/forwarder receipt alone is not the original worker exit.
+    // FailedUnproven retains the same original carrier in this same packet.
+    std::future::poll_fn(|cx| poll_cpu_actual_exit(&packet, cx)).await;
 }
 
-fn make_closed_legacy_forwarder(
+async fn make_closed_legacy_forwarder(
     executor: QueryBlockingExecutor,
     control: CpuWorkControl,
     wake: Arc<dyn StatusIntakeWake>,
     packet: Arc<InternalCpuRetirement<OperationOutput>>,
     mut completed: oneshot::Sender<OperationResult>,
-) -> impl std::future::Future<Output = ()> + Send {
-    async move {
-        let work =
-            executor.execute_preserving(make_cpu_work(Arc::downgrade(&packet), control.clone()));
-        tokio::pin!(work);
-        let early = tokio::select! {
-            biased;
-            failure = control.stopped() => Err(failure),
-            _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
-            result = &mut work => Ok(result),
-        };
-        match early {
-            Ok(result) => {
-                let result = packet.receive_work(result);
-                if let Err(original) = completed.send(result) {
-                    packet
-                        .state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .outcome = Some(original);
-                }
-                packet.notify(0, wake.as_ref());
-            }
-            Err(error) => {
-                if let Err(Err(original)) = completed.send(Err(error)) {
-                    packet.state.lock().unwrap_or_else(|e| e.into_inner()).early = Some(original);
-                }
-                packet.notify(0, wake.as_ref());
-                let result = packet.receive_work(work.await);
+) {
+    let work = executor.execute_preserving(make_cpu_work(Arc::downgrade(&packet), control.clone()));
+    tokio::pin!(work);
+    let early = tokio::select! {
+        biased;
+        failure = control.stopped() => Err(failure),
+        _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
+        result = &mut work => Ok(result),
+    };
+    match early {
+        Ok(result) => {
+            let result = packet.receive_work(result);
+            if let Err(original) = completed.send(result) {
                 packet
                     .state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .outcome = Some(result);
-                packet.notify(1, wake.as_ref());
+                    .outcome = Some(original);
             }
+            packet.notify(0, wake.as_ref());
+        }
+        Err(error) => {
+            if let Err(Err(original)) = completed.send(Err(error)) {
+                packet.state.lock().unwrap_or_else(|e| e.into_inner()).early = Some(original);
+            }
+            packet.notify(0, wake.as_ref());
+            let result = packet.receive_work(work.await);
+            packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .outcome = Some(result);
+            packet.notify(1, wake.as_ref());
         }
     }
 }
 
 #[cfg(test)]
-fn make_forwarder<I, O, F>(
+async fn make_forwarder<I, O, F>(
     executor: QueryBlockingExecutor,
     input: InternalResultValue<I>,
     cancellation: QueryCancellationView,
@@ -1945,52 +1939,49 @@ fn make_forwarder<I, O, F>(
     original_retirement: Arc<InternalCpuRetirement<O>>,
     mut completed: oneshot::Sender<Result<InternalResultValue<O>, ExecutionFailureInput>>,
     apply: F,
-) -> impl std::future::Future<Output = ()> + Send
-where
+) where
     I: Send + 'static,
     O: Send + 'static,
     F: FnOnce(I, &ResultWindowAlias) -> O + Send + 'static,
 {
-    async move {
-        let worker_cancellation = cancellation.clone();
-        let work = executor.execute_preserving(move || {
-            if let Some(reason) = worker_cancellation.reason() {
-                return Err(cpu_cancellation_failure(reason));
-            }
-            Ok(input.transform(apply))
-        });
-        tokio::pin!(work);
-        let early_error = tokio::select! {
-            biased;
-            reason = cancellation.cancelled() => cpu_cancellation_failure(reason),
-            _ = completed.closed() => cpu_execution_failure("internal result CPU consumer closed"),
-            result = &mut work => {
-                let result = original_retirement.receive_work(result);
-                if let Err(original) = completed.send(result) {
-                    original_retirement.state.lock().unwrap_or_else(|e| e.into_inner()).outcome = Some(original);
-                }
-                original_retirement.notify(0, wake.as_ref());
-                return;
-            }
-        };
-        if let Err(Err(original)) = completed.send(Err(early_error)) {
-            original_retirement
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .early = Some(original);
+    let worker_cancellation = cancellation.clone();
+    let work = executor.execute_preserving(move || {
+        if let Some(reason) = worker_cancellation.reason() {
+            return Err(cpu_cancellation_failure(reason));
         }
-        original_retirement.notify(0, wake.as_ref());
-        // An early cancellation/closed receiver or notification panic is
-        // not exit. Keep this exact preserving receipt until actual return.
-        let late = original_retirement.receive_work(work.await);
+        Ok(input.transform(apply))
+    });
+    tokio::pin!(work);
+    let early_error = tokio::select! {
+        biased;
+        reason = cancellation.cancelled() => cpu_cancellation_failure(reason),
+        _ = completed.closed() => cpu_execution_failure("internal result CPU consumer closed"),
+        result = &mut work => {
+            let result = original_retirement.receive_work(result);
+            if let Err(original) = completed.send(result) {
+                original_retirement.state.lock().unwrap_or_else(|e| e.into_inner()).outcome = Some(original);
+            }
+            original_retirement.notify(0, wake.as_ref());
+            return;
+        }
+    };
+    if let Err(Err(original)) = completed.send(Err(early_error)) {
         original_retirement
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .outcome = Some(late);
-        original_retirement.notify(1, wake.as_ref());
+            .early = Some(original);
     }
+    original_retirement.notify(0, wake.as_ref());
+    // An early cancellation/closed receiver or notification panic is
+    // not exit. Keep this exact preserving receipt until actual return.
+    let late = original_retirement.receive_work(work.await);
+    original_retirement
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .outcome = Some(late);
+    original_retirement.notify(1, wake.as_ref());
 }
 
 #[cfg(test)]

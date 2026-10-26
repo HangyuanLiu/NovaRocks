@@ -292,8 +292,8 @@ fn cow_observed_context(
     .unwrap_or_else(|error| panic!("{}", error.retire_on_original_worker(None)));
     drop(receiving);
     drop(original_session);
-    let captured = recorded.lock().unwrap().begin_context.take().unwrap();
-    captured
+
+    recorded.lock().unwrap().begin_context.take().unwrap()
 }
 
 #[test]

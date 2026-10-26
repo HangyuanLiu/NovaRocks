@@ -203,7 +203,7 @@ fn service(error: impl ToString) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())
 }
 pub(crate) fn computation_service_error(error: TerminalError) -> QueryServiceError {
-    let result = match (
+    match (
         error.failure_cause,
         error.execution_failure,
         error.compile_control,
@@ -212,8 +212,7 @@ pub(crate) fn computation_service_error(error: TerminalError) -> QueryServiceErr
         (_, Some(input), _) => QueryServiceError::from_execution_failure(input),
         (_, _, Some(control)) => QueryServiceError::from_compile_control(control),
         _ => service(error.message),
-    };
-    result
+    }
 }
 fn health(
     detail: &'static str,

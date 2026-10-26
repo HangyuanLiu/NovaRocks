@@ -118,7 +118,7 @@ struct Staged {
 enum Receiving {
     Vacant,
     Reserved(Binding),
-    Staged(Staged),
+    Staged(Box<Staged>),
     Taken(ComputationReadyToken),
 }
 struct Holder {
@@ -143,7 +143,7 @@ impl Holder {
                 "decoded payload differs from its original receiving custody",
             ));
         }
-        *receiving = Receiving::Staged(staged);
+        *receiving = Receiving::Staged(Box::new(staged));
         Ok(())
     }
     fn take(
@@ -174,7 +174,7 @@ impl Holder {
         else {
             unreachable!()
         };
-        Ok(staged)
+        Ok(*staged)
     }
 }
 
