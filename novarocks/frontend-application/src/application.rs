@@ -661,6 +661,7 @@ impl FrontendExecutionRuntimeOwner {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.drain_workload_until(deadline).await?;
         self.shutdown_executors_until(deadline).await

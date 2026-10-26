@@ -549,7 +549,7 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 view.reserve_in(execution(2), &mut target)
             }));
-            let original_panic = result.err().expect("the previous real waiter must panic");
+            let original_panic = result.expect_err("the previous real waiter must panic");
             assert!(original_panic.is::<WakeFailure>());
             let next = target
                 .as_ref()

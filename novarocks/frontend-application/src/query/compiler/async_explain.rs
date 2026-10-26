@@ -22,7 +22,7 @@ use super::*;
 
 pub(crate) enum PreparedAsyncExplain {
     Lines(Vec<String>),
-    Profile(PreparedAsyncProfile),
+    Profile(Box<PreparedAsyncProfile>),
 }
 
 pub(crate) struct PreparedAsyncProfile {
@@ -364,10 +364,12 @@ impl FrontendQueryCompiler {
                 std::time::Instant::now(),
                 encoding_control,
             );
-        Ok(PreparedAsyncExplain::Profile(PreparedAsyncProfile {
-            computation: Some(computation),
-            output,
-            completion,
-        }))
+        Ok(PreparedAsyncExplain::Profile(Box::new(
+            PreparedAsyncProfile {
+                computation: Some(computation),
+                output,
+                completion,
+            },
+        )))
     }
 }

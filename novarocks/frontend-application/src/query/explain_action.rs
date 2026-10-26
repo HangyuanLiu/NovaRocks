@@ -151,7 +151,7 @@ struct ExplainStatementAction {
     preparation: Option<PreparationFuture>,
     preparation_started: bool,
     prepared: Option<Result<PreparedExplain, QueryServiceError>>,
-    profile: Option<PreparedAsyncProfile>,
+    profile: Option<Box<PreparedAsyncProfile>>,
     capacity: Option<QueryResultCapacityBinding>,
     original: OriginalComputationStart,
     execution: Option<Result<ExecutionHandle, QueryExecutionError>>,
@@ -294,7 +294,7 @@ impl ExplainStatementAction {
                 Ok(ready) => ready,
                 Err(e) => return Poll::Ready(Err(governed_query_execution_error(e))),
             };
-            let profile = self.profile.take().expect("same ready profile");
+            let profile = *self.profile.take().expect("same ready profile");
             self.diagnostics = Some(Box::pin(make_profile_diagnostics(ProfileDiagnosticInput {
                 ready,
                 completion: profile.completion,

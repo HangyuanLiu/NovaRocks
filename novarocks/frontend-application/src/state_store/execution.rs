@@ -580,12 +580,11 @@ impl RequestControl {
                 match control {
                     Self::ExistingObligation(token) => token.stopped().await,
                     Self::Business => match root {
-                        Some(root) => match root.cancellation() {
-                            Ok(cancel) => {
+                        Some(root) => {
+                            if let Ok(cancel) = root.cancellation() {
                                 cancel.cancelled().await;
                             }
-                            Err(_) => {}
-                        },
+                        }
                         None => std::future::pending().await,
                     },
                 }
@@ -1154,7 +1153,7 @@ impl Cell {
         if phase.result.is_none()
             && let Poll::Ready(result) = phase.receipt.as_mut().unwrap().poll_result(cx)
         {
-            let result = result.map_err(|e| failure(e));
+            let result = result.map_err(failure);
             phase.result = Some(result.clone());
             self.original.receive_result(phase.request, result);
             changed = true;

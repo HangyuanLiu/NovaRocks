@@ -204,6 +204,43 @@ impl RefreshPlanContract {
     }
 }
 
+pub(crate) async fn baseline_predecessors_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
+    previous_sources: &[RefreshStateBaselineSource],
+    connector_control: &dyn ConnectorControlResolver,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    BaselinePredecessors,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let mut predecessors = BaselinePredecessors::default();
+    for source in previous_sources {
+        let named = occurrence_display(source.occurrence_id, &source.table);
+        if predecessors.snapshots.contains_key(&source.occurrence_id) {
+            return Err(format!(
+                "MV refresh baseline names {named} more than once; one occurrence is pinned at \
+                 one source"
+            )
+            .into());
+        }
+        let snapshot_id = io
+            .snapshot_from_revision(
+                connector_control,
+                &source.table,
+                &source.semantic_revision,
+                connector_context,
+            )
+            .await?;
+        predecessors
+            .snapshots
+            .insert(source.occurrence_id, snapshot_id);
+        predecessors
+            .table_object_ids
+            .insert(source.occurrence_id, source.table_object_id()?);
+    }
+    Ok(predecessors)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -396,41 +433,4 @@ mod tests {
         assert_eq!(contract.snapshot_pins, snapshot_pins);
         assert_eq!(contract.affected_partitions, affected_partitions);
     }
-}
-
-pub(crate) async fn baseline_predecessors_original(
-    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
-    previous_sources: &[RefreshStateBaselineSource],
-    connector_control: &dyn ConnectorControlResolver,
-    connector_context: &ConnectorRequestContext,
-) -> Result<
-    BaselinePredecessors,
-    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
-> {
-    let mut predecessors = BaselinePredecessors::default();
-    for source in previous_sources {
-        let named = occurrence_display(source.occurrence_id, &source.table);
-        if predecessors.snapshots.contains_key(&source.occurrence_id) {
-            return Err(format!(
-                "MV refresh baseline names {named} more than once; one occurrence is pinned at \
-                 one source"
-            )
-            .into());
-        }
-        let snapshot_id = io
-            .snapshot_from_revision(
-                connector_control,
-                &source.table,
-                &source.semantic_revision,
-                connector_context,
-            )
-            .await?;
-        predecessors
-            .snapshots
-            .insert(source.occurrence_id, snapshot_id);
-        predecessors
-            .table_object_ids
-            .insert(source.occurrence_id, source.table_object_id()?);
-    }
-    Ok(predecessors)
 }

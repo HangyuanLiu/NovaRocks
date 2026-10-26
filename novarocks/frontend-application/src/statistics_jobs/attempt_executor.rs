@@ -1626,8 +1626,8 @@ pub(super) mod tests {
             ),
         };
         let a = Arc::new(Field::new("a", DataType::Int64, true));
-        assert!(resolve_columns(&request(vec!["missing"]), &[a.clone()]).is_err());
-        assert!(resolve_columns(&request(vec!["a", "A"]), &[a.clone()]).is_err());
+        assert!(resolve_columns(&request(vec!["missing"]), std::slice::from_ref(&a)).is_err());
+        assert!(resolve_columns(&request(vec!["a", "A"]), std::slice::from_ref(&a)).is_err());
         assert!(
             resolve_columns(
                 &request(vec!["a"]),

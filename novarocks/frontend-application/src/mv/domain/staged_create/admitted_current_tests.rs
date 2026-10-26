@@ -837,8 +837,7 @@ async fn an_actual_local_committed_effect_still_uses_committed_convergence() {
     let premature = fixture
         .observe(MvConvergence::CommittedEffect)
         .await
-        .err()
-        .expect("Current must not bypass the original publication terminal");
+        .expect_err("Current must not bypass the original publication terminal");
     assert!(premature.to_string().contains("ObservationNotAllowed"));
     assert_eq!(*fixture.caps.events.lock().unwrap(), vec!["capture"]);
     fixture.caps.events.lock().unwrap().clear();

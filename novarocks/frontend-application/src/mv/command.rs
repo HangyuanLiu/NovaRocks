@@ -109,7 +109,7 @@ impl MvCommandExecutor {
                     catalog: context.session().current_catalog().map(str::to_owned),
                     statement: lower_typed_show(show)?,
                 },
-                MaterializedViewStatement::ExplainRefresh(explain) => crate::query::mv_read_action::ReadRequest::Explain(
+                MaterializedViewStatement::ExplainRefresh(explain) => crate::query::mv_read_action::ReadRequest::Explain(Box::new(
                     crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
                         ports: self.ports.clone(),
                         current_catalog: context.session().current_catalog().map(str::to_owned),
@@ -117,7 +117,7 @@ impl MvCommandExecutor {
                         statement: lower_typed_refresh(&explain.refresh)?,
                         level: lower_typed_explain_level(explain.level),
                         context: command_context.connector_context().clone(),
-                    }),
+                    })),
                 _ => unreachable!(),
             };
             return crate::query::mv_read_action::prepare(

@@ -1330,6 +1330,15 @@ fn publication_facts_from_interpreted(
     })
 }
 
+fn publication_snapshot_id(
+    published: &MvRefreshPublicationFinalizationFacts,
+) -> Result<i64, MvPhaseFailure> {
+    published
+        .publication_version()
+        .snapshot_id()
+        .ok_or_else(|| phase_service("MV committed receipt has no exact snapshot"))
+}
+
 #[cfg(test)]
 mod receipt_migration_tests {
     use super::super::publication_migration_tests::*;
@@ -1487,13 +1496,4 @@ mod receipt_migration_tests {
         );
         assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
     }
-}
-
-fn publication_snapshot_id(
-    published: &MvRefreshPublicationFinalizationFacts,
-) -> Result<i64, MvPhaseFailure> {
-    published
-        .publication_version()
-        .snapshot_id()
-        .ok_or_else(|| phase_service("MV committed receipt has no exact snapshot"))
 }

@@ -2811,7 +2811,7 @@ pub(crate) mod tests {
         assert!(call.retains_original_unknown());
         assert!(Arc::ptr_eq(
             &original,
-            &fixture
+            fixture
                 .session
                 .lock_accumulated()
                 .unwrap()

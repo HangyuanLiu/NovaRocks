@@ -229,7 +229,7 @@ impl Fixture {
                 crate::application::test_constant_policy(),
             )
             .with_management_entrance(entrance.clone());
-            ReadRequest::Explain(MvExplainPreparationInput {
+            ReadRequest::Explain(Box::new(MvExplainPreparationInput {
                 ports,
                 current_catalog: Some("ice".into()),
                 current_database: "db".into(),
@@ -245,7 +245,7 @@ impl Fixture {
                     64 * 1024,
                 )
                 .unwrap(),
-            })
+            }))
         } else {
             ReadRequest::Show {
                 catalog: Some("ice".into()),

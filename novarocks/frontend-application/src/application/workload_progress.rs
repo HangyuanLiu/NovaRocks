@@ -288,42 +288,6 @@ async fn run_original_progress(
     }
 }
 
-/// Actual independent service backing facts. The original WC driver is moved,
-/// not copied: its own base quote must not be charged a second time here.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FrontendWorkloadProgressGeometry {
-    pub supervisor_inline: std::alloc::Layout,
-    pub custody_arc: std::alloc::Layout,
-    pub moved_driver_box: std::alloc::Layout,
-    pub worker_frame: std::alloc::Layout,
-    pub owned_sleep: std::alloc::Layout,
-}
-pub(crate) fn progress_geometry() -> Result<
-    FrontendWorkloadProgressGeometry,
-    novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-> {
-    use std::alloc::Layout;
-    fn frame<F: Future<Output = ()>>(
-        _: fn(
-            DeadlineExpiryHandle,
-            Arc<DriverCustody>,
-            tokio::sync::watch::Receiver<bool>,
-            FrontendWorkloadProgressPolicy,
-        ) -> F,
-    ) -> Layout {
-        Layout::new::<F>()
-    }
-    Ok(FrontendWorkloadProgressGeometry {
-        supervisor_inline: Layout::new::<FrontendWorkloadDeadlineSupervisor>(),
-        custody_arc: novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
-            DriverCustody,
-        >())?,
-        moved_driver_box: Layout::new::<JointProgressDriver>(),
-        worker_frame: frame(run_original_progress),
-        owned_sleep: Layout::new::<Sleep>(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

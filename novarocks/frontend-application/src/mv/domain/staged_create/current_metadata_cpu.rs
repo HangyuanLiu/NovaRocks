@@ -46,10 +46,11 @@ pub(crate) struct CurrentProjectionMetadataCpu {
 }
 enum Control {
     Business(QueryCancellationView),
-    ExistingObligation {
-        io: Arc<MetadataIoAdmission>,
-        context: ConnectorRequestContext,
-    },
+    ExistingObligation(Box<ExistingObligation>),
+}
+struct ExistingObligation {
+    io: Arc<MetadataIoAdmission>,
+    context: ConnectorRequestContext,
 }
 impl CurrentProjectionMetadataCpu {
     pub(crate) fn business(
@@ -82,10 +83,10 @@ impl CurrentProjectionMetadataCpu {
             cpu,
             root,
             window,
-            control: Control::ExistingObligation {
+            control: Control::ExistingObligation(Box::new(ExistingObligation {
                 io,
                 context: obligation,
-            },
+            })),
             runtime,
             wake,
         }
@@ -96,7 +97,8 @@ impl CurrentProjectionMetadataCpu {
     ) -> Result<ConnectorRequestContext, WorkError> {
         match &self.control {
             Control::Business(_) => Ok(request.clone()),
-            Control::ExistingObligation { io, context } => {
+            Control::ExistingObligation(obligation) => {
+                let ExistingObligation { io, context } = obligation.as_ref();
                 io.check_existing_metadata_obligation_context(&self.root, request)?;
                 // Explicitly selected original obligation only. Keep this
                 // request's fresh observation and exact selected capabilities.
@@ -120,7 +122,8 @@ impl CurrentProjectionMetadataCpu {
                 self.runtime.clone(),
                 Arc::clone(&self.wake),
             ),
-            Control::ExistingObligation { io, context } => {
+            Control::ExistingObligation(obligation) => {
+                let ExistingObligation { io, context } = obligation.as_ref();
                 self.cpu.planning_metadata_settlement_cpu_port(
                     &self.root,
                     window,

@@ -75,7 +75,7 @@ pub(crate) enum ReadRequest {
         catalog: Option<String>,
         statement: MvShowStatement,
     },
-    Explain(MvExplainPreparationInput),
+    Explain(Box<MvExplainPreparationInput>),
 }
 
 type IoFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -696,7 +696,8 @@ impl State {
             ReadRequest::Show { catalog, statement } => {
                 (Some((catalog, statement)), Turn::Inventory)
             }
-            ReadRequest::Explain(mut input) => {
+            ReadRequest::Explain(input) => {
+                let mut input = *input;
                 let io = self.io.as_ref().unwrap();
                 let capacity = io.root_capacity().map_err(work)?;
                 let window = capacity.try_window_alias().map_err(work)?;

@@ -150,6 +150,12 @@ pub enum ResolvedMetadataMaintenance {
     },
 }
 
+type MaintenancePreparation = Pin<
+    Box<
+        dyn Future<Output = Result<MetadataMaintenanceSession, ResolvedMetadataMaintenance>> + Send,
+    >,
+>;
+
 /// The original durable-operation owner stores this call before polling it.
 /// Cancelling a borrowed wait leaves preparation, the exact lease and execution
 /// handle in this same field; it is not permission to create another call.
@@ -159,14 +165,7 @@ pub struct MetadataMaintenanceCall {
     operation_id: ConnectorMutationOperationId,
     intent: MetadataMaintenanceIntent,
     context: ConnectorRequestContext,
-    preparation: Option<
-        Pin<
-            Box<
-                dyn Future<Output = Result<MetadataMaintenanceSession, ResolvedMetadataMaintenance>>
-                    + Send,
-            >,
-        >,
-    >,
+    preparation: Option<MaintenancePreparation>,
     preparation_poll_unproven: bool,
     session: Option<MetadataMaintenanceSession>,
     failure: Option<ResolvedMetadataMaintenance>,
@@ -272,10 +271,6 @@ impl MetadataMaintenanceCall {
             ) if self.preparation.is_none() && !self.preparation_poll_unproven => R::Disposed,
             _ => R::Retained,
         }
-    }
-
-    pub fn original_context(&self) -> &ConnectorRequestContext {
-        &self.context
     }
 
     pub fn operation_id(&self) -> ConnectorMutationOperationId {
@@ -401,12 +396,6 @@ impl MetadataMaintenanceCall {
             ResolvedMetadataMaintenance::ContractFailure { .. } => Some(D::CommitUnknown),
         }
     }
-
-    pub fn execution_failure(&self) -> Option<&ConnectorError> {
-        self.session
-            .as_ref()
-            .and_then(MetadataMaintenanceSession::execution_failure)
-    }
 }
 
 pub async fn resolve_metadata_maintenance(
@@ -459,14 +448,6 @@ pub async fn execute_planned_metadata_maintenance(
     completed_projection(session.execute(cache_finalizer).await)
 }
 
-/// A read-only observation has no mutation identity or publication journal.
-/// Its original owner must still retain this value while borrowing its wait.
-pub struct MetadataMaintenanceObservation {
-    _lease: ConnectorMetadataMaintenanceLease,
-    future: Option<Pin<Box<dyn Future<Output = Result<Option<u64>, ConnectorError>> + Send>>>,
-    result: Option<Result<Option<u64>, ConnectorError>>,
-    poll_unproven: bool,
-}
 /// The original background source already formed this exact metadata
 /// handle on its selected Provider metadata CPU. This constructor borrows
 /// that same generation; it does not load or create another schema.
@@ -490,98 +471,6 @@ pub(crate) fn begin_captured_max_compactable_data_files(
     let request =
         ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table.clone(), context)?;
     lease.begin_read_max_compactable_data_files(request, cpu)
-}
-
-impl MetadataMaintenanceObservation {
-    pub fn try_new(
-        resolver: &dyn ConnectorMetadataMaintenanceResolver,
-        instance_id: &ConnectorInstanceId,
-        table: ConnectorTableIdentity,
-        context: ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        if &table.instance_id != instance_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector maintenance observation table does not belong to requested instance",
-            ));
-        }
-        let lease = resolver.acquire_current_metadata_maintenance(instance_id)?;
-        let owner = lease.clone();
-        let future = Box::pin(async move {
-            let metadata = crate::connector::schema_creation::load_frontend_table_async(
-                owner.metadata().as_ref(),
-                ConnectorTableRequest {
-                    table: table.clone(),
-                    resolution: ConnectorTableResolution::StrictBaseTable,
-                    context: context.clone(),
-                },
-            )
-            .await?;
-            if metadata.identity != table
-                || metadata.table.owner() != &owner.descriptor().instance_id
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "connector metadata returned a table handle for a different exact owner",
-                ));
-            }
-            let request =
-                ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table, context)?;
-            Ok(owner
-                .read_max_compactable_data_files(request)
-                .await?
-                .value())
-        });
-        Ok(Self {
-            _lease: lease,
-            future: Some(future),
-            result: None,
-            poll_unproven: false,
-        })
-    }
-    pub(crate) fn poll_result(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<u64>, ConnectorError>> {
-        if self.poll_unproven {
-            return Poll::Ready(Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "metadata maintenance observation did not prove actual exit",
-            )));
-        }
-        if let Some(result) = &self.result {
-            return Poll::Ready(result.clone());
-        }
-        self.poll_unproven = true;
-        match self
-            .future
-            .as_mut()
-            .expect("observation future is installed")
-            .as_mut()
-            .poll(cx)
-        {
-            Poll::Pending => {
-                self.poll_unproven = false;
-                Poll::Pending
-            }
-            Poll::Ready(result) => {
-                self.result = Some(result.clone());
-                let retired = self.future.take();
-                drop(retired);
-                self.poll_unproven = false;
-                Poll::Ready(result)
-            }
-        }
-    }
-    pub async fn wait(&mut self) -> Result<Option<u64>, ConnectorError> {
-        std::future::poll_fn(|cx| self.poll_result(cx)).await
-    }
-}
-
-pub async fn read_max_compactable_data_files(
-    observation: &mut MetadataMaintenanceObservation,
-) -> Result<Option<u64>, ConnectorError> {
-    observation.wait().await
 }
 
 pub struct MetadataMaintenanceSession {
@@ -682,13 +571,6 @@ impl MetadataMaintenanceSession {
             .as_ref()
             .and_then(|execution| execution.retained_result())
             .or_else(|| self.provider_outcome.clone())
-    }
-    /// Actual frame/notification failure is independent of publication facts.
-    /// The original session retains this cause while its source is unproven.
-    pub fn execution_failure(&self) -> Option<&ConnectorError> {
-        self.provider_outcome
-            .as_ref()
-            .and_then(|result| result.as_ref().err())
     }
     /// Installs the original provider execution handle before the first wait.
     /// Re-entry resumes this exact handle; it never constructs another request.
@@ -1268,16 +1150,6 @@ mod tests {
         };
         super::resolve_metadata_maintenance(&mut call, finalizer).await
     }
-    async fn read_max_compactable_data_files(
-        resolver: &dyn ConnectorMetadataMaintenanceResolver,
-        instance: &ConnectorInstanceId,
-        table: ConnectorTableIdentity,
-        context: ConnectorRequestContext,
-    ) -> Result<Option<u64>, ConnectorError> {
-        let mut observation =
-            MetadataMaintenanceObservation::try_new(resolver, instance, table, context)?;
-        super::read_max_compactable_data_files(&mut observation).await
-    }
     struct Resolver {
         provider: Arc<FakeProvider>,
         releases: Arc<AtomicUsize>,
@@ -1545,42 +1417,137 @@ mod tests {
         ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError> {
             unreachable!("observation must not execute")
         }
-        fn read_max_compactable_data_files(
+        fn begin_read_max_compactable_data_files(
             &self,
-            request: novarocks_spi::connector::ConnectorMaxCompactableDataFilesRequest,
-        ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceFuture<
-            '_,
-            ConnectorMaxCompactableDataFiles,
+            request: ConnectorMaxCompactableDataFilesRequest,
+            _cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution,
+            ConnectorError,
         > {
-            Box::pin(async move {
-                assert_eq!(request.table.owner(), &self.inner.descriptor.instance_id);
-                Ok(ConnectorMaxCompactableDataFiles::new(self.observation))
-            })
+            assert_eq!(request.table.owner(), &self.inner.descriptor.instance_id);
+            Ok(
+                novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution::from_source(
+                    Arc::new(FiniteObservationSource {
+                        _request: request,
+                        value: self.observation,
+                    }),
+                ),
+            )
+        }
+    }
+
+    // This finite Provider fixture starts no Work, CPU input or foreign future.
+    // Its close means no work existed; it does not model a production footer.
+    struct FiniteObservationSource {
+        _request: ConnectorMaxCompactableDataFilesRequest,
+        value: Option<u64>,
+    }
+    impl novarocks_spi::connector::ConnectorMaxCompactableDataFilesSource for FiniteObservationSource {
+        fn poll_result(
+            &self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<ConnectorMaxCompactableDataFiles, ConnectorError>> {
+            Poll::Ready(Ok(ConnectorMaxCompactableDataFiles::new(self.value)))
+        }
+        fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+
+    // Neither the finite value Source nor the default refusal creates CPU work.
+    // Any dispatch or exit observation through this port is a fixture error.
+    struct UnusedObservationCpu;
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for UnusedObservationCpu {
+        fn submit_metadata_in(
+            &self,
+            _: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            panic!("the observation fixture starts no CPU work")
+        }
+        fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            panic!("the observation fixture has no CPU input")
+        }
+        fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            panic!("the observation fixture claims no CPU exit")
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            panic!("the observation fixture has no CPU source")
         }
     }
 
     struct ObservingResolver {
-        provider: Arc<ObservingProvider>,
+        planning: novarocks_spi::connector::ConnectorControlPlanningLease,
+        provider: Arc<dyn ConnectorMetadataMaintenance>,
     }
-    impl ConnectorMetadataMaintenanceResolver for ObservingResolver {
-        fn acquire_current_metadata_maintenance(
-            &self,
-            _: &ConnectorInstanceId,
-        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+    impl ObservingResolver {
+        fn new(
+            metadata: Arc<dyn ConnectorMetadata>,
+            provider: Arc<dyn ConnectorMetadataMaintenance>,
+        ) -> Self {
+            use novarocks_spi::connector::ConnectorControlResolver;
+            let descriptor = provider.descriptor().clone();
+            // The existing catalog fixture supplies unused planning/distribution
+            // facets. Metadata capture uses this observation Provider itself.
+            let unused = novarocks_catalog_application::test_support::test_control_binding_for(
+                descriptor.instance_id.clone(),
+                5,
+            );
+            let binding = novarocks_spi::connector::ConnectorControlBinding::try_new(
+                descriptor.clone(),
+                provider.binding_key().incarnation,
+                metadata,
+                unused.planning().clone(),
+                unused.execution_distribution().clone(),
+                None,
+            )
+            .expect("observation control binding");
+            let registry = crate::connector::fixture::FixtureConnectorRegistry::new();
+            registry.register_fixture_control(binding);
+            let controls = crate::connector::fixture::FixtureControlResolver::new(registry);
+            let planning = controls
+                .acquire_current(&descriptor.instance_id)
+                .expect("current observation generation");
+            Self { planning, provider }
+        }
+        fn lease(&self) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
             ConnectorMetadataMaintenanceLease::new(
-                self.provider.inner.descriptor.clone(),
-                ConnectorControlRuntimeId::from_bytes([9; 16]),
-                self.provider.inner.key.incarnation,
-                self.provider.clone(),
+                self.provider.descriptor().clone(),
+                self.planning.control_runtime_id(),
+                self.provider.binding_key().incarnation,
+                self.planning.binding().metadata().clone(),
                 self.provider.clone(),
                 || {},
             )
         }
+    }
+    impl ConnectorMetadataMaintenanceResolver for ObservingResolver {
+        fn acquire_current_metadata_maintenance(
+            &self,
+            instance: &ConnectorInstanceId,
+        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+            if instance != &self.provider.descriptor().instance_id {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "observation generation not registered",
+                ));
+            }
+            self.lease()
+        }
         fn acquire_exact_metadata_maintenance(
             &self,
-            _: ConnectorControlRuntimeId,
+            runtime: ConnectorControlRuntimeId,
         ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-            unreachable!("observation only uses the current generation")
+            if runtime != self.planning.control_runtime_id() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "observation generation retired",
+                ));
+            }
+            self.lease()
         }
     }
 
@@ -1588,21 +1555,37 @@ mod tests {
     async fn observation_reads_the_provider_scalar_without_planning() {
         let inner = FakeProvider::new(Mode::Committed);
         let instance_id = inner.descriptor.instance_id.clone();
-        let resolver = ObservingResolver {
-            provider: Arc::new(ObservingProvider {
-                inner: inner.clone(),
-                observation: Some(7),
-            }),
-        };
-
-        let observed = read_max_compactable_data_files(
-            &resolver,
-            &instance_id,
-            table(&instance_id),
-            context(),
+        let provider = Arc::new(ObservingProvider {
+            inner: inner.clone(),
+            observation: Some(7),
+        });
+        let resolver = ObservingResolver::new(provider.clone(), provider);
+        let context = context();
+        let metadata = crate::connector::schema_creation::load_frontend_table_async(
+            resolver.planning.binding().metadata().as_ref(),
+            ConnectorTableRequest {
+                table: table(&instance_id),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            },
         )
         .await
-        .expect("observation");
+        .expect("captured observation metadata");
+        let mut observation = begin_captured_max_compactable_data_files(
+            &resolver,
+            &resolver.planning,
+            &metadata,
+            context,
+            Arc::new(UnusedObservationCpu),
+        )
+        .expect("observation source");
+        let observed = std::future::poll_fn(|cx| observation.poll_result(cx))
+            .await
+            .expect("observation")
+            .value();
+        std::future::poll_fn(|cx| observation.poll_closed(cx))
+            .await
+            .expect("finite observation closed");
 
         assert_eq!(observed, Some(7));
         assert_eq!(inner.metadata_calls.load(Ordering::SeqCst), 1);
@@ -1613,18 +1596,30 @@ mod tests {
     #[tokio::test]
     async fn observation_is_unsupported_when_the_provider_does_not_implement_it() {
         let provider = FakeProvider::new(Mode::Committed);
-        let resolver = Resolver::new(provider.clone());
-
-        let error = read_max_compactable_data_files(
-            &resolver,
-            &provider.descriptor.instance_id,
-            table(&provider.descriptor.instance_id),
-            context(),
+        let resolver = ObservingResolver::new(provider.clone(), provider.clone());
+        let context = context();
+        let metadata = crate::connector::schema_creation::load_frontend_table_async(
+            resolver.planning.binding().metadata().as_ref(),
+            ConnectorTableRequest {
+                table: table(&provider.descriptor.instance_id),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            },
         )
         .await
-        .expect_err("default observation must fail closed");
+        .expect("captured observation metadata");
+        let error = begin_captured_max_compactable_data_files(
+            &resolver,
+            &resolver.planning,
+            &metadata,
+            context,
+            Arc::new(UnusedObservationCpu),
+        )
+        .err()
+        .expect("default observation must fail closed");
 
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
     }
@@ -1632,17 +1627,32 @@ mod tests {
     #[tokio::test]
     async fn observation_rejects_a_table_from_another_instance() {
         let provider = FakeProvider::new(Mode::Committed);
-        let resolver = Resolver::new(provider.clone());
+        let resolver = ObservingResolver::new(provider.clone(), provider.clone());
         let foreign = ConnectorInstanceId::parse("catalog.other").unwrap();
-
-        let error = read_max_compactable_data_files(
+        let context = context();
+        // Author the same foreign identity without metadata I/O, then use the
+        // real captured-helper owner gate before asking the Provider for a Source.
+        let metadata =
+            crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+                provider.create_test_table(
+                    ConnectorTableRequest {
+                        table: table(&foreign),
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: context.clone(),
+                    },
+                    creation,
+                )
+            })
+            .expect("foreign metadata fixture");
+        let error = begin_captured_max_compactable_data_files(
             &resolver,
-            &provider.descriptor.instance_id,
-            table(&foreign),
-            context(),
+            &resolver.planning,
+            &metadata,
+            context,
+            Arc::new(UnusedObservationCpu),
         )
-        .await
-        .expect_err("foreign instance must fail closed");
+        .err()
+        .expect("foreign instance must fail closed");
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 0);
