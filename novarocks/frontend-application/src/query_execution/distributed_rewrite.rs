@@ -182,28 +182,6 @@ struct ConnectorDistributedRewriteSessionInner {
 }
 
 impl ConnectorDistributedRewriteSession {
-    /// A plan that froze no group. It writes nothing, so it deliberately has no
-    /// write session and never derives a write-stack lease -- there is nothing
-    /// for one to admit.
-    pub fn noop(
-        plan: ConnectorDistributedRewritePlan,
-        lease: ConnectorDistributedRewriteLease,
-    ) -> Result<Self, ConnectorError> {
-        lease.validate_plan(&plan)?;
-        if !plan.cohorts().is_empty() {
-            return Err(invalid(
-                "distributed rewrite plan froze groups, so it is not a no-op",
-            ));
-        }
-        Ok(Self {
-            inner: Arc::new(ConnectorDistributedRewriteSessionInner {
-                plan: Arc::new(plan),
-                lease,
-                write_session: None,
-            }),
-        })
-    }
-
     /// Pure seal of the exact accepted session. Its original begin receiver
     /// remains an affirmative owner independently of this borrowed CPU work.
     pub(crate) fn from_original_session(
@@ -923,18 +901,26 @@ mod tests {
     #[test]
     fn empty_plan_is_noop_without_writer_session() {
         let (plan, lease) = fixture(0);
-        let session = ConnectorDistributedRewriteSession::noop(plan, lease).unwrap();
+        let session =
+            ConnectorDistributedRewriteSession::from_original_session(Arc::new(plan), lease, None)
+                .unwrap();
         assert!(session.is_noop());
         assert!(session.write_session().is_none());
     }
 
     #[test]
-    fn a_plan_with_frozen_groups_is_refused_as_a_noop() {
+    fn a_plan_with_frozen_groups_requires_its_original_writer_session() {
         let (plan, lease) = fixture(1);
-        let Err(error) = ConnectorDistributedRewriteSession::noop(plan, lease) else {
+        let Err(error) =
+            ConnectorDistributedRewriteSession::from_original_session(Arc::new(plan), lease, None)
+        else {
             panic!("a plan that froze a group must open a write session");
         };
-        assert!(error.to_string().contains("not a no-op"), "{error}");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error.to_string().contains("actual empty/nonempty plan"),
+            "{error}"
+        );
     }
 
     /// The begin request describes the writer input the frozen groups signed,

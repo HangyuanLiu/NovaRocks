@@ -1022,25 +1022,16 @@ impl SplitAssignmentRoundGuard {
             .clone()
     }
 
-    /// Takes the final profile without waiting for the pump.
-    ///
-    /// An absent outcome is accepted only after the attempt owner explicitly
-    /// abandoned residual delivery; an ordinary successful finish may never
-    /// turn an unfinished assignment into a successful empty profile.
-    pub(crate) fn finish_after_attempt(
-        self,
-        abandoned: bool,
-    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
-        let outcome = self
-            .outcome
+    /// Read only an error from the original pump's published outcome.
+    /// This does not prove actual exit.
+    #[cfg(test)]
+    pub(crate) fn published_close_failure_for_test(&self) -> Option<SplitAssignmentDriverError> {
+        self.outcome
             .lock()
             .unwrap_or_else(|lock| lock.into_inner())
-            .clone();
-        match outcome {
-            Some(outcome) => outcome,
-            None if abandoned => Ok(SplitSourceProfile::default()),
-            None => Err(SplitAssignmentDriverError::DeliveryInProgress),
-        }
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned()
     }
 }
 
@@ -2108,10 +2099,9 @@ mod tests {
             wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
         };
 
-        assert!(matches!(
-            guard.finish_after_attempt(false),
-            Err(SplitAssignmentDriverError::DeliveryInProgress)
-        ));
+        let profile = guard.profile_source().current();
+        drop(guard);
+        assert!(matches!(profile, SplitAssignmentProfileRead::Pending));
         assert!(
             stop.is_stopped(),
             "consuming the guard signals residual stop"
@@ -2151,9 +2141,14 @@ mod tests {
         // result afterwards.
         assert!(failed.failure().is_some());
         assert_eq!(failed.failure_source().failure(), failed.failure());
-        failed
-            .finish_after_attempt(false)
-            .expect_err("the joined verdict is still the round's result");
+        let profile = failed.profile_source().current();
+        let original = failed.failure_source().failure().unwrap();
+        let published = failed
+            .published_close_failure_for_test()
+            .expect("the joined verdict is still the round's result");
+        drop(failed);
+        assert!(matches!(profile, SplitAssignmentProfileRead::Failed));
+        assert_eq!(published, original);
 
         let healthy = SplitAssignmentRoundGuard {
             stop: RoundSplitAssignmentStop::default(),
@@ -2166,9 +2161,9 @@ mod tests {
             "a deliverer that ran out of sources has not failed"
         );
         assert!(healthy.failure_source().failure().is_none());
-        healthy
-            .finish_after_attempt(false)
-            .expect("a clean stop is still a clean stop");
+        let profile = healthy.profile_source().current();
+        drop(healthy);
+        assert!(matches!(profile, SplitAssignmentProfileRead::Available(_)));
     }
 
     struct NoCloseTaskUpdates;
@@ -2393,7 +2388,9 @@ mod tests {
         let repeated_error = round.take_pump_close_error();
         let selected_cause = round.failure_cause().cloned();
         let computational_failure = guard.failure_source().failure();
-        let result = guard.finish_after_attempt(false);
+        let result = guard.profile_source().current();
+        let published_failure = guard.published_close_failure_for_test();
+        drop(guard);
         let final_closes = closes.load(Ordering::SeqCst);
         let final_drops = drops.load(Ordering::SeqCst);
         drop(round);
@@ -2436,7 +2433,8 @@ mod tests {
             "a local cleanup must not mint a Task conclusion"
         );
         if panic_profile || panic_close || provider_error {
-            let error = result.expect_err("the original close error must not be hidden");
+            assert!(matches!(result, SplitAssignmentProfileRead::Failed));
+            let error = published_failure.expect("the original close error must not be hidden");
             let input = error
                 .execution_failure()
                 .expect("the source owner projected its own fact");
@@ -2465,7 +2463,7 @@ mod tests {
                 );
             }
         } else {
-            assert!(result.is_ok());
+            assert!(matches!(result, SplitAssignmentProfileRead::Available(_)));
             assert!(close_error.is_none());
         }
         assert!(shutdown.is_ok());
@@ -2615,7 +2613,8 @@ mod tests {
             .expect("the health cause is the original protected job error")
             .clone();
         let owner_name = health.owner;
-        let result = guard.finish_after_attempt(false);
+        let result = guard.profile_source().current();
+        drop(guard);
         drop(health);
         drop(round);
         drop(data_runtime);
@@ -2633,7 +2632,7 @@ mod tests {
             originating_cause.is_none(),
             "health is not a new Task failure"
         );
-        assert!(result.is_err());
+        assert!(matches!(result, SplitAssignmentProfileRead::Failed));
         assert!(
             computational_failure.is_none(),
             "the original health cause is not a computation verdict"
@@ -2783,7 +2782,8 @@ mod tests {
         });
         let joined = round.turn();
         let closed = round.pumps_closed();
-        let outcome = guard.finish_after_attempt(false);
+        let outcome = guard.profile_source().current();
+        drop(guard);
         drop(round);
         drop(data_runtime);
         until(|| control.snapshot().scopes.is_empty());
@@ -2793,7 +2793,7 @@ mod tests {
         assert!(released_enum.is_ok() && released_close.is_ok());
         assert!(!falsely_closed && !closed_before_release);
         assert_eq!(prematurely_closed_source, 0);
-        assert!(saw_close && closed && outcome.is_ok());
+        assert!(saw_close && closed && matches!(outcome, SplitAssignmentProfileRead::Available(_)));
         assert_eq!(waiting_enum.root_responsibilities, 1);
         assert_eq!(waiting_close.root_responsibilities, 1);
         assert_eq!(waiting_close.result_windows.held_positions, [0, 0, 1, 0]);

@@ -164,7 +164,7 @@ impl StatisticsPlanCpuJob {
                     let Some(Err(error)) = original.marker.take() else {
                         unreachable!()
                     };
-                    *destination = Some(Err(StatisticsPreparationFailure::Cpu(error)));
+                    *destination = Some(Err(StatisticsPreparationFailure::Cpu(Box::new(error))));
                 }
                 _ => panic!("closed statistics creator returned a foreign marker"),
             }

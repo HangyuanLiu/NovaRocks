@@ -1110,9 +1110,16 @@ mod tests {
         );
         assert_eq!(enumerations.load(Ordering::SeqCst), 0);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
+        let profile = guard.profile_source().current();
+        let cleanup = guard.published_close_failure_for_test();
+        drop(guard);
         assert!(matches!(
-            guard.finish_after_attempt(false),
-            Err(SplitAssignmentDriverError::SourceClose { .. })
+            profile,
+            crate::query_execution::split_assignment_round::SplitAssignmentProfileRead::Failed
+        ));
+        assert!(matches!(
+            cleanup,
+            Some(SplitAssignmentDriverError::SourceClose { .. })
         ));
         drop(assembled);
         root.owner.complete();
@@ -2568,7 +2575,13 @@ mod tests {
         assert_eq!(enumerations.load(Ordering::SeqCst), 0);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
         assert!(assembled.round.pumps_closed());
-        let cleanup = guard.finish_after_attempt(false).unwrap_err();
+        let profile = guard.profile_source().current();
+        let cleanup = guard.published_close_failure_for_test().unwrap();
+        drop(guard);
+        assert!(matches!(
+            profile,
+            crate::query_execution::split_assignment_round::SplitAssignmentProfileRead::Failed
+        ));
         assert!(matches!(
             cleanup,
             SplitAssignmentDriverError::SourceClose { .. }
@@ -2688,7 +2701,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(closes.load(Ordering::SeqCst), 1);
-        assert_eq!(guard.finish_after_attempt(false).unwrap_err(), original);
+        let profile = guard.profile_source().current();
+        let published = guard.published_close_failure_for_test().unwrap();
+        drop(guard);
+        assert!(matches!(
+            profile,
+            crate::query_execution::split_assignment_round::SplitAssignmentProfileRead::Failed
+        ));
+        assert_eq!(published, original);
         drop(assembled);
         drop(drive);
         finish_pending_actor(logical, context).await;

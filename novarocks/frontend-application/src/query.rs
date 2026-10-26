@@ -4231,12 +4231,11 @@ mod tests {
 
     #[test]
     fn prepared_distributed_failure_route_keeps_selected_task_and_root_input() {
-        use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+        use crate::query_execution::contract::DistributedQueryError;
         use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, TaskIdentity};
         use novarocks_failure_contract::FailureProjection;
-        use novarocks_query_application::{
-            coordination::RootResultFetchFailure,
-            execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
         use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
         use novarocks_types::{BackendProcessId, StageId, TaskId};
@@ -4263,22 +4262,16 @@ mod tests {
         );
         for (error, expected) in [
             (
-                DistributedQueryError::from_execution(task_input.clone()).with_root_fetch_failure(
-                    RootResultFetchFailure::from_input(root_input.clone()),
-                ),
+                DistributedQueryError::from_execution(task_input.clone()),
                 task_input,
             ),
             (
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::Failed,
-                    "private coordinator wrapper must not replace root input",
-                )
-                .with_root_fetch_failure(RootResultFetchFailure::from_input(root_input.clone())),
+                DistributedQueryError::from_execution(root_input.clone()),
                 root_input,
             ),
         ] {
-            // This is the same cold-path projection called by the production
-            // execute_prepared_query Distributed arm, before caller fallback.
+            // Exercise the existing typed carrier's service projection and
+            // caller fallback, without driving a Native attempt.
             let routed = routed_distributed_query_failure(error);
             let service = selected_execution_or_worker_fallback(
                 Err(routed),

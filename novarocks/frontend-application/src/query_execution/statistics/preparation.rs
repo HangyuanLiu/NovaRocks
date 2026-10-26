@@ -106,7 +106,7 @@ pub(crate) type StatisticsPreparationOutcome =
 /// Raw worker/forwarder/Drop failures remain in the same job's health packet.
 pub(crate) enum StatisticsPreparationFailure {
     Domain(DistributedQueryError),
-    Cpu(novarocks_query_application::execution_error::ExecutionFailureInput),
+    Cpu(Box<novarocks_query_application::execution_error::ExecutionFailureInput>),
 }
 
 /// A signed plan and its exact Provider program. This is not a computation

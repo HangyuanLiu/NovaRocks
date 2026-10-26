@@ -67,15 +67,6 @@ impl StatementComputationAssembly for PreparedDistributedRewriteCohort {
 pub(crate) struct ReadyRewriteCohort {
     _original: ReadyWriteComputation,
 }
-impl ReadyRewriteCohort {
-    pub(crate) fn row_count(&self) -> u64 {
-        self._original.accepted.row_count()
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self._original.accepted.is_empty()
-    }
-}
-
 /// Inline in the original maintenance Action. The same MIO and neutral
 /// context are borrowed at poll time; this creates no Root/runtime/permit.
 pub(crate) struct RewriteCohortComputation {
@@ -88,27 +79,6 @@ pub(crate) struct RewriteCohortComputation {
     failure: Option<StatementNativeHealthFailure>,
 }
 impl RewriteCohortComputation {
-    pub(crate) fn new(
-        root: WorkScope,
-        initial: InitialComputationReservation,
-        launcher: Arc<dyn LogicalExecutionLauncher>,
-        cohort: PreparedDistributedRewriteCohort,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> Result<Self, QueryServiceError> {
-        let expected_session = Arc::clone(&cohort.write_session);
-        let mut source = Self::empty(
-            root,
-            initial,
-            launcher,
-            expected_session,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        );
-        source.install_prepared(cohort)?;
-        Ok(source)
-    }
     /// The real Stage is admitted before cohort planning. This is the SAME
     /// common computation source; it does not mint a preparation-only P.
     pub(crate) fn empty(

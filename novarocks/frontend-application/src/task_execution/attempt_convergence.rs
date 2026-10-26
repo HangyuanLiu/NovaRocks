@@ -472,18 +472,6 @@ impl NativeAttemptConvergenceOwner {
         Ok(())
     }
 
-    /// Observe only the original remote facts. This never supplies local pump
-    /// exit, normal production, Task acceptance, or a fresh observation budget.
-    pub(crate) fn observe_remote(
-        &mut self,
-        round: &TaskRound,
-        incoming_deadline: std::time::Instant,
-    ) -> Option<NativeActiveConvergenceClosure> {
-        let deadline = self.retain_remote_deadline(incoming_deadline);
-        self.observe_remote_closure(round, deadline);
-        self.remote_closure.clone()
-    }
-
     fn retain_remote_deadline(&mut self, incoming: std::time::Instant) -> std::time::Instant {
         let deadline = self
             .remote_deadline
@@ -1105,8 +1093,11 @@ mod tests {
             "positive original facts precede the expired request"
         );
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let deadline = owner.retain_remote_deadline(expired);
+        owner.observe_remote_closure(&round, deadline);
         let closure = owner
-            .observe_remote(&round, expired)
+            .remote_closure
+            .clone()
             .expect("already accepted evidence");
         match closure {
             NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Contexts(
@@ -1123,8 +1114,10 @@ mod tests {
         }
         // A later shutdown/re-entry cannot replace the previously frozen
         // positive evidence with a second remote disposition either.
+        let deadline = owner.retain_remote_deadline(expired - std::time::Duration::from_secs(1));
+        owner.observe_remote_closure(&round, deadline);
         assert!(matches!(
-            owner.observe_remote(&round, expired - std::time::Duration::from_secs(1)),
+            owner.remote_closure.clone(),
             Some(NativeActiveConvergenceClosure::Evidence(_))
         ));
         let contributions = round.execution().released_runtime_filter_contributions();

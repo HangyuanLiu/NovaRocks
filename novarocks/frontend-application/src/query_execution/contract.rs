@@ -199,7 +199,6 @@ enum DistributedQueryErrorBody {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DistributedQueryError {
     domain_source: Option<novarocks_execution_contract::failure::SharedFailureCause>,
-    root_fetch_failure: Option<novarocks_query_application::coordination::RootResultFetchFailure>,
     kind: DistributedQueryErrorKind,
     body: DistributedQueryErrorBody,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
@@ -212,7 +211,6 @@ impl DistributedQueryError {
     ) -> Self {
         Self {
             domain_source: None,
-            root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Failed,
             body: DistributedQueryErrorBody::Execution(Box::new(input)),
             compile_control: None,
@@ -231,7 +229,6 @@ impl DistributedQueryError {
     pub fn new(kind: DistributedQueryErrorKind, message: impl Into<String>) -> Self {
         Self {
             domain_source: None,
-            root_fetch_failure: None,
             kind,
             body: DistributedQueryErrorBody::Coordinator(message.into()),
             compile_control: None,
@@ -325,34 +322,6 @@ impl DistributedQueryError {
         self.compile_control.clone()
     }
 
-    /// Preserve the transport verdict after this coordinator has failed its
-    /// installed attempt. It grants no pre-ready or transparent retry proof.
-    pub(crate) fn with_root_fetch_failure(
-        mut self,
-        failure: novarocks_query_application::coordination::RootResultFetchFailure,
-    ) -> Self {
-        use novarocks_coordination_contract::AttemptFailureClass as C;
-        if self.execution_failure().is_some() {
-            // This is supplemental transport evidence, not another selection.
-            self.root_fetch_failure = Some(failure);
-            return self;
-        }
-        self.kind = match failure.class() {
-            C::ResourceGovernance => DistributedQueryErrorKind::Rejected,
-            C::ContractViolation => DistributedQueryErrorKind::ContractViolation,
-            _ => DistributedQueryErrorKind::Failed,
-        };
-        self.body = DistributedQueryErrorBody::Execution(Box::new(failure.input().clone()));
-        self.root_fetch_failure = Some(failure);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn root_fetch_failure(
-        &self,
-    ) -> Option<&novarocks_query_application::coordination::RootResultFetchFailure> {
-        self.root_fetch_failure.as_ref()
-    }
-
     /// The coordinator consumes its own closed state. Foreign domain facts and
     /// already selected root-read input are forwarded without reclassification;
     /// text-only coordinator failures explicitly select this owner's reason.
@@ -367,9 +336,6 @@ impl DistributedQueryError {
             DistributedQueryErrorBody::Execution(input) => return *input,
             DistributedQueryErrorBody::Coordinator(message) => message,
         };
-        if let Some(failure) = self.root_fetch_failure {
-            return failure.input().clone();
-        }
         let site = ExecutionFailureSite::Coordinator;
         if let Some(source) = self.domain_source {
             return ExecutionFailureInput::new(
@@ -491,11 +457,7 @@ mod tests {
                 novarocks_query_application::coordination::RootResultFetchFailure::from_input(
                     input.clone(),
                 );
-            let error = super::DistributedQueryError::new(
-                super::DistributedQueryErrorKind::Failed,
-                "root failed",
-            )
-            .with_root_fetch_failure(observed);
+            let error = super::DistributedQueryError::from_execution(observed.input().clone());
             assert_eq!(error.into_execution_failure_input(), input);
         }
     }
@@ -986,11 +948,11 @@ mod selected_execution_carrier_tests {
     use super::*;
     use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
     use novarocks_query_application::execution_error::{
-        ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        ExecutionFailureInput, ExecutionFailureSite,
     };
 
     #[test]
-    fn selected_execution_is_not_reclassified_by_later_root_fetch_evidence() {
+    fn selected_execution_carrier_preserves_its_original_input() {
         let source = novarocks_spi::connector::ConnectorError::new(
             novarocks_spi::connector::ConnectorErrorKind::Internal,
             "private provider diagnostic",
@@ -1000,20 +962,9 @@ mod selected_execution_carrier_tests {
             SafeDetail::new("original safe task failure").unwrap(),
             ExecutionFailureSite::Coordinator,
         );
-        let later = ExecutionFailureInput::new(
-            QueryFailureReason::ResultProtocol.failure_fact(),
-            SafeDetail::new("later root protocol failure").unwrap(),
-            ExecutionFailureSite::Coordinator,
-        );
-        let failure = DistributedQueryError::from_execution(original.clone())
-            .with_root_fetch_failure(
-                novarocks_query_application::coordination::RootResultFetchFailure::from_input(
-                    later,
-                ),
-            );
+        let failure = DistributedQueryError::from_execution(original.clone());
         assert_eq!(failure.execution_failure(), Some(&original));
         assert_eq!(failure.kind(), DistributedQueryErrorKind::Failed);
-        assert!(failure.root_fetch_failure().is_some());
         assert_eq!(failure.into_execution_failure_input(), original);
     }
 }
