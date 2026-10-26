@@ -30,6 +30,8 @@
 
 // Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
+#[cfg(test)]
+use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_physical_plan::PlanVersionId;
@@ -160,7 +162,7 @@ pub(crate) fn encode_completed_plan(
 ///
 /// The capability moves rather than copies, because a capability cannot be
 /// copied; the encoding stays behind for whichever carrier reads it.
-fn split_frozen_reads(
+pub(crate) fn split_frozen_reads(
     reads: novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
 ) -> (
     BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
@@ -244,6 +246,15 @@ impl PreparedStaticPlan {
         >,
     ) -> EncodedCompletedPlan {
         let (_, capabilities) = split_frozen_reads(access);
+        self.bind_capabilities(capabilities)
+    }
+    /// The original Source retired the encodings on its CPU turn and retains
+    /// these same capabilities until that turn's actual exit. This checked
+    /// receiving step performs no opaque encoding destructor.
+    pub(crate) fn bind_capabilities(
+        self,
+        capabilities: BTreeMap<ProviderReadOccurrenceId, FrozenReadCapability>,
+    ) -> EncodedCompletedPlan {
         let access = self
             .access
             .bind(self.encoded.candidate.plan(), capabilities);
@@ -934,7 +945,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request(), &scope),
+            )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let plan_fragments = completed.candidate().plan().fragments().len();
 
@@ -1000,7 +1014,7 @@ mod tests {
         let completed = runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql), &scope),
+                    .complete_for_test(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
         let control = SqlCompileControl::unbounded();
@@ -1129,7 +1143,7 @@ mod tests {
         runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql), &scope),
+                    .complete_for_test(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"))
     }
@@ -1527,7 +1541,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request, &scope),
+            )
             .unwrap_or_else(|error| panic!("wide statistics source completion: {error:#?}"));
         let plan = completed.candidate().plan();
         assert_eq!(
@@ -1851,7 +1868,8 @@ mod tests {
             let (_root, scope) = query_scope();
             let completed = runtime
                 .block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                        .complete_for_test(request(), &scope),
                 )
                 .expect("the actual admitted VALUES plan completes");
             let fragments = completed.candidate().plan().fragments().len();
@@ -1894,7 +1912,8 @@ mod tests {
             );
             let completed = runtime
                 .block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                        .complete_for_test(request(), &scope),
                 )
                 .expect("the actual admitted VALUES plan completes");
             let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
@@ -1927,7 +1946,8 @@ mod tests {
 
             let completed = runtime
                 .block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                        .complete_for_test(request(), &scope),
                 )
                 .unwrap();
             let freezes_before_refusal =
@@ -1982,7 +2002,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request(), &scope),
+            )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let version = completed.candidate().plan().version();
         let encoded = encode_completed_plan(
@@ -2020,7 +2043,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request(), &scope),
+            )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let topology = completed_plan_topology(completed.candidate().plan())
             .expect("a completed plan has a topology");
@@ -2187,7 +2213,7 @@ mod tests {
             .build()
             .unwrap();
         let (_root, scope) = query_scope();
-        let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(
+        let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete_for_test(
             request_for("SELECT hll_hash('x') AS h,bitmap_agg(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_string(bitmap_agg(1)) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();

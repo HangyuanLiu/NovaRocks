@@ -38,7 +38,7 @@ use novarocks_query_application::coordination::{
 };
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
-    QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
+    QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
     CancellationReason, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
@@ -382,7 +382,6 @@ struct FrontendExecutionRuntimeOwner {
     root_admission: RootAdmissionHandle,
     workload_observation: WorkloadObservationHandle,
     query_cpu: QueryCpuExecutorOwner,
-    query_cpu_executor: QueryCpuExecutor,
     query_blocking: QueryBlockingExecutorOwner,
     query_blocking_executor: QueryBlockingExecutor,
     internal_result_cpu: InternalResultCpuOwner,
@@ -468,7 +467,7 @@ impl FrontendExecutionRuntimeOwner {
             })?;
         let query_blocking_executor = query_blocking.executor();
         connector_blocking_io
-            .install_original_executors(query_cpu_executor.clone(), query_blocking_executor.clone())
+            .install_original_executors(query_cpu_executor, query_blocking_executor.clone())
             .map_err(|error| {
                 FrontendApplicationError::new(
                     FrontendApplicationErrorKind::WorkloadControlOpen,
@@ -568,7 +567,6 @@ impl FrontendExecutionRuntimeOwner {
             root_admission: workload.root_admission,
             workload_observation: workload.observation,
             query_cpu,
-            query_cpu_executor,
             query_blocking,
             query_blocking_executor,
             internal_result_cpu,
@@ -796,10 +794,6 @@ impl FrontendExecutionRuntimeOwner {
 
     fn workload_observation(&self) -> WorkloadObservationHandle {
         self.workload_observation.clone()
-    }
-
-    fn query_cpu_executor(&self) -> QueryCpuExecutor {
-        self.query_cpu_executor.clone()
     }
 
     fn query_blocking_executor(&self) -> QueryBlockingExecutor {
@@ -2253,11 +2247,6 @@ impl FrontendApplicationHost {
         self.state_store_host
             .as_ref()
             .map(StateStoreHost::provider_id)
-    }
-
-    /// Cloneable submission handle for the process-owned CPU preparation pool.
-    pub(crate) fn query_cpu_executor(&self) -> QueryCpuExecutor {
-        self.execution_runtime_owner.query_cpu_executor()
     }
 
     /// Cloneable submission handle for synchronous command edges whose

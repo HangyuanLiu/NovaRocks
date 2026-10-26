@@ -1015,20 +1015,20 @@ type DeliveryFuture<'a> =
 type ReadFuture =
     Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>;
 
-/// Minted only after this original Client pump consumed Root End, drained its
+/// Minted only after this original streaming Rows pump consumed Root End, drained its
 /// real delivery/read slots and obtained its final actor success. Moving this
 /// token out is not P retirement: the supervisor consumes it after the pump
 /// and its driver frame have returned normally.
-pub(crate) struct ClientRowsComputedCut {
-    source: crate::admitted_query_context::ClientComputationCutHandle,
+pub(crate) struct StreamedRowsComputedCut {
+    source: crate::admitted_query_context::StreamedComputationCutHandle,
     _activation: novarocks_coordination_contract::AttemptActivationIdentity,
     _root: TaskIdentity,
     sealing: Result<(), WorkError>,
 }
-impl ClientRowsComputedCut {
+impl StreamedRowsComputedCut {
     pub(crate) fn is_for(
         &self,
-        source: &crate::admitted_query_context::ClientComputationCutHandle,
+        source: &crate::admitted_query_context::StreamedComputationCutHandle,
     ) -> bool {
         self.source.same_source(source)
     }
@@ -1040,9 +1040,9 @@ impl ClientRowsComputedCut {
 }
 pub(super) struct RootPumpDecision {
     pub(super) conclusion: LogicalConclusion,
-    pub(super) client_cut: Option<ClientRowsComputedCut>,
+    pub(super) streamed_cut: Option<StreamedRowsComputedCut>,
 }
-pub(super) async fn run_client_root_relay(
+pub(super) async fn run_streamed_root_relay(
     permit: RunningAttemptPermit,
     root: TaskIdentity,
     scope: WorkScope,
@@ -1050,7 +1050,7 @@ pub(super) async fn run_client_root_relay(
     statuses: AcceptedRootStatusSource,
     native_terminal: NativeAttemptTerminalSource,
     root_ack: super::RootAckTailReservation,
-    client: Option<crate::admitted_query_context::ClientComputationCutHandle>,
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
 ) -> Result<RootPumpDecision, ResultPumpFailure> {
     run_root_relay_core(
         permit,
@@ -1061,7 +1061,7 @@ pub(super) async fn run_client_root_relay(
         native_terminal,
         root_ack,
         None,
-        client,
+        streamed,
     )
     .await
 }
@@ -1133,7 +1133,7 @@ async fn run_root_relay_core(
     native_terminal: NativeAttemptTerminalSource,
     root_ack: super::RootAckTailReservation,
     ready: Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
-    client: Option<crate::admitted_query_context::ClientComputationCutHandle>,
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
 ) -> Result<RootPumpDecision, ResultPumpFailure> {
     let RootRelayBinding {
         port,
@@ -1141,9 +1141,9 @@ async fn run_root_relay_core(
         window,
         max_wait,
     } = binding;
-    if client
+    if streamed
         .as_ref()
-        .is_some_and(|client| !client.is_for_scope(&scope))
+        .is_some_and(|streamed| !streamed.is_for_scope(&scope))
         || statuses.root != root
         || frontier.root() != root
         || permit.identity().execution() != root.query_execution_id()
@@ -1393,7 +1393,7 @@ async fn run_root_relay_core(
             .await
             .map(|conclusion| RootPumpDecision {
                 conclusion,
-                client_cut: None,
+                streamed_cut: None,
             });
     }
     if !runtime.success_sealed {
@@ -1430,10 +1430,10 @@ async fn run_root_relay_core(
     let activation = permit.identity();
     match permit.finish_result_stream().await {
         Ok(conclusion) => {
-            let client_cut = if conclusion == LogicalConclusion::Succeeded {
-                if let Some(source) = client {
+            let streamed_cut = if conclusion == LogicalConclusion::Succeeded {
+                if let Some(source) = streamed {
                     let sealing = source.seal_producer();
-                    Some(ClientRowsComputedCut {
+                    Some(StreamedRowsComputedCut {
                         source,
                         _activation: activation,
                         _root: root,
@@ -1447,7 +1447,7 @@ async fn run_root_relay_core(
             };
             Ok(RootPumpDecision {
                 conclusion,
-                client_cut,
+                streamed_cut,
             })
         }
         Err(error) => Err(finish_handoff_failure(observer_owner, error).await),

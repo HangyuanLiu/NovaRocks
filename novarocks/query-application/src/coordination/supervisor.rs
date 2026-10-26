@@ -1651,10 +1651,10 @@ async fn run_logical_role(
     body.seed = Some(seed);
     body.consumer = consumer;
     body.capacity = capacity;
-    body.client_computation = body
+    body.streamed_computation = body
         .capacity
         .as_ref()
-        .and_then(|capacity| capacity.client_computation_producer());
+        .and_then(|capacity| capacity.streamed_computation_producer());
     let description = Arc::clone(body.description.as_ref().unwrap());
     let internal_consumer = body.consumer.clone();
     let internal = internal_consumer.is_some();
@@ -2608,10 +2608,10 @@ async fn drive_rows_attempt_until_pump_decision(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
     internal: &mut Option<InternalExecutionConsumer>,
-    client: Option<crate::admitted_query_context::ClientComputationCutHandle>,
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
 ) -> (
     Result<super::LogicalConclusion, ResultPumpFailure>,
-    Option<super::result_pump::ClientRowsComputedCut>,
+    Option<super::result_pump::StreamedRowsComputedCut>,
 ) {
     let RootRelayWork {
         scope,
@@ -2698,10 +2698,10 @@ async fn drive_rows_attempt_until_pump_decision(
             .await
             .map(|conclusion| super::result_pump::RootPumpDecision {
                 conclusion,
-                client_cut: None,
+                streamed_cut: None,
             })
         } else {
-            super::result_pump::run_client_root_relay(
+            super::result_pump::run_streamed_root_relay(
                 running,
                 root,
                 scope,
@@ -2709,7 +2709,7 @@ async fn drive_rows_attempt_until_pump_decision(
                 runtime.statuses,
                 terminal_source,
                 root_ack,
-                client,
+                streamed,
             )
             .await
         }
@@ -2746,7 +2746,7 @@ async fn drive_rows_attempt_until_pump_decision(
     };
     observe_internal_ready(internal, ready.as_ref());
     match pump_result {
-        Ok(decision) => (Ok(decision.conclusion), decision.client_cut),
+        Ok(decision) => (Ok(decision.conclusion), decision.streamed_cut),
         Err(error) => (Err(error), None),
     }
 }
@@ -2870,7 +2870,7 @@ async fn supervise_rows_inner(
     clock: &dyn MonotonicClock,
     mut attempt: RowsAttempt,
 ) -> Result<(), QueryExecutionError> {
-    let client_computation = session.client_computation_cut_handle();
+    let streamed_computation = session.streamed_computation_cut_handle();
     let mut residuals = JoinSet::new();
     // One recovery window covers every replacement preparation. A failed
     // successor cannot renew the topology wait by starting another attempt.
@@ -2888,7 +2888,7 @@ async fn supervise_rows_inner(
             ));
         }
         let drive = NativeAttemptDrive::new(&attempt.running);
-        let (pump_result, client_cut) = drive_rows_attempt_until_pump_decision(
+        let (pump_result, streamed_cut) = drive_rows_attempt_until_pump_decision(
             &mut attempt.active,
             &drive,
             RootRelayWork {
@@ -2901,7 +2901,7 @@ async fn supervise_rows_inner(
             shutdown,
             requester,
             internal,
-            client_computation.clone(),
+            streamed_computation.clone(),
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
@@ -2924,7 +2924,7 @@ async fn supervise_rows_inner(
             ) => {
                 // The original pump/driver future has returned and dropped its
                 // local producer slots. Only now can its private cut retire P.
-                if let Some(cut) = client_cut {
+                if let Some(cut) = streamed_cut {
                     cut.retire_after_pump_exit().await.map_err(work_error)?;
                 }
                 session.retire_preparation();

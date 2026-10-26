@@ -19,7 +19,9 @@
 pub(crate) mod io_source;
 use super::statement_computation::StatementStageAdmission;
 use super::*;
-use crate::query_execution::completion_facts::FrontendCompletionCustody;
+use crate::query_execution::completion_facts::{
+    FrontendCompletionCustody, FrontendCompletionPorts, FrontendPlanningCpuSource,
+};
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use crate::state_store::execution::StateStoreOriginalOwner;
 use io_source::ReadMetadataIoSource;
@@ -39,72 +41,81 @@ use novarocks_state_store_api::StateStoreExecutionRequests;
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::task::{Context, Poll};
 
-struct ReadPreparationInput {
-    compiler: FrontendQueryCompiler,
-    topology: BackendTopologyService,
-    role: ClusterRole,
-    optimizer_limit: u64,
-    sql: String,
-    parsed: ParsedStatement,
-    state: SessionSqlState,
-    deadline: Option<Instant>,
-    cancellation: QueryCancellationView,
-    scope: WorkScope,
-    window: ResultWindowAlias,
-    purpose: FrontendQueryPurpose,
-    provider: Arc<FrontendCompletionCustody>,
-    io: Arc<ReadMetadataIoSource>,
-    state_store: Option<Arc<dyn StateStoreExecutionRequests>>,
+pub(super) struct ReadPreparationInput {
+    pub(super) compiler: FrontendQueryCompiler,
+    pub(super) topology: BackendTopologyService,
+    pub(super) role: ClusterRole,
+    pub(super) optimizer_limit: u64,
+    pub(super) sql: String,
+    pub(super) parsed: ParsedStatement,
+    pub(super) state: SessionSqlState,
+    pub(super) deadline: Option<Instant>,
+    pub(super) cancellation: QueryCancellationView,
+    pub(super) scope: WorkScope,
+    pub(super) window: ResultWindowAlias,
+    pub(super) purpose: FrontendQueryPurpose,
+    pub(super) provider: Arc<FrontendCompletionCustody>,
+    pub(super) planning_cpu: Arc<FrontendPlanningCpuSource>,
+    pub(super) io: Arc<ReadMetadataIoSource>,
+    pub(super) state_store: Option<Arc<dyn StateStoreExecutionRequests>>,
     #[cfg(novarocks_dev_controls)]
-    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+    pub(super) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     #[cfg(novarocks_dev_controls)]
-    statement_token: StatementToken,
+    pub(super) statement_token: StatementToken,
 }
-async fn prepare_read(
+pub(super) async fn prepare_read(
     input: ReadPreparationInput,
-) -> Result<PreparedQueryOperation, QueryServiceError> {
-    let parsed = input
-        .state
-        .substitute_user_variables(input.parsed)
+) -> Result<Result<PreparedQueryOperation, QueryServiceError>, StatementNativeHealthFailure> {
+    let prepared: Result<_, QueryServiceError> = async {
+        let parsed = input
+            .state
+            .substitute_user_variables(input.parsed)
+            .map_err(|e| internal_error(e.to_string()))?;
+        let topology =
+            wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
+                .await?;
+        let (catalog, database, execution, mut optimizer, semantics) =
+            input.state.into_query_attempt_inputs();
+        let semantics = novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed)
+            .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
+        if optimizer.optimizer_query_mem_limit_bytes.is_none() {
+            optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
+        }
+        let options = with_query_hints(
+            query_options_from_session_settings(&execution),
+            &semantics,
+            match &parsed {
+                ParsedStatement::Query(q) => Some(q),
+                _ => None,
+            },
+        );
+        let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
+            .map_err(|e| internal_error(e.to_string()))?;
+        let context = RequestContext::admit(RequestAdmission::new(
+            catalog,
+            database,
+            input.role,
+            topology,
+            input.deadline,
+            input.cancellation,
+            optimizer,
+            semantics,
+        ))
+        .with_result_capacity(capacity)
         .map_err(|e| internal_error(e.to_string()))?;
-    let topology =
-        wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
-            .await?;
-    let (catalog, database, execution, mut optimizer, semantics) =
-        input.state.into_query_attempt_inputs();
-    let semantics = novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed)
-        .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
-    if optimizer.optimizer_query_mem_limit_bytes.is_none() {
-        optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
+        #[cfg(novarocks_dev_controls)]
+        let context = match input.observation.as_ref().and_then(|h| h.nomination()) {
+            Some(nomination) => context
+                .with_test_statement_nomination(Arc::new(nomination))
+                .map_err(internal_error)?,
+            None => context,
+        };
+        Ok((parsed, context, options))
     }
-    let options = with_query_hints(
-        query_options_from_session_settings(&execution),
-        &semantics,
-        match &parsed {
-            ParsedStatement::Query(q) => Some(q),
-            _ => None,
-        },
-    );
-    let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
-        .map_err(|e| internal_error(e.to_string()))?;
-    let context = RequestContext::admit(RequestAdmission::new(
-        catalog,
-        database,
-        input.role,
-        topology,
-        input.deadline,
-        input.cancellation,
-        optimizer,
-        semantics,
-    ))
-    .with_result_capacity(capacity)
-    .map_err(|e| internal_error(e.to_string()))?;
-    #[cfg(novarocks_dev_controls)]
-    let context = match input.observation.as_ref().and_then(|h| h.nomination()) {
-        Some(nomination) => context
-            .with_test_statement_nomination(Arc::new(nomination))
-            .map_err(internal_error)?,
-        None => context,
+    .await;
+    let (parsed, context, options) = match prepared {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
     };
     #[cfg(novarocks_dev_controls)]
     let rewrite = input
@@ -119,8 +130,13 @@ async fn prepare_read(
             )
         })
         .transpose()
-        .map_err(internal_error)?;
-    input
+        .map_err(internal_error);
+    #[cfg(novarocks_dev_controls)]
+    let rewrite = match rewrite {
+        Ok(rewrite) => rewrite,
+        Err(error) => return Ok(Err(error)),
+    };
+    let result = input
         .compiler
         .prepare_read_async(
             &parsed,
@@ -128,19 +144,24 @@ async fn prepare_read(
             &context,
             Some(options),
             &input.scope,
-            &input.provider,
+            FrontendCompletionPorts {
+                provider: &input.provider,
+                cpu: input.planning_cpu.as_ref(),
+            },
             input.io,
             input.state_store,
             #[cfg(novarocks_dev_controls)]
-            rewrite.as_ref(),
+            rewrite,
         )
-        .await
-        .map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql)))
+        .await?;
+    Ok(result.map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql))))
 }
 async fn close_provider(
     source: Arc<FrontendCompletionCustody>,
+    planning_cpu: Arc<FrontendPlanningCpuSource>,
 ) -> Result<(), StatementNativeHealthFailure> {
-    source.close().await
+    source.close().await?;
+    planning_cpu.close().await
 }
 type ProviderClose = Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send>>;
 fn poll_provider_close(
@@ -164,40 +185,60 @@ fn poll_provider_close(
     drop(future.take());
     Poll::Ready(result.as_ref().unwrap().clone())
 }
-type Preparation =
-    Pin<Box<dyn Future<Output = Result<PreparedQueryOperation, QueryServiceError>> + Send>>;
+type Preparation = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Result<PreparedQueryOperation, QueryServiceError>,
+                    StatementNativeHealthFailure,
+                >,
+            > + Send,
+    >,
+>;
 
-/// Original statement residual: it keeps the same Root and source registered
-/// while actual lazy scan/credential streams and Native closure are pending.
-struct ReadNativeTail {
+/// The original statement's shared metadata/StateStore ports. A multi-stage
+/// SET retains this same packet; a scalar stage never closes these ports.
+pub(super) struct ReadNativeServices {
     state_store: Option<StateStoreOriginalOwner>,
     io: Arc<ReadMetadataIoSource>,
-    stage: StatementStageAdmission,
-    exit: Option<LogicalExecutionExitObserver>,
-    receipt: Option<Result<LogicalExecutionExitReceipt, QueryExecutionError>>,
-    launched: bool,
-    health: Option<StatementNativeHealthFailure>,
 }
-impl ReadNativeTail {
+impl ReadNativeServices {
+    pub(super) fn new(
+        state_store: Option<StateStoreOriginalOwner>,
+        io: Arc<ReadMetadataIoSource>,
+    ) -> Self {
+        Self { state_store, io }
+    }
+    pub(super) fn io(&self) -> &Arc<ReadMetadataIoSource> {
+        &self.io
+    }
     fn retain_state_store_health(
-        &mut self,
+        health: &mut Option<StatementNativeHealthFailure>,
         cause: novarocks_state_store_api::StateStoreExecutionFailure,
     ) {
-        if self.health.is_none() {
-            self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+        if health.is_none() {
+            *health = Some(StatementNativeHealthFailure::actual_exit_unproven(
                 "Read StateStore original custody failed",
                 Arc::new(cause),
             ));
         }
     }
-    fn poll_state_store(&mut self, cx: &mut Context<'_>) {
+    pub(super) fn poll_state_store(
+        &self,
+        cx: &mut Context<'_>,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) {
         if let Some(source) = self.state_store.as_ref()
             && let Err(cause) = source.poll_progress(cx)
         {
-            self.retain_state_store_health(cause);
+            Self::retain_state_store_health(health, cause);
         }
     }
-    fn state_store_quiescent(&mut self, cx: &mut Context<'_>) -> bool {
+    pub(super) fn state_store_quiescent(
+        &self,
+        cx: &mut Context<'_>,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) -> bool {
         match self
             .state_store
             .as_ref()
@@ -206,58 +247,164 @@ impl ReadNativeTail {
             None | Some(Ok(true)) => true,
             Some(Ok(false)) => false,
             Some(Err(cause)) => {
-                self.retain_state_store_health(cause);
+                Self::retain_state_store_health(health, cause);
                 false
             }
         }
     }
-
-    // Native and MIO use the same actual-exit algorithm at the business cut
-    // and during residual retirement. StateStore quiescence/close is separate:
-    // an idle Original can still retain unresolved evidence after this cut.
-    fn poll_required_exit(
+    pub(super) fn poll_state_store_closed(
         &mut self,
         cx: &mut Context<'_>,
+        health: &mut Option<StatementNativeHealthFailure>,
     ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        if let Some(health) = &self.health {
+        if let Some(health) = health.as_ref() {
             return Poll::Ready(Err(health.clone()));
         }
-        let mut io_withdrawn = false;
-        if let Some(io) = self.io.original() {
-            // A refused bootstrap has no running I/O. Only its original
-            // withdrawal author can return its never-installed proposal.
-            if !self.launched {
-                match io.withdraw_unstarted_in() {
-                    Ok(Some(_)) => io_withdrawn = true,
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
-                            "Read initial I/O withdrawal failed",
-                            Arc::new(error),
-                        ));
-                        return Poll::Ready(Err(self.health.clone().unwrap()));
-                    }
-                }
+        match self
+            .state_store
+            .as_mut()
+            .map(|source| source.poll_closed(cx))
+        {
+            None | Some(Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+            Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(Err(cause))) => {
+                Self::retain_state_store_health(health, cause);
+                Poll::Ready(Err(health.as_ref().unwrap().clone()))
             }
-            if !io_withdrawn && let Err(error) = io.poll_actual_progress_continuing(cx) {
-                self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+        }
+    }
+    /// Only the original never-started I/O author can withdraw its proposal.
+    /// Call at the whole-statement unstarted cut, never between scalar stages.
+    pub(super) fn withdraw_unstarted_io(
+        &self,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) -> Result<bool, StatementNativeHealthFailure> {
+        if let Some(health) = health.as_ref() {
+            return Err(health.clone());
+        }
+        match self.io.original() {
+            None => Ok(false),
+            Some(io) => match io.withdraw_unstarted_in() {
+                Ok(Some(_)) => {
+                    if let Some(failure) = io.health_failure() {
+                        *health = Some(failure.clone());
+                        return Err(failure);
+                    }
+                    Ok(true)
+                }
+                Ok(None) => Ok(false),
+                Err(error) => {
+                    *health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                        "Read initial I/O withdrawal failed",
+                        Arc::new(error),
+                    ));
+                    Err(health.as_ref().unwrap().clone())
+                }
+            },
+        }
+    }
+    pub(super) fn poll_io_progress(
+        &self,
+        cx: &mut Context<'_>,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) -> Result<(), StatementNativeHealthFailure> {
+        if let Some(health) = health.as_ref() {
+            return Err(health.clone());
+        }
+        if let Some(io) = self.io.original() {
+            if let Err(error) = io.poll_actual_progress_continuing(cx) {
+                *health = Some(StatementNativeHealthFailure::actual_exit_unproven(
                     "Read I/O continuation failed before actual exit",
                     Arc::new(error),
                 ));
-                return Poll::Ready(Err(self.health.clone().unwrap()));
+                return Err(health.as_ref().unwrap().clone());
             }
-            if let Some(health) = io.health_failure() {
-                self.health = Some(health);
-                return Poll::Ready(Err(self.health.clone().unwrap()));
+            if let Some(failure) = io.health_failure() {
+                *health = Some(failure.clone());
+                return Err(failure);
             }
+        }
+        Ok(())
+    }
+    pub(super) fn poll_io_quiescent(
+        &self,
+        cx: &mut Context<'_>,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        if let Some(health) = health.as_ref() {
+            return Poll::Ready(Err(health.clone()));
+        }
+        if let Some(io) = self.io.original() {
+            match io.poll_actual_quiescent_continuing(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(failure)) => {
+                    *health = Some(failure.clone());
+                    return Poll::Ready(Err(failure));
+                }
+                Poll::Ready(Ok(_)) => {
+                    // Ordinary failure remains in the same MIO business slot.
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// This stage's original admission and independent Native exit observation.
+/// Its owned read position retires through the pump cut, not through this tail.
+pub(super) struct ReadNativeStageTail {
+    pub(super) stage: StatementStageAdmission,
+    exit: Option<LogicalExecutionExitObserver>,
+    receipt: Option<Result<LogicalExecutionExitReceipt, QueryExecutionError>>,
+    launched: bool,
+}
+impl ReadNativeStageTail {
+    pub(super) fn new(stage: StatementStageAdmission) -> Self {
+        Self {
+            stage,
+            exit: None,
+            receipt: None,
+            launched: false,
+        }
+    }
+    pub(super) fn is_launched(&self) -> bool {
+        self.launched
+    }
+    /// Install the exact accepted observer before the caller notifies progress.
+    pub(super) fn observe_start_in(
+        &mut self,
+        attempt: &novarocks_query_application::api::LogicalExecutionStartAttempt,
+        original_exit: &mut Option<LogicalExecutionExitObserver>,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) {
+        if attempt.result().is_ok() {
+            self.launched = true;
+            self.exit = original_exit.take();
+            if self.exit.is_none() {
+                *health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                    "accepted Read has no original Native observer",
+                    Arc::new(WorkError::Conflict),
+                ));
+            }
+        }
+    }
+    /// Observe only the original Native stage. This neither closes shared
+    /// ports nor retires its stage owner or proves another input's exit.
+    pub(super) fn poll_stage_exit(
+        &mut self,
+        cx: &mut Context<'_>,
+        health: &mut Option<StatementNativeHealthFailure>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        if let Some(health) = health.as_ref() {
+            return Poll::Ready(Err(health.clone()));
         }
         if self.launched {
             if self.exit.is_none() && self.receipt.is_none() {
-                self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                *health = Some(StatementNativeHealthFailure::actual_exit_unproven(
                     "Read start has no original Native exit observer",
                     Arc::new(WorkError::Conflict),
                 ));
-                return Poll::Ready(Err(self.health.clone().unwrap()));
+                return Poll::Ready(Err(health.as_ref().unwrap().clone()));
             }
             if let Some(exit) = self.exit.as_mut() {
                 match exit.poll_exit(cx) {
@@ -267,68 +414,80 @@ impl ReadNativeTail {
                 drop(self.exit.take());
             }
             if self.receipt.as_ref().is_some_and(Result::is_err) {
-                self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                *health = Some(StatementNativeHealthFailure::actual_exit_unproven(
                     "Read original Native exit was refused",
                     Arc::new(WorkError::Conflict),
                 ));
-                return Poll::Ready(Err(self.health.clone().unwrap()));
-            }
-        }
-        if !io_withdrawn && let Some(io) = self.io.original() {
-            match io.poll_actual_quiescent_continuing(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(health)) => {
-                    self.health = Some(health.clone());
-                    return Poll::Ready(Err(health));
-                }
-                Poll::Ready(Ok(_)) => {
-                    // The same MIO body retains its ordinary failure. Business
-                    // selection reads that fact; it is not an exit failure.
-                }
+                return Poll::Ready(Err(health.as_ref().unwrap().clone()));
             }
         }
         Poll::Ready(Ok(()))
     }
+}
 
-    fn poll_business_exit(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        let state_store_quiescent = self.state_store_quiescent(cx);
-        match self.poll_required_exit(cx) {
-            Poll::Ready(Ok(())) if state_store_quiescent => {
-                self.stage.retire_unlaunched();
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Ok(())) => Poll::Pending,
-            result => result,
-        }
-    }
-
-    fn poll_exit(
+/// The single Read composes these same packets; their declaration order keeps
+/// the original StateStore/I/O/stage/observer/receipt/health Drop sequence.
+struct ReadNativeTail {
+    services: ReadNativeServices,
+    native: ReadNativeStageTail,
+    health: Option<StatementNativeHealthFailure>,
+}
+impl ReadNativeTail {
+    // Native and MIO retain the same actual-exit order at both original cuts.
+    fn poll_required_exit(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), StatementNativeHealthFailure>> {
         if let Some(health) = &self.health {
             return Poll::Ready(Err(health.clone()));
         }
-        // Continue the original Source even while Native cleanup is pending.
-        // Only full retirement requests close of its retained idle obligation.
-        let state_store_closed = match self
-            .state_store
-            .as_mut()
-            .map(|source| source.poll_closed(cx))
-        {
-            None | Some(Poll::Ready(Ok(()))) => true,
-            Some(Poll::Pending) => false,
-            Some(Poll::Ready(Err(cause))) => {
-                self.retain_state_store_health(cause);
-                return Poll::Ready(Err(self.health.clone().unwrap()));
-            }
+        let io_withdrawn = if !self.native.is_launched() {
+            self.services.withdraw_unstarted_io(&mut self.health)?
+        } else {
+            false
         };
+        if !io_withdrawn {
+            self.services.poll_io_progress(cx, &mut self.health)?;
+        }
+        match self.native.poll_stage_exit(cx, &mut self.health) {
+            Poll::Ready(Ok(())) => {}
+            result => return result,
+        }
+        if !io_withdrawn {
+            match self.services.poll_io_quiescent(cx, &mut self.health) {
+                Poll::Ready(Ok(())) => {}
+                result => return result,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+    fn poll_business_exit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        let state_store_quiescent = self.services.state_store_quiescent(cx, &mut self.health);
+        match self.poll_required_exit(cx) {
+            Poll::Ready(Ok(())) if state_store_quiescent => {
+                self.native.stage.retire_unlaunched();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(())) => Poll::Pending,
+            result => result,
+        }
+    }
+    fn poll_exit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        let state_store_closed = match self.services.poll_state_store_closed(cx, &mut self.health) {
+            Poll::Ready(Ok(())) => true,
+            Poll::Pending => false,
+            Poll::Ready(Err(health)) => return Poll::Ready(Err(health)),
+        };
+        // Native/MIO still advance while StateStore close is Pending.
         match self.poll_required_exit(cx) {
             Poll::Ready(Ok(())) if state_store_closed => {
-                self.stage.retire_unlaunched();
+                self.native.stage.retire_unlaunched();
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(())) => Poll::Pending,
@@ -345,6 +504,8 @@ impl GovernedStatementResidual for ReadNativeTail {
     }
 }
 struct ReadStatementAction {
+    planning_cpu: Arc<FrontendPlanningCpuSource>,
+    preparation_health: Option<StatementNativeHealthFailure>,
     provider: Arc<FrontendCompletionCustody>,
     provider_close: Option<ProviderClose>,
     provider_close_result: Option<Result<(), StatementNativeHealthFailure>>,
@@ -371,6 +532,9 @@ impl ReadStatementAction {
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
+        if self.preparation_health.is_some() {
+            return Poll::Pending;
+        }
         let tail = self
             .tail
             .as_mut()
@@ -382,7 +546,7 @@ impl ReadStatementAction {
             .execution_owner_slot()
             .as_ref()
             .expect("Read retains its original Root");
-        match tail.io.poll_progress(work, cx) {
+        match tail.services.io().poll_progress(work, cx) {
             Ok(ready) => self.bootstrap_ready |= ready,
             Err(e) => {
                 self.error.get_or_insert_with(|| {
@@ -400,7 +564,11 @@ impl ReadStatementAction {
                 self.preparation_started = true;
                 match future.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(value) => self.prepared = Some(value),
+                    Poll::Ready(Ok(value)) => self.prepared = Some(value),
+                    Poll::Ready(Err(health)) => {
+                        self.preparation_health = Some(health);
+                        return Poll::Pending;
+                    }
                 }
                 if self.provider.local_health_failure().is_some() {
                     return Poll::Pending;
@@ -445,7 +613,7 @@ impl ReadStatementAction {
             }
         }
         if self.error.is_none()
-            && let Some(error) = tail.io.original().and_then(|io| io.failure())
+            && let Some(error) = tail.services.io().original().and_then(|io| io.failure())
         {
             self.error = Some(QueryServiceError::from_failure_cause(
                 novarocks_failure_contract::SharedFailureCause::new(error),
@@ -456,7 +624,7 @@ impl ReadStatementAction {
                 Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
             }
-            if let Some(error) = tail.io.original().and_then(|io| io.failure()) {
+            if let Some(error) = tail.services.io().original().and_then(|io| io.failure()) {
                 self.error = Some(QueryServiceError::from_failure_cause(
                     novarocks_failure_contract::SharedFailureCause::new(error),
                 ));
@@ -470,24 +638,25 @@ impl ReadStatementAction {
         if self.error.is_none() && self.read.is_some() {
             // Actual physical footer, not an idle projection's final settlement,
             // is the preparation-to-Native cut. Unknown remains in the tail.
-            if !tail.state_store_quiescent(cx) {
+            if !tail.services.state_store_quiescent(cx, &mut tail.health) {
                 return Poll::Pending;
             }
             let io = tail
-                .io
+                .services
+                .io()
                 .original()
                 .expect("Read CPU body installed original source");
             let work = owner
                 .execution_owner_slot()
                 .as_ref()
                 .expect("original Root");
-            match tail.stage.poll_admit(&io, work, cx) {
+            match tail.native.stage.poll_admit(&io, work, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => self.error = Some(e),
                 Poll::Ready(Ok(())) => {}
             }
             if self.error.is_none() && self.capacity.is_none() {
-                match tail.stage.install_client_capacity_in(
+                match tail.native.stage.install_client_capacity_in(
                     &io,
                     &owner.result_window_alias().expect("admitted Client window"),
                     &mut self.capacity,
@@ -499,26 +668,20 @@ impl ReadStatementAction {
             if self.error.is_none() {
                 match self.launcher.start_read_in(
                     &mut self.read,
-                    tail.stage.owner_slot(),
+                    tail.native.stage.owner_slot(),
                     self.capacity.as_ref().unwrap(),
-                    &tail.io,
+                    tail.services.io(),
                     &mut self.original,
                     #[cfg(novarocks_dev_controls)]
                     self.observation.clone(),
                 ) {
                     Err(e) => self.error = Some(governed_query_execution_error(e)),
                     Ok(notification) => {
-                        if notification.result().is_ok() {
-                            tail.launched = true;
-                            tail.exit = self.original.exit.take();
-                            if tail.exit.is_none() {
-                                tail.health =
-                                    Some(StatementNativeHealthFailure::actual_exit_unproven(
-                                        "accepted Read has no original Native observer",
-                                        Arc::new(WorkError::Conflict),
-                                    ));
-                            }
-                        }
+                        tail.native.observe_start_in(
+                            &notification,
+                            &mut self.original.exit,
+                            &mut tail.health,
+                        );
                         if let Err(error) = notification.finish() {
                             self.error = Some(governed_query_execution_error(error));
                         }
@@ -555,7 +718,11 @@ impl ReadStatementAction {
             {
                 match future.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => self.prepared = Some(result),
+                    Poll::Ready(Ok(result)) => self.prepared = Some(result),
+                    Poll::Ready(Err(health)) => {
+                        self.preparation_health = Some(health);
+                        return Poll::Pending;
+                    }
                 }
                 self.completed_preparation = true;
                 drop(self.preparation.take());
@@ -569,7 +736,7 @@ impl ReadStatementAction {
                 Poll::Ready(Err(_)) => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
             }
-            if !tail.launched {
+            if !tail.native.is_launched() {
                 // A refused mount left every original input in this action.
                 // Dispose those inputs before retiring its unlaunched stage.
                 drop(self.local.take());
@@ -593,8 +760,10 @@ impl ReadStatementAction {
 }
 impl GovernedStatementAction for ReadStatementAction {
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        self.provider
-            .local_health_failure()
+        self.preparation_health
+            .clone()
+            .or_else(|| self.planning_cpu.local_health_failure())
+            .or_else(|| self.provider.local_health_failure())
             .or_else(|| {
                 self.provider_close_result
                     .as_ref()
@@ -602,8 +771,10 @@ impl GovernedStatementAction for ReadStatementAction {
             })
             .or_else(|| {
                 self.tail.as_ref().and_then(|t| {
-                    t.io.health_failure()
-                        .or_else(|| t.stage.local_health_failure())
+                    t.services
+                        .io()
+                        .health_failure()
+                        .or_else(|| t.native.stage.local_health_failure())
                         .or_else(|| t.health.clone())
                 })
             })
@@ -631,11 +802,11 @@ impl GovernedStatementAction for ReadStatementAction {
         // Newly borrowed phases are dispatched in the same poll, including
         // Pending. No borrower wake is needed to discover its own new request.
         if let Some(tail) = self.tail.as_mut() {
-            tail.poll_state_store(cx);
+            tail.services.poll_state_store(cx, &mut tail.health);
         }
         let result = self.poll_read(owner, cx);
         if let Some(tail) = self.tail.as_mut() {
-            tail.poll_state_store(cx);
+            tail.services.poll_state_store(cx, &mut tail.health);
         }
         result
     }
@@ -701,6 +872,7 @@ impl FrontendQuerySession {
             stage
         };
         let provider = FrontendCompletionCustody::new();
+        let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
         #[cfg(novarocks_dev_controls)]
         let observation = self
             .service
@@ -724,6 +896,7 @@ impl FrontendQuerySession {
             window,
             purpose,
             provider: Arc::clone(&provider),
+            planning_cpu: Arc::clone(&planning_cpu),
             io: Arc::clone(&io),
             state_store: state_store_requests,
             #[cfg(novarocks_dev_controls)]
@@ -731,19 +904,20 @@ impl FrontendQuerySession {
             #[cfg(novarocks_dev_controls)]
             statement_token: statement.token(),
         };
-        let provider_close = Some(Box::pin(close_provider(Arc::clone(&provider))) as ProviderClose);
+        let provider_close = Some(Box::pin(close_provider(
+            Arc::clone(&provider),
+            Arc::clone(&planning_cpu),
+        )) as ProviderClose);
         let action = ReadStatementAction {
+            planning_cpu,
+            preparation_health: None,
             provider,
             provider_close,
             provider_close_result: None,
             local: None,
             tail: Some(Box::new(ReadNativeTail {
-                state_store: state_store_owner,
-                io,
-                stage,
-                exit: None,
-                receipt: None,
-                launched: false,
+                services: ReadNativeServices::new(state_store_owner, io),
+                native: ReadNativeStageTail::new(stage),
                 health: None,
             })),
             preparation: Some(Box::pin(prepare_read(input))),
@@ -789,7 +963,7 @@ impl FrontendQuerySession {
 fn local_preparation_profile() -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
     local_preparation_profile_with_dependencies(&[])
 }
-fn local_preparation_profile_with_dependencies(
+pub(super) fn local_preparation_profile_with_dependencies(
     dependencies: &[SharedDependency],
 ) -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
     use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
@@ -925,12 +1099,8 @@ mod tests {
         );
         let original = io.original().unwrap();
         let mut tail = ReadNativeTail {
-            state_store: None,
-            io,
-            stage: StatementStageAdmission::new(scope, 0),
-            exit: None,
-            receipt: None,
-            launched: false,
+            services: ReadNativeServices::new(None, io),
+            native: ReadNativeStageTail::new(StatementStageAdmission::new(scope, 0)),
             health: None,
         };
         assert!(matches!(
@@ -940,7 +1110,7 @@ mod tests {
         assert_eq!(original.failure(), Some(refused));
         assert!(tail.health.is_none());
         assert!(
-            tail.receipt.is_none(),
+            tail.native.receipt.is_none(),
             "an unlaunched Read has no Native footer"
         );
         assert!(matches!(tail.poll_exit(&mut cx), Poll::Ready(Ok(()))));
@@ -1001,12 +1171,8 @@ mod tests {
             "the refused request never acquires a physical permit"
         );
         let mut tail = ReadNativeTail {
-            state_store: None,
-            io,
-            stage: StatementStageAdmission::new(scope, 0),
-            exit: None,
-            receipt: None,
-            launched: false,
+            services: ReadNativeServices::new(None, io),
+            native: ReadNativeStageTail::new(StatementStageAdmission::new(scope, 0)),
             health: None,
         };
         assert!(tail.poll_business_exit(&mut cx).is_pending());
@@ -1031,18 +1197,22 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let mut tail = ReadNativeTail {
-            state_store: None,
-            io: ReadMetadataIoSource::new(root.owner.scope(), local_preparation_profile().unwrap()),
-            stage: StatementStageAdmission::new(root.owner.scope(), 1),
-            exit: None,
-            receipt: None,
-            launched: true,
+            services: ReadNativeServices::new(
+                None,
+                ReadMetadataIoSource::new(root.owner.scope(), local_preparation_profile().unwrap()),
+            ),
+            native: ReadNativeStageTail {
+                stage: StatementStageAdmission::new(root.owner.scope(), 1),
+                exit: None,
+                receipt: None,
+                launched: true,
+            },
             health: None,
         };
         let result = tail.poll_exit(&mut Context::from_waker(Waker::noop()));
         assert!(matches!(result, Poll::Ready(Err(_))));
         assert!(tail.health.is_some());
-        assert!(tail.receipt.is_none());
+        assert!(tail.native.receipt.is_none());
         drop(tail);
         finish(control, root, driver);
     }
@@ -1052,10 +1222,16 @@ mod tests {
 mod provider_close_tests {
     use super::*;
     use std::task::Waker;
-    #[test]
-    fn uninstalled_provider_still_receives_original_close_before_local_read_exit() {
+    #[tokio::test]
+    async fn uninstalled_provider_still_receives_original_close_before_local_read_exit() {
         let source = FrontendCompletionCustody::new();
-        let mut future = Some(Box::pin(close_provider(Arc::clone(&source))) as ProviderClose);
+        let planning_cpu = FrontendPlanningCpuSource::new(
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+                tokio::runtime::Handle::current(),
+            ),
+        );
+        let mut future =
+            Some(Box::pin(close_provider(Arc::clone(&source), planning_cpu)) as ProviderClose);
         let mut receipt = None;
         assert!(matches!(
             poll_provider_close(

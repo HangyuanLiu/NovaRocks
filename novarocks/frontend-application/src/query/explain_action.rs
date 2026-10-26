@@ -19,8 +19,10 @@
 
 use super::*;
 use crate::query::compiler::{PreparedAsyncExplain, PreparedAsyncProfile};
+use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
+use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_query_application::api::{ExecutionHandle, LocalResultProducer, OwnedLocalResult};
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
@@ -28,8 +30,16 @@ use novarocks_query_application::session_control::{
 };
 use std::task::{Context, Poll};
 
-type PreparationFuture =
-    Pin<Box<dyn Future<Output = Result<PreparedExplain, QueryServiceError>> + Send>>;
+type PreparationFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Result<PreparedExplain, QueryServiceError>,
+                    StatementNativeHealthFailure,
+                >,
+            > + Send,
+    >,
+>;
 type DiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<QueryResult, QueryServiceError>> + Send>>;
 
@@ -46,6 +56,7 @@ struct ExplainPreparationInput {
     scope: novarocks_workload_control::WorkScope,
     window: ResultWindowAlias,
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
+    planning_cpu: Arc<FrontendPlanningCpuSource>,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
@@ -55,68 +66,76 @@ struct PreparedExplain {
 }
 async fn make_explain_preparation(
     input: ExplainPreparationInput,
-) -> Result<PreparedExplain, QueryServiceError> {
-    if input.cancellation.is_cancelled() {
-        return Err(internal_error(
-            "typed statement was cancelled before query compilation began",
-        ));
-    }
-    let topology = input
-        .topology
-        .snapshot()
-        .map_err(|e| internal_error(e.to_string()))?;
-    let topology = if topology.targets().is_empty() {
-        wait_for_eligible_query_topology_after(
-            &input.topology,
-            &input.cancellation,
-            topology.revision(),
-            input
-                .deadline
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+) -> Result<Result<PreparedExplain, QueryServiceError>, StatementNativeHealthFailure> {
+    let prepared: Result<_, QueryServiceError> = async {
+        if input.cancellation.is_cancelled() {
+            return Err(internal_error(
+                "typed statement was cancelled before query compilation began",
+            ));
+        }
+        let topology = input
+            .topology
+            .snapshot()
+            .map_err(|e| internal_error(e.to_string()))?;
+        let topology = if topology.targets().is_empty() {
+            wait_for_eligible_query_topology_after(
+                &input.topology,
+                &input.cancellation,
+                topology.revision(),
+                input
+                    .deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+            )
+            .await?
+        } else {
+            topology
+        };
+        let (catalog, database, execution, mut optimizer, semantics) =
+            input.state.into_query_attempt_inputs();
+        let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
+            &semantics,
+            &ParsedStatement::ExplainQuery(input.explain.clone()),
         )
-        .await?
-    } else {
-        topology
-    };
-    let (catalog, database, execution, mut optimizer, semantics) =
-        input.state.into_query_attempt_inputs();
-    let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
-        &semantics,
-        &ParsedStatement::ExplainQuery(input.explain.clone()),
-    )
-    .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
-    if optimizer.optimizer_query_mem_limit_bytes.is_none() {
-        optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
-    }
-    let options = with_query_hints(
-        query_options_from_session_settings(&execution),
-        &semantics,
-        Some(&input.explain.query),
-    );
-    let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
+        .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
+        if optimizer.optimizer_query_mem_limit_bytes.is_none() {
+            optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
+        }
+        let options = with_query_hints(
+            query_options_from_session_settings(&execution),
+            &semantics,
+            Some(&input.explain.query),
+        );
+        let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
+            .map_err(|e| internal_error(e.to_string()))?;
+        let context = RequestContext::admit(RequestAdmission::new(
+            catalog,
+            database,
+            input.role,
+            topology,
+            input.deadline,
+            input.cancellation,
+            optimizer,
+            semantics,
+        ))
+        .with_result_capacity(capacity.clone())
         .map_err(|e| internal_error(e.to_string()))?;
-    let context = RequestContext::admit(RequestAdmission::new(
-        catalog,
-        database,
-        input.role,
-        topology,
-        input.deadline,
-        input.cancellation,
-        optimizer,
-        semantics,
-    ))
-    .with_result_capacity(capacity.clone())
-    .map_err(|e| internal_error(e.to_string()))?;
-    #[cfg(novarocks_dev_controls)]
-    let context = match input
-        .observation
-        .as_ref()
-        .and_then(|handle| handle.nomination())
-    {
-        Some(nomination) => context
-            .with_test_statement_nomination(Arc::new(nomination))
-            .map_err(internal_error)?,
-        None => context,
+        #[cfg(novarocks_dev_controls)]
+        let context = match input
+            .observation
+            .as_ref()
+            .and_then(|handle| handle.nomination())
+        {
+            Some(nomination) => context
+                .with_test_statement_nomination(Arc::new(nomination))
+                .map_err(internal_error)?,
+            None => context,
+        };
+        Ok((context, options, capacity))
+    }
+    .await;
+    let (context, options, capacity) = match prepared {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
     };
     let value = input
         .compiler
@@ -126,10 +145,12 @@ async fn make_explain_preparation(
             Some(options),
             &input.scope,
             &input.provider_source,
+            input.planning_cpu.as_ref(),
         )
-        .await
-        .map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql)))?;
-    Ok(PreparedExplain { value, capacity })
+        .await?;
+    Ok(value
+        .map(|value| PreparedExplain { value, capacity })
+        .map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql))))
 }
 struct ProfileDiagnosticInput {
     ready: crate::query_execution::internal_consumer::profile::ReadyProfileComputation,
@@ -148,6 +169,8 @@ async fn make_profile_diagnostics(
 struct ExplainStatementAction {
     // Outside the polled preparation F: async unwind may destroy its fields.
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
+    planning_cpu: Arc<FrontendPlanningCpuSource>,
+    preparation_health: Option<StatementNativeHealthFailure>,
     preparation: Option<PreparationFuture>,
     preparation_started: bool,
     prepared: Option<Result<PreparedExplain, QueryServiceError>>,
@@ -166,7 +189,10 @@ impl GovernedStatementAction for ExplainStatementAction {
     fn local_health_failure(
         &self,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
-        self.provider_source.local_health_failure()
+        self.preparation_health
+            .clone()
+            .or_else(|| self.planning_cpu.local_health_failure())
+            .or_else(|| self.provider_source.local_health_failure())
     }
     fn poll_action(
         &mut self,
@@ -202,6 +228,9 @@ impl ExplainStatementAction {
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
+        if self.preparation_health.is_some() {
+            return Poll::Pending;
+        }
         if !self.preparation_started {
             if owner.cancellation().reason().is_some() {
                 return Poll::Ready(Err(internal_error(
@@ -213,7 +242,11 @@ impl ExplainStatementAction {
         if let Some(future) = self.preparation.as_mut() {
             match future.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(value) => self.prepared = Some(value),
+                Poll::Ready(Ok(value)) => self.prepared = Some(value),
+                Poll::Ready(Err(health)) => {
+                    self.preparation_health = Some(health);
+                    return Poll::Pending;
+                }
             }
             // A failed close is already in the outside source. Let QA first
             // receive that typed health while this same completed F remains
@@ -223,6 +256,10 @@ impl ExplainStatementAction {
             }
             // Original output is stable before destroying the completed F.
             drop(self.preparation.take());
+        }
+        match self.planning_cpu.poll_closed(cx) {
+            Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
+            Poll::Ready(Ok(())) => {}
         }
         if let Some(prepared) = self.prepared.take() {
             match prepared {
@@ -359,6 +396,7 @@ impl FrontendQuerySession {
         };
         let provider_source =
             crate::query_execution::completion_facts::FrontendCompletionCustody::new();
+        let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
         let input = ExplainPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -375,11 +413,14 @@ impl FrontendQuerySession {
             scope: statement.scope().clone(),
             window,
             provider_source: Arc::clone(&provider_source),
+            planning_cpu: Arc::clone(&planning_cpu),
             #[cfg(novarocks_dev_controls)]
             observation: observation.clone(),
         };
         let action = Box::new(ExplainStatementAction {
             provider_source,
+            planning_cpu,
+            preparation_health: None,
             preparation: Some(Box::pin(make_explain_preparation(input))),
             preparation_started: false,
             prepared: None,
@@ -403,10 +444,8 @@ impl FrontendQuerySession {
 mod tests {
     use super::*;
     use novarocks_query_application::{
-        api::{QueryExecutionFuture, ReservedExecutionIdentity},
-        client_connection::ClientConnectionToken,
-        query_control::QueryApplicationControl,
-        session_control::StatementActionReady,
+        api::ReservedExecutionIdentity, client_connection::ClientConnectionToken,
+        query_control::QueryApplicationControl, session_control::StatementActionReady,
     };
     use novarocks_workload_control::{
         ResourceConfig, ResultCapacityConfig, ResultCapacityHandle, WorkloadConfig, WorkloadControl,
@@ -448,17 +487,6 @@ mod tests {
             QueryExecutionError,
         > {
             panic!("Local EXPLAIN cannot start Native work")
-        }
-        fn start(
-            &self,
-            _: crate::query_execution::completion::PreparedLogicalRead,
-            _: WorkOwner,
-            _: Option<ResultWindowAlias>,
-            #[cfg(novarocks_dev_controls)] _: Option<
-                crate::preparation_diagnostics::StatementObservationHandle,
-            >,
-        ) -> QueryExecutionFuture {
-            panic!("Local EXPLAIN cannot start a row computation")
         }
     }
     async fn statement() -> (
@@ -505,6 +533,12 @@ mod tests {
         ExplainStatementAction {
             provider_source:
                 crate::query_execution::completion_facts::FrontendCompletionCustody::new(),
+            planning_cpu: FrontendPlanningCpuSource::new(
+                crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+                    tokio::runtime::Handle::current(),
+                ),
+            ),
+            preparation_health: None,
             preparation: Some(preparation),
             preparation_started: false,
             prepared: None,
@@ -532,10 +566,10 @@ mod tests {
         let (send, receive) = futures::channel::oneshot::channel();
         let mut action = action(Box::pin(async move {
             receive.await.unwrap();
-            Ok(PreparedExplain {
+            Ok(Ok(PreparedExplain {
                 value: PreparedAsyncExplain::Lines(vec!["observed".into()]),
                 capacity: binding,
-            })
+            }))
         }));
         let produce = futures::future::poll_fn(|cx| {
             let window = owner.result_window_alias();

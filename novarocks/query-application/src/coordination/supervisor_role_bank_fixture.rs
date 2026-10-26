@@ -148,6 +148,13 @@ fn governance_with_query_limit(
     client: bool,
     query_limit: Option<usize>,
 ) -> TestGovernance<impl Future<Output = Result<(), QueryExecutionError>> + Send> {
+    governance_with_result_positions(client, query_limit, None)
+}
+fn governance_with_result_positions(
+    client: bool,
+    query_limit: Option<usize>,
+    internal_positions: Option<usize>,
+) -> TestGovernance<impl Future<Output = Result<(), QueryExecutionError>> + Send> {
     // This function pointer names the SAME actual opaque async factory. Quote
     // its real M too (a pointer here, not the production zero-sized item).
     let factory: TestRoleFactory<_> = make_logical_role;
@@ -182,6 +189,9 @@ fn governance_with_query_limit(
     let mut result = novarocks_workload_control::ResultCapacityConfig::V1;
     if client {
         result.client_compute_positions = 1;
+    }
+    if let Some(positions) = internal_positions {
+        result.positions[2] = positions;
     }
     control.configure_result_capacity(result).unwrap();
     let (admission, driver) = control.configure_responsibility(config).unwrap();

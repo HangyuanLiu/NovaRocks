@@ -29,9 +29,7 @@ use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
 };
 use crate::query_execution::planning::sql_compile_control_from_execution;
-use crate::query_execution::planning::time_travel::{
-    TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
-};
+use crate::query_execution::planning::time_travel::{TimeTravelRewriteError, has_time_travel_refs};
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_physical_plan::{
     MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, ScanReadBudget,
@@ -106,7 +104,7 @@ pub(crate) enum FrontendQueryCompilerError {
 }
 
 impl FrontendQueryCompilerError {
-    fn from_compile(error: SqlCompileError) -> Self {
+    pub(crate) fn from_compile(error: SqlCompileError) -> Self {
         match error {
             SqlCompileError::Analyze(error) => match error.control_error() {
                 Some(control) => Self::Control(control),
@@ -125,13 +123,13 @@ impl FrontendQueryCompilerError {
             error => Self::Engine(error.to_string()),
         }
     }
-    fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
+    pub(crate) fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
         match error {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
             other => Self::Source(novarocks_failure_contract::SharedFailureCause::new(other)),
         }
     }
-    fn from_completion(
+    pub(crate) fn from_completion(
         error: &novarocks_query_application::preparation::FinalPlanCompletionError,
     ) -> Self {
         use novarocks_query_application::preparation::FinalPlanCompletionError as E;
@@ -227,62 +225,6 @@ impl FrontendQueryCompiler {
         self.constant_policy
     }
 
-    pub(crate) fn prepare_statement(
-        &self,
-        statement: &Statement,
-        purpose: FrontendQueryPurpose,
-        context: &RequestContext,
-        query_options: Option<QueryOptions>,
-        scope: &novarocks_workload_control::WorkScope,
-        #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
-            &crate::mv::test_controls::MvRewriteStatementTarget,
-        >,
-    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
-        purpose.validate(statement)?;
-        let connector_planning_context = connector_planning_context_for_query_on_runtime(
-            self.connector_blocking_io.runtime(),
-            query_options.as_ref(),
-            context.execution().cancellation().clone(),
-        )?;
-        let connector_context = connector_planning_context.request();
-        let current_catalog = context.session().current_catalog();
-        let current_database = context.session().current_database();
-
-        match statement {
-            Statement::Query(query) => {
-                if let Some(result) = information_schema::try_query_materialized_views(
-                    self.system_tables.mv_readiness().as_ref(),
-                    query,
-                )? {
-                    return Ok(PreparedQueryOperation::immediate(result));
-                }
-                let query = self.prepare_query(
-                    query,
-                    current_catalog,
-                    current_database,
-                    connector_context,
-                    context.execution().sql_semantics(),
-                )?;
-                self.complete_distributed_read(
-                    purpose,
-                    &query,
-                    current_catalog,
-                    current_database,
-                    query_options,
-                    connector_planning_context,
-                    context.execution(),
-                    context,
-                    scope,
-                    #[cfg(novarocks_dev_controls)]
-                    rewrite_statement,
-                )
-            }
-            _ => Err(FrontendQueryCompilerError::Engine(
-                "synchronous query preparation only accepts SELECT statements".to_string(),
-            )),
-        }
-    }
-
     /// The owners in this process that can answer what completing a statement
     /// asks, and the lane their synchronous calls are admitted through.
     fn completion_fact_owners(
@@ -325,243 +267,6 @@ impl FrontendQueryCompiler {
             max_batch_bytes: MAX_SCAN_BATCH_BYTES,
         }
     }
-
-    /// Compile one plain read into a completed plan, and hand the execution
-    /// it describes to the owner that runs attempts of it.
-    ///
-    /// The compiler asks for what it needs and this process answers: a
-    /// relation, a statistic, a materialized view, or a provider read. Every
-    /// answer reaches exactly one owner, and the ones that may call a remote
-    /// catalog are admitted through the bounded lane rather than run here.
-    ///
-    /// Completion is asynchronous because answering can wait; preparation is
-    /// not, and runs on its own threads rather than the runtime's, so it is
-    /// awaited here. That keeps this statement's threading exactly as it was
-    /// -- the sealed path reached the same catalogs synchronously from the
-    /// same threads -- and leaves making preparation itself asynchronous as
-    /// its own change.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The completion path receives distinct frozen read facts and live owner ports; bundling them would duplicate the operation contract."
-    )]
-    fn complete_distributed_read(
-        &self,
-        purpose: FrontendQueryPurpose,
-        query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        query_options: Option<QueryOptions>,
-        connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
-        execution: &QueryExecutionContext,
-        _context: &RequestContext,
-        scope: &novarocks_workload_control::WorkScope,
-        #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
-            &crate::mv::test_controls::MvRewriteStatementTarget,
-        >,
-    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
-        use novarocks_query_application::preparation::FinalPlanCompletionDriver;
-
-        let connector_context = connector_planning_context.request();
-        let bindings = Arc::new(
-            crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-                .expect("query table binding scope allocation must not fail"),
-        );
-        let facts = crate::query_execution::completion_facts::frontend_fact_source(
-            self.completion_fact_owners(),
-            crate::query_execution::completion_facts::StatementFactScope::binding_only(
-                Arc::clone(&bindings),
-                connector_context.clone(),
-                current_catalog,
-                scope,
-                execution.result_capacity().cloned().ok_or_else(|| {
-                    FrontendQueryCompilerError::Engine(
-                        "completion facts require the admitted result capacity".to_owned(),
-                    )
-                })?,
-            )
-            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
-            crate::query_execution::compiler::typed_connector_session()
-                .map_err(FrontendQueryCompilerError::Engine)?,
-        );
-        let version = crate::query_execution::physical_encoding::mint_plan_version();
-        let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
-            version,
-            SqlStatementInput::parsed_query(Box::new(query.clone())),
-            SqlCompileIntent::Query,
-            SqlSessionContext {
-                sql_semantics: execution.sql_semantics().clone(),
-                current_catalog: current_catalog.map(str::to_string),
-                current_database: current_database.to_string(),
-                optimizer_settings: execution.optimizer_settings().clone(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
-            crate::query_execution::constant_eval::constant_evaluator(),
-            self.constant_policy(),
-            sql_compile_control_from_execution(execution),
-            Self::pipeline_dop_domain(query_options.as_ref())?,
-            Self::scan_read_budget(query_options.as_ref()),
-            novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
-        );
-        let encoding_control = request.control().clone();
-        let completed = self
-            .connector_blocking_io
-            .runtime()
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
-            .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
-        // Resolve application purpose before the plan is shared with Native
-        // projection. Presentation uses one FE offset, never the BE clock.
-        let root_output = match purpose {
-            FrontendQueryPurpose::ClientRows => {
-                novarocks_result_contract::FrozenRootOutput::ClientRows(
-                    novarocks_sql::compiler::client_render_schema_from_port(
-                        completed.candidate().original_public_result_port(),
-                        chrono::Local::now().offset().local_minus_utc(),
-                    )
-                    .map_err(FrontendQueryCompilerError::Engine)?,
-                )
-            }
-            FrontendQueryPurpose::ScalarValue => scalar_root_output_from_public_port(
-                completed.candidate().original_public_result_port(),
-            )?,
-            FrontendQueryPurpose::LocalRows => {
-                return Err(FrontendQueryCompilerError::Engine(
-                    "distributed read received a different application output purpose".into(),
-                ));
-            }
-        };
-        let completed = completed
-            .freeze_root_output(root_output)
-            .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
-        // What this statement delivers is a property of the frozen plan, read
-        // before the plan is consumed by encoding.
-        let output =
-            novarocks_query_application::preparation::OutputContract::from_completed_candidate(
-                novarocks_query_application::api::QueryExecutionKind::Read,
-                completed.candidate(),
-            )
-            .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(novarocks_dev_controls)]
-        let selected_mv_rewrite = completed
-            .candidate()
-            .plan()
-            .annotations()
-            .iter()
-            .any(|annotation| annotation.key.as_ref() == "sql.mv_rewrite_provenance");
-        let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-            completed,
-            self.query.static_plan_carrier(),
-            self.constant_policy(),
-            None,
-            &encoding_control,
-        )
-        .map_err(FrontendQueryCompilerError::from_encode)?;
-        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
-        let description =
-            novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
-                novarocks_query_application::api::QueryExecutionKind::Read,
-                candidate,
-                template
-                    .attempt_scheduling_facts()
-                    .map_err(FrontendQueryCompilerError::Engine)?
-                    .fragments
-                    .iter()
-                    .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
-                    .collect(),
-                output,
-                novarocks_coordination_contract::ExecutionEffect::None,
-                // A sealed, effect-free read may replace its attempt before
-                // output visibility without compiling a different plan.
-                novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility,
-                Vec::new(),
-                novarocks_query_application::preparation::FrozenCostEstimate::unknown(
-                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-                ),
-                novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
-                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-                ),
-            )
-            .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(novarocks_dev_controls)]
-        if let Some(controls) = self.mv_readiness.test_controls() {
-            controls
-                .rewrite(
-                    current_catalog,
-                    current_database,
-                    query,
-                    selected_mv_rewrite,
-                    rewrite_statement,
-                    execution.cancellation(),
-                )
-                .map_err(FrontendQueryCompilerError::Engine)?;
-        }
-        Ok(PreparedQueryOperation::LogicalRead(
-            crate::query_execution::completion::PreparedLogicalRead::new(
-                description,
-                template,
-                Arc::new(
-                    crate::query_execution::contract::ResolvedQueryOptions::from_upstream(
-                        query_options,
-                    ),
-                ),
-            ),
-        ))
-    }
-
-    fn prepare_query(
-        &self,
-        query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> Result<Query, FrontendQueryCompilerError> {
-        let mut prepared = self.prepare_query_views_and_time_travel(
-            query,
-            current_catalog,
-            current_database,
-            connector_context,
-            sql_semantics,
-        )?;
-        novarocks_query_application::system_catalog_rewrite::rewrite_query(
-            self.system_tables.facts_port().as_ref(),
-            self.system_tables.system_catalog().as_ref(),
-            connector_context,
-            &mut prepared,
-        )?;
-        Ok(prepared)
-    }
-
-    fn prepare_query_views_and_time_travel(
-        &self,
-        query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> Result<Query, FrontendQueryCompilerError> {
-        let mut prepared = query.clone();
-        self.view.view_service().rewrite_query(
-            &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
-            &mut prepared,
-            ViewRequestContext {
-                current_catalog,
-                current_database,
-                connector_context: Some(connector_context),
-            },
-            sql_semantics,
-        )?;
-        if has_time_travel_refs(&prepared) {
-            rewrite_time_travel_refs(
-                &self.query,
-                current_catalog,
-                current_database,
-                &mut prepared,
-                connector_context,
-            )?;
-        }
-        Ok(prepared)
-    }
 }
 
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
@@ -588,7 +293,7 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
     )
 }
 
-fn scalar_root_output_from_public_port(
+pub(crate) fn scalar_root_output_from_public_port(
     port: Option<&novarocks_physical_plan::ResultPort>,
 ) -> Result<novarocks_result_contract::FrozenRootOutput, FrontendQueryCompilerError> {
     novarocks_sql::compiler::validate_public_result_logical_identities(port)
@@ -611,10 +316,10 @@ mod compile_control_tests {
     fn service(
         error: FrontendQueryCompilerError,
     ) -> novarocks_query_application::session_error::QueryServiceError {
-        match super::super::governed_compiler_failure(error, "SELECT value") {
-            super::super::GovernedPreparationError::Service(error)
-            | super::super::GovernedPreparationError::Cancelled(error) => error,
-        }
+        super::super::routed_execution_service_error(super::super::routed_compiler_failure(
+            error,
+            "SELECT value",
+        ))
     }
 
     #[test]
@@ -799,14 +504,11 @@ mod compile_control_tests {
         let error =
             AnalyzeError::unknown_column("unknown column", novarocks_parser::Span::new(7, 14));
         let expected = error.to_user_error(Some(sql));
-        let super::super::GovernedPreparationError::Service(service) =
-            super::super::governed_compiler_failure(
+        let service =
+            super::super::routed_execution_service_error(super::super::routed_compiler_failure(
                 FrontendQueryCompilerError::from_compile(SqlCompileError::Analyze(error)),
                 sql,
-            )
-        else {
-            panic!("analysis is not a cancellation observation")
-        };
+            ));
         assert_eq!(service.user_error(), Some(&expected));
         assert!(service.execution_failure().is_none());
         assert!(service.user_error().unwrap().location().is_some());
@@ -846,14 +548,12 @@ mod compile_control_tests {
                     other => panic!("unexpected author: {other}"),
                 }
             );
-            let super::super::GovernedPreparationError::Service(service) =
-                super::super::governed_compiler_failure(
+            let service = super::super::routed_execution_service_error(
+                super::super::routed_compiler_failure(
                     FrontendQueryCompilerError::Source(source),
                     "SELECT 1",
-                )
-            else {
-                panic!("a source error is final")
-            };
+                ),
+            );
             assert_eq!(service.execution_failure().unwrap().fact(), expected);
             let (code, message) = match expected.class() {
                 FailureClass::Unsupported => (

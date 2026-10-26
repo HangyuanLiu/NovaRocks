@@ -1436,6 +1436,24 @@ impl MetadataIoAdmission {
             &body.root, stage, body.payload.as_ref().ok_or(WorkError::NotReady)?, compute)
     }
 
+    pub(crate) fn install_internal_read_stage_capacity_in(
+        &self,
+        stage: &WorkOwner,
+        compute: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+        target: &mut Option<
+            novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        >,
+    ) -> Result<(), WorkError> {
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        if body.unstarted_withdrawing || body.unstarted_withdrawn {
+            return Err(WorkError::Released);
+        }
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_owned_internal_computation_in(
+            &body.root, stage, body.payload.as_ref().ok_or(WorkError::NotReady)?, compute, target,
+        )
+    }
+
     pub(crate) fn install_client_stage_capacity_in(
         &self,
         window: &novarocks_workload_control::ResultWindowAlias,

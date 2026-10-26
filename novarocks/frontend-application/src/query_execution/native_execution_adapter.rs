@@ -50,8 +50,7 @@ use novarocks_query_application::api::{
     NativeAttemptActivationFuture, NativeAttemptConvergenceFuture, NativeAttemptPreparationError,
     NativeAttemptPreparationFailure, NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
     NativeAttemptPreparationRequest, NativeAttemptPreparationWork, NativeAttemptRunFuture,
-    NativeAttemptTerminal, QueryExecutionClient, QueryExecutionError, QueryExecutionFuture,
-    QueryExecutionRequest,
+    NativeAttemptTerminal, QueryExecutionClient, QueryExecutionError, QueryExecutionRequest,
 };
 use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort, AbortQueryContextIssueIdentity,
@@ -91,8 +90,7 @@ use crate::query_execution::attempt_initialization::{
 use crate::query_execution::completion::PreparedLogicalRead;
 use crate::query_execution::contract::{DistributedQueryError, ResolvedQueryOptions};
 use crate::query_execution::internal_consumer::attempt_handoff::{
-    AttemptHandoffOfferPort, AttemptHandoffProducer, AttemptHandoffReserveView,
-    AttemptHandoffResources,
+    AttemptHandoffProducer, AttemptHandoffReserveView, AttemptHandoffResources,
 };
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
 use crate::query_execution::logical_execution::{
@@ -999,19 +997,6 @@ impl FrontendNativeLogicalExecutionLauncher {
     }
 }
 
-struct FrontendLogicalLaunch {
-    description: novarocks_query_application::preparation::FrozenExecutionDescription,
-    template: PreparedDistributedAttemptTemplate,
-    options: Arc<ResolvedQueryOptions>,
-    internal: Option<InternalNativeRegistration>,
-}
-struct InternalNativeRegistration {
-    consumer: Arc<dyn novarocks_query_application::api::InternalComputationConsumer>,
-    handoffs: Arc<AttemptHandoffOfferPort>,
-    diagnostics: ComputationDiagnostics,
-    initial_credentials: Option<Arc<InitialComputationCredentials>>,
-}
-
 impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
     fn start_read_in(
         &self,
@@ -1267,213 +1252,6 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
     ) -> Result<novarocks_query_application::api::ReservedExecutionIdentity, QueryExecutionError>
     {
         self.client.reserve_identity()
-    }
-    fn start(
-        &self,
-        read: PreparedLogicalRead,
-        owner: WorkOwner,
-        result_window: Option<novarocks_workload_control::ResultWindowAlias>,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> QueryExecutionFuture {
-        let (description, template, options) = read.into_parts();
-        let result_capacity = match result_window
-            .map(|window| QueryResultCapacityBinding::try_new(&owner.scope(), window))
-            .transpose()
-        {
-            Ok(capacity) => capacity,
-            Err(error) => {
-                return Box::pin(async move {
-                    Err(QueryExecutionError::from_execution(
-                        ExecutionFailureInput::new(
-                            error.failure_fact(),
-                            SafeDetail::truncating(
-                                "logical execution result capacity binding failed",
-                            ),
-                            ExecutionFailureSite::Coordinator,
-                        ),
-                    ))
-                });
-            }
-        };
-        self.start_native(
-            FrontendLogicalLaunch {
-                description,
-                template,
-                options,
-                internal: None,
-            },
-            owner,
-            result_capacity,
-            None,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        )
-    }
-}
-
-impl FrontendNativeLogicalExecutionLauncher {
-    fn start_native(
-        &self,
-        launch: FrontendLogicalLaunch,
-        owner: WorkOwner,
-        result_capacity: Option<QueryResultCapacityBinding>,
-        reservation: Option<novarocks_query_application::api::ReservedExecutionIdentity>,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> QueryExecutionFuture {
-        let FrontendLogicalLaunch {
-            description,
-            template,
-            options,
-            internal,
-        } = launch;
-        let (consumer, handoffs, diagnostics, initial_credentials) = match internal {
-            Some(InternalNativeRegistration {
-                consumer,
-                handoffs,
-                diagnostics,
-                initial_credentials,
-            }) => (
-                Some(consumer),
-                Some(handoffs),
-                diagnostics,
-                initial_credentials,
-            ),
-            None => (None, None, ComputationDiagnostics::None, None),
-        };
-        if let Err(detail) = validate_initial_computation_start(
-            &description,
-            diagnostics,
-            initial_credentials.as_ref(),
-            reservation.as_ref(),
-        ) {
-            return Box::pin(async move {
-                Err(QueryExecutionError::from_execution(
-                    ExecutionFailureInput::new(
-                        QueryFailureReason::PreparationProtocol.failure_fact(),
-                        SafeDetail::truncating(detail),
-                        ExecutionFailureSite::Coordinator,
-                    ),
-                ))
-            });
-        }
-        if result_capacity
-            .as_ref()
-            .is_some_and(|capacity| !capacity.window_alias().is_for_scope(&owner.scope()))
-        {
-            return Box::pin(async {
-                Err(QueryExecutionError::from_execution(
-                    ExecutionFailureInput::new(
-                        QueryFailureReason::PreparationProtocol.failure_fact(),
-                        SafeDetail::truncating(
-                            "logical execution result window belongs to a foreign scope",
-                        ),
-                        ExecutionFailureSite::Coordinator,
-                    ),
-                ))
-            });
-        }
-        if !description.matches_plan_seal(template.native_manifest_template().plan()) {
-            return Box::pin(async {
-                Err(QueryExecutionError::from_execution(
-                    ExecutionFailureInput::new(
-                        QueryFailureReason::PreparationProtocol.failure_fact(),
-                        SafeDetail::truncating(
-                            "prepared logical execution Native template has a foreign plan seal",
-                        ),
-                        ExecutionFailureSite::Coordinator,
-                    ),
-                ))
-            });
-        }
-        let delivery = match description
-            .row_carrier()
-            .map_err(|error| {
-                attempt_runtime_failure(QueryFailureReason::PreparationProtocol, error)
-                    .error()
-                    .clone()
-            })
-            .and_then(|carrier| {
-                ProductionRootDelivery::bind(
-                    carrier,
-                    result_capacity
-                        .as_ref()
-                        .map(QueryResultCapacityBinding::window_alias),
-                )
-            }) {
-            Ok(delivery) => delivery,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        // Validate the carrier before any Native work, but retain its runtime
-        // capacity only in the explicit QA start binding below.
-        drop(delivery);
-        // The Native seed borrows this FA-private handoff port; it never
-        // retains attempt credentials. The statement/domain owner must keep
-        // the strong custody registered before preparation and through open.
-        let initial_credentials =
-            initial_credentials.map(|credentials| Arc::downgrade(&credentials));
-        let aborts = LogicalAbortRouter::new();
-        let replacements = LogicalReplacementQualificationPort::new(
-            self.runtime.clone(),
-            aborts.worker_closed_contexts(),
-            aborts.closure_epoch(),
-        );
-        let factory = ProductionDormantAttemptFactory {
-            read_io: None,
-            runtime: self.runtime.clone(),
-            options,
-            aborts: Arc::clone(&aborts),
-            diagnostics,
-            initial_credentials,
-            replacements: replacements.clone(),
-            handoffs: handoffs.map(|offers| offers.reserve_view()),
-            pending_projection: None,
-            pending_handoff: None,
-        };
-        let attempts = FrontendNativeAttemptPreparationPort::new(
-            template,
-            Arc::clone(&self.runtime.topology),
-            factory,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-            #[cfg(novarocks_dev_controls)]
-            self.runtime.test_controls.clone(),
-            #[cfg(novarocks_dev_controls)]
-            self.runtime.observations.clone(),
-        );
-        let replacement_port = match description.recovery() {
-            RecoveryMode::NoRecovery => None,
-            RecoveryMode::RestartAttemptBeforeVisibility => {
-                Some(Arc::new(replacements) as Arc<dyn ReplacementQualificationEffectPort>)
-            }
-        };
-        let request = QueryExecutionRequest::bind_native(
-            description,
-            aborts as Arc<dyn AbortQueryContextEffectPort>,
-            replacement_port,
-            attempts,
-        );
-        let request = match result_capacity {
-            Some(capacity) => match request.with_result_capacity(capacity) {
-                Ok(request) => request,
-                Err(error) => return Box::pin(async move { Err(error) }),
-            },
-            None => request,
-        };
-        let request = match consumer {
-            Some(consumer) => match request.with_internal_consumer(consumer) {
-                Ok(request) => request,
-                Err(error) => return Box::pin(async move { Err(error) }),
-            },
-            None => request,
-        };
-        match reservation {
-            Some(reservation) => self.client.start_reserved(request, owner, reservation),
-            None => self.client.start(request, owner),
-        }
     }
 }
 

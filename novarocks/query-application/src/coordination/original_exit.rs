@@ -438,7 +438,8 @@ pub(super) struct OriginalNativePreparation {
     pub(super) description: Option<Arc<crate::preparation::FrozenExecutionDescription>>,
     pub(super) consumer: Option<Arc<dyn crate::api::InternalComputationConsumer>>,
     pub(super) capacity: Option<crate::admitted_query_context::QueryResultCapacityBinding>,
-    pub(super) client_computation: Option<crate::admitted_query_context::ClientComputationProducer>,
+    pub(super) streamed_computation:
+        Option<crate::admitted_query_context::StreamedComputationProducer>,
     pub(super) native_actions:
         Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
     pub(super) exiting: bool,
@@ -459,10 +460,10 @@ impl OriginalNativePreparation {
         drop(self.consumer.take());
         drop(self.description.take());
         drop(self.port.take());
-        if let Some(client) = self.client_computation.as_ref() {
-            client.native_body_exited().map_err(|_| ())?;
+        if let Some(streamed) = self.streamed_computation.as_ref() {
+            streamed.native_body_exited().map_err(|_| ())?;
         }
-        drop(self.client_computation.take());
+        drop(self.streamed_computation.take());
         self.exiting = false;
         Ok(())
     }

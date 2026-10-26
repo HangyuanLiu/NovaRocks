@@ -55,7 +55,7 @@ pub(crate) struct StatementStageAdmission {
     root: WorkScope,
     peak_bytes: u64,
     admitted: bool,
-    client_transferred: bool,
+    capacity_transferred: bool,
     child: Option<JointAdmission>,
     child_receipt: Option<JointAdjustmentReceipt>,
     owner: Option<WorkOwner>,
@@ -74,7 +74,7 @@ impl StatementStageAdmission {
             root,
             peak_bytes,
             admitted: false,
-            client_transferred: false,
+            capacity_transferred: false,
             child: None,
             child_receipt: None,
             owner: None,
@@ -249,7 +249,7 @@ impl StatementStageAdmission {
         &mut self,
         io: &MetadataIoAdmission,
     ) -> Result<(), QueryServiceError> {
-        if !self.admitted || self.client_transferred {
+        if !self.admitted || self.capacity_transferred {
             return Err(internal_error(
                 "statement stage is not admitted for Internal capacity",
             ));
@@ -265,13 +265,35 @@ impl StatementStageAdmission {
     pub(crate) fn capacity(&self) -> Option<&QueryResultCapacityBinding> {
         self.capacity.as_ref()
     }
+    pub(crate) fn install_internal_read_capacity_in(
+        &mut self,
+        io: &MetadataIoAdmission,
+        target: &mut Option<QueryResultCapacityBinding>,
+    ) -> Result<(), QueryServiceError> {
+        if !self.admitted || self.capacity_transferred {
+            return Err(internal_error(
+                "Internal read computation was not owned by this stage",
+            ));
+        }
+        io.install_internal_read_stage_capacity_in(
+            self.owner
+                .as_ref()
+                .ok_or_else(|| internal_error("statement stage owner is not installed"))?,
+            &mut self.compute,
+            target,
+        )
+        .map_err(|error| internal_error(error.to_string()))?;
+        self.capacity_transferred = true;
+        Ok(())
+    }
+
     pub(crate) fn install_client_capacity_in(
         &mut self,
         io: &MetadataIoAdmission,
         window: &novarocks_workload_control::ResultWindowAlias,
         target: &mut Option<QueryResultCapacityBinding>,
     ) -> Result<(), QueryServiceError> {
-        if !self.admitted || self.client_transferred {
+        if !self.admitted || self.capacity_transferred {
             return Err(internal_error(
                 "Client computation was not owned by this stage",
             ));
@@ -285,7 +307,7 @@ impl StatementStageAdmission {
             target,
         )
         .map_err(|error| internal_error(error.to_string()))?;
-        self.client_transferred = true;
+        self.capacity_transferred = true;
         // The exact Client computation and its window are now stable in target.
         // This preparation-only alias must not follow unrelated residual work.
         drop(self.client_window.take());
@@ -895,10 +917,7 @@ mod tests {
         internal_result_cpu::{InternalResultCpuOwner, admitted_internal_fixture},
         statistics::StatisticsRootResultDecoder,
     };
-    use novarocks_query_application::{
-        api::QueryExecutionFuture, cancellation::QueryCancellationSource,
-    };
-    use novarocks_workload_control::ResultWindowAlias;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
     struct NoNativeLaunch;
     impl LogicalExecutionLauncher for NoNativeLaunch {
         fn start_read_in(
@@ -934,17 +953,6 @@ mod tests {
             QueryExecutionError,
         > {
             panic!("Local EXPLAIN cannot start Native work")
-        }
-        fn start(
-            &self,
-            _: crate::query_execution::completion::PreparedLogicalRead,
-            _: WorkOwner,
-            _: Option<ResultWindowAlias>,
-            #[cfg(novarocks_dev_controls)] _: Option<
-                crate::preparation_diagnostics::StatementObservationHandle,
-            >,
-        ) -> QueryExecutionFuture {
-            panic!("Local EXPLAIN cannot start a row computation")
         }
     }
 
@@ -1054,5 +1062,128 @@ mod tests {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(tail.poll_exit(&mut cx).is_pending());
         assert!(tail.local_health_failure().is_some());
+    }
+    #[test]
+    fn internal_read_capacity_moves_same_stage_grant_through_original_mio() {
+        use novarocks_workload_control::joint_admission::{
+            JointProgress, JointProgressDriver, ResponsibilityConfig,
+        };
+        use novarocks_workload_control::{
+            ControlStorageConfig, ResultCapacityConfig, WorkloadConfig, WorkloadControl,
+        };
+        fn drive(driver: &mut JointProgressDriver) {
+            for _ in 0..10000 {
+                if matches!(driver.step(), JointProgress::Idle(_)) {
+                    return;
+                }
+            }
+            panic!("original finite stage driver did not become idle");
+        }
+        let count = 64;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: count,
+            business_limit: count,
+            query_concurrency_limit: count,
+            scope_records_limit: count,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let mut config = ResultCapacityConfig::V1;
+        config.positions[2] = 1;
+        let result_capacity = control.configure_result_capacity(config).unwrap();
+        let (_, mut driver) = control
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+            })
+            .unwrap();
+        control
+            .configure_control_storage(ControlStorageConfig::new(count, &[]))
+            .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let io = MetadataIoAdmission::for_original_source(&root.owner, Vec::new()).unwrap();
+        let mut stage = StatementStageAdmission::new(root.owner.scope(), 0);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut admitted = false;
+        for _ in 0..10000 {
+            drive(&mut driver);
+            if !io.poll_progress(&root.owner, &mut cx).unwrap() {
+                continue;
+            }
+            match stage.poll_admit(&io, &root.owner, &mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    admitted = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            admitted,
+            "the actual Root/MIO stage must admit its real position"
+        );
+        assert_eq!(result_capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let mut target = Some(QueryResultCapacityBinding::from_root_owner(&root.owner).unwrap());
+        assert!(
+            stage
+                .install_internal_read_capacity_in(&io, &mut target)
+                .is_err()
+        );
+        assert!(stage.compute.is_some() && !stage.capacity_transferred);
+        assert!(
+            target
+                .as_ref()
+                .unwrap()
+                .window_alias()
+                .internal_manifest_binding()
+                .unwrap()
+                .is_none()
+        );
+        drop(target.take());
+        stage
+            .install_internal_read_capacity_in(&io, &mut target)
+            .unwrap();
+        assert!(stage.compute.is_none() && stage.capacity_transferred);
+        let binding = target.as_ref().unwrap();
+        assert_eq!(
+            binding.class(),
+            novarocks_workload_control::ResultWindowClass::Internal
+        );
+        assert_eq!(
+            binding.scope().id(),
+            stage.owner.as_ref().unwrap().scope().id()
+        );
+        assert!(
+            binding
+                .window_alias()
+                .internal_manifest_binding()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stage
+                .install_internal_read_capacity_in(&io, &mut target)
+                .is_err()
+        );
+        // This stage never launched Native work. Its original receiving value
+        // actually exits before its positive position and stage owner retire.
+        drop(target.take());
+        assert_eq!(result_capacity.snapshot().held_positions, [0; 4]);
+        stage.retire_unlaunched();
+        drive(&mut driver);
+        assert!(matches!(
+            io.poll_actual_quiescent_continuing(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop((stage, io));
+        root.business.release();
+        root.owner.complete();
+        drive(&mut driver);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
     }
 }

@@ -16,6 +16,8 @@
 // under the License.
 
 //! Closed validated fixtures for actual fixed-consumer component tests.
+#[cfg(test)]
+use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
 use crate::query_execution::lifecycle_plan::{
     AttemptCredentialLeaseCollector, AttemptCredentialStorage,
 };
@@ -102,7 +104,7 @@ pub(crate) async fn internal_profile_recovery_description(
         DEFAULT_COMPLETION_LIMITS,
     );
     let completed = FinalPlanCompletionDriver::new(Arc::new(LiteralProfileFacts))
-        .complete(request, scope)
+        .complete_for_test(request, scope)
         .await
         .expect("the original literal SQL Profile plan completes without external facts")
         .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)

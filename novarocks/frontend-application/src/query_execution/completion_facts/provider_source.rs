@@ -25,7 +25,7 @@ use novarocks_query_application::{
 };
 use std::sync::Mutex;
 
-type CompletionResult = Result<
+pub(super) type CompletionResult = Result<
     CompletedPlanWithAccess<FrozenProviderRead>,
     FinalPlanCompletionFailure<FrozenProviderRead>,
 >;
@@ -40,13 +40,34 @@ struct ProviderCompletionState {
     joined: bool,
 }
 
+struct CompletionAccessBody {
+    taken: Option<novarocks_query_application::preparation::ReadAccessSink<FrozenProviderRead>>,
+}
+struct CompletionAccessOriginal {
+    body: Mutex<Option<CompletionAccessBody>>,
+}
+struct CompletionAccessLoan<'a> {
+    original: &'a CompletionAccessOriginal,
+    body: Option<CompletionAccessBody>,
+}
+impl Drop for CompletionAccessLoan<'_> {
+    fn drop(&mut self) {
+        let mut target = self.original.body.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(target.is_none(), "one original completion access loan");
+        *target = self.body.take();
+    }
+}
 pub(crate) struct FrontendCompletionCustody {
     state: Mutex<ProviderCompletionState>,
+    access: CompletionAccessOriginal,
 }
 impl FrontendCompletionCustody {
     pub(crate) fn new() -> Arc<Self> {
         let owner = Arc::new(Self {
             state: Mutex::new(ProviderCompletionState::default()),
+            access: CompletionAccessOriginal {
+                body: Mutex::new(Some(CompletionAccessBody { taken: None })),
+            },
         });
         // Materialize the same platform mutex at the source constructor.
         drop(owner.state.lock().unwrap_or_else(|p| p.into_inner()));
@@ -143,33 +164,82 @@ impl FrontendCompletionCustody {
     }
     /// Complete the same original driver, then join the same Provider source.
     /// No caller cancellation can detach the borrowed close from its holder.
-    pub(crate) async fn complete(
+    pub(crate) async fn complete_in(
         &self,
         request: novarocks_sql::compiler::SqlFinalPlanCompileRequest,
         scope: &novarocks_workload_control::WorkScope,
-    ) -> Result<CompletionResult, StatementNativeHealthFailure> {
+        cpu: &dyn novarocks_query_application::preparation::SqlCompletionCpuPort,
+    ) -> Result<(), StatementNativeHealthFailure> {
         let facts = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             Arc::clone(state.facts.as_ref().expect("installed original facts"))
         };
+        let body = self
+            .access
+            .body
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let mut loan = CompletionAccessLoan {
+            original: &self.access,
+            body,
+        };
+        let body = loan.body.as_mut().expect("original completion access body");
+        assert!(body.taken.is_none(), "one original completion invocation");
+        body.taken = Some(novarocks_query_application::preparation::ReadAccessSink::new());
         let driver = FinalPlanCompletionDriver::new(facts);
-        let outcome = driver.complete(request, scope).await;
+        let candidate = match driver
+            .complete(request, scope, body.taken.as_ref().unwrap(), cpu)
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(health) => {
+                let selected = {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.health.is_none() {
+                        state.health = Some(health.clone());
+                    }
+                    state.health.as_ref().unwrap().clone()
+                };
+                return Err(selected);
+            }
+        };
+        let outcome =
+            FinalPlanCompletionDriver::pair_completed(candidate, body.taken.take().unwrap());
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             assert!(state.outcome.is_none() && !state.joined);
             state.outcome = Some(outcome);
         }
-        // The canonical facts/Provider remain in State, so this cannot be a
-        // last alias of the source. The result is stable before any cleanup.
+        // The original outcome and all capabilities are stable before cleanup.
+        drop(loan);
         drop(driver);
-        self.close().await?;
-        let outcome = self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        self.close().await
+    }
+    /// Observe the original verdict without moving its unpaired capabilities.
+    pub(crate) fn completed_error(
+        &self,
+    ) -> Option<novarocks_query_application::preparation::FinalPlanCompletionError> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match state
             .outcome
-            .take();
-        Ok(outcome.expect("same completed original result"))
+            .as_ref()
+            .expect("same completed original outcome")
+        {
+            Ok(_) => None,
+            Err(failure) => Some(failure.error().clone()),
+        }
+    }
+    pub(crate) fn handoff_completed_in(
+        &self,
+        destination: &super::planning_cpu::FrontendPlanningCpuSource,
+        input: &mut Option<super::planning_cpu::CompletedReadCpuInput>,
+    ) -> Result<(), &'static str> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.joined || state.health.is_some() {
+            return Err("completion Provider exit is unproven");
+        }
+        destination.install_completed_in(&mut state.outcome, input)
     }
     pub(crate) async fn close(&self) -> Result<(), StatementNativeHealthFailure> {
         let provider = {

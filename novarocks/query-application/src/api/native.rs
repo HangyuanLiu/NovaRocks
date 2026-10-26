@@ -1031,14 +1031,14 @@ impl LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeSession {
-    pub(crate) fn client_computation_cut_handle(
+    pub(crate) fn streamed_computation_cut_handle(
         &self,
-    ) -> Option<crate::admitted_query_context::ClientComputationCutHandle> {
+    ) -> Option<crate::admitted_query_context::StreamedComputationCutHandle> {
         self.attempts
             .as_ref()?
             .result_capacity
             .as_ref()?
-            .client_computation_cut_handle()
+            .streamed_computation_cut_handle()
     }
     pub(crate) fn set_result_capacity_in(
         &mut self,

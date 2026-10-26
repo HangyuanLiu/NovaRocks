@@ -28,8 +28,23 @@
 //! revision and selection interpretation then consume those completed facts;
 //! the shared connector worker remains only for explicitly authored leaf work.
 
+mod planning_cpu;
 mod provider_source;
+pub(crate) use planning_cpu::{
+    CompletedReadCpuInput, FrontendPlanningCpuSource, LogicalFinishInput, ReadEncodingInput,
+    ReadEncodingPurpose,
+};
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(novarocks_dev_controls)]
+pub(crate) use planning_cpu::ReadRewriteInput;
 pub(crate) use provider_source::FrontendCompletionCustody;
+
+/// Borrow the original Provider and pure CPU sources for one completion.
+pub(crate) struct FrontendCompletionPorts<'a> {
+    pub(crate) provider: &'a FrontendCompletionCustody,
+    pub(crate) cpu: &'a FrontendPlanningCpuSource,
+}
 
 use std::sync::Arc;
 
@@ -382,27 +397,6 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
         }
         Ok(facts)
     }
-}
-
-/// The fact source one statement's completion is driven with, with all four
-/// kinds of question answered by this process.
-pub(crate) fn frontend_fact_source(
-    owners: CompletionFactOwners,
-    scope: StatementFactScope,
-    session: ConnectorSession,
-) -> QueryCompletionFactSource<FrozenProviderRead> {
-    let provider_reads = Arc::new(
-        FrontendProviderReadFacts::binding_only(
-            Arc::clone(&owners.connector_control),
-            Arc::clone(&scope.bindings),
-            session,
-            scope.connector_context.clone(),
-            owners.blocking.clone(),
-            scope.capacity.clone(),
-        )
-        .with_creator_mode(scope.creator_mode),
-    );
-    statement_fact_source(owners, scope, provider_reads)
 }
 
 /// Install the same concrete Provider and fact ports in the original action's

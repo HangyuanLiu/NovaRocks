@@ -1718,6 +1718,7 @@ fn protocol_fixture_inputs(
 
 #[cfg(test)]
 mod tests {
+    use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use novarocks_execution::task_execution::AdmissionEpochCapability;
@@ -1948,7 +1949,10 @@ mod tests {
         // SQL completion keeps the real immutable call-source journal even
         // when constant folding leaves only a literal Values expression.
         let paired = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request, &scope),
+            )
             .expect("the exact original Int64 payload completes from SQL");
         let plan = paired.candidate().plan();
         assert_eq!(plan.version(), version);

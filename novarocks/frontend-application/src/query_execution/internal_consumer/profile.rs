@@ -335,26 +335,64 @@ pub(crate) fn profile_computation_consumer(
 
 /// Concrete preparation connects the fixed consumer, exact handoff offer and
 /// diagnostic mode without a caller assembling independent registrations.
-pub(crate) fn prepare_profile_computation(
+/// All fallible Profile preparation precedes binding the original access.
+pub(crate) struct PreparedProfileComputationParts {
+    computation: Option<crate::query_execution::logical_execution::PreparedLogicalComputationParts>,
+    output: Option<ProfileComputationOutput>,
+}
+pub(crate) fn prepare_profile_computation_parts(
     description: FrozenExecutionDescription,
-    template: PreparedDistributedAttemptTemplate,
+    plan: PlanSeal,
     options: Arc<ResolvedQueryOptions>,
-) -> Result<(PreparedLogicalComputation, ProfileComputationOutput), QueryExecutionError> {
+) -> Result<PreparedProfileComputationParts, QueryExecutionError> {
     let description = description
         .into_internal_computation()
         .map_err(|_| profile_error("Profile preparation has no frozen internal result contract"))?;
-    let plan = template.native_manifest_template().plan();
     let (consumer, offers, output) = profile_computation_consumer(&description, plan)?;
-    let computation = PreparedLogicalComputation::new(
-        description,
-        template,
-        options,
-        consumer,
-        offers,
-        ComputationDiagnostics::Profile,
-    )
-    .map_err(|_| profile_error("Profile preparation differs from its Native template"))?;
-    Ok((computation, output))
+    let computation =
+        crate::query_execution::logical_execution::PreparedLogicalComputationParts::try_new(
+            description,
+            plan,
+            options,
+            consumer,
+            offers,
+            ComputationDiagnostics::Profile,
+        )
+        .map_err(|_| profile_error("Profile preparation differs from its Native template"))?;
+    Ok(PreparedProfileComputationParts {
+        computation: Some(computation),
+        output: Some(output),
+    })
+}
+impl PreparedProfileComputationParts {
+    pub(crate) fn move_in(
+        parts: &mut Option<Self>,
+        template: &mut Option<PreparedDistributedAttemptTemplate>,
+        destination: &mut Option<(PreparedLogicalComputation, ProfileComputationOutput)>,
+    ) -> Result<(), QueryExecutionError> {
+        if destination.is_some() {
+            return Err(profile_error("Profile receiver is occupied"));
+        }
+        let original = parts
+            .as_mut()
+            .ok_or_else(|| profile_error("original Profile parts are absent"))?;
+        if original.output.is_none() {
+            return Err(profile_error(
+                "original Profile receiving cells are occupied",
+            ));
+        }
+        let mut received = None;
+        crate::query_execution::logical_execution::PreparedLogicalComputationParts::move_in(
+            &mut original.computation,
+            template,
+            &mut received,
+        )
+        .map_err(|_| profile_error("Profile preparation differs from its Native template"))?;
+        *destination = Some((received.unwrap(), original.output.take().unwrap()));
+        let retired = parts.take();
+        drop(retired);
+        Ok(())
+    }
 }
 
 impl InternalComputationConsumer for ProfileComputationConsumer {

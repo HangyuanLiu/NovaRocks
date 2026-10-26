@@ -420,11 +420,13 @@ impl ResultWindowGrant {
 pub struct ResultWindowAlias {
     backing: AliasBacking,
 }
+type NativeComputationStamp = (WorkId, [u64; 2]);
+
 enum AliasBacking {
     Window {
         holder: Arc<WindowHolder>,
         execution_scope: Option<Arc<WindowExecutionScope>>,
-        client_computation: Option<(WorkId, [u64; 2])>,
+        client_computation: Option<NativeComputationStamp>,
         manifest: Option<(
             crate::joint_admission::InternalManifestBinding,
             crate::joint_admission::RetainedPayloadAlias,
@@ -441,6 +443,7 @@ enum AliasBacking {
         root: WorkScope,
         execution: WorkScope,
         binding: Option<crate::joint_admission::InternalManifestBinding>,
+        streamed_computation: Option<NativeComputationStamp>,
     },
 }
 
@@ -477,7 +480,10 @@ pub(crate) enum NativeCapacityFence {
         stage: WorkId,
         key: [u64; 2],
     },
-    InternalPayload([u64; 2]),
+    InternalPayload {
+        payload: [u64; 2],
+        computation: Option<NativeComputationStamp>,
+    },
 }
 impl NativeCapacityFence {
     pub(crate) fn validate(&self, state: &State, root: WorkId) -> Result<(), WorkError> {
@@ -498,8 +504,19 @@ impl NativeCapacityFence {
                     state, root, *stage, *key,
                 )
             }
-            Self::InternalPayload(key) => {
-                crate::joint_admission::ledger::validate_native_payload_fence(state, root, *key)
+            Self::InternalPayload {
+                payload,
+                computation,
+            } => {
+                crate::joint_admission::ledger::validate_native_payload_fence(
+                    state, root, *payload,
+                )?;
+                if let Some((stage, key)) = computation {
+                    crate::joint_admission::ledger::validate_native_computation_fence(
+                        state, root, *stage, *key,
+                    )?;
+                }
+                Ok(())
             }
         }
     }
@@ -597,8 +614,19 @@ impl ResultWindowAlias {
                 }
             }
             AliasBacking::RootRetention { .. } => return Err(WorkError::Conflict),
-            AliasBacking::InternalRoot { payload, .. } => {
-                NativeCapacityFence::InternalPayload(payload.native_source_key()?)
+            AliasBacking::InternalRoot {
+                payload,
+                execution,
+                streamed_computation,
+                ..
+            } => {
+                if streamed_computation.is_some_and(|(stage, _)| execution.id != stage) {
+                    return Err(WorkError::Conflict);
+                }
+                NativeCapacityFence::InternalPayload {
+                    payload: payload.native_source_key()?,
+                    computation: *streamed_computation,
+                }
             }
         };
         crate::joint_admission::ledger::delegate_native_actions(
@@ -637,8 +665,19 @@ impl ResultWindowAlias {
                 }
             }
             AliasBacking::RootRetention { .. } => return Err(WorkError::Conflict),
-            AliasBacking::InternalRoot { payload, .. } => {
-                NativeCapacityFence::InternalPayload(payload.native_source_key()?)
+            AliasBacking::InternalRoot {
+                payload,
+                execution,
+                streamed_computation,
+                ..
+            } => {
+                if streamed_computation.is_some_and(|(stage, _)| execution.id != stage) {
+                    return Err(WorkError::Conflict);
+                }
+                NativeCapacityFence::InternalPayload {
+                    payload: payload.native_source_key()?,
+                    computation: *streamed_computation,
+                }
             }
         };
         crate::joint_admission::ledger::capture_native_action(
@@ -691,6 +730,7 @@ impl ResultWindowAlias {
                 root: root.clone(),
                 execution: execution.clone(),
                 binding: None,
+                streamed_computation: None,
             },
         })
     }
@@ -719,6 +759,28 @@ impl ResultWindowAlias {
         *target = Some(binding);
         Ok(alias)
     }
+    /// Attach only the same positive computation's weak Native liveness fence.
+    /// This borrows the original grants; ownership moves only in the receiving
+    /// QA custody author. Plain/borrowed Internal payloads keep their contract.
+    pub fn from_streamed_internal_computation(
+        root: &WorkScope,
+        stage: &crate::WorkOwner,
+        payload: &crate::joint_admission::RetainedPayloadGrant,
+        computation: &crate::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        let mut alias = Self::from_internal_computation(root, stage, payload, computation)?;
+        let AliasBacking::InternalRoot {
+            binding: Some(binding),
+            streamed_computation,
+            ..
+        } = &mut alias.backing
+        else {
+            unreachable!()
+        };
+        *streamed_computation = Some(binding.computation_identity());
+        Ok(alias)
+    }
+
     /// Preserve the actual Client window while attaching only the original
     /// positive Root/stage manifest authority. No Internal result window or
     /// new quota is acquired, and retention alone cannot call this constructor.
@@ -794,13 +856,16 @@ impl ResultWindowAlias {
             _ => Ok(None),
         }
     }
-    /// A governed Client alias cannot become a legacy execution allowance by
-    /// dropping its manifest projection or deriving another attribution scope.
-    pub fn has_client_computation_stamp(&self) -> bool {
+    /// A streamed alias cannot become a legacy execution allowance through a
+    /// new activity binding. The marker grants no computation position itself.
+    pub fn has_streamed_computation_stamp(&self) -> bool {
         matches!(
             &self.backing,
             AliasBacking::Window {
                 client_computation: Some(_),
+                ..
+            } | AliasBacking::InternalRoot {
+                streamed_computation: Some(_),
                 ..
             }
         )
@@ -843,6 +908,8 @@ impl ResultWindowAlias {
                 payload.check_backing_total(0)?;
                 *execution = root.clone();
                 *binding = None;
+                // Keep any streamed marker: retention does not reopen the
+                // old stage's Native Foreground computation authority.
             }
             AliasBacking::Window { .. } => return Err(WorkError::Conflict),
         }
@@ -921,12 +988,14 @@ impl ResultWindowAlias {
                 root,
                 execution,
                 binding,
+                streamed_computation,
             } => AliasBacking::InternalRoot {
                 budget: Arc::clone(budget),
                 payload: payload.try_clone().map_err(internal_pin_error)?,
                 root: root.clone(),
                 execution: execution.clone(),
                 binding: binding.clone(),
+                streamed_computation: *streamed_computation,
             },
         };
         Ok(Self { backing })
@@ -973,6 +1042,7 @@ impl ResultWindowAlias {
             budget,
             payload,
             root,
+            streamed_computation,
             ..
         } = &self.backing
         {
@@ -998,6 +1068,7 @@ impl ResultWindowAlias {
                     // A different execution cannot inherit the old stage's
                     // positive-computation authority through retention alone.
                     binding: None,
+                    streamed_computation: *streamed_computation,
                 },
             });
         }

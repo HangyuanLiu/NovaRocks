@@ -78,19 +78,6 @@ impl InfoColumn {
     }
 }
 
-/// The materialized-views virtual table consumes only ready Accelerator
-/// projections, never a retained row from a quarantined lake package.
-/// This synchronous entry is the explicit legacy adapter.
-pub fn try_query_materialized_views(
-    readiness: &MvReadinessPort,
-    query: &ast::Query,
-) -> Result<Option<StatementResult>, String> {
-    let Some(projection) = materialized_view_projection(query)? else {
-        return Ok(None);
-    };
-    render_materialized_view_rows(query, &projection, materialized_view_rows(readiness)?).map(Some)
-}
-
 /// The caller retains the original owner and result delivery capability.
 /// Missing/expired original execution never selects the synchronous adapter.
 pub(crate) async fn try_query_materialized_views_in(
@@ -167,22 +154,6 @@ fn render_materialized_view_rows(
     apply_order_by(query, &mut rows)?;
     build_query_result(projection, &rows).map(StatementResult::Query)
 }
-fn materialized_view_rows(
-    readiness: &MvReadinessPort,
-) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let mut inventory = readiness
-        .local_projection_inventory()
-        .map_err(|e| format!("load materialized view metadata inventory failed: {e}"))?;
-    let mut rows = MaterializedViewRows::default();
-    while let Some(loaded) = inventory
-        .next_ready()
-        .map_err(|e| format!("load materialized view metadata failed: {e}"))?
-    {
-        rows.push(&loaded.projection)?;
-    }
-    Ok(rows.rows)
-}
-
 #[derive(Default)]
 struct MaterializedViewRows {
     rows: Vec<MaterializedViewInfoRow>,
@@ -690,11 +661,11 @@ mod original_read_tests {
                 .is_none()
         );
         let invalid = query("SELECT unknown_mv_column FROM information_schema.materialized_views");
-        let old = try_query_materialized_views(&port, &invalid).unwrap_err();
+        let local_column_error = materialized_view_projection(&invalid).unwrap_err();
         let new = try_query_materialized_views_in(&port, &invalid, Arc::new(expired.clone()))
             .await
             .unwrap_err();
-        assert_eq!(new.to_string(), old);
+        assert_eq!(new.to_string(), local_column_error);
         assert!(
             new.failure_cause().is_none(),
             "a local column error must not invent a provider fact"

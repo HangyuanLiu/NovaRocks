@@ -211,40 +211,40 @@ struct ResultCapacityActivity {
 #[derive(Default)]
 struct ResultCapacityActivityState {
     count: usize,
-    client: Option<ClientComputationCustody>,
+    streamed: Option<StreamedComputationCustody>,
 }
-struct ClientComputationCustody {
-    // The sole positive Client computation; Window/Native tails carry no pin.
+struct StreamedComputationCustody {
+    // The sole positive streamed computation; Window/Native tails carry no pin.
     grant: Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
     sealed: bool,
     producer_exited: bool,
     retiring: bool,
     retired: bool,
 }
-/// Private original-source observation. Only the real Client pump/Native
+/// Private original-source observation. Only the real streaming pump/Native
 /// body exit authors may close it; a Work identity or success enum cannot.
 #[derive(Clone)]
-pub(crate) struct ClientComputationCutHandle {
+pub(crate) struct StreamedComputationCutHandle {
     activity: std::sync::Weak<ResultCapacityActivity>,
     scope: WorkScope,
 }
 /// One inline custody reference to the existing activity allocation in the
 /// original Native body. It prevents incidental capacity-alias Drop from
 /// retiring the computation before the real local producer frame exits.
-pub(crate) struct ClientComputationProducer {
+pub(crate) struct StreamedComputationProducer {
     activity: std::sync::Arc<ResultCapacityActivity>,
     scope: WorkScope,
 }
-impl ClientComputationProducer {
+impl StreamedComputationProducer {
     pub(crate) fn native_body_exited(&self) -> Result<(), WorkError> {
-        let handle = ClientComputationCutHandle {
+        let handle = StreamedComputationCutHandle {
             activity: std::sync::Arc::downgrade(&self.activity),
             scope: self.scope.clone(),
         };
         handle.native_body_exited()
     }
 }
-impl ClientComputationCutHandle {
+impl StreamedComputationCutHandle {
     pub(crate) fn is_for_scope(&self, scope: &WorkScope) -> bool {
         self.scope.id() == scope.id()
     }
@@ -254,26 +254,26 @@ impl ClientComputationCutHandle {
     pub(crate) fn seal_producer(&self) -> Result<(), WorkError> {
         let activity = self.activity.upgrade().ok_or(WorkError::Released)?;
         let mut state = activity.state.lock().expect("result activity lock");
-        let client = state.client.as_mut().ok_or(WorkError::Conflict)?;
-        client.sealed = true;
+        let streamed = state.streamed.as_mut().ok_or(WorkError::Conflict)?;
+        streamed.sealed = true;
         Ok(())
     }
     fn producer_exited(&self) -> Result<std::sync::Arc<ResultCapacityActivity>, WorkError> {
         let activity = self.activity.upgrade().ok_or(WorkError::Released)?;
         {
             let mut state = activity.state.lock().expect("result activity lock");
-            let client = state.client.as_mut().ok_or(WorkError::Conflict)?;
-            client.sealed = true;
-            client.producer_exited = true;
+            let streamed = state.streamed.as_mut().ok_or(WorkError::Conflict)?;
+            streamed.sealed = true;
+            streamed.producer_exited = true;
         }
-        retire_client_if_ready(&activity);
+        retire_streamed_if_ready(&activity);
         Ok(activity)
     }
     /// Only after the original driver/pump frame returned normally. The
     /// private pump token is checked before any positive grant can exit.
     pub(crate) async fn retire_after_pump_exit(
         &self,
-        cut: super::coordination::ClientRowsComputedCut,
+        cut: super::coordination::StreamedRowsComputedCut,
     ) -> Result<(), WorkError> {
         if !cut.is_for(self) {
             return Err(WorkError::Conflict);
@@ -287,9 +287,9 @@ impl ClientComputationCutHandle {
                 .state
                 .lock()
                 .expect("result activity lock")
-                .client
+                .streamed
                 .as_ref()
-                .is_some_and(|client| client.retired)
+                .is_some_and(|streamed| streamed.retired)
             {
                 return Ok(());
             }
@@ -303,32 +303,32 @@ impl ClientComputationCutHandle {
         self.producer_exited().map(|_| ())
     }
 }
-fn retire_client_if_ready(activity: &std::sync::Arc<ResultCapacityActivity>) {
+fn retire_streamed_if_ready(activity: &std::sync::Arc<ResultCapacityActivity>) {
     let grant = {
         let mut state = activity.state.lock().expect("result activity lock");
         if state.count != 0 {
             return;
         }
-        let Some(client) = state.client.as_mut() else {
+        let Some(streamed) = state.streamed.as_mut() else {
             return;
         };
-        if !client.producer_exited || !client.sealed || client.retiring || client.retired {
+        if !streamed.producer_exited || !streamed.sealed || streamed.retiring || streamed.retired {
             return;
         }
-        client.retiring = true;
-        client
+        streamed.retiring = true;
+        streamed
             .grant
             .take()
-            .expect("one original Client computation")
+            .expect("one original streamed computation")
     };
     // The original positive resource exits outside the activity mutex. A Drop
     // unwind leaves Retiring, never a fabricated completed retirement.
     drop(grant);
     {
         let mut state = activity.state.lock().expect("result activity lock");
-        let client = state.client.as_mut().unwrap();
-        client.retiring = false;
-        client.retired = true;
+        let streamed = state.streamed.as_mut().unwrap();
+        streamed.retiring = false;
+        streamed.retired = true;
     }
     activity.exited.notify_all();
     activity.async_exited.notify_waiters();
@@ -354,7 +354,7 @@ impl Drop for ResultCapacityActivityLease {
             state.count == 0
         };
         if exited {
-            retire_client_if_ready(&self.activity);
+            retire_streamed_if_ready(&self.activity);
             self.activity.exited.notify_all();
             self.activity.async_exited.notify_waiters();
         }
@@ -390,7 +390,7 @@ impl QueryResultCapacityBinding {
     pub fn try_new(scope: &WorkScope, window: ResultWindowAlias) -> Result<Self, WorkError> {
         if !window.is_for_scope(scope)
             || window.class() == ResultWindowClass::Closing
-            || window.has_client_computation_stamp()
+            || window.has_streamed_computation_stamp()
         {
             return Err(WorkError::Conflict);
         }
@@ -468,13 +468,44 @@ impl QueryResultCapacityBinding {
         let compute = source.as_ref().ok_or(WorkError::Released)?;
         let window =
             ResultWindowAlias::from_client_computation(root, stage, original, payload, compute)?;
+        Self::install_owned_streamed_computation_in(stage, window, source, target);
+        Ok(())
+    }
+
+    /// Transfer the same positive Internal read computation, after the original
+    /// Root payload, direct stage and actual position have all been validated.
+    pub fn from_owned_internal_computation_in(
+        root: &WorkScope,
+        stage: &novarocks_workload_control::WorkOwner,
+        payload: &novarocks_workload_control::joint_admission::RetainedPayloadGrant,
+        source: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+        target: &mut Option<Self>,
+    ) -> Result<(), WorkError> {
+        if target.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        let compute = source.as_ref().ok_or(WorkError::Released)?;
+        let window =
+            ResultWindowAlias::from_streamed_internal_computation(root, stage, payload, compute)?;
+        Self::install_owned_streamed_computation_in(stage, window, source, target);
+        Ok(())
+    }
+
+    // Both public authors validate their distinct original grants before this
+    // closed move. Retention aliases cannot install an owned computation here.
+    fn install_owned_streamed_computation_in(
+        stage: &novarocks_workload_control::WorkOwner,
+        window: ResultWindowAlias,
+        source: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+        target: &mut Option<Self>,
+    ) {
         let mut activity = std::sync::Arc::new(ResultCapacityActivity::default());
         let state = std::sync::Arc::get_mut(&mut activity)
             .unwrap()
             .state
             .get_mut()
             .expect("new result activity lock");
-        state.client = Some(ClientComputationCustody {
+        state.streamed = Some(StreamedComputationCustody {
             grant: source.take(),
             sealed: false,
             producer_exited: false,
@@ -486,20 +517,19 @@ impl QueryResultCapacityBinding {
             window,
             activity,
         });
-        Ok(())
     }
-    pub(crate) fn client_computation_producer(&self) -> Option<ClientComputationProducer> {
+    pub(crate) fn streamed_computation_producer(&self) -> Option<StreamedComputationProducer> {
         let state = self.activity.state.lock().expect("result activity lock");
-        state.client.as_ref()?;
-        Some(ClientComputationProducer {
+        state.streamed.as_ref()?;
+        Some(StreamedComputationProducer {
             activity: std::sync::Arc::clone(&self.activity),
             scope: self.scope.clone(),
         })
     }
-    pub(crate) fn client_computation_cut_handle(&self) -> Option<ClientComputationCutHandle> {
+    pub(crate) fn streamed_computation_cut_handle(&self) -> Option<StreamedComputationCutHandle> {
         let state = self.activity.state.lock().expect("result activity lock");
-        state.client.as_ref()?;
-        Some(ClientComputationCutHandle {
+        state.streamed.as_ref()?;
+        Some(StreamedComputationCutHandle {
             activity: std::sync::Arc::downgrade(&self.activity),
             scope: self.scope.clone(),
         })
@@ -539,7 +569,11 @@ impl QueryResultCapacityBinding {
         self.scope.check()?;
         let window = self.window.try_clone()?;
         let mut state = self.activity.state.lock().expect("result activity lock");
-        if state.client.as_ref().is_some_and(|client| client.sealed) {
+        if state
+            .streamed
+            .as_ref()
+            .is_some_and(|streamed| streamed.sealed)
+        {
             return Err(WorkError::Conflict);
         }
         state.count = state
@@ -565,6 +599,13 @@ impl QueryResultCapacityBinding {
         self.scope.check()?;
         let window = self.window.try_clone()?;
         let mut state = self.activity.state.lock().expect("result activity lock");
+        if state
+            .streamed
+            .as_ref()
+            .is_some_and(|streamed| streamed.sealed)
+        {
+            return Err(WorkError::Conflict);
+        }
         state.count = state
             .count
             .checked_add(1)

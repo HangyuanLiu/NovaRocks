@@ -21,7 +21,7 @@ use crate::query_execution::native_execution_adapter::source_cohort::tests::{
 };
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_query_application::{
-    api::{QueryExecutionFuture, ReservedExecutionIdentity},
+    api::ReservedExecutionIdentity,
     cpu::{QueryBlockingExecutorConfig, QueryBlockingExecutorOwner},
 };
 use novarocks_state_store_api::{
@@ -236,17 +236,6 @@ impl LogicalExecutionLauncher for NoNativeLaunch {
     {
         panic!("Failed Read cannot start Native work")
     }
-    fn start(
-        &self,
-        _: crate::query_execution::completion::PreparedLogicalRead,
-        _: WorkOwner,
-        _: Option<ResultWindowAlias>,
-        #[cfg(novarocks_dev_controls)] _: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> QueryExecutionFuture {
-        panic!("Failed Read cannot start a row computation")
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -326,18 +315,21 @@ async fn read_error_hands_same_idle_original_to_residual_only_after_actual_foote
     let selected = cause.clone();
     let input = source.clone();
     let preparation: Preparation = Box::pin(async move {
-        std::future::poll_fn(|cx| {
-            input
-                .slot
-                .lock()
-                .unwrap()
-                .as_mut()
-                .unwrap()
-                .poll_phase(cx, IdleOriginal::request(Phase::Get))
-        })
-        .await
-        .map_err(QueryServiceError::from_failure_cause)?;
-        Err(QueryServiceError::from_failure_cause(selected))
+        Ok(async {
+            std::future::poll_fn(|cx| {
+                input
+                    .slot
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .poll_phase(cx, IdleOriginal::request(Phase::Get))
+            })
+            .await
+            .map_err(QueryServiceError::from_failure_cause)?;
+            Err(QueryServiceError::from_failure_cause(selected))
+        }
+        .await)
     });
     let grant = capacity
         .try_acquire(&scope, ResultWindowClass::Client)
@@ -352,18 +344,23 @@ async fn read_error_hands_same_idle_original_to_residual_only_after_actual_foote
         [1, 0, 0, 0],
         "only the original Stage now retains the Client position"
     );
+    let planning_cpu = FrontendPlanningCpuSource::new(
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
     let mut action = ReadStatementAction {
+        planning_cpu: planning_cpu.clone(),
+        preparation_health: None,
         provider: provider.clone(),
-        provider_close: Some(Box::pin(close_provider(provider.clone())) as ProviderClose),
+        provider_close: Some(
+            Box::pin(close_provider(provider.clone(), planning_cpu)) as ProviderClose
+        ),
         provider_close_result: None,
         local: None,
         tail: Some(Box::new(ReadNativeTail {
-            state_store: Some(original_owner),
-            io,
-            stage,
-            exit: None,
-            receipt: None,
-            launched: false,
+            services: ReadNativeServices::new(Some(original_owner), io),
+            native: ReadNativeStageTail::new(stage),
             health: None,
         })),
         preparation: Some(preparation),

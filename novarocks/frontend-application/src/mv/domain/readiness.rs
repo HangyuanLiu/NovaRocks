@@ -42,29 +42,6 @@ pub struct MvReadinessPort {
     controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
-pub(crate) struct MvLocalProjectionInventory {
-    inventory: novarocks_mv_application::readiness::MvBoundedKeyedProjectionInventory,
-    handle: tokio::runtime::Handle,
-}
-
-impl MvLocalProjectionInventory {
-    fn block_on<T>(
-        handle: &tokio::runtime::Handle,
-        future: impl std::future::Future<Output = T>,
-    ) -> T {
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => tokio::task::block_in_place(|| handle.block_on(future)),
-            Err(_) => handle.block_on(future),
-        }
-    }
-
-    pub(crate) fn next_ready(
-        &mut self,
-    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
-        Self::block_on(&self.handle, self.inventory.next_ready())
-    }
-}
-
 fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
     use novarocks_mv_application::repository::MvProjectionInventoryBound;
 
@@ -253,19 +230,6 @@ impl MvReadinessPort {
             }
         }
         Ok(())
-    }
-
-    /// Local-source profile: one finite locator snapshot and one decoded
-    /// page. Planning/background callers keep their own inventory contract.
-    pub(crate) fn local_projection_inventory(
-        &self,
-    ) -> Result<MvLocalProjectionInventory, MvRepositoryError> {
-        let bound = local_inventory_bound();
-        let inventory = self.block_on(self.service.bounded_projection_inventory(bound))?;
-        Ok(MvLocalProjectionInventory {
-            inventory,
-            handle: self.handle.clone(),
-        })
     }
 
     pub(crate) fn list_ready_projections(

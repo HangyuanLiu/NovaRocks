@@ -26,6 +26,8 @@
 //! are assembled here, from the same production owners a statement uses,
 //! because the Frontend host that composes them needs a StateStore.
 
+#[cfg(test)]
+use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -423,7 +425,8 @@ impl PaimonFixture {
         let completed = self
             .runtime
             .block_on(
-                FinalPlanCompletionDriver::new(Arc::new(source)).complete(request_for(sql), &scope),
+                FinalPlanCompletionDriver::new(Arc::new(source))
+                    .complete_for_test(request_for(sql), &scope),
             )
             .unwrap_or_else(|failure| panic!("{sql}: completes against Paimon: {failure}"));
         self.runtime

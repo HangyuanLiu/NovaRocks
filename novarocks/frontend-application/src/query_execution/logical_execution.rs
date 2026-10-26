@@ -70,16 +70,6 @@ pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
     ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>;
-
-    fn start(
-        &self,
-        read: PreparedLogicalRead,
-        owner: WorkOwner,
-        result_window: Option<novarocks_workload_control::ResultWindowAlias>,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> QueryExecutionFuture;
 }
 
 /// Fixed fields inside the statement's existing stable action. These are
@@ -312,6 +302,80 @@ pub(crate) struct PreparedLogicalComputation {
     pub(super) diagnostics: ComputationDiagnostics,
     pub(super) initial_credentials: Option<Arc<InitialComputationCredentials>>,
 }
+fn validate_prepared_computation(
+    description: &FrozenExecutionDescription,
+    plan: novarocks_query_application::api::PlanSeal,
+) -> Result<(), String> {
+    if description.finish_boundary() != ExecutionFinishBoundary::ComputationReady
+        || !description.matches_plan_seal(plan)
+    {
+        return Err(
+            "internal computation does not match its frozen finish boundary or Native plan".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Checked neutral pieces; the original template remains outside this value
+/// until its Source's actual CPU exit and receiving transfer.
+pub(crate) struct PreparedLogicalComputationParts {
+    description: FrozenExecutionDescription,
+    options: Arc<ResolvedQueryOptions>,
+    consumer: Arc<dyn InternalComputationConsumer>,
+    handoffs: Arc<AttemptHandoffOfferPort>,
+    diagnostics: ComputationDiagnostics,
+}
+impl PreparedLogicalComputationParts {
+    pub(crate) fn try_new(
+        description: FrozenExecutionDescription,
+        plan: novarocks_query_application::api::PlanSeal,
+        options: Arc<ResolvedQueryOptions>,
+        consumer: Arc<dyn InternalComputationConsumer>,
+        handoffs: AttemptHandoffOfferPort,
+        diagnostics: ComputationDiagnostics,
+    ) -> Result<Self, String> {
+        validate_prepared_computation(&description, plan)?;
+        Ok(Self {
+            description,
+            options,
+            consumer,
+            handoffs: Arc::new(handoffs),
+            diagnostics,
+        })
+    }
+    pub(crate) fn move_in(
+        parts: &mut Option<Self>,
+        template: &mut Option<PreparedDistributedAttemptTemplate>,
+        destination: &mut Option<PreparedLogicalComputation>,
+    ) -> Result<(), String> {
+        if destination.is_some() {
+            return Err("computation receiver is occupied".into());
+        }
+        let original = parts
+            .as_ref()
+            .ok_or("checked computation parts are absent")?;
+        let original_template = template
+            .as_ref()
+            .ok_or("original computation template is absent")?;
+        validate_prepared_computation(
+            &original.description,
+            original_template.native_manifest_template().plan(),
+        )?;
+        let original = parts.take().unwrap();
+        let template = template.take().unwrap();
+        *destination = Some(PreparedLogicalComputation {
+            description: original.description,
+            template,
+            options: original.options,
+            consumer: original.consumer,
+            handoffs: original.handoffs,
+            diagnostics: original.diagnostics,
+            initial_credentials: None,
+        });
+        Ok(())
+    }
+}
+
 impl PreparedLogicalComputation {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -322,14 +386,7 @@ impl PreparedLogicalComputation {
         handoffs: AttemptHandoffOfferPort,
         diagnostics: ComputationDiagnostics,
     ) -> Result<Self, String> {
-        if description.finish_boundary() != ExecutionFinishBoundary::ComputationReady
-            || !description.matches_plan_seal(template.native_manifest_template().plan())
-        {
-            return Err(
-                "internal computation does not match its frozen finish boundary or Native plan"
-                    .into(),
-            );
-        }
+        validate_prepared_computation(&description, template.native_manifest_template().plan())?;
         Ok(Self {
             description,
             template,

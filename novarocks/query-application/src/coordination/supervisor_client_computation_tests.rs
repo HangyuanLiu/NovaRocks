@@ -61,7 +61,9 @@ mod client_computation_tests {
             Ok(())
         }
     }
-    struct EndPort;
+    struct EndPort {
+        scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
+    }
     impl crate::api::BoundedRootReadPort for EndPort {
         fn read(
             &self,
@@ -77,9 +79,33 @@ mod client_computation_tests {
                     > + Send,
             >,
         > {
+            let scalar_schema = self.scalar_schema.clone();
             Box::pin(async move {
                 use novarocks_execution_contract::root_result::*;
                 let outcome = match request.wanted() {
+                    Some(sequence) if scalar_schema.is_some() => {
+                        use novarocks_result_contract::{BorrowedScalarLeaf, ScalarLeafCursor};
+                        assert_eq!(sequence, NonZeroU64::MIN);
+                        let cursor = ScalarLeafCursor::try_new(
+                            scalar_schema.as_ref().unwrap(),
+                            BorrowedScalarLeaf::NoRows,
+                        )
+                        .unwrap();
+                        let mut body = vec![0; cursor.encoded_len()];
+                        cursor.copy_range(0, &mut body).unwrap();
+                        RootReadOutcome::Data(
+                            RootResultData::try_new(
+                                request.kind(),
+                                sequence,
+                                bytes::Bytes::from(body),
+                                Some(RootResultEnd {
+                                    sequence: NonZeroU64::new(2).unwrap(),
+                                    output_rows: cursor.rows(),
+                                }),
+                            )
+                            .unwrap(),
+                        )
+                    }
                     Some(sequence) => RootReadOutcome::End(RootResultEnd {
                         sequence,
                         output_rows: 0,
@@ -112,6 +138,7 @@ mod client_computation_tests {
         backend: BackendProcessId,
         window: TestWindow,
         signals: Arc<Signals>,
+        scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
     }
     impl NativeAttemptPreparationPort for Preparation {
         fn prepare_in<'a>(
@@ -122,6 +149,7 @@ mod client_computation_tests {
                 backend: self.backend,
                 window: self.window.clone(),
                 signals: Arc::clone(&self.signals),
+                scalar_schema: self.scalar_schema.clone(),
             });
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(request);
@@ -134,6 +162,7 @@ mod client_computation_tests {
         backend: BackendProcessId,
         window: TestWindow,
         signals: Arc<Signals>,
+        scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
     }
     impl DormantNativeAttemptOwner for Dormant {
         fn poll_bind_qualification(
@@ -156,6 +185,7 @@ mod client_computation_tests {
             let contexts = schedule.contexts().to_vec();
             let window = self.window.clone();
             let signals = Arc::clone(&self.signals);
+            let scalar_schema = self.scalar_schema.clone();
             Box::pin(async move {
                 let control = Arc::new(SealPort {
                     sender: std::sync::Mutex::new(None),
@@ -181,7 +211,18 @@ mod client_computation_tests {
                     .unwrap();
                 *control.sender.lock().unwrap() = Some(sender);
                 let mut binding = test_root_binding(root, window.0.try_clone().unwrap(), None);
-                binding.port = Arc::new(EndPort);
+                if scalar_schema.is_some() {
+                    binding.frontier = super::super::super::RootRelayFrontier::new(
+                        root,
+                        novarocks_result_contract::RootProfileId::V1,
+                        novarocks_result_contract::RootOutputKind::InternalFacts(
+                            novarocks_result_contract::InternalResultDomain::ScalarValueV1,
+                        ),
+                        None,
+                    )
+                    .unwrap();
+                }
+                binding.port = Arc::new(EndPort { scalar_schema });
                 Ok(ActivatedNativeAttempt::relayed_rows(
                     Active {
                         contexts,
@@ -271,13 +312,14 @@ mod client_computation_tests {
         payload: &RetainedPayloadGrant,
         root: &WorkScope,
         owner: &WorkOwner,
-        window: &novarocks_workload_control::ResultWindowAlias,
+        window: Option<&novarocks_workload_control::ResultWindowAlias>,
     ) -> InternalComputationGrant {
-        let mut builder = payload
-            .root_stage_source(root, owner)
-            .unwrap()
-            .for_client_window(window)
-            .unwrap()
+        let source = payload.root_stage_source(root, owner).unwrap();
+        let source = match window {
+            Some(window) => source.for_client_window(window).unwrap(),
+            None => source,
+        };
+        let mut builder = source
             .begin(8 * 1024 * 1024, JointLane::Foreground)
             .unwrap();
         builder.end_payload().unwrap();
@@ -294,23 +336,39 @@ mod client_computation_tests {
             .notify();
         compute.unwrap()
     }
-    fn request(
+    async fn request(
         capacity: QueryResultCapacityBinding,
-        attempts: Preparation,
+        mut attempts: Preparation,
+        internal: bool,
     ) -> QueryExecutionRequest {
         use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
-        let plan = crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version());
-        let render =
-            novarocks_sql::compiler::client_render_schema(plan.candidate().plan(), 0).unwrap();
+        let plan = if internal {
+            crate::completed_plan_fixture::completed_literal_query(
+                fixture_version(),
+                "SELECT 1 AS a",
+            )
+            .await
+        } else {
+            crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version())
+        };
+        let root_output = if internal {
+            FrozenRootOutput::ScalarValue(
+                plan.candidate()
+                    .original_public_result_port()
+                    .and_then(|port| port.scalar_schema.clone())
+                    .expect("the actual one-column SQL result has its frozen scalar contract"),
+            )
+        } else {
+            let render =
+                novarocks_sql::compiler::client_render_schema(plan.candidate().plan(), 0).unwrap();
+            FrozenRootOutput::ClientRows(render)
+        };
         let candidate = crate::preparation::CompletedPhysicalPlanCandidate::for_program(
             plan.candidate()
                 .plan()
                 .as_ref()
                 .clone()
-                .with_root_output(RootOutputContract::new(
-                    RootProfileId::V1,
-                    FrozenRootOutput::ClientRows(render),
-                ))
+                .with_root_output(RootOutputContract::new(RootProfileId::V1, root_output))
                 .unwrap(),
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
@@ -332,6 +390,7 @@ mod client_computation_tests {
             ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
         )
         .unwrap();
+        attempts.scalar_schema = description.scalar_schema().cloned();
         QueryExecutionRequest::bind_native(
             description,
             PermanentlyBackpressuredAbortEffectPort::shared(),
@@ -375,7 +434,10 @@ mod client_computation_tests {
         }
     }
     async fn success_cut(hold_activity: bool) {
-        let mut control = governance_with_client_compute(true);
+        streamed_success_cut(hold_activity, false).await;
+    }
+    async fn streamed_success_cut(hold_activity: bool, internal: bool) {
+        let mut control = governance_with_result_positions(!internal, None, internal.then_some(1));
         let (observations, cleanup, shutdown) = {
             let root = control.begin_root().await;
             let scope = root.owner.scope();
@@ -406,30 +468,54 @@ mod client_computation_tests {
             drop(pending);
             let payload = payload.unwrap();
             let first = child(&scope).await;
-            let window = scope
-                .result_capacity()
-                .unwrap()
-                .try_acquire(
+            let window = if internal {
+                None
+            } else {
+                Some(
+                    scope
+                        .result_capacity()
+                        .unwrap()
+                        .try_acquire(
+                            &scope,
+                            novarocks_workload_control::ResultWindowClass::Client,
+                        )
+                        .unwrap(),
+                )
+            };
+            let stage_window = window.as_ref().map(|window| window.retain_alias());
+            let mut compute = Some(stage(&payload, &scope, &first, stage_window.as_ref()).await);
+            let activity_alias = (internal && hold_activity)
+                .then(|| compute.as_ref().unwrap().retain_alias().unwrap());
+            let mut capacity = None;
+            if internal {
+                QueryResultCapacityBinding::from_owned_internal_computation_in(
                     &scope,
-                    novarocks_workload_control::ResultWindowClass::Client,
+                    &first,
+                    &payload,
+                    &mut compute,
+                    &mut capacity,
                 )
                 .unwrap();
-            let mut compute = Some(stage(&payload, &scope, &first, &window.retain_alias()).await);
-            let mut capacity = None;
-            QueryResultCapacityBinding::from_owned_client_computation_in(
-                &scope,
-                &first,
-                &window.retain_alias(),
-                &payload,
-                &mut compute,
-                &mut capacity,
-            )
-            .unwrap();
+            } else {
+                QueryResultCapacityBinding::from_owned_client_computation_in(
+                    &scope,
+                    &first,
+                    stage_window.as_ref().unwrap(),
+                    &payload,
+                    &mut compute,
+                    &mut capacity,
+                )
+                .unwrap();
+            }
+            assert!(
+                compute.is_none(),
+                "the same positive grant moved into original custody"
+            );
             let capacity = capacity.unwrap();
             assert_eq!(
                 scope.result_capacity().unwrap().snapshot().held_positions,
-                [1, 0, 0, 0],
-                "Client computation must reuse its original Client window"
+                if internal { [0, 0, 1, 0] } else { [1, 0, 0, 0] },
+                "each streamed computation uses its actual original position class"
             );
             let original_tail = capacity.try_clone().unwrap();
             let old_manifest = capacity
@@ -452,12 +538,21 @@ mod client_computation_tests {
                 NonZeroU64::MIN,
                 NonZeroU64::MIN,
             );
-            let mut activity = hold_activity.then(|| capacity.begin_result_activity().unwrap());
+            let mut activity = hold_activity.then(|| {
+                if internal {
+                    capacity
+                        .begin_internal_result_activity(activity_alias.unwrap())
+                        .unwrap()
+                } else {
+                    capacity.begin_result_activity().unwrap()
+                }
+            });
             let signals = Arc::new(Signals::default());
             let attempts = Preparation {
                 backend: BackendProcessId::new_v7(),
                 window: TestWindow(capacity.try_window_alias().unwrap()),
                 signals: Arc::clone(&signals),
+                scalar_schema: None,
             };
             let (mut supervisor, client) = test_supervisor(
                 &control,
@@ -470,16 +565,16 @@ mod client_computation_tests {
             let second = child(&scope).await;
             let mut second_compute = None;
             let observations: Result<(), ClientObservationFailure> = async {
-                let mut execution = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    client.start(request(capacity, attempts), first),
-                )
-                .await
-                .map_err(|_| "Client start timeout")?
-                .map_err(|error| ClientObservationFailure::Execution {
-                    phase: "Client start",
-                    error,
-                })?;
+                let request = request(capacity, attempts, internal).await;
+                let scalar_schema = request.description().scalar_schema().cloned();
+                let mut execution =
+                    tokio::time::timeout(Duration::from_secs(2), client.start(request, first))
+                        .await
+                        .map_err(|_| "Client start timeout")?
+                        .map_err(|error| ClientObservationFailure::Execution {
+                            phase: "Client start",
+                            error,
+                        })?;
                 let mut exit = execution
                     .take_exit_observer()
                     .ok_or("original exit observer missing")?;
@@ -490,6 +585,39 @@ mod client_computation_tests {
                 rows.begin_schema()
                     .ok_or("Client schema delivery missing")?
                     .complete();
+                if internal {
+                    use novarocks_result_contract::{BorrowedScalarLeaf, BorrowedScalarRecord};
+                    let Some(crate::api::ResultDelivery::Segment(segment)) =
+                        tokio::time::timeout(Duration::from_secs(2), rows.next())
+                            .await
+                            .map_err(|_| "actual Internal scalar record timeout")?
+                            .map_err(|error| ClientObservationFailure::Execution {
+                                phase: "Internal scalar record",
+                                error,
+                            })?
+                    else {
+                        return Err(
+                            "ScalarValue requires its explicit original NoRows record".into()
+                        );
+                    };
+                    let frozen = scalar_schema
+                        .as_ref()
+                        .expect("the actual frozen Internal scalar schema");
+                    let record = BorrowedScalarRecord::try_decode(frozen, segment.body())
+                        .map_err(|_| "the actual scalar record must match its frozen contract")?;
+                    if record.rows() != 0 || segment.rows() != record.rows() {
+                        return Err(
+                            "the original scalar NoRows record must retain zero rows".into()
+                        );
+                    }
+                    if !matches!(
+                        BorrowedScalarLeaf::decode(frozen, segment.body()),
+                        Ok(BorrowedScalarLeaf::NoRows)
+                    ) {
+                        return Err("the original scalar record must represent NoRows".into());
+                    }
+                    segment.complete();
+                }
                 let delivery = tokio::time::timeout(Duration::from_secs(2), rows.next())
                     .await
                     .map_err(|_| "actual Client EOF timeout")?
@@ -505,11 +633,12 @@ mod client_computation_tests {
                 }
                 end.complete();
                 wait_preparation_exit_fact(&signals.sealed).await?;
-                let mut builder = payload
-                    .root_stage_source(&scope, &second)
-                    .unwrap()
-                    .for_client_window(&window.retain_alias())
-                    .unwrap()
+                let source = payload.root_stage_source(&scope, &second).unwrap();
+                let source = match stage_window.as_ref() {
+                    Some(window) => source.for_client_window(window).unwrap(),
+                    None => source,
+                };
+                let mut builder = source
                     .begin(8 * 1024 * 1024, JointLane::Foreground)
                     .unwrap();
                 builder.end_payload().unwrap();
@@ -548,10 +677,9 @@ mod client_computation_tests {
                     .notify();
                 drop(ready);
                 drop(next);
-                if scope.result_capacity().unwrap().snapshot().held_positions != [1, 0, 0, 0] {
-                    return Err(
-                        "Client stage incorrectly consumed a separate Internal position".into(),
-                    );
+                let expected = if internal { [0, 0, 1, 0] } else { [1, 0, 0, 0] };
+                if scope.result_capacity().unwrap().snapshot().held_positions != expected {
+                    return Err("streamed stage consumed a foreign position class".into());
                 }
                 if signals.cleanup_exited.load(Ordering::SeqCst) {
                     return Err("Native cleanup was not held".into());
@@ -589,7 +717,7 @@ mod client_computation_tests {
             }
             .await;
             eprintln!(
-                "Client hold_activity={hold_activity}, observations={observations:?}, actual_exit_snapshot: sealed={}, local_run_exited={}, cleanup_entered={}, cleanup_exited={}",
+                "streamed internal={internal}, hold_activity={hold_activity}, observations={observations:?}, actual_exit_snapshot: sealed={}, local_run_exited={}, cleanup_entered={}, cleanup_exited={}",
                 signals.sealed.load(Ordering::SeqCst),
                 signals.local_run_exited.load(Ordering::SeqCst),
                 signals.cleanup_entered.load(Ordering::SeqCst),
@@ -606,6 +734,7 @@ mod client_computation_tests {
                 old_authority,
                 old_manifest,
                 original_tail,
+                stage_window,
                 window,
                 payload,
             ));
@@ -626,5 +755,13 @@ mod client_computation_tests {
     #[tokio::test]
     async fn client_success_seal_waits_actual_activity_exit_before_p1_reuse() {
         success_cut(true).await;
+    }
+    #[tokio::test]
+    async fn internal_read_success_releases_actual_p1_before_original_native_cleanup() {
+        streamed_success_cut(false, true).await;
+    }
+    #[tokio::test]
+    async fn internal_read_success_cut_waits_actual_activity_before_p1_reuse() {
+        streamed_success_cut(true, true).await;
     }
 }
