@@ -15,105 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
-use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, RefreshSnapshotPinOccurrence};
+use crate::mv::domain::refresh::pin::RefreshSnapshotPinOccurrence;
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
-use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
-use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorErrorKind, ConnectorExactSemanticRevision,
-    ConnectorRequestContext,
-};
+use novarocks_spi::connector::ConnectorExactSemanticRevision;
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_types::naming::TableIdentity;
-#[cfg(test)]
-use std::sync::Arc;
-
-/// Capture refresh pins from the exact connector-control and storage-observation
-/// capabilities selected by the caller.  This keeps an EXPLAIN or foreground
-/// refresh attempt from reconstructing application state just to re-observe
-/// a base table.
-pub fn capture_refresh_snapshot_pin_with_ports(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredKeyedMvProjection,
-    connector_context: &ConnectorRequestContext,
-) -> Result<RefreshSnapshotPin, String> {
-    let relations = &projection.facts.definition().relation_occurrences;
-    let mut entries = Vec::with_capacity(relations.len());
-    for relation in relations {
-        let base_ref = TableIdentity {
-            catalog: relation.catalog_at_binding.clone(),
-            namespace: relation.namespace_at_binding.clone(),
-            table: relation.relation_at_binding.clone(),
-        };
-        let (observed, exact_revision) =
-            crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
-                connector_control,
-                storage_observation,
-                &base_ref,
-                connector_context,
-            )?;
-        entries.push(finish_pin_occurrence(
-            relation.occurrence_id,
-            &relation.object_id,
-            base_ref,
-            observed,
-            exact_revision,
-        )?);
-    }
-    RefreshSnapshotPin::try_from_occurrences(entries)
-}
-
-/// Await observations through the caller's original capabilities; retaining and
-/// driving those capabilities remains the caller's responsibility.
-pub async fn capture_refresh_snapshot_pin_with_ports_async(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredKeyedMvProjection,
-    connector_context: &ConnectorRequestContext,
-) -> Result<RefreshSnapshotPin, MvApplicationError> {
-    let relations = &projection.facts.definition().relation_occurrences;
-    let mut entries = Vec::with_capacity(relations.len());
-    for relation in relations {
-        let base_ref = TableIdentity {
-            catalog: relation.catalog_at_binding.clone(),
-            namespace: relation.namespace_at_binding.clone(),
-            table: relation.relation_at_binding.clone(),
-        };
-        let (observed, exact_revision) =
-            crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports_async(
-                connector_control,
-                storage_observation,
-                &base_ref,
-                connector_context,
-            )
-            .await
-            .map_err(|error| {
-                let kind = if error.kind() == ConnectorErrorKind::Unavailable {
-                    MvApplicationErrorKind::Unavailable
-                } else {
-                    MvApplicationErrorKind::Engine
-                };
-                MvApplicationError::from_connector(kind, error)
-            })?;
-        entries.push(
-            finish_pin_occurrence(
-                relation.occurrence_id,
-                &relation.object_id,
-                base_ref,
-                observed,
-                exact_revision,
-            )
-            .map_err(invalid_pin)?,
-        );
-    }
-    RefreshSnapshotPin::try_from_occurrences(entries).map_err(invalid_pin)
-}
-
-fn invalid_pin(message: String) -> MvApplicationError {
-    MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, message)
-}
 
 pub(crate) fn finish_pin_occurrence(
     occurrence_id: u32,
@@ -153,125 +59,12 @@ pub(crate) fn finish_pin_occurrence(
 }
 
 #[cfg(test)]
-type AfterCaptureHook = Arc<dyn Fn() + Send + Sync>;
-
-#[cfg(test)]
-struct AfterCaptureHookRegistration {
-    owner: std::thread::ThreadId,
-    hook: AfterCaptureHook,
-}
-
-#[cfg(test)]
-fn lock_after_capture_hook_for_test() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("after_capture_hook test lock")
-}
-
-#[cfg(test)]
-fn after_capture_hook_slot() -> &'static std::sync::Mutex<Option<AfterCaptureHookRegistration>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCaptureHookRegistration>>> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn invoke_after_capture_hook() {
-    let current_thread = std::thread::current().id();
-    let hook = after_capture_hook_slot()
-        .lock()
-        .expect("after_capture_hook lock")
-        .as_ref()
-        .and_then(|registration| {
-            (registration.owner == current_thread).then(|| Arc::clone(&registration.hook))
-        });
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-/// Test-only race seam.  Production callers must retain every exact base
-/// materialization before any post-capture work can observe a newer table
-/// generation.
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn invoke_after_capture_hook_for_test() {
-    invoke_after_capture_hook();
-}
-
-#[cfg(test)]
-fn set_after_capture_hook(f: AfterCaptureHook) {
-    *after_capture_hook_slot()
-        .lock()
-        .expect("after_capture_hook lock") = Some(AfterCaptureHookRegistration {
-        owner: std::thread::current().id(),
-        hook: f,
-    });
-}
-
-#[cfg(test)]
-fn clear_after_capture_hook() {
-    *after_capture_hook_slot()
-        .lock()
-        .expect("after_capture_hook lock") = None;
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) struct AfterCaptureHookGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl AfterCaptureHookGuard {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn install(hook: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let lock = lock_after_capture_hook_for_test();
-        set_after_capture_hook(hook);
-        Self { _lock: lock }
-    }
-}
-
-#[cfg(test)]
-impl Drop for AfterCaptureHookGuard {
-    fn drop(&mut self) {
-        clear_after_capture_hook();
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn after_capture_hook_round_trip() {
-        let _hook_lock = lock_after_capture_hook_for_test();
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_for_hook = Arc::clone(&flag);
-        set_after_capture_hook(Arc::new(move || {
-            flag_for_hook.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
-        std::thread::spawn(invoke_after_capture_hook)
-            .join()
-            .expect("invoke hook from non-owner thread");
-        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
-        invoke_after_capture_hook();
-        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
-        clear_after_capture_hook();
-        flag.store(false, std::sync::atomic::Ordering::SeqCst);
-        invoke_after_capture_hook();
-        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
-    }
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
+    use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
+    use novarocks_spi::connector::ConnectorRequestContext;
 
     fn observation(
         object: &[u8],
@@ -386,7 +179,7 @@ mod tests {
             finish_pin_occurrence(9, &persisted, base_ref(), empty, empty_revision).unwrap_err();
         assert!(missing.contains("has no current snapshot"));
         for message in [mismatch, changed, missing] {
-            let error = invalid_pin(message.clone());
+            let error = PreparationError::from(message.clone()).0;
             assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
             assert_eq!(error.message(), message);
             assert_eq!(error.original_failure(), None);

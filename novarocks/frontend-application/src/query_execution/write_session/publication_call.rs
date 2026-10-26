@@ -253,18 +253,18 @@ impl WritePublicationCall {
                     let pending = !matches!(self.session.has_unreceived_productions(), Ok(false));
                     if let Some(Ok(ConnectorWriteAbortOutcome::KnownUncommitted { cleanup })) =
                         &mut self.abort_outcome
+                        && pending
+                        && matches!(
+                            cleanup,
+                            novarocks_spi::connector::ExternalMutationFinalization::Complete
+                        )
                     {
-                        if pending
-                            && matches!(
-                                cleanup,
-                                novarocks_spi::connector::ExternalMutationFinalization::Complete
-                            )
-                        {
-                            *cleanup = novarocks_spi::connector::ExternalMutationFinalization::Failed(
-                                novarocks_spi::connector::ConnectorMutationFailure::new(
-                                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                                    "unreceived writer outputs retain an unknown object inventory"));
-                        }
+                        *cleanup = novarocks_spi::connector::ExternalMutationFinalization::Failed(
+                            novarocks_spi::connector::ConnectorMutationFailure::new(
+                                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                                "unreceived writer outputs retain an unknown object inventory",
+                            ),
+                        );
                     }
                     let unknown = matches!(
                         self.abort_outcome,
@@ -392,11 +392,12 @@ impl WritePublicationCall {
             return Poll::Pending;
         }
         let polled = self.poll_actual_completion(cx);
-        if !self.poll_poisoned && polled.is_pending() {
-            if let Err(cause) = self.retain_needed_for_close() {
-                self.health=novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("write needed-ready close handoff failed",Arc::new(cause));
-                return Poll::Pending;
-            }
+        if !self.poll_poisoned
+            && polled.is_pending()
+            && let Err(cause) = self.retain_needed_for_close()
+        {
+            self.health=novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("write needed-ready close handoff failed",Arc::new(cause));
+            return Poll::Pending;
         }
         polled
     }

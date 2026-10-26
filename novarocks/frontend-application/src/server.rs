@@ -571,9 +571,6 @@ async fn build_frontend_role_products(
                     host.workload_root_admission(),
                 ),
             ),
-            crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
-                &statistics_connector_control,
-            )),
             core_capabilities::statistics_attempt_executor(
                 core_capabilities::StatisticsAttemptExecutorPorts::new(
                     role,

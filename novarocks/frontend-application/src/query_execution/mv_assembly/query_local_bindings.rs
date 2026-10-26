@@ -317,7 +317,6 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
         validate_source_revisions_original(
             &materialization,
             current.iter().chain(previous.values()),
-            &base,
         )?;
         materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot_id);
         let mut frozen_snapshot_ids = current
@@ -388,7 +387,6 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
 fn validate_source_revisions_original<'a>(
     materialization: &crate::catalog_application::query_catalog::ConnectorQueryTableMaterialization,
     sources: impl Iterator<Item = &'a MvRewriteSourceSnapshot>,
-    base: &TableIdentity,
 ) -> Result<
     (),
     crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,

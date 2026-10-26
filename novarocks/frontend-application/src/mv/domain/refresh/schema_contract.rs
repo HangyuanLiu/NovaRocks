@@ -17,7 +17,6 @@
 
 //! Exact D/L schema validation; no legacy descriptor or schema-contract recovery.
 
-use crate::mv::domain::refresh::observation::observe_schema_validation_for_table;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_mv_application::persistence::codec::{InterpretationDocument, RelationOccurrence};
@@ -26,10 +25,6 @@ use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProject
 use novarocks_mv_application::persistence::runtime_bindings::{
     MvRuntimeBindings, reconstruct_keyed_runtime_bindings,
 };
-use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorRequestContext, MvStorageObservationPort,
-};
-use novarocks_types::naming::TableIdentity;
 
 /// A query-local rename, identified by D occurrence and opaque provider field.
 /// The SQL owner must apply these facts with lexical occurrence scope.
@@ -143,47 +138,6 @@ pub(crate) fn validate_aggregate_schema_contract_for_base(
     validate_relation_occurrence_schema(occurrence, base_observation)
 }
 
-/// Repartition admission validates the currently installed interpretation first.
-/// Applying renamed input columns requires the SQL owner's occurrence-aware rewriter.
-pub(crate) fn validate_repartition_schema_contract(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
-    target_observation: &MvSchemaValidationObservation,
-    connector_context: &ConnectorRequestContext,
-) -> Result<(), String> {
-    validate_projection_target(projection, target_observation)?;
-    let occurrences = &projection.facts.definition().relation_occurrences;
-    if occurrences.len() != base_refs.len() {
-        return Err(
-            "MV repartition source references do not retain every D occurrence".to_string(),
-        );
-    }
-    for (occurrence, table) in occurrences.iter().zip(base_refs) {
-        if occurrence.catalog_at_binding != table.catalog
-            || occurrence.namespace_at_binding != table.namespace
-            || occurrence.relation_at_binding != table.table
-        {
-            return Err(format!(
-                "MV repartition locator does not match occurrence {}",
-                occurrence.occurrence_id
-            ));
-        }
-        let observed = observe_schema_validation_for_table(
-            connector_control,
-            storage_observation,
-            table,
-            connector_context,
-        )?;
-        let renames = validate_relation_occurrence_schema(occurrence, &observed)?;
-        if !renames.is_empty() {
-            return Err("MV repartition requires occurrence-aware SQL field rebinding".to_string());
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,8 +145,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
-        ConnectorCommittedVersion, ConnectorInstanceId, ConnectorTableIdentity,
-        ConnectorTableObjectId, MvObservedSourceField,
+        ConnectorCommittedVersion, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableIdentity, ConnectorTableObjectId, MvObservedSourceField,
         MvSchemaValidationObservation as SpiObservation,
     };
 

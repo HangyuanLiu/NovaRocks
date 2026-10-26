@@ -273,13 +273,13 @@ impl BackgroundManagementPass {
             if let Some(io) = &self.io {
                 let _ = io.poll_continuing(cx);
             }
-            if let Some(store) = &self.store {
-                if let Err(cause) = store.poll_progress(cx) {
-                    return Poll::Ready(Err(StatementNativeHealthFailure::actual_exit_unproven(
-                        "MV cadence StateStore progress is unproven",
-                        Arc::new(cause),
-                    )));
-                }
+            if let Some(store) = &self.store
+                && let Err(cause) = store.poll_progress(cx)
+            {
+                return Poll::Ready(Err(StatementNativeHealthFailure::actual_exit_unproven(
+                    "MV cadence StateStore progress is unproven",
+                    Arc::new(cause),
+                )));
             }
             let capture = self.capture.poll_closed(cx);
             if let Some(health) = self.local_health_failure() {
@@ -470,6 +470,25 @@ impl ScheduledCall {
                         None
                     }
                 };
+                if let Some(catalog) = self.request.target.catalog.as_deref()
+                    && controls
+                        .transient_preparation(
+                            catalog,
+                            &self.request.target.database,
+                            &self.request.target.name,
+                        )
+                        .map_err(|error| {
+                            QueryServiceError::new(QueryServiceErrorKind::Unavailable, error)
+                        })?
+                {
+                    return Poll::Ready(Err(QueryServiceError::new(
+                        QueryServiceErrorKind::Unavailable,
+                        format!(
+                            "test-injected temporary connector unavailability while preparing {}.{}.{}",
+                            catalog, self.request.target.database, self.request.target.name
+                        ),
+                    )));
+                }
             }
         }
         if !self.initialized {
@@ -812,12 +831,11 @@ impl SchedulerOriginal {
             }
             let decision = scheduler::complete(&product, &request, disposition, now_unix_millis());
             #[cfg(novarocks_dev_controls)]
-            if let Some(admitted) = call.outcome.take() {
-                if let Some(controls) = self.dependencies.readiness.test_controls() {
-                    if let Err(error) = controls.scheduler_request_completed(admitted, &decision) {
-                        tracing::warn!(%error,"finite MV scheduler terminal observation failed");
-                    }
-                }
+            if let Some(admitted) = call.outcome.take()
+                && let Some(controls) = self.dependencies.readiness.test_controls()
+                && let Err(error) = controls.scheduler_request_completed(admitted, &decision)
+            {
+                tracing::warn!(%error,"finite MV scheduler terminal observation failed");
             }
             #[cfg(not(novarocks_dev_controls))]
             let _ = decision;
@@ -1078,48 +1096,48 @@ impl MaintenanceOriginal {
                     }
                 }
             }
-            if !stop.is_requested() {
-                if let (Some(isolation), Some(entrance), Some(continuation)) = (
+            if !stop.is_requested()
+                && let (Some(isolation), Some(entrance), Some(continuation)) = (
                     self.isolation.as_ref(),
                     product.management_entrance(),
                     product.management_continuation(),
+                )
+            {
+                body.startup = Some(Default::default());
+                let receiving = body.startup.as_mut().unwrap();
+                match receiving.prepare_file_in(
+                    isolation,
+                    &self.dependencies.execution.blocking,
+                    &pass.root.as_ref().unwrap().owner.scope(),
+                    pass.window.as_ref().unwrap(),
                 ) {
-                    body.startup = Some(Default::default());
-                    let receiving = body.startup.as_mut().unwrap();
-                    match receiving.prepare_file_in(
-                        isolation,
-                        &self.dependencies.execution.blocking,
-                        &pass.root.as_ref().unwrap().owner.scope(),
-                        pass.window.as_ref().unwrap(),
-                    ) {
-                        Err(error) => {
-                            tracing::warn!(%error, "MV startup continuation could not prepare its original file source")
-                        }
-                        Ok(()) => {
-                            let mut continuation_f = Box::pin(crate::mv::domain::startup_continuation::run_startup_continuation_pass_async_in(&entrance, &continuation, &readiness, self.dependencies.ports.connector_control(), isolation, pass.context.as_ref().unwrap(), pass.metadata_cpu.as_ref().unwrap(), receiving));
-                            std::future::poll_fn(|cx| {
-                                let _ = pass.poll_progress(&stop, cx);
-                                if let Some(health) = pass.local_health_failure() {
-                                    std::panic::panic_any(health);
-                                }
-                                match continuation_f.as_mut().poll(cx) {
-                                    Poll::Pending => Poll::Pending,
-                                    Poll::Ready(report) => {
-                                        body.startup_report = Some(report);
-                                        Poll::Ready(())
-                                    }
-                                }
-                            })
-                            .await;
-                            drop(continuation_f);
-                            std::future::poll_fn(|cx| {
-                                let _ = pass.poll_progress(&stop, cx);
-                                receiving.poll_closed(cx)
-                            })
-                            .await;
-                            if let Some(health) = receiving.local_health_failure() {
+                    Err(error) => {
+                        tracing::warn!(%error, "MV startup continuation could not prepare its original file source")
+                    }
+                    Ok(()) => {
+                        let mut continuation_f = Box::pin(crate::mv::domain::startup_continuation::run_startup_continuation_pass_async_in(&entrance, &continuation, &readiness, self.dependencies.ports.connector_control(), isolation, pass.context.as_ref().unwrap(), pass.metadata_cpu.as_ref().unwrap(), receiving));
+                        std::future::poll_fn(|cx| {
+                            let _ = pass.poll_progress(&stop, cx);
+                            if let Some(health) = pass.local_health_failure() {
                                 std::panic::panic_any(health);
                             }
+                            match continuation_f.as_mut().poll(cx) {
+                                Poll::Pending => Poll::Pending,
+                                Poll::Ready(report) => {
+                                    body.startup_report = Some(report);
+                                    Poll::Ready(())
+                                }
+                            }
+                        })
+                        .await;
+                        drop(continuation_f);
+                        std::future::poll_fn(|cx| {
+                            let _ = pass.poll_progress(&stop, cx);
+                            receiving.poll_closed(cx)
+                        })
+                        .await;
+                        if let Some(health) = receiving.local_health_failure() {
+                            std::panic::panic_any(health);
                         }
                     }
                 }
@@ -1130,17 +1148,17 @@ impl MaintenanceOriginal {
         // File/Provider children and their actual receipts retire before the
         // StateStore and MIO parent, on both normal and stopped paths.
         drop(body.startup.take());
-        if let Some(report) = body.startup_report.take() {
-            if !report.is_silent() {
-                tracing::info!(
-                    readmitted = report.readmitted,
-                    waiting = report.waiting,
-                    operator_only = report.operator_only,
-                    not_covered = report.not_covered,
-                    failed = report.failed,
-                    "MV startup continuation pass"
-                );
-            }
+        if let Some(report) = body.startup_report.take()
+            && !report.is_silent()
+        {
+            tracing::info!(
+                readmitted = report.readmitted,
+                waiting = report.waiting,
+                operator_only = report.operator_only,
+                not_covered = report.not_covered,
+                failed = report.failed,
+                "MV startup continuation pass"
+            );
         }
         if let Err(health) = body.management.as_mut().unwrap().close().await {
             std::panic::panic_any(health);

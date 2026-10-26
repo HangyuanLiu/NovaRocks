@@ -33,6 +33,10 @@ use std::sync::Mutex;
 
 type Access = FinalPlanRuntimeAccess<FrozenProviderRead>;
 type CompileResult<T> = Result<T, novarocks_sql::compiler::SqlCompileError>;
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The complete rewrite input belongs to the original Arc-owned CpuBody and its same-body loan; inline variants avoid an additional variant allocation."
+)]
 enum OriginalInput {
     BeginRequest {
         plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
@@ -65,6 +69,10 @@ enum OriginalInput {
         constant_policy: novarocks_functions::ConstantPolicy,
     },
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The original Arc-owned CpuBody and its same-body loan retain this complete rewrite result until its existing transfer; inline variants avoid an additional variant allocation."
+)]
 enum OriginalOutput {
     BeginRequest {
         request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
@@ -321,11 +329,11 @@ impl RewritePreparationCustody {
         }
         if let Some(original) = self.original.as_ref() {
             let mut loan = CpuLoan::take(original);
-            if let OriginalInput::Freeze { access, .. } = &mut loan.body.as_mut().unwrap().input {
-                if let Some(access) = access.take() {
-                    assert!(self.returned.is_none());
-                    self.returned = Some(access.into_taken());
-                }
+            if let OriginalInput::Freeze { access, .. } = &mut loan.body.as_mut().unwrap().input
+                && let Some(access) = access.take()
+            {
+                assert!(self.returned.is_none());
+                self.returned = Some(access.into_taken());
             }
         }
     }

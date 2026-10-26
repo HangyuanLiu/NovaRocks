@@ -453,13 +453,13 @@ impl State {
             })
     }
     fn progress_state_store(&mut self, cx: &mut Context<'_>) {
-        if let Some(original) = &self.state_store {
-            if let Err(failure) = original.poll_progress(cx) {
-                // Keep the port's original progress failure while the Product
-                // receives its own result. Health remains independently owned
-                // by the same port and is observed through local_health().
-                self.state_store_progress_failure.get_or_insert(failure);
-            }
+        if let Some(original) = &self.state_store
+            && let Err(failure) = original.poll_progress(cx)
+        {
+            // Keep the port's original progress failure while the Product
+            // receives its own result. Health remains independently owned
+            // by the same port and is observed through local_health().
+            self.state_store_progress_failure.get_or_insert(failure);
         }
     }
     fn poll_state_store_closed(
@@ -711,10 +711,10 @@ async fn receive(body: &mut Body) -> Result<(), String> {
         .as_ref()
         .ok_or("cleanup original provider Source is absent")?;
     let result = std::future::poll_fn(|cx| source.poll_output(cx)).await;
-    if let Err(error) = &result {
-        if body.first_error.is_none() {
-            body.first_error = Some(error.clone());
-        }
+    if let Err(error) = &result
+        && body.first_error.is_none()
+    {
+        body.first_error = Some(error.clone());
     }
     body.output = Some(result);
     receive_original_failure(body);

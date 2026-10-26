@@ -22,7 +22,6 @@
 //! statistics application crate owns current-process job state and worker
 //! composition.
 
-use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::fmt;
 use std::sync::Arc;
 
@@ -30,12 +29,11 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningLease, ConnectorControlRegistry,
     ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
-    ConnectorTableObjectSelector, ConnectorTableRequest, ConnectorTableResolution,
-    LakePublicationId, MAX_CONNECTOR_STATISTICS_METRICS, StatisticsBasisRelation,
-    StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
+    ConnectorTableObjectSelector, ConnectorTableResolution, LakePublicationId,
+    StatisticsBasisRelation, StatisticsDataVersion, StatisticsMetric, StatisticsMetricSource,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -123,22 +121,6 @@ pub trait StatisticsTargetResolver: Send + Sync {
             ))
         })
     }
-    fn capture_table_object(
-        &self,
-        target: &StatisticsTableTarget,
-        context: ConnectorRequestContext,
-    ) -> Result<StatisticsTargetCapture, StatisticsApplicationError>;
-}
-
-/// Read-only frontend table-statistics surface. Unlike ANALYZE submission, it is
-/// intentionally short-lived and resolves its latest table
-/// metadata only for this one short-lived read.
-pub trait StatisticsTableReader: Send + Sync {
-    fn show_table_stats(
-        &self,
-        target: &StatisticsTableTarget,
-        context: ConnectorRequestContext,
-    ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError>;
 }
 
 pub struct ConnectorStatisticsTargetResolver {
@@ -152,64 +134,6 @@ impl ConnectorStatisticsTargetResolver {
 }
 
 impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
-    fn capture_table_object(
-        &self,
-        target: &StatisticsTableTarget,
-        context: ConnectorRequestContext,
-    ) -> Result<StatisticsTargetCapture, StatisticsApplicationError> {
-        let instance_id = ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let lease = self
-            .controls
-            .acquire_current(&instance_id)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        if lease.binding().statistics().is_none() {
-            return Err(StatisticsApplicationError::from_connector_error(
-                ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                    "connector control generation has no statistics capability",
-                ),
-            ));
-        }
-        let captured = lease
-            .binding()
-            .metadata()
-            .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
-                table: ConnectorTableIdentity {
-                    instance_id,
-                    namespace: Arc::from(target.namespace.as_str()),
-                    table: Arc::from(target.table.as_str()),
-                },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                selector: ConnectorTableObjectSelector::Current,
-                context: context.clone(),
-            })
-            .map_err(StatisticsApplicationError::from_connector_error)?;
-        let job_admission = lease
-            .binding()
-            .metadata()
-            .admit_table_job(
-                novarocks_spi::connector::ConnectorTableJobAdmissionRequest {
-                    table: ConnectorTableIdentity {
-                        instance_id: ConnectorInstanceId::parse(&target.catalog)
-                            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-                        namespace: Arc::from(target.namespace.as_str()),
-                        table: Arc::from(target.table.as_str()),
-                    },
-                    job: novarocks_spi::connector::ConnectorTableJobKind::Statistics,
-                    context: context.clone(),
-                },
-            )
-            .map_err(StatisticsApplicationError::from_connector_error)?;
-        Ok(StatisticsTargetCapture {
-            job_admission,
-            connector_instance_id: captured.metadata.table.owner().as_str().to_string(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            object_id: captured.object_id.as_bytes().to_vec(),
-            sql_columns: sql_visible_column_names(captured.metadata.schema()),
-        })
-    }
     fn planning_lease(
         &self,
         target: &StatisticsTableTarget,
@@ -292,48 +216,6 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
     }
 }
 
-/// Rebind a durable request through the caller's existing planning lease.
-///
-/// This keeps metadata rebinding and statistics preparation in one connector
-/// generation, and the returned provider facts remain attempt-local.
-pub(crate) fn rebind_table_object(
-    lease: &ConnectorControlPlanningLease,
-    context: ConnectorRequestContext,
-    request: &StatisticsAttemptRequest,
-) -> Result<StatisticsAttemptBinding, StatisticsApplicationError> {
-    let instance_id = ConnectorInstanceId::parse(&request.connector_instance_id)
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-    let expected_object_id =
-        ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&request.object_id))
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-    let ConnectorTableObjectBinding { metadata, .. } = lease
-        .binding()
-        .metadata()
-        .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(request.namespace.as_str()),
-                table: Arc::from(request.table.as_str()),
-            },
-            expected_object_id,
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            selector: ConnectorTableObjectSelector::Current,
-            context,
-        })
-        .map_err(StatisticsApplicationError::from_connector_error)?;
-    let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
-        StatisticsApplicationError::new(
-            "connector metadata did not provide a statistics data-version for rebound table",
-        )
-    })?;
-    let sql_columns = sql_visible_columns(metadata.schema());
-    Ok(StatisticsAttemptBinding {
-        table: metadata.table,
-        data_version,
-        sql_columns,
-    })
-}
-
 pub(crate) async fn rebind_table_object_async(
     lease: &ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
@@ -401,119 +283,6 @@ fn sql_visible_column_names(schema: &arrow::datatypes::Schema) -> Vec<String> {
         .iter()
         .map(|field| field.name().clone())
         .collect()
-}
-
-pub struct ConnectorStatisticsTableReader {
-    controls: Arc<dyn ConnectorControlRegistry>,
-}
-
-impl ConnectorStatisticsTableReader {
-    pub fn new(controls: Arc<dyn ConnectorControlRegistry>) -> Self {
-        Self { controls }
-    }
-}
-
-impl StatisticsTableReader for ConnectorStatisticsTableReader {
-    fn show_table_stats(
-        &self,
-        target: &StatisticsTableTarget,
-        context: ConnectorRequestContext,
-    ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError> {
-        let metadata = load_statistics_table_metadata(
-            self.controls.as_ref(),
-            context.clone(),
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            ConnectorTableResolution::StrictBaseTable,
-        )
-        .map_err(StatisticsApplicationError::new)?;
-        let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
-            StatisticsApplicationError::new(
-                "connector metadata did not provide a statistics data-version pin",
-            )
-        })?;
-        let sql_columns = sql_visible_columns(metadata.schema());
-        let requested_column_metric_count = sql_columns.len().saturating_mul(5);
-        if requested_column_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
-            return Err(StatisticsApplicationError::new(format!(
-                "SHOW TABLE STATS requires {requested_column_metric_count} column metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
-            )));
-        }
-        let requested_metric_count = 1usize.saturating_add(requested_column_metric_count);
-        let mut metrics = Vec::with_capacity(requested_metric_count);
-        metrics.push(StatisticsMetric::RowCount);
-        for column in sql_columns {
-            let name: Arc<str> = Arc::from(column.name().as_str());
-            metrics.extend([
-                StatisticsMetric::NullCount {
-                    column: Arc::clone(&name),
-                },
-                StatisticsMetric::Minimum {
-                    column: Arc::clone(&name),
-                },
-                StatisticsMetric::Maximum {
-                    column: Arc::clone(&name),
-                },
-                StatisticsMetric::AverageSize {
-                    column: Arc::clone(&name),
-                },
-                StatisticsMetric::ThetaNdv { column: name },
-            ]);
-        }
-        let metrics = StatisticsMetricRequest::try_new(metrics)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let lease = self
-            .controls
-            .acquire_current_statistics(metadata.table.owner())
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let evidence = lease
-            .read(StatisticsReadRequest {
-                // An ANALYZE job measures the table, not one query's read.
-                narrowed_read: None,
-                table: metadata.table,
-                data_version,
-                metrics,
-                context,
-            })
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let queried_version = evidence.data_version().clone();
-        Ok(evidence
-            .into_metrics()
-            .into_iter()
-            .map(|(metric, state)| statistics_table_stat_view(metric, state, &queried_version))
-            .collect())
-    }
-}
-
-/// Load one short-lived statistics observation directly through the
-/// frontend-owned connector-control registry.  This preserves the exact
-/// generation lease for the load and does not expose a Core metadata bridge.
-fn load_statistics_table_metadata(
-    controls: &dyn ConnectorControlRegistry,
-    context: ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    resolution: ConnectorTableResolution,
-) -> Result<ConnectorTableMetadata, String> {
-    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let binding = controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
-    binding
-        .binding()
-        .metadata()
-        .load_frontend_table(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            resolution,
-            context,
-        })
-        .map_err(|error| error.to_string())
 }
 
 /// Placeholder for the per-metric columns of a row that has no measured value.

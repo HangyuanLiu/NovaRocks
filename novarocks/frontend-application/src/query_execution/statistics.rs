@@ -296,34 +296,6 @@ impl StatisticsRelationIdentity {
     }
 }
 
-/// Frontend authorities one statistics collection is planned with.
-///
-/// There are only two, because a completed plan negotiates its own read
-/// through the provider-read protocol: the control that read is frozen
-/// through, and the catalog the collection's aggregates are bound in.
-pub struct CompletedStatisticsPlanningServices<'a> {
-    constant_policy: novarocks_functions::ConstantPolicy,
-    typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
-    functions: &'a novarocks_functions::EngineFunctionCatalog,
-    static_plan_carrier: &'a crate::query_execution::package_freeze::CompiledPackageCarrier,
-}
-
-impl<'a> CompletedStatisticsPlanningServices<'a> {
-    pub const fn new(
-        typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
-        functions: &'a novarocks_functions::EngineFunctionCatalog,
-        constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: &'a crate::query_execution::package_freeze::CompiledPackageCarrier,
-    ) -> Self {
-        Self {
-            constant_policy,
-            typed_connector_control,
-            functions,
-            static_plan_carrier,
-        }
-    }
-}
-
 /// How much one collection's scan may return in a batch.
 ///
 /// A collection has no session to lower this, so it states the contract's own

@@ -1853,21 +1853,19 @@ impl DmlExecutionKernel {
             if !receiving
                 .publication_context_received
                 .load(Ordering::Acquire)
-            {
-                if let Some(Ok(context)) = receiving
+                && let Some(Ok(context)) = receiving
                     .publication_original
                     .observation()
                     .finalization_context()
-                {
-                    let previous = {
-                        let mut slot = target.context.lock().unwrap_or_else(|p| p.into_inner());
-                        std::mem::replace(&mut *slot, context)
-                    };
-                    receiving
-                        .publication_context_received
-                        .store(true, Ordering::Release);
-                    drop(previous);
-                }
+            {
+                let previous = {
+                    let mut slot = target.context.lock().unwrap_or_else(|p| p.into_inner());
+                    std::mem::replace(&mut *slot, context)
+                };
+                receiving
+                    .publication_context_received
+                    .store(true, Ordering::Release);
+                drop(previous);
             }
             result
         })

@@ -1093,7 +1093,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
     }
 }
 
-pub(crate) async fn previous_refresh_locators(
+async fn previous_refresh_locators(
     io: &MvRefreshPreparationIo,
     baseline: &RefreshStateBaseline,
     connector_control: &dyn ConnectorControlRegistry,

@@ -890,11 +890,11 @@ impl MvRefreshPreparationIo {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|received| Arc::clone(&received.cpu));
-        if let Some(cpu) = scan_cpu {
-            if let Some(cause) = cpu.local_failure() {
-                return Some(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+        if let Some(cpu) = scan_cpu
+            && let Some(cause) = cpu.local_failure()
+        {
+            return Some(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
                     "MV metadata CPU original exit is unproven", cause));
-            }
         }
         let loan = self.retained_loan();
         for retained in loan.values.as_ref().unwrap() {

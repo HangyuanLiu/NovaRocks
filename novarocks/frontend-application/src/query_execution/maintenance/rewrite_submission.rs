@@ -372,15 +372,15 @@ impl OptimizeSubmissionState {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), StatementNativeHealthFailure>> {
         self.wake.0.register(cx.waker());
-        if let Some(io) = self.io.as_ref() {
-            if let Err(error) = io.poll_continuing(cx) {
-                // An unstarted ordinary refusal is retained by the Source;
-                // actual quiescence below decides physical exit separately.
-                if let Some(failure) = io.health_failure() {
-                    return Poll::Ready(Err(failure));
-                }
-                self.ordinary_io_failure.get_or_insert(error);
+        if let Some(io) = self.io.as_ref()
+            && let Err(error) = io.poll_continuing(cx)
+        {
+            // An unstarted ordinary refusal is retained by the Source;
+            // actual quiescence below decides physical exit separately.
+            if let Some(failure) = io.health_failure() {
+                return Poll::Ready(Err(failure));
             }
+            self.ordinary_io_failure.get_or_insert(error);
         }
         std::task::ready!(self.poll_prepare_exit(cx));
         let Ok(mut source) = self.source.try_lock() else {
@@ -523,12 +523,12 @@ async fn prepare_original_submission(
         .await
         .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)?;
     #[cfg(novarocks_dev_controls)]
-    if let Some(controls) = &original.controls {
-        if let Some(nomination) = original.engine.execution.test_statement_nomination() {
-            original.receipt = controls
-                .begin_submission(nomination.as_ref(), &original.target)
-                .map_err(TerminalError::pre_dispatch_failed)?;
-        }
+    if let Some(controls) = &original.controls
+        && let Some(nomination) = original.engine.execution.test_statement_nomination()
+    {
+        original.receipt = controls
+            .begin_submission(nomination.as_ref(), &original.target)
+            .map_err(TerminalError::pre_dispatch_failed)?;
     }
     let metadata = original.lease.metadata().clone();
     let completion = metadata

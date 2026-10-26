@@ -432,11 +432,10 @@ impl OriginalMaintenanceFacts {
                 let raw = std::future::poll_fn(|cx| {
                     let original = self.observation.as_mut().unwrap();
                     let polled = original.poll_result(cx);
-                    if polled.is_pending() {
-                        if let Some(cause) = original.local_failure() {
+                    if polled.is_pending()
+                        && let Some(cause) = original.local_failure() {
                             std::panic::panic_any(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("MV compaction facts original CPU exit is unproven", cause));
                         }
-                    }
                     polled
                 }).await;
                 // Scalar/error reaches this stable original field before its

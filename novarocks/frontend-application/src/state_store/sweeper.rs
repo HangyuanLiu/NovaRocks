@@ -163,10 +163,10 @@ impl AbandonedAttemptSweep {
             } else {
                 self.original.poll_progress(cx)?;
             }
-            if result.is_none() {
-                if let Poll::Ready(done) = pass.as_mut().poll(cx) {
-                    result = Some(done);
-                }
+            if result.is_none()
+                && let Poll::Ready(done) = pass.as_mut().poll(cx)
+            {
+                result = Some(done);
             }
             // The pass can install a Source during this very poll. A previous
             // empty observation cannot prove that newly installed source exited.

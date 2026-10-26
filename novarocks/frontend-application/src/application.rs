@@ -2765,17 +2765,17 @@ impl FrontendApplicationHost {
                 Err(_) => return Err("frontend original StateStore close remains pending".into()),
             }
         }
-        if self.state_store_host.is_none() && self.state_store_opening.is_none() {
-            if let Err(error) = self
+        if self.state_store_host.is_none()
+            && self.state_store_opening.is_none()
+            && let Err(error) = self
                 .execution_runtime_owner
                 .shutdown_executors_until(deadline)
                 .await
-            {
-                if let Some(primary) = primary_error.as_mut() {
-                    primary.push_str(&format!("; cleanup failed: {error}"));
-                } else {
-                    primary_error = Some(error);
-                }
+        {
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {error}"));
+            } else {
+                primary_error = Some(error);
             }
         }
         primary_error.map_or(Ok(()), Err)

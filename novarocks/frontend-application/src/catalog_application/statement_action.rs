@@ -188,21 +188,21 @@ impl State {
         }
     }
     fn progress(&mut self, cx: &mut Context<'_>) {
-        if let Some(original) = &self.original {
-            if let Err(cause) = original.poll_progress(cx) {
-                self.progress_failure.get_or_insert(cause);
-            }
+        if let Some(original) = &self.original
+            && let Err(cause) = original.poll_progress(cx)
+        {
+            self.progress_failure.get_or_insert(cause);
         }
     }
     fn poll_business(&mut self, cx: &mut Context<'_>) {
         self.progress(cx);
-        if let Some(future) = self.future.as_mut() {
-            if let Poll::Ready(outcome) = future.as_mut().poll(cx) {
-                // Whole domain error, SAME observation and committed evidence
-                // are retained before any public result projection or Drop.
-                self.outcome = Some(outcome);
-                drop(self.future.take());
-            }
+        if let Some(future) = self.future.as_mut()
+            && let Poll::Ready(outcome) = future.as_mut().poll(cx)
+        {
+            // Whole domain error, SAME observation and committed evidence
+            // are retained before any public result projection or Drop.
+            self.outcome = Some(outcome);
+            drop(self.future.take());
         }
         // The business poll may have just bound its first physical Source.
         self.progress(cx);

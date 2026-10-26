@@ -311,10 +311,10 @@ async fn actual_sqlite_original_observation_and_pinned_host_close_share_producti
         Duration::from_secs(5),
         std::future::poll_fn(|cx| {
             let result = opening.poll_close(&mut ready, &executor, deadline, cx);
-            if result.is_pending() {
-                if let Some(notice) = release_tx.take() {
-                    notice.send(()).unwrap();
-                }
+            if result.is_pending()
+                && let Some(notice) = release_tx.take()
+            {
+                notice.send(()).unwrap();
             }
             result
         }),

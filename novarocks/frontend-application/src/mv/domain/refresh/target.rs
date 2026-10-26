@@ -18,12 +18,8 @@
 //! Iceberg MV target identity and statement-name resolution.
 
 use crate::mv::domain::analysis::resolve_mv_name;
-use crate::mv::domain::refresh::target_binding::{
-    MvTargetBinding, load_mv_target_binding_with_ports, load_mv_target_binding_with_ports_typed,
-};
+use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
-use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_spi::connector::{ConnectorControlResolver, ConnectorError, ConnectorRequestContext};
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
@@ -86,97 +82,6 @@ pub fn resolve_refresh_mv_target(
     })
 }
 
-/// Loads the sealed target binding used by one Iceberg MV refresh attempt.
-///
-/// This capability deliberately receives only the two admitted ports, the
-/// normalized domain target, and the request context.  It does not depend on
-/// the aggregate refresh source or query assembly state.
-pub fn load_iceberg_mv_target_binding(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    target: &IcebergMvTarget,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_ports(
-        connector_control,
-        storage_observation,
-        &TableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        connector_context,
-    )
-}
-
-/// Typed counterpart used by the background refresh path. A caller must map
-/// the returned connector category to its retry policy instead of inferring
-/// one from text after it has crossed the preparation boundary.
-pub(crate) fn load_iceberg_mv_target_binding_typed(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    target: &IcebergMvTarget,
-    connector_context: &ConnectorRequestContext,
-    #[cfg(novarocks_dev_controls)] controls: Option<&crate::mv::test_controls::MvTestControls>,
-) -> Result<MvTargetBinding, ConnectorError> {
-    #[cfg(novarocks_dev_controls)]
-    if let Some(controls) = controls
-        && controls
-            .transient_preparation(&target.catalog, &target.namespace, &target.table)
-            .map_err(|error| {
-                ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                    error,
-                )
-            })?
-    {
-        return Err(ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            format!(
-                "test-injected temporary connector unavailability while preparing {}.{}.{}",
-                target.catalog, target.namespace, target.table
-            ),
-        ));
-    }
-    load_mv_target_binding_with_ports_typed(
-        connector_control,
-        storage_observation,
-        &TableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        connector_context,
-    )
-}
-
-/// Validates that the persisted MV definition still names the target snapshot
-/// that was observed for refresh planning.
-pub fn validate_target_snapshot(
-    target: &IcebergMvTarget,
-    mv_definition: &StoredKeyedMvProjection,
-    binding: &MvTargetBinding,
-    entrance: &novarocks_mv_application::management::ManagementEntrance,
-    context: &ConnectorRequestContext,
-) -> Result<(), String> {
-    let documents = binding
-        .lease()
-        .derive_document_storage_lease()
-        .map_err(|e| e.to_string())?;
-    let request = crate::mv::domain::staged_create::keyed_request(
-        &documents,
-        binding.identity().clone(),
-        mv_definition
-            .facts
-            .source_revision()
-            .target_object_id
-            .clone(),
-        context.clone(),
-    );
-    let (observed,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&documents,request,Default::default(),entrance).map_err(|e|e.to_string())?;
-    validate_target_snapshot_observed(target, mv_definition, binding, &observed)
-}
-
 /// Validate the original target fence using an already observed exact Current.
 /// This pure author is shared by synchronous and asynchronous observation.
 pub(crate) fn validate_target_snapshot_observed(
@@ -197,22 +102,6 @@ pub(crate) fn validate_target_snapshot_observed(
         .map_err(|e| e.to_string())?;
 
     Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn recorded_target_snapshot_id(
-    target: &IcebergMvTarget,
-    mv_definition: &StoredKeyedMvProjection,
-) -> Result<i64, String> {
-    published_target_snapshot_id(mv_definition)?.ok_or_else(|| {
-        format!(
-            "iceberg materialized view {}.{}.{} has no recorded target snapshot",
-            target.catalog, target.namespace, target.table
-        )
-    })
 }
 
 fn published_target_snapshot_id(

@@ -341,7 +341,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
     /// management before a provider dispatch.
     async fn execute_automatic_metadata_action(
         &self,
-        state: &MaintenanceActionState,
+        _state: &MaintenanceActionState,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {

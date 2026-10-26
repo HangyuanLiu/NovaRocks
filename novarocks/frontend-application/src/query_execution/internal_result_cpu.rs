@@ -950,16 +950,15 @@ impl ProviderReadCpuJob {
         // Both original output and input are stable before any actual Drop.
         // Each named destruction cut executes once. Opaque payloads remain in
         // the original packet; no formatting, retry, extra worker or reaper.
-        if let Some(marker) = self.marker.take() {
-            if let Err(cause) =
+        if let Some(marker) = self.marker.take()
+            && let Err(cause) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(marker)))
-            {
-                job.retirement
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .provider_marker_failure = Some(QueryBlockingFailure::panicked(cause));
-            }
+        {
+            job.retirement
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .provider_marker_failure = Some(QueryBlockingFailure::panicked(cause));
         }
         if let Some(cause) = job.health_failure() {
             return Err(cause);
@@ -1001,13 +1000,13 @@ impl ProviderReadCpuJob {
 }
 impl Drop for ProviderReadCpuJob {
     fn drop(&mut self) {
-        if !self.finished {
-            if let Some(job) = self.job.take() {
-                // Invalid whole-source loss is fail-closed, not normal close.
-                // Keep the finite original packet/join/backing; do not spawn a
-                // replacement or pretend the actual source has exited.
-                std::mem::forget(job);
-            }
+        if !self.finished
+            && let Some(job) = self.job.take()
+        {
+            // Invalid whole-source loss is fail-closed, not normal close.
+            // Keep the finite original packet/join/backing; do not spawn a
+            // replacement or pretend the actual source has exited.
+            std::mem::forget(job);
         }
     }
 }

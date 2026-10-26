@@ -446,6 +446,10 @@ impl MvWritePreparePublicationInput {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The complete request belongs to the original Arc-backed activation Body and its loan; inline variants avoid an additional variant allocation."
+)]
 pub(crate) enum MvWriteActivationRequest {
     Analyze(Option<MvWriteAnalysisInput>),
     Optimize {
@@ -457,6 +461,10 @@ pub(crate) enum MvWriteActivationRequest {
     PreparePublication(MvWritePreparePublicationInput),
     Create(super::create_publication::CreatePublicationInput),
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The complete result is retained in the original Arc-backed activation Body before its existing receiving transfer; inline variants avoid an additional variant allocation."
+)]
 pub(crate) enum MvWriteActivationOutput {
     Analyzed(MvWriteAnalysis),
     ProviderNeeds(MvWriteProviderNeeds),

@@ -675,10 +675,10 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                 Ok(())
             }
             .await;
-            if let Err(error) = &result {
-                if let Some(source) = source.take() {
-                    let _ = source.fail(error.clone()).await;
-                }
+            if let Err(error) = &result
+                && let Some(source) = source.take()
+            {
+                let _ = source.fail(error.clone()).await;
             }
             // An early CPU error is reported first. The original job remains
             // in stable custody until its actual forwarder has exited.

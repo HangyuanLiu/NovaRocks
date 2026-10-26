@@ -49,6 +49,10 @@ use std::{
 
 /// Neither variant accepts an arbitrary callback or Future. The existing
 /// MvWriteActivationOriginal runs these pure authors on its original CPU worker.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The complete CREATE input is inline in the original activation request and Arc-backed Body; inline variants avoid an additional variant allocation."
+)]
 pub(crate) enum CreatePublicationInput {
     StageDeclarations {
         plan: Arc<IcebergMvCreatePlan>,
@@ -64,6 +68,10 @@ pub(crate) enum CreatePublicationInput {
         context: ConnectorRequestContext,
     },
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The complete CREATE output moves from the original Arc-backed activation Body into the existing stable CREATE Body; inline variants avoid an additional variant allocation."
+)]
 pub(crate) enum CreatePublicationOutput {
     StageDeclarations {
         columns: Vec<ConnectorColumnDefinition>,

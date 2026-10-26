@@ -156,10 +156,10 @@ impl FrontendStateStoreOpening {
         target: &mut Option<StateStoreHost>,
     ) -> Poll<Result<(), FrontendApplicationError>> {
         let result = self.poll_open_inner(cx, target);
-        if let Poll::Ready(Err(error)) = &result {
-            if let Some(cause) = error.original_state_store_failure() {
-                self.first_failure.get_or_insert_with(|| cause.clone());
-            }
+        if let Poll::Ready(Err(error)) = &result
+            && let Some(cause) = error.original_state_store_failure()
+        {
+            self.first_failure.get_or_insert_with(|| cause.clone());
         }
         result
     }

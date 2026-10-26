@@ -288,24 +288,23 @@ impl RequestCell {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        if let Some(progress) = progress {
-            if matches!(progress.poll_original_progress(cx), Poll::Ready(Ok(())))
-                && progress.actual_exit_observed()
-            {
-                let retired = {
-                    let mut field = self.progress.lock().unwrap_or_else(|p| p.into_inner());
-                    if field
-                        .as_ref()
-                        .is_some_and(|old| Arc::ptr_eq(old, &progress))
-                    {
-                        field.take()
-                    } else {
-                        None
-                    }
-                };
-                drop(retired);
-                changed = true;
-            }
+        if let Some(progress) = progress
+            && matches!(progress.poll_original_progress(cx), Poll::Ready(Ok(())))
+            && progress.actual_exit_observed()
+        {
+            let retired = {
+                let mut field = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+                if field
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, &progress))
+                {
+                    field.take()
+                } else {
+                    None
+                }
+            };
+            drop(retired);
+            changed = true;
         }
         let Some(mut original) = loan(&self.stream) else {
             return changed;
@@ -973,19 +972,19 @@ impl MetadataIoAdmission {
         }
         // First finish the ONE original atomic replacement. Its active grant set
         // cannot change or be reclaimed while this exact receipt is outstanding.
-        if let Some(admission) = body.growth.as_mut() {
-            if let Poll::Ready(result) = Pin::new(admission).poll(cx) {
-                match result {
-                    Ok(ready) => body.growth_ready = Some(ready),
-                    Err(failure) => {
-                        let i = body.growth_cell.take().unwrap();
-                        cells[i].body.as_mut().unwrap().failure = Some(failure.error.clone());
-                        body.failure.get_or_insert(failure.error);
-                        body.changed = true;
-                        body.growth.take();
-                        body.growth_route.take();
-                        body.growth_bytes = 0;
-                    }
+        if let Some(admission) = body.growth.as_mut()
+            && let Poll::Ready(result) = Pin::new(admission).poll(cx)
+        {
+            match result {
+                Ok(ready) => body.growth_ready = Some(ready),
+                Err(failure) => {
+                    let i = body.growth_cell.take().unwrap();
+                    cells[i].body.as_mut().unwrap().failure = Some(failure.error.clone());
+                    body.failure.get_or_insert(failure.error);
+                    body.changed = true;
+                    body.growth.take();
+                    body.growth_route.take();
+                    body.growth_bytes = 0;
                 }
             }
         }
@@ -1280,10 +1279,11 @@ impl MetadataIoAdmission {
         // These refusals were received into the same cells above. They are
         // business observations, not structural failures of this progress turn.
         // Actual-exit consumers still inspect every admission, stream and alias.
-        if observation == ProgressObservation::Business && !body.first_ready {
-            if let Some(error) = &body.failure {
-                return Err(error.clone());
-            }
+        if observation == ProgressObservation::Business
+            && !body.first_ready
+            && let Some(error) = &body.failure
+        {
+            return Err(error.clone());
         }
         Ok(body.first_ready)
     }
@@ -1687,10 +1687,10 @@ impl MetadataIoAdmission {
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(error(&WorkError::Released));
         }
-        if !body.settlement {
-            if let Some(failure) = &body.failure {
-                return Err(error(failure));
-            }
+        if !body.settlement
+            && let Some(failure) = &body.failure
+        {
+            return Err(error(failure));
         }
         for (index, cell) in body.cells.iter_mut().enumerate() {
             // Keep the original bootstrap request intact until its own first
@@ -1729,12 +1729,11 @@ impl MetadataIoAdmission {
             state.requested = dependency.clone();
             state.owned = owned;
             state.claimed = true;
-            if let Some(dependency) = dependency.as_ref() {
-                if state.grant.is_some()
-                    && !state.full.as_ref().is_some_and(|f| f.contains(dependency))
-                {
-                    state.extension = Some(dependency.clone());
-                }
+            if let Some(dependency) = dependency.as_ref()
+                && state.grant.is_some()
+                && !state.full.as_ref().is_some_and(|f| f.contains(dependency))
+            {
+                state.extension = Some(dependency.clone());
             }
             let request = ConnectorIoRequest::from_original(
                 Arc::clone(cell) as Arc<dyn ConnectorIoRequestSource>

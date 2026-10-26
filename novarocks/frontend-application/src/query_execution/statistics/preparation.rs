@@ -96,19 +96,6 @@ impl StatisticsPreparationCustody {
         Ok(())
     }
 }
-/// Additional fixed Arc/Mutex backing only. Inline custody is already in the
-/// actual Action/PlanSlot Layout and must not be invoiced again.
-pub(crate) fn statistics_preparation_custody_metadata_bytes()
--> Result<std::num::NonZeroU64, WorkError> {
-    let layouts = ReadAccessSink::<FrozenProviderRead>::known_source_layouts()
-        .map_err(|_| WorkError::ArithmeticOverflow)?;
-    let bytes = layouts[0]
-        .size()
-        .checked_add(layouts[1].size())
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    std::num::NonZeroU64::new(u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?)
-        .ok_or(WorkError::ArithmeticOverflow)
-}
 
 pub(crate) type StatisticsPreparationJob =
     crate::query_execution::internal_result_cpu::StatisticsPlanCpuJob;
@@ -131,9 +118,6 @@ pub(crate) struct PreparedStatisticsComputationAssembly {
     program: StatisticsCollectionProgram,
 }
 impl PreparedStatisticsComputationAssembly {
-    pub(crate) fn source_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Self>()
-    }
     pub(crate) fn prepare_computation(
         self,
         initial: InitialComputationReservation,
@@ -302,12 +286,6 @@ fn work_failure(error: WorkError) -> DistributedQueryError {
         DistributedQueryErrorKind::Rejected,
         novarocks_failure_contract::SharedFailureCause::new(error),
     )
-}
-
-/// The actual pure input backing, for the eventual action's closed source quote.
-/// This is not the CPU queue/header quote and is not an admission capability.
-pub(crate) fn statistics_preparation_input_layout() -> std::alloc::Layout {
-    std::alloc::Layout::new::<StatisticsPlanCpuInput>()
 }
 
 pub(crate) struct StatisticsPlanCpuInput {
@@ -499,29 +477,6 @@ pub(super) fn prepare_statistics_scan(
     };
 
     Ok((bindings, scan))
-}
-
-pub(super) fn build_statistics_assembly(
-    execution: &QueryExecutionContext,
-    scan: novarocks_sql::planning::dml::StatisticsConnectorScan,
-    fact: novarocks_sql::compiler::ProviderReadFact,
-    access: FinalPlanRuntimeAccess<FrozenProviderRead>,
-    program: StatisticsCollectionProgram,
-    functions: &novarocks_functions::EngineFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: &CompiledPackageCarrier,
-) -> Result<PreparedStatisticsComputationAssembly, DistributedQueryError> {
-    let parts = build_statistics_plan_parts(
-        execution,
-        scan,
-        fact,
-        &access,
-        &program,
-        functions,
-        constant_policy,
-        static_plan_carrier,
-    )?;
-    Ok(finish_statistics_assembly(parts, access, program))
 }
 
 struct StatisticsPlanParts {

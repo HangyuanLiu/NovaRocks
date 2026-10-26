@@ -1416,12 +1416,22 @@ fn begin_cow_write_session(
         execution,
         connector_context,
     )?;
-    crate::query_execution::write_session::begin_cow_connector_write_session(
-        input.lease,
-        write_lease,
-        input.request,
-        input.original,
-    )
+    let original_session = Arc::new(std::sync::Mutex::new(None));
+    let receiving = crate::query_execution::write_session::WriteBeginReceiving::new(Arc::clone(
+        &original_session,
+    ));
+    let result = futures::executor::block_on(
+        crate::query_execution::write_session::begin_cow_connector_write_session_async_in(
+            input.lease,
+            write_lease,
+            input.request,
+            input.original,
+            &receiving,
+        ),
+    );
+    drop(receiving);
+    drop(original_session);
+    result
 }
 
 struct CowBeginInput {
@@ -5893,13 +5903,22 @@ mod tests {
                 },
                 context: context.clone(),
             };
-            let session = crate::query_execution::write_session::begin_cow_connector_write_session(
-                write_lease,
-                &planning.derive_write_lease().unwrap(),
-                begin_request,
-                original,
+            let original_session = Arc::new(std::sync::Mutex::new(None));
+            let receiving = crate::query_execution::write_session::WriteBeginReceiving::new(
+                Arc::clone(&original_session),
+            );
+            let session = futures::executor::block_on(
+                crate::query_execution::write_session::begin_cow_connector_write_session_async_in(
+                    write_lease,
+                    &planning.derive_write_lease().unwrap(),
+                    begin_request,
+                    original,
+                    &receiving,
+                ),
             )
             .unwrap();
+            drop(receiving);
+            drop(original_session);
             // The checked session obtains the same immutable properties from its actual lease.
             drop(properties);
             let write = build_cow_update_distributed_write(

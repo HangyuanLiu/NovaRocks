@@ -669,10 +669,10 @@ impl CreateOriginal {
         if body.empty.poll_closed(cx).is_pending() {
             return Poll::Pending;
         }
-        if let Some(publication) = body.publication.as_mut() {
-            if publication.poll_closed(cx).is_pending() {
-                return Poll::Pending;
-            }
+        if let Some(publication) = body.publication.as_mut()
+            && publication.poll_closed(cx).is_pending()
+        {
+            return Poll::Pending;
         }
         if self
             .state

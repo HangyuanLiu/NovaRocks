@@ -304,13 +304,13 @@ impl StartupContinuationReceiving {
         )
     }
     pub(crate) fn poll_progress(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if self.raw.is_none() {
-            if let Some(job) = self.job.as_mut() {
-                match job.poll_progress(cx) {
-                    std::task::Poll::Pending => return std::task::Poll::Pending,
-                    std::task::Poll::Ready(Err(error)) => self.raw = Some(Err(error)),
-                    std::task::Poll::Ready(Ok(())) => self.raw = job.try_take(),
-                }
+        if self.raw.is_none()
+            && let Some(job) = self.job.as_mut()
+        {
+            match job.poll_progress(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(error)) => self.raw = Some(Err(error)),
+                std::task::Poll::Ready(Ok(())) => self.raw = job.try_take(),
             }
         }
         std::task::Poll::Ready(())

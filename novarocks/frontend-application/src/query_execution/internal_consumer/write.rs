@@ -520,10 +520,10 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                 Ok(())
             }
             .await;
-            if let Err(error) = &result {
-                if let Some(source) = source.take() {
-                    let _ = source.fail(error.clone()).await;
-                }
+            if let Err(error) = &result
+                && let Some(source) = source.take()
+            {
+                let _ = source.fail(error.clone()).await;
             }
             let closed = if owns_activation {
                 holder.cpu.join_closed().await

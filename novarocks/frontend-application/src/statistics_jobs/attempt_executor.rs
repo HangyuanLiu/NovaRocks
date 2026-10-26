@@ -559,11 +559,11 @@ impl StatisticsState {
             self.failure
                 .get_or_insert_with(|| FrontendStatisticsAttemptExecutor::scope_error(error));
         }
-        if let Some(original) = owner.execution_owner_slot().as_ref() {
-            if let Err(error) = self.io.poll_progress(original, cx) {
-                self.failure
-                    .get_or_insert_with(|| FrontendStatisticsAttemptExecutor::scope_error(error));
-            }
+        if let Some(original) = owner.execution_owner_slot().as_ref()
+            && let Err(error) = self.io.poll_progress(original, cx)
+        {
+            self.failure
+                .get_or_insert_with(|| FrontendStatisticsAttemptExecutor::scope_error(error));
         }
         if let Some(future) = self.pending.as_mut() {
             match future.as_mut().poll(cx) {

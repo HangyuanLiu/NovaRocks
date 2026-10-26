@@ -410,10 +410,10 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
         self.closing = true;
         // Close already accepted sources before waiting for a late provider.
         self.close_accepted().await?;
-        if let Some(opening) = &mut self.opening {
-            if self.outcome.is_none() {
-                std::future::poll_fn(|cx| S::poll_open_in(opening, cx, &mut self.outcome)).await;
-            }
+        if let Some(opening) = &mut self.opening
+            && self.outcome.is_none()
+        {
+            std::future::poll_fn(|cx| S::poll_open_in(opening, cx, &mut self.outcome)).await;
         }
         if let Some(Err(error)) = &self.outcome {
             return Err(StatementNativeHealthFailure::actual_exit_unproven(
@@ -1027,10 +1027,10 @@ impl AttemptReady {
     }
 
     pub(crate) async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {
-        if self.close_job.is_none() {
-            if let Some(plan) = self.split_assignment_plan.as_mut() {
-                plan.close_in(&mut self.close_job);
-            }
+        if self.close_job.is_none()
+            && let Some(plan) = self.split_assignment_plan.as_mut()
+        {
+            plan.close_in(&mut self.close_job);
         }
         if let Some(job) = &mut self.close_job {
             if self.close_outcome.is_none() {

@@ -522,11 +522,11 @@ impl SplitAssignmentPump {
         let waker = self.source_waker.clone();
         let mut cx = Context::from_waker(&waker);
         let mut changed = 0;
-        if let Some(timer) = &mut self.timer {
-            if timer.as_mut().poll(&mut cx).is_ready() {
-                self.timer = None;
-                self.timer_at = None;
-            }
+        if let Some(timer) = &mut self.timer
+            && timer.as_mut().poll(&mut cx).is_ready()
+        {
+            self.timer = None;
+            self.timer_at = None;
         }
         if self.enumeration_in_flight {
             let job = self
@@ -563,27 +563,29 @@ impl SplitAssignmentPump {
                 }
             }
         }
-        if self.closing && !self.enumeration_in_flight && self.close_job.is_none() {
-            if let Some(assignment) = self.assignment.take() {
-                let mut pins = assignment.join_pins();
-                if let Some(pin) = self
-                    .enumeration_result
-                    .as_ref()
-                    .and_then(|e| e.source.source.join_pin())
-                {
-                    pins.push(pin);
-                }
-                let input = CloseInput {
-                    assignment,
-                    enumeration: self.enumeration_result.take(),
-                };
-                self.close_job = Some(
-                    self.data_runtime
-                        .connector_blocking_io()
-                        .prepare_cpu_retirement(pins, input, close_assignment),
-                );
-                changed += 1;
+        if self.closing
+            && !self.enumeration_in_flight
+            && self.close_job.is_none()
+            && let Some(assignment) = self.assignment.take()
+        {
+            let mut pins = assignment.join_pins();
+            if let Some(pin) = self
+                .enumeration_result
+                .as_ref()
+                .and_then(|e| e.source.source.join_pin())
+            {
+                pins.push(pin);
             }
+            let input = CloseInput {
+                assignment,
+                enumeration: self.enumeration_result.take(),
+            };
+            self.close_job = Some(
+                self.data_runtime
+                    .connector_blocking_io()
+                    .prepare_cpu_retirement(pins, input, close_assignment),
+            );
+            changed += 1;
         }
         if let Some(job) = self.close_job.as_mut() {
             match job.poll_progress(&mut cx) {

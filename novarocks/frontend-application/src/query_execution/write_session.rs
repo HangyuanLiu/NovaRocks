@@ -214,36 +214,6 @@ impl ConnectorWriteSession {
         )
     }
 
-    pub(crate) async fn begin_async(
-        lease: ConnectorWriteStackLease,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        mut request: ConnectorWriteBeginRequest,
-    ) -> Result<Self, ConnectorError> {
-        if matches!(
-            &request.flavor,
-            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
-        ) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "application-document writes require an application-document session entrypoint",
-            ));
-        }
-        let staged = matches!(
-            &request.flavor,
-            ConnectorWriteSessionFlavor::StagedCreate(_)
-        );
-        request.context = context_for_write_begin(request.context, &catalog_properties)?;
-        let plan = lease.session().begin_write_async(request).await?;
-        Ok(Self::from_begin_plan(
-            lease,
-            catalog_properties,
-            plan,
-            WritePublicationState::Ordinary,
-            staged,
-            false,
-        ))
-    }
-
     /// The statement owns `receiving` before polling this borrowed begin.
     /// Adopt the actual Provider result before dropping its original child F.
     pub(crate) async fn begin_async_in(
@@ -696,17 +666,6 @@ impl ConnectorWriteSession {
             terminal_storage: Mutex::new(None),
             cow_original: None,
         }
-    }
-
-    /// COW-only checked entry with the original control and receiving owner.
-    fn begin_cow_checked(
-        lease: ConnectorWriteStackLease,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        request: ConnectorWriteBeginRequest,
-        original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    ) -> Result<Self, novarocks_spi::connector::ConnectorCowBeginFailure> {
-        let checked = lease.session().begin_cow_write_checked(request, original)?;
-        Self::from_checked_cow_plan(lease, catalog_properties, checked)
     }
 
     fn from_checked_cow_plan(
@@ -1481,42 +1440,6 @@ pub(super) fn context_for_write_begin(
     }
 }
 
-/// Open one distributed write's session on a write stack already pinned to the
-/// generation that planned it.
-///
-/// The catalog identity comes from the same generation's write lease rather
-/// than from a fresh catalog resolution: the recipes the session seals are
-/// stamped into fragments beside this handle, and a handle from a different
-/// incarnation would name a runtime that never admitted them.
-pub(crate) fn begin_connector_write_session(
-    lease: ConnectorWriteStackLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    request: ConnectorWriteBeginRequest,
-) -> Result<std::sync::Arc<ConnectorWriteSession>, String> {
-    let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
-        "connector write lease has no immutable catalog runtime identity".to_string()
-    })?;
-    ConnectorWriteSession::begin(lease, catalog_properties, request)
-        .map(std::sync::Arc::new)
-        .map_err(|error| format!("begin connector write session: {error}"))
-}
-
-/// COW-only entry: retain the exact provider error until its original
-/// synchronous command worker projects and retires it. Other write callers
-/// keep their existing String boundary.
-pub(crate) fn begin_cow_connector_write_session(
-    lease: ConnectorWriteStackLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    request: ConnectorWriteBeginRequest,
-    original: novarocks_spi::connector::ConnectorOriginalResultScope,
-) -> Result<Arc<ConnectorWriteSession>, crate::query_execution::dml::mutation_flow::CowFailure> {
-    let (catalog_properties, request, original) =
-        prepare_cow_begin_input(write_lease, request, original)?;
-    ConnectorWriteSession::begin_cow_checked(lease, catalog_properties, request, original)
-        .map(Arc::new)
-        .map_err(crate::query_execution::dml::mutation_flow::CowFailure::checked_begin)
-}
-
 fn prepare_cow_begin_input(
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     mut request: ConnectorWriteBeginRequest,
@@ -1592,27 +1515,6 @@ pub(crate) async fn begin_cow_connector_write_session_async_in(
     receiving
         .completed_cow_result()
         .map_err(CowFailure::checked_begin)
-}
-
-/// Open an application-document write with its declaration frozen and its
-/// exact publication pending until execution supplies the remaining facts.
-pub(crate) fn begin_connector_application_document_write_session_pending(
-    lease: ConnectorWriteStackLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    request: ConnectorWriteBeginRequest,
-) -> Result<std::sync::Arc<ConnectorWriteSession>, String> {
-    let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
-        "connector write lease has no immutable catalog runtime identity".to_string()
-    })?;
-    ConnectorWriteSession::begin_pending_application_document_publication(
-        lease,
-        catalog_properties,
-        request,
-    )
-    .map(std::sync::Arc::new)
-    .map_err(|error| {
-        format!("begin connector write session with pending application documents: {error}")
-    })
 }
 
 /// Borrow the original asynchronous begin while retaining its exact declaration.
@@ -1995,8 +1897,8 @@ pub(crate) mod tests {
             ConnectorError,
         > {
             let mut outcome = outcome.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
-            if let Ok(committed) = &outcome {
-                if let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } = committed {
+            if let Ok(committed) = &outcome
+                && let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } = committed {
                     let deferred = self.recorded.lock().unwrap().defer_finish_cleanup;
                     self.recorded.lock().unwrap().terminal_committed = Some((
                         Arc::clone(needed),
@@ -2028,7 +1930,6 @@ pub(crate) mod tests {
                         }
                     }
                 }
-            }
             if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup }) = &outcome {
                 self.recorded.lock().unwrap().terminal_committed = Some((Arc::clone(needed), cleanup.clone()));
             }
@@ -4586,10 +4487,16 @@ pub(crate) mod tests {
     async fn async_begin_uses_the_original_session_plan_and_context() {
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
         recorded.lock().unwrap().capture_begin_context = true;
-        let session =
-            ConnectorWriteSession::begin_async(lease, catalog_properties(), begin_request())
-                .await
-                .unwrap();
+        let original = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original));
+        let session = ConnectorWriteSession::begin_async_in(
+            lease,
+            catalog_properties(),
+            begin_request(),
+            &receiving,
+        )
+        .await
+        .unwrap();
         assert_eq!(session.targets().len(), 1);
         assert_eq!(recorded.lock().unwrap().begin, 1);
         assert!(recorded.lock().unwrap().begin_context.is_some());

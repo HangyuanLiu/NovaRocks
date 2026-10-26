@@ -345,11 +345,11 @@ impl StateStoreOriginalOwner {
             self.close_requested = true;
             self.request_close();
         }
-        if let Some(retry) = self.retry.as_mut() {
-            if retry.as_mut().poll(cx).is_ready() {
-                self.retry.take();
-                self.request_close();
-            }
+        if let Some(retry) = self.retry.as_mut()
+            && retry.as_mut().poll(cx).is_ready()
+        {
+            self.retry.take();
+            self.request_close();
         }
         match self.poll_progress(cx) {
             Ok(true) => {
@@ -738,10 +738,10 @@ impl Port {
         }
     }
     fn business_stop(&self, deadline: Instant) -> Option<Failure> {
-        if let Purpose::Instance { root, .. } = &self.purpose {
-            if let Err(error) = root.check() {
-                return Some(failure(error));
-            }
+        if let Purpose::Instance { root, .. } = &self.purpose
+            && let Err(error) = root.check()
+        {
+            return Some(failure(error));
         }
         deadline_failure(deadline)
     }
@@ -764,10 +764,9 @@ impl Port {
         if !matches!(
             self.purpose,
             Purpose::ClosingInstance { .. } | Purpose::InstanceEvidence { .. }
-        ) {
-            if let Some(error) = control.stop(self, deadline) {
-                return Err(error);
-            }
+        ) && let Some(error) = control.stop(self, deadline)
+        {
+            return Err(error);
         }
         let cell = Arc::new(Cell {
             original: original.clone(),
@@ -920,11 +919,11 @@ impl Cell {
         };
         let result = catch_unwind(AssertUnwindSafe(|| {
             let body = loan.body.as_mut().unwrap();
-            if body.health.is_none() {
-                if let Some(error) = self.original.local_failure() {
-                    body.health = Some(error);
-                    body.notify = true;
-                }
+            if body.health.is_none()
+                && let Some(error) = self.original.local_failure()
+            {
+                body.health = Some(error);
+                body.notify = true;
             }
             if body.health.is_some() {
                 // Health forbids another phase, but cannot abandon the same
@@ -1025,25 +1024,23 @@ impl Cell {
         // A borrower may poll on another thread immediately after notification.
         // Restore its stable receiving fields before any foreign wake.
         drop(loan);
-        if notify {
-            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.observer.wake())) {
-                let error: Failure = failure(QueryBlockingFailure::panicked(panic));
-                {
-                    let mut slot = self.body.lock().unwrap_or_else(|p| p.into_inner());
-                    let body = slot.as_mut().expect("body restored before notification");
-                    body.health.get_or_insert_with(|| error.clone());
-                    assert!(
-                        body.notification_failure.is_none(),
-                        "failed original notification is not retried"
-                    );
-                    body.notification_failure = Some(error.clone());
-                }
-                let slot = self.body.lock().unwrap_or_else(|p| p.into_inner());
-                return match slot.as_ref().unwrap().reportable_health() {
-                    Some(error) => Err(error),
-                    None => Ok(false),
-                };
+        if notify && let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.observer.wake())) {
+            let error: Failure = failure(QueryBlockingFailure::panicked(panic));
+            {
+                let mut slot = self.body.lock().unwrap_or_else(|p| p.into_inner());
+                let body = slot.as_mut().expect("body restored before notification");
+                body.health.get_or_insert_with(|| error.clone());
+                assert!(
+                    body.notification_failure.is_none(),
+                    "failed original notification is not retried"
+                );
+                body.notification_failure = Some(error.clone());
             }
+            let slot = self.body.lock().unwrap_or_else(|p| p.into_inner());
+            return match slot.as_ref().unwrap().reportable_health() {
+                Some(error) => Err(error),
+                None => Ok(false),
+            };
         }
         result
     }
@@ -1061,10 +1058,10 @@ impl Cell {
             Phase::Rollback | Phase::Close | Phase::EvidenceRead | Phase::EvidenceRelease
         );
         if !settlement {
-            if let Some(gate) = phase.gate.as_mut() {
-                if gate.as_mut().poll(cx).is_ready() {
-                    phase.gate.take();
-                }
+            if let Some(gate) = phase.gate.as_mut()
+                && gate.as_mut().poll(cx).is_ready()
+            {
+                phase.gate.take();
             }
             if let Some(error) = self
                 .control
@@ -1101,14 +1098,13 @@ impl Cell {
                     }
                 }
             }
-            if !settlement {
-                if let Some(error) = self
+            if !settlement
+                && let Some(error) = self
                     .original
                     .publication_refusal(phase.request)
                     .or_else(|| self.control.stop(port, self.deadline))
-                {
-                    return self.withdraw(phase, error);
-                }
+            {
+                return self.withdraw(phase, error);
             }
             if phase.prepared.is_none() {
                 match port.executor.prepare_in(
@@ -1122,14 +1118,13 @@ impl Cell {
                     }
                 }
                 // Receipt is stable before the original marks its commit dispatch.
-                if !settlement {
-                    if let Some(error) = self
+                if !settlement
+                    && let Some(error) = self
                         .original
                         .publication_refusal(phase.request)
                         .or_else(|| self.control.stop(port, self.deadline))
-                    {
-                        return self.withdraw(phase, error);
-                    }
+                {
+                    return self.withdraw(phase, error);
                 }
                 if let Err(error) = self.original.before_publish(phase.request) {
                     return self.withdraw(phase, error);
@@ -1159,13 +1154,13 @@ impl Cell {
             return Ok(false);
         }
         let mut changed = false;
-        if phase.result.is_none() {
-            if let Poll::Ready(result) = phase.receipt.as_mut().unwrap().poll_result(cx) {
-                let result = result.map_err(|e| failure(e));
-                phase.result = Some(result.clone());
-                self.original.receive_result(phase.request, result);
-                changed = true;
-            }
+        if phase.result.is_none()
+            && let Poll::Ready(result) = phase.receipt.as_mut().unwrap().poll_result(cx)
+        {
+            let result = result.map_err(|e| failure(e));
+            phase.result = Some(result.clone());
+            self.original.receive_result(phase.request, result);
+            changed = true;
         }
         if phase.result.is_none() {
             return Ok(changed);
@@ -1186,7 +1181,6 @@ impl Cell {
                 phase.exit = Some(Err(error.clone()));
                 self.original
                     .receive_exit(phase.request, Err(error.clone()));
-                changed = true;
                 return Err(error);
             }
         }

@@ -151,21 +151,21 @@ impl Round {
         }
     }
     fn progress(&mut self, cx: &mut Context<'_>) {
-        if let Some(original) = &self.original {
-            if let Err(cause) = original.poll_progress(cx) {
-                self.failure.get_or_insert(cause);
-            }
+        if let Some(original) = &self.original
+            && let Err(cause) = original.poll_progress(cx)
+        {
+            self.failure.get_or_insert(cause);
         }
-        if let Some(future) = self.future.as_mut() {
-            if let Poll::Ready(outcome) = future.as_mut().poll(cx) {
-                self.outcome = Some(outcome);
-                drop(self.future.take());
-            }
+        if let Some(future) = self.future.as_mut()
+            && let Poll::Ready(outcome) = future.as_mut().poll(cx)
+        {
+            self.outcome = Some(outcome);
+            drop(self.future.take());
         }
-        if let Some(original) = &self.original {
-            if let Err(cause) = original.poll_progress(cx) {
-                self.failure.get_or_insert(cause);
-            }
+        if let Some(original) = &self.original
+            && let Err(cause) = original.poll_progress(cx)
+        {
+            self.failure.get_or_insert(cause);
         }
     }
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), String>> {

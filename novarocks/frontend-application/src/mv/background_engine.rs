@@ -150,19 +150,18 @@ pub(crate) async fn current_source_inputs_in(
                 .metadata()
                 .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
                 .map_err(provider_error)?;
-            if let Some(snapshot) = observed.current_snapshot_id() {
-                if lease
+            if let Some(snapshot) = observed.current_snapshot_id()
+                && lease
                     .binding()
                     .metadata()
                     .read_selector_from_exact_revision(&metadata.table, &revision)
                     .map_err(provider_error)?
                     != ConnectorReadSelector::SnapshotId(snapshot)
-                {
-                    return Err(MvBackgroundEngineError::new(
-                        MvBackgroundEngineErrorKind::TransientUnavailable,
-                        "MV scheduler source observation and exact revision disagree",
-                    ));
-                }
+            {
+                return Err(MvBackgroundEngineError::new(
+                    MvBackgroundEngineErrorKind::TransientUnavailable,
+                    "MV scheduler source observation and exact revision disagree",
+                ));
             }
             let revision = persist_exact_connector_revision(&revision).map_err(|error| {
                 MvBackgroundEngineError::new(

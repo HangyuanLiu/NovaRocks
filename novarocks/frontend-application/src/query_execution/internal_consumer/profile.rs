@@ -135,17 +135,16 @@ impl ProfileReceivingHolder {
                     ));
                 }
             };
-            if let Some(prior) = prior {
-                if prior.activation.actor() != binding.activation.actor()
+            if let Some(prior) = prior
+                && (prior.activation.actor() != binding.activation.actor()
                     || prior.activation.execution().query_id()
                         != binding.activation.execution().query_id()
                     || prior.plan != binding.plan
-                    || prior.activation.generation() >= binding.activation.generation()
-                {
-                    return Err(profile_error(
-                        "Profile receiving custody cannot admit a stale or foreign activation",
-                    ));
-                }
+                    || prior.activation.generation() >= binding.activation.generation())
+            {
+                return Err(profile_error(
+                    "Profile receiving custody cannot admit a stale or foreign activation",
+                ));
             }
             std::mem::replace(&mut *state, ReceivingState::Reserved(binding))
         };

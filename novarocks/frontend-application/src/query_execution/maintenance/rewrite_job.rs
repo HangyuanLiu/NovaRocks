@@ -421,11 +421,11 @@ impl RewriteActionState {
                 self.refused_close = Some(Box::pin(close_refused_cohort(self.domain.clone())));
             }
         }
-        if let Some(original) = self.refused_close.as_mut() {
-            if let Poll::Ready(result) = original.as_mut().poll(cx) {
-                self.refused_result = Some(result);
-                drop(self.refused_close.take());
-            }
+        if let Some(original) = self.refused_close.as_mut()
+            && let Poll::Ready(result) = original.as_mut().poll(cx)
+        {
+            self.refused_result = Some(result);
+            drop(self.refused_close.take());
         }
         if let Some(Err(failure)) = self.refused_result.as_ref() {
             self.health = Some(failure.clone());
@@ -449,35 +449,33 @@ impl RewriteActionState {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {
         self.wake.0.register(cx.waker());
-        if let Some(original) = owner.execution_owner_slot().as_ref() {
-            if let Err(error) = self.io.poll_progress(original, cx) {
-                if self.selected.is_none() {
-                    self.selected = Some(TerminalError::from_original_cause(error));
-                }
+        if let Some(original) = owner.execution_owner_slot().as_ref()
+            && let Err(error) = self.io.poll_progress(original, cx)
+            && self.selected.is_none()
+        {
+            self.selected = Some(TerminalError::from_original_cause(error));
+        }
+        if self.selected.is_some()
+            && let Ok(mut source) = self.domain.try_lock()
+        {
+            source.stopping = true;
+            if source.stop_reason.is_none() {
+                source.stop_reason = self.selected.clone();
             }
         }
-        if self.selected.is_some() {
-            if let Ok(mut source) = self.domain.try_lock() {
-                source.stopping = true;
-                if source.stop_reason.is_none() {
-                    source.stop_reason = self.selected.clone();
-                }
-            }
-        }
-        if !self.product_exited {
-            if let Poll::Ready(result) = self
+        if !self.product_exited
+            && let Poll::Ready(result) = self
                 .product
                 .as_mut()
                 .expect("same original Rewrite Product F")
                 .as_mut()
                 .poll(cx)
-            {
-                self.product_result = Some(result);
-                // The actual result is stable before the original F Drop,
-                // including when another negative observer borrows Domain.
-                drop(self.product.take());
-                self.product_exited = true;
-            }
+        {
+            self.product_result = Some(result);
+            // The actual result is stable before the original F Drop,
+            // including when another negative observer borrows Domain.
+            drop(self.product.take());
+            self.product_exited = true;
         }
         if let Ok(mut source) = self.domain.try_lock() {
             if let Some(result) = self.product_result.take() {
@@ -527,15 +525,15 @@ impl RewriteActionState {
         self.wake.0.register(cx.waker());
         if let Ok(mut source) = self.domain.try_lock() {
             source.stopping = true;
-            if let Some(call) = source.cohort.as_mut() {
-                if call.phase != CohortPhase::Complete {
-                    if call.result.is_none() {
-                        call.result = Some(Err(TerminalError::cancelled_before_dispatch(
-                            "Rewrite original Source is closing",
-                        )));
-                    }
-                    call.phase = CohortPhase::Refused;
+            if let Some(call) = source.cohort.as_mut()
+                && call.phase != CohortPhase::Complete
+            {
+                if call.result.is_none() {
+                    call.result = Some(Err(TerminalError::cancelled_before_dispatch(
+                        "Rewrite original Source is closing",
+                    )));
                 }
+                call.phase = CohortPhase::Refused;
             }
         }
         if let Err(error) = self.io.poll_continuing(cx) {

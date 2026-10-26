@@ -28,40 +28,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::application;
-use super::model::StatisticsJobTarget;
 use novarocks_statistics_application::{
     StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobAdmission,
     StatisticsJobCreate, StatisticsJobId, StatisticsJobRuntime, StatisticsJobService,
     StatisticsTarget,
 };
 use novarocks_workload_control::{PendingQueryRoot, RootAdmissionHandle, WorkClass, WorkRequest};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StatisticsStatementResult {
-    JobSubmitted(StatisticsJob),
-    JobCancellationRequested(StatisticsJob),
-    AnalyzeJobs(Vec<StatisticsJob>),
-    TableStats(Vec<StatisticsTableStatRow>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsTableStatRow {
-    pub metric_name: String,
-    pub value: Option<String>,
-    pub status: String,
-    pub basis_version: String,
-    pub source: String,
-    pub numeric_nature: String,
-    pub basis_relation: String,
-}
-
-pub trait TableStatisticsReader: Send + Sync {
-    fn show_table_stats(
-        &self,
-        target: &StatisticsJobTarget,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Vec<StatisticsTableStatRow>, String>;
-}
 
 /// T12's role composition supplies a root for each independently-owned
 /// background statistics business request. There is intentionally no default
@@ -96,57 +68,10 @@ impl StatisticsJobRootScopeSource for RootAdmissionStatisticsJobSource {
     }
 }
 
-struct StatisticsTableReaderAdapter {
-    inner: Arc<dyn application::StatisticsTableReader>,
-}
-
-impl TableStatisticsReader for StatisticsTableReaderAdapter {
-    fn show_table_stats(
-        &self,
-        target: &StatisticsJobTarget,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Vec<StatisticsTableStatRow>, String> {
-        self.inner
-            .show_table_stats(
-                &application::StatisticsTableTarget {
-                    catalog: target.catalog.clone(),
-                    namespace: target.namespace.clone(),
-                    table: target.table.clone(),
-                },
-                context,
-            )
-            .map_err(|error| error.to_string())
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| StatisticsTableStatRow {
-                        metric_name: row.metric,
-                        value: row.value,
-                        status: row.status,
-                        basis_version: row.basis_version,
-                        source: row.source,
-                        numeric_nature: row.numeric_nature,
-                        basis_relation: row.basis_relation,
-                    })
-                    .collect()
-            })
-    }
-}
-
-/// Construct the sole role-local adapter for SQL statistics reads. The
-/// product port receives it at construction and never accepts a later sink.
-pub(crate) fn table_statistics_reader_for_role(
-    controls: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-) -> Arc<dyn TableStatisticsReader> {
-    Arc::new(StatisticsTableReaderAdapter {
-        inner: Arc::new(application::ConnectorStatisticsTableReader::new(controls)),
-    })
-}
-
 pub struct FrontendStatisticsApplicationPort {
     job_runtime: Arc<StatisticsJobRuntime>,
     target_resolver: Arc<dyn application::StatisticsTargetResolver>,
     root_scope: Arc<dyn StatisticsJobRootScopeSource>,
-    table_statistics: Arc<dyn TableStatisticsReader>,
     runtime: tokio::runtime::Handle,
     blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
 }
@@ -155,7 +80,6 @@ impl FrontendStatisticsApplicationPort {
         job_service: StatisticsJobService,
         target_resolver: Arc<dyn application::StatisticsTargetResolver>,
         root_scope: Arc<dyn StatisticsJobRootScopeSource>,
-        table_statistics: Arc<dyn TableStatisticsReader>,
         core_executor: Arc<dyn StatisticsAttemptExecutor>,
         runtime: tokio::runtime::Handle,
         blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
@@ -168,7 +92,6 @@ impl FrontendStatisticsApplicationPort {
             )),
             target_resolver,
             root_scope,
-            table_statistics,
             runtime,
             blocking,
         }
@@ -318,38 +241,6 @@ impl FrontendStatisticsApplicationPort {
     }
 }
 
-fn map_application_result(
-    result: StatisticsStatementResult,
-) -> application::StatisticsApplicationResult {
-    match result {
-        StatisticsStatementResult::JobSubmitted(job) => {
-            application::StatisticsApplicationResult::JobSubmitted(job_view(job))
-        }
-        StatisticsStatementResult::JobCancellationRequested(job) => {
-            application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))
-        }
-        StatisticsStatementResult::AnalyzeJobs(jobs) => {
-            application::StatisticsApplicationResult::AnalyzeJobs(
-                jobs.into_iter().map(job_view).collect(),
-            )
-        }
-        StatisticsStatementResult::TableStats(rows) => {
-            application::StatisticsApplicationResult::TableStats(
-                rows.into_iter()
-                    .map(|row| application::StatisticsTableStatView {
-                        metric: row.metric_name,
-                        value: row.value,
-                        status: row.status,
-                        basis_version: row.basis_version,
-                        source: row.source,
-                        numeric_nature: row.numeric_nature,
-                        basis_relation: row.basis_relation,
-                    })
-                    .collect(),
-            )
-        }
-    }
-}
 fn job_view(job: StatisticsJob) -> application::StatisticsJobView {
     let (error_message, error_kind) = if let Some(failure) = &job.publication_failure {
         (Some(failure.public_message()), Some("PUBLICATION"))
@@ -927,10 +818,10 @@ impl novarocks_query_application::session_control::GovernedStatementAction
             self.result = Some(std::task::ready!(future.as_mut().poll(cx)));
             drop(self.future.take());
         }
-        if self.result.as_ref().is_some_and(Result::is_err) {
-            if let Some(prepared) = self.prepared.as_mut() {
-                prepared.retire_unsubmitted(&mut self.admission);
-            }
+        if self.result.as_ref().is_some_and(Result::is_err)
+            && let Some(prepared) = self.prepared.as_mut()
+        {
+            prepared.retire_unsubmitted(&mut self.admission);
         }
         let result = self
             .result

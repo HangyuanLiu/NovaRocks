@@ -2401,31 +2401,29 @@ impl FrontendQuerySession {
         }
         if let Ok(Some(ProductSqlCommand::Maintenance(command))) =
             lower_product_sql_command(&parsed_statement)
-        {
-            if crate::query_execution::maintenance::command::is_async_metadata_command(
+            && crate::query_execution::maintenance::command::is_async_metadata_command(
                 &command,
                 context.session().current_catalog(),
                 context.session().current_database(),
             )
             .unwrap_or(false)
+        {
+            let action = match self
+                .service
+                .product_command_router
+                .prepare_maintenance_statement_action(command, context, command_context)
             {
-                let action = match self
-                    .service
-                    .product_command_router
-                    .prepare_maintenance_statement_action(command, context, command_context)
-                {
-                    Ok(action) => action,
-                    Err(error) => {
-                        return Ok(self.governed_typed_error(
-                            routed_execution_service_error(product_command_error(error)),
-                            statement,
-                        ));
-                    }
-                };
-                return self
-                    .execute_observed_statement_action(statement, action)
-                    .await;
-            }
+                Ok(action) => action,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(
+                        routed_execution_service_error(product_command_error(error)),
+                        statement,
+                    ));
+                }
+            };
+            return self
+                .execute_observed_statement_action(statement, action)
+                .await;
         }
         if let ParsedStatement::MaterializedView(mv) = &parsed_statement {
             use novarocks_parser::ast::MaterializedViewStatement;
