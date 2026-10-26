@@ -84,15 +84,6 @@ impl PreparedMvNativeWriteAssembly {
     ) -> &std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession> {
         &self.session
     }
-
-    pub fn finish(self) -> PreparedMvSessionWrite {
-        PreparedMvSessionWrite {
-            description: self.description,
-            template: self.template,
-            query_options: self.query_options,
-            session: self.session,
-        }
-    }
 }
 
 /// MV uses the same complete-write consumer as the other write intents. The
@@ -198,38 +189,6 @@ fn mv_write_description(
             novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
         ),
     )
-}
-
-/// A session-driven MV write, one step away from dispatch.
-///
-/// The session rides along as the request's single commit authority, so no
-/// operation, cohort, or attempt identity reaches the writer data plane.
-pub struct PreparedMvSessionWrite {
-    description: novarocks_query_application::preparation::FrozenExecutionDescription,
-    template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    query_options: Option<QueryOptions>,
-    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-}
-
-impl PreparedMvSessionWrite {
-    pub(crate) fn into_request(
-        self,
-        execution: &QueryExecutionContext,
-    ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
-        let request = crate::query_execution::contract::build_request_from_finalized_execution(
-            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
-                self.description,
-                self.template,
-            ),
-            self.query_options,
-            crate::query_execution::contract::DistributedQueryIntent::Write,
-            execution,
-            None,
-        )
-        .map_err(|error| error.to_string())?;
-        crate::query_execution::contract::with_connector_write_session(request, self.session)
-            .map_err(|error| error.to_string())
-    }
 }
 
 /// Complete one MV write after its SQL producer has stated every provider read.

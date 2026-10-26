@@ -372,19 +372,6 @@ pub struct QueryTaskExecution {
     released_children_of: BTreeSet<StageId>,
 }
 
-/// What happened when an urgent context abort reached transport admission.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AbortSubmission {
-    /// The context owner had already minted or completed its abort.
-    NoIntent,
-    /// The transport owns this abort and will publish its acknowledgement.
-    Accepted,
-    /// The abort never entered an owner or dispatcher queue. The
-    /// process-level transport supervisor owns the capacity-change wake that
-    /// will schedule its next turn.
-    Backpressured,
-}
-
 /// Real dispatcher and process-transport capacity reserved for one exact
 /// actor-owned Abort preview.
 #[derive(Debug)]
@@ -726,6 +713,16 @@ impl QueryTaskExecution {
             .iter()
             .find(|(context, _)| context.backend_process_id() == backend)
             .and_then(|(_, owner)| owner.pre_ready_observation_remaining(self.clock.now()))
+    }
+
+    pub(crate) fn rejected_establish_observation_remaining(
+        &self,
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
+    ) -> Option<Duration> {
+        self.owners
+            .get(&context)?
+            .rejected_establish_observation_remaining(operation_id, self.clock.now())
     }
 
     /// Takes contexts whose task-operation acknowledgement requires an
@@ -1370,69 +1367,6 @@ impl QueryTaskExecution {
             let _ = self.dispatcher.cancel_queued(operation_id);
             self.operation_targets.remove(&operation_id);
             self.rollback_unsent(target, operation_id);
-        }
-    }
-
-    /// Forces one context down, ahead of everything queued for it.
-    pub fn abort_context(
-        &mut self,
-        context: QueryContextRef,
-        cause: AbortCause,
-    ) -> Result<AbortSubmission, TaskExecutionError> {
-        let now = self.clock.now();
-        let Some(intent) = self
-            .owners
-            .get_mut(&context)
-            .and_then(|owner| owner.abort_intent(cause))
-        else {
-            return Ok(AbortSubmission::NoIntent);
-        };
-        let operation_id = intent.operation_id();
-        self.dispatcher.validate_operation_carrier(&intent)?;
-        let preparation = self
-            .owners
-            .get_mut(&context)
-            .ok_or(TaskExecutionError::UnknownOperation)?
-            .queue_preparation(&intent);
-        let Some(queue_permit) =
-            Self::reserve_process_request(self.sink.as_ref(), intent.queue_request(), preparation)?
-        else {
-            self.rollback_unsent(OperationTarget::Context(context), operation_id);
-            return Ok(AbortSubmission::Backpressured);
-        };
-        if let Err(error) = self
-            .dispatcher
-            .enqueue_priority_reserved(intent, now, queue_permit)
-        {
-            self.rollback_unsent(OperationTarget::Context(context), operation_id);
-            return Err(error);
-        }
-        self.operation_targets
-            .insert(operation_id, OperationTarget::Context(context));
-        let Some(batch) = self
-            .dispatcher
-            .take_priority_lane_batch(context.backend_process_id(), DispatchLane::Lifecycle)
-        else {
-            return Ok(AbortSubmission::Backpressured);
-        };
-        let acceptance = batch.acceptance();
-        match self.sink.try_submit(batch) {
-            TaskOperationSubmit::Accepted => {
-                self.dispatcher.accept(acceptance)?;
-                Ok(AbortSubmission::Accepted)
-            }
-            TaskOperationSubmit::Backpressured(batch) => {
-                self.dispatcher.restore_backpressured(batch);
-                Ok(AbortSubmission::Backpressured)
-            }
-            TaskOperationSubmit::AdmissionFailed { batch, error } => {
-                self.rollback_rejected_batch(batch)?;
-                Err(TaskExecutionError::Workload(error))
-            }
-            TaskOperationSubmit::Rejected { batch, reason } => {
-                self.rollback_rejected_batch(batch)?;
-                Err(TaskExecutionError::Schedule(reason))
-            }
         }
     }
 

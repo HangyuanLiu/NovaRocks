@@ -603,11 +603,27 @@ impl LogicalExecutionState {
         self.attempts.get(&execution).copied()
     }
 
+    /// Read-only opportunity to observe independent replacement evidence. This
+    /// neither consumes the running capability nor authorizes a successor.
+    pub(crate) fn may_observe_pre_ready_replacement(&self, deadline_reached: bool) -> bool {
+        self.conclusion.is_none()
+            && super::recovery::recovery_window_refusal(super::recovery::RecoveryWindowInput {
+                mode: self.recovery_mode,
+                effect: self.effect,
+                output_visible: self.delivery.output_visible(),
+                attempts_started: self.attempts_started,
+                max_attempts: self.max_attempts,
+                deadline_reached,
+            })
+            .is_none()
+    }
+
     pub(crate) fn begin_replacement(
         &mut self,
         failed: &AttemptCapability,
         replacement: QueryExecutionId,
         failure: AttemptFailureClass,
+        pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
         deadline_reached: bool,
     ) -> Result<ReplacementToken, ActorStateError> {
         if self.conclusion.is_some() {
@@ -615,6 +631,11 @@ impl LogicalExecutionState {
         }
         self.require_current_capability(failed)?;
         let failed_execution = failed.execution;
+        if pre_ready_replacement
+            .is_some_and(|witness| witness.context().query_execution_id() != failed_execution)
+        {
+            return Err(ActorStateError::NotCurrent);
+        }
         match self.phase {
             ExecutionPhase::Running { execution, .. } if execution == failed_execution => {}
             ExecutionPhase::Running { .. } => return Err(ActorStateError::NotCurrent),
@@ -625,6 +646,7 @@ impl LogicalExecutionState {
             mode: self.recovery_mode,
             effect: self.effect,
             failure,
+            pre_ready_replacement,
             output_visible: self.delivery.output_visible(),
             attempts_started: self.attempts_started,
             max_attempts: self.max_attempts,
@@ -1427,6 +1449,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             ),
             Err(ActorStateError::WrongPhase)
@@ -1482,6 +1505,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             ),
             Err(ActorStateError::RecoveryRefused(
@@ -1507,6 +1531,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1756,6 +1781,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1797,6 +1823,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1831,6 +1858,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1862,6 +1890,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -2036,6 +2065,67 @@ mod tests {
                 generation: 2,
                 deadline: origin.saturating_add(Duration::from_secs(2)),
             })
+        );
+    }
+    #[test]
+    fn replacement_witness_is_rechecked_against_actual_running_attempt() {
+        use novarocks_execution_contract::QueryContextRef;
+        use novarocks_types::{BackendProcessId, FrontendProcessId};
+        let mut state = LogicalExecutionState::new(
+            execution(1),
+            RecoveryMode::RestartAttemptBeforeVisibility,
+            ExecutionEffect::None,
+            LogicalOutputMode::ResultStream,
+            2,
+        )
+        .unwrap();
+        let initial = running_capability(&mut state, execution(1));
+        let foreign = QueryContextRef::new(
+            execution(2),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (_, witness, _) = crate::api::pre_ready_identity_refusal_test_fixture(foreign);
+        assert_eq!(
+            state.begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::ContractViolation,
+                Some(witness),
+                false
+            ),
+            Err(ActorStateError::NotCurrent)
+        );
+        assert_eq!(
+            state.begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::ContractViolation,
+                None,
+                false
+            ),
+            Err(ActorStateError::RecoveryRefused(
+                RecoveryRefusal::FailureClass
+            ))
+        );
+        let current = QueryContextRef::new(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (_, witness, _) = crate::api::pre_ready_identity_refusal_test_fixture(current);
+        state
+            .begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::ContractViolation,
+                Some(witness),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            state.attempt(execution(1)).unwrap().disposition,
+            AttemptDisposition::Residual
         );
     }
 }

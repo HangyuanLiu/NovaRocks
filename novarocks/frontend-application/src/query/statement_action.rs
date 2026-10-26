@@ -40,10 +40,36 @@ impl StatementReadyReceiver {
         tail.finish()
             .map_err(|e| internal_error(format!("statement progress notification refused: {e:?}")))
     }
-    fn take_protocol(&self) -> Result<StatementResult, QueryServiceError> {
+    fn take_protocol(
+        &self,
+        cancellation: &QueryCancellationView,
+    ) -> Result<StatementResult, QueryServiceError> {
+        let original_error = {
+            let ready = self.ready.lock().unwrap_or_else(|p| p.into_inner());
+            ready
+                .as_ref()
+                .and_then(|ready| ready.result.as_ref().err())
+                .cloned()
+        };
+        // An eligible observation may accept an expired Root deadline and
+        // invoke its callbacks. The original Err and owner stay in this stable
+        // receiver while reconciliation runs outside its mutex. Success never
+        // observes cancellation here.
+        let reconciled = original_error
+            .as_ref()
+            .map(|error| error.clone().reconcile_local_stop_observation(cancellation));
         let mut output = None;
         {
             let mut ready = self.ready.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(original) = original_error.as_ref() {
+                let current = ready.as_mut().and_then(|ready| ready.result.as_mut().err());
+                let Some(current) = current.filter(|current| *current == original) else {
+                    return Err(internal_error(
+                        "statement receiving error changed during reconciliation",
+                    ));
+                };
+                *current = reconciled.expect("same observed business error");
+            }
             StatementActionReady::transfer_protocol_in(&mut ready, &mut output)
                 .map_err(internal_error)?;
         }
@@ -106,6 +132,6 @@ impl FrontendQuerySession {
             }
         };
         self.statement_ready.install(receipt)?;
-        self.statement_ready.take_protocol()
+        self.statement_ready.take_protocol(&cancellation)
     }
 }

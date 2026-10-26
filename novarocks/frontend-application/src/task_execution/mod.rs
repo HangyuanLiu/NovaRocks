@@ -29,7 +29,7 @@
 //! transport owner implements, which is also what makes every behaviour here
 //! testable without a wire.
 //!
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 pub(crate) mod abort_effect;
 pub(crate) mod actor_gate;

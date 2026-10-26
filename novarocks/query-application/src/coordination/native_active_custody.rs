@@ -18,7 +18,8 @@
 //! Custody of the same active Native Box under its original actor registration.
 //! No new WorkOwner, governance obligation, actor, admission, or dispatch policy.
 
-use super::{LogicalExecutionRuntimeRegistryHandle, StatementNativeResidualRegistry};
+use super::LogicalExecutionRuntimeRegistryHandle;
+use super::runtime_registry::health::LogicalExecutionHealth;
 use crate::api::{
     ActiveNativeAttemptOwner, NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptConvergence, QueryExecutionError, QueryExecutionErrorKind,
@@ -437,12 +438,12 @@ impl Drop for RootAckTailReservation {
 #[derive(Clone)]
 pub(crate) struct NativeActiveCustodyRegistry {
     slots: Arc<Mutex<BTreeMap<NativeActiveCustodyKey, Arc<ActiveSlot>>>>,
-    health: StatementNativeResidualRegistry,
+    health: LogicalExecutionHealth,
     progress: Arc<Notify>,
     root_ack_ready: Arc<RootAckReadyIndex>,
 }
 impl NativeActiveCustodyRegistry {
-    pub(crate) fn new(health: StatementNativeResidualRegistry, progress: Arc<Notify>) -> Self {
+    pub(super) fn new(health: LogicalExecutionHealth, progress: Arc<Notify>) -> Self {
         Self {
             slots: Arc::new(Mutex::new(BTreeMap::new())),
             health,
@@ -1451,7 +1452,7 @@ pub(crate) fn root_ack_test_fixture(
     root: TaskIdentity,
 ) -> (RootAckTestOwner, RootAckTailReservation) {
     let registry = NativeActiveCustodyRegistry::new(
-        StatementNativeResidualRegistry::new(317),
+        LogicalExecutionHealth::new(Arc::new(Notify::new())),
         Arc::new(Notify::new()),
     );
     root_ack_test_fixture_in(registry, activation, root)
@@ -1838,6 +1839,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn early_remote_tracking_keeps_same_owner_and_window_without_renewing_terminal_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct HeldWindowOwner {
+            _window: novarocks_workload_control::ResultWindowGrant,
+            drops: Arc<AtomicUsize>,
+        }
+        impl fmt::Debug for HeldWindowOwner {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("HeldWindowOwner").finish_non_exhaustive()
+            }
+        }
+        impl Drop for HeldWindowOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl ActiveNativeAttemptOwner for HeldWindowOwner {
+            fn run<'a>(
+                &'a mut self,
+                _: &'a crate::coordination::NativeAttemptDrive,
+                _: CancellationView,
+            ) -> crate::api::NativeAttemptRunFuture<'a> {
+                panic!("an early tracking proof must not dispatch Native work")
+            }
+            fn converge<'a>(
+                &'a mut self,
+                _: NativeActiveConvergenceRequest,
+            ) -> crate::api::NativeActiveAttemptConvergenceFuture<'a> {
+                panic!("a rejected tracking proof must not restart convergence")
+            }
+        }
+
+        let (control, work, capacity, window) = tail_work();
+        let scope = work.owner.scope();
+        let (activation, root) = tail_identity(431);
+        let key = NativeActiveCustodyKey {
+            initial: activation.execution(),
+            generation: 1,
+            execution: activation.execution(),
+        };
+        let context = QueryContextRef::new(
+            key.execution,
+            FrontendProcessId::new_v7(),
+            root.backend_process_id(),
+        );
+        let mut runtime =
+            super::super::LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
+        let storage = NativeActiveCustodyRegistry::new(
+            LogicalExecutionHealth::new(Arc::new(Notify::new())),
+            Arc::new(Notify::new()),
+        );
+        // Exercise the real exact-context reservation and owner binding. This
+        // rejection precedes forwarding any closure to the actor registry.
+        let reservation = storage
+            .reserve_with_original_exit(key, &[context], runtime.handle(), Weak::new())
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original: Box<dyn ActiveNativeAttemptOwner> = Box::new(HeldWindowOwner {
+            _window: window,
+            drops: Arc::clone(&drops),
+        });
+        let address = &*original as *const dyn ActiveNativeAttemptOwner as *const () as usize;
+        let mut active = reservation.bind(original);
+        let ack = active.reserve_root_ack_tail(activation, root).unwrap();
+        drop(ack); // No ACK was issued; this supplies no Native exit evidence.
+
+        let cut = Instant::now();
+        let budget = Duration::from_secs(30);
+        active.begin_terminal_cut(cut);
+        let first = active.request(scope.cancellation().unwrap(), budget);
+        assert_eq!(first.remote_observation_deadline(), cut + budget);
+        active.begin_terminal_cut(cut + Duration::from_secs(1));
+        let repeated = active.request(scope.cancellation().unwrap(), budget + budget);
+        assert_eq!(
+            repeated.remote_observation_deadline(),
+            first.remote_observation_deadline()
+        );
+        assert!(Instant::now() < first.remote_observation_deadline());
+        drop((first, repeated));
+
+        let error = active
+            .record_and_close(NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                exact_contexts: vec![context].into_boxed_slice(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            error.message(),
+            "active Native remote tracking ended before its original deadline",
+        );
+        assert!(!active.closed);
+        assert!(
+            active.owner.is_none(),
+            "the same Box moves to unresolved custody"
+        );
+        assert_eq!(storage.len(), 1);
+        {
+            let held = active.custody.slot.owner.lock().unwrap();
+            let Some(ActiveSlotOwner::Retained(original)) = held.as_ref() else {
+                panic!("an early tracking proof must retain the original owner");
+            };
+            assert_eq!(
+                &*original._owner as *const dyn ActiveNativeAttemptOwner as *const () as usize,
+                address,
+            );
+            assert!(original.failure.cause().is::<ActiveCustodyInvariant>());
+            assert_eq!(original.failure.detail(), error.message());
+        }
+        assert!(!active.custody.slot.root_ack.lock().unwrap().native_closed);
+        assert!(storage.blocks_registration(key.initial, key.generation));
+        assert_eq!(storage.health.health().unwrap().message(), error.message());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        work.owner.complete();
+        work.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        drop(active);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        assert_eq!(
+            control
+                .snapshot()
+                .obligation_endings
+                .tracking_ended_remote_unknown,
+            0
+        );
+
+        // Only the explicit process-exit disposition abandons this failed
+        // owner. No error, unused ACK, or borrowed wrapper drop certified exit.
+        storage.abandon_for_process_exit();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(
+            control.snapshot().obligation_endings.settled_with_evidence,
+            0
+        );
+        runtime.abandon_for_process_exit();
+    }
+
+    #[tokio::test]
     async fn original_ack_survives_driver_unwind_before_and_after_first_poll() {
         use std::sync::atomic::{AtomicBool, Ordering};
         for after_first_poll in [false, true] {
@@ -2072,7 +2216,7 @@ mod tests {
     #[test]
     fn health_search_stays_in_exact_prefix_and_keeps_first_held_source_order() {
         let registry = NativeActiveCustodyRegistry::new(
-            StatementNativeResidualRegistry::new(316),
+            LogicalExecutionHealth::new(Arc::new(Notify::new())),
             Arc::new(Notify::new()),
         );
         let initial = execution(91, 71, 3);
@@ -2173,7 +2317,7 @@ mod tests {
     #[test]
     fn exact_registration_prefix_membership_covers_adjacent_and_extreme_keys() {
         let registry = NativeActiveCustodyRegistry::new(
-            StatementNativeResidualRegistry::new(315),
+            LogicalExecutionHealth::new(Arc::new(Notify::new())),
             Arc::new(Notify::new()),
         );
         let low = execution(i64::MIN, i64::MIN, 1);

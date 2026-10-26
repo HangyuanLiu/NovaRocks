@@ -222,8 +222,24 @@ impl ReadNativeTail {
         if let Some(health) = &self.health {
             return Poll::Ready(Err(health.clone()));
         }
+        let mut io_withdrawn = false;
         if let Some(io) = self.io.original() {
-            if let Err(error) = io.poll_continuing(cx) {
+            // A refused bootstrap has no running I/O. Only its original
+            // withdrawal author can return its never-installed proposal.
+            if !self.launched {
+                match io.withdraw_unstarted_in() {
+                    Ok(Some(_)) => io_withdrawn = true,
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                            "Read initial I/O withdrawal failed",
+                            Arc::new(error),
+                        ));
+                        return Poll::Ready(Err(self.health.clone().unwrap()));
+                    }
+                }
+            }
+            if !io_withdrawn && let Err(error) = io.poll_actual_progress_continuing(cx) {
                 self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
                     "Read I/O continuation failed before actual exit",
                     Arc::new(error),
@@ -258,17 +274,17 @@ impl ReadNativeTail {
                 return Poll::Ready(Err(self.health.clone().unwrap()));
             }
         }
-        if let Some(io) = self.io.original() {
-            match io.poll_quiescent_continuing(cx) {
+        if !io_withdrawn && let Some(io) = self.io.original() {
+            match io.poll_actual_quiescent_continuing(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => {
-                    self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
-                        "Read I/O close failed",
-                        Arc::new(error),
-                    ));
-                    return Poll::Ready(Err(self.health.clone().unwrap()));
+                Poll::Ready(Err(health)) => {
+                    self.health = Some(health.clone());
+                    return Poll::Ready(Err(health));
                 }
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(_)) => {
+                    // The same MIO body retains its ordinary failure. Business
+                    // selection reads that fact; it is not an exit failure.
+                }
             }
         }
         Poll::Ready(Ok(()))
@@ -369,8 +385,11 @@ impl ReadStatementAction {
         match tail.io.poll_progress(work, cx) {
             Ok(ready) => self.bootstrap_ready |= ready,
             Err(e) => {
-                self.error
-                    .get_or_insert_with(|| internal_error(e.to_string()));
+                self.error.get_or_insert_with(|| {
+                    QueryServiceError::from_failure_cause(
+                        novarocks_failure_contract::SharedFailureCause::new(e),
+                    )
+                });
             }
         }
         if !self.bootstrap_ready && self.error.is_none() {
@@ -422,23 +441,31 @@ impl ReadStatementAction {
                             }
                         }
                     }
-                    Ok(PreparedQueryOperation::Distributed(_)) => {
-                        self.error = Some(internal_error(
-                            "Read completion returned a legacy distributed operation",
-                        ))
-                    }
                 }
             }
         }
-        if self.local.is_some() {
+        if self.error.is_none() {
+            if let Some(error) = tail.io.original().and_then(|io| io.failure()) {
+                self.error = Some(QueryServiceError::from_failure_cause(
+                    novarocks_failure_contract::SharedFailureCause::new(error),
+                ));
+            }
+        }
+        if self.error.is_none() && self.local.is_some() {
             match tail.poll_business_exit(cx) {
                 Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
             }
-            self.result_transferred = true;
-            return Poll::Ready(Ok(StatementActionValue::Local(
-                self.local.take().expect("closed local Read result"),
-            )));
+            if let Some(error) = tail.io.original().and_then(|io| io.failure()) {
+                self.error = Some(QueryServiceError::from_failure_cause(
+                    novarocks_failure_contract::SharedFailureCause::new(error),
+                ));
+            } else {
+                self.result_transferred = true;
+                return Poll::Ready(Ok(StatementActionValue::Local(
+                    self.local.take().expect("closed local Read result"),
+                )));
+            }
         }
         if self.error.is_none() && self.read.is_some() {
             // Actual physical footer, not an idle projection's final settlement,
@@ -545,6 +572,7 @@ impl ReadStatementAction {
             if !tail.launched {
                 // A refused mount left every original input in this action.
                 // Dispose those inputs before retiring its unlaunched stage.
+                drop(self.local.take());
                 drop(self.original.input.take());
                 drop(self.original.request.take());
                 drop(self.read.take());
@@ -629,6 +657,10 @@ impl FrontendQuerySession {
             .query_compiler
             .validate_original_read_runtime()
             .map_err(|error| internal_error(error.to_string()))?;
+        let cancellation = QueryCancellationView::governed(
+            statement.cancellation().clone(),
+            statement.timeout_ms(),
+        );
         let state_store = self
             .service
             .state_store
@@ -640,7 +672,10 @@ impl FrontendQuerySession {
                 Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
             })
             .transpose()
-            .map_err(QueryServiceError::from_failure_cause)?;
+            .map_err(|cause| {
+                QueryServiceError::from_failure_cause(cause)
+                    .reconcile_local_stop_observation(&cancellation)
+            })?;
         let dependencies = self
             .service
             .state_store
@@ -870,6 +905,125 @@ mod tests {
         drop((request, source));
         finish(control, root, driver);
     }
+    #[test]
+    fn cancelled_read_bootstrap_withdraws_original_without_manufacturing_health() {
+        let (control, driver, _) = fixture();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        let profile = local_preparation_profile().unwrap();
+        let io = ReadMetadataIoSource::new(scope.clone(), profile.clone());
+        io.configure_read_source(&profile).unwrap();
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::DeadlineExceeded);
+        let mut cx = Context::from_waker(Waker::noop());
+        let refused = io.poll_progress(&root.owner, &mut cx).unwrap_err();
+        assert_eq!(
+            refused,
+            WorkError::Cancelled(novarocks_workload_control::CancellationReason::DeadlineExceeded)
+        );
+        let original = io.original().unwrap();
+        let mut tail = ReadNativeTail {
+            state_store: None,
+            io,
+            stage: StatementStageAdmission::new(scope, 0),
+            exit: None,
+            receipt: None,
+            launched: false,
+            health: None,
+        };
+        assert!(matches!(
+            tail.poll_business_exit(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(original.failure(), Some(refused));
+        assert!(tail.health.is_none());
+        assert!(
+            tail.receipt.is_none(),
+            "an unlaunched Read has no Native footer"
+        );
+        assert!(matches!(tail.poll_exit(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        drop((original, tail));
+        finish(control, root, driver);
+    }
+
+    #[test]
+    fn stopped_read_keeps_real_request_alias_until_actual_quiescence_without_health() {
+        use crate::query_execution::native_execution_adapter::source_cohort::tests::drive;
+        let (control, mut driver, _) = fixture();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        let profile = local_preparation_profile().unwrap();
+        let io = ReadMetadataIoSource::new(scope.clone(), profile.clone());
+        io.configure_read_source(&profile).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..100 {
+            ready = io.poll_progress(&root.owner, &mut cx).unwrap();
+            drive(&mut driver);
+            if ready {
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "the original MIO actually installed its positive payload"
+        );
+        let original = io.original().unwrap();
+        let selected = SharedDependency::Thrift(
+            novarocks_resource_contract::ThriftServiceOrigin::from_selected_address(
+                "read-new-route:9083",
+            )
+            .unwrap(),
+        );
+        let request = io.request(selected).unwrap();
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::DeadlineExceeded);
+        assert!(io.poll_progress(&root.owner, &mut cx).unwrap());
+        let refused = original
+            .failure()
+            .expect("same actual domain-growth refusal");
+        assert_eq!(
+            refused,
+            WorkError::Cancelled(novarocks_workload_control::CancellationReason::DeadlineExceeded)
+        );
+        let mut permit = None;
+        assert!(matches!(
+            request.poll_admitted_in(&mut permit, &mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert!(
+            permit.is_none(),
+            "the refused request never acquires a physical permit"
+        );
+        let mut tail = ReadNativeTail {
+            state_store: None,
+            io,
+            stage: StatementStageAdmission::new(scope, 0),
+            exit: None,
+            receipt: None,
+            launched: false,
+            health: None,
+        };
+        assert!(tail.poll_business_exit(&mut cx).is_pending());
+        assert!(tail.health.is_none());
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        drop(request);
+        assert!(matches!(
+            tail.poll_business_exit(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(tail.health.is_none());
+        assert_eq!(original.failure(), Some(refused));
+        assert!(matches!(tail.poll_exit(&mut cx), Poll::Ready(Ok(()))));
+        drop((original, tail));
+        finish(control, root, driver);
+    }
+
     #[test]
     fn ordinary_read_tail_cannot_treat_absent_native_observer_as_actual_exit() {
         let (control, driver, _) = fixture();

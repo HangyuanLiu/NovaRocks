@@ -21,7 +21,7 @@
 //! original fixed role cell receives one governed work owner before returning
 //! a future to the caller. The same supervisor task polls every logical role;
 //! dropping a caller reply cannot detach its original frame or input. Actor
-//! and statement Native residual owners retain their existing exit contracts.
+//! and Native active custody retain their existing exit contracts.
 //!
 //! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
@@ -195,7 +195,7 @@ impl std::error::Error for LogicalExecutionSupervisorShutdownError {}
 /// Shutdown borrows this owner. A timed-out or cancelled wait leaves the exact
 /// join handle and Registry owner here so a later call resumes the same
 /// convergence.
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)
 pub struct LogicalExecutionSupervisor {
     shutdown: watch::Sender<bool>,
     join: Option<JoinHandle<OriginalRootOutcome>>,
@@ -204,7 +204,6 @@ pub struct LogicalExecutionSupervisor {
     original_root_panic: std::mem::ManuallyDrop<Option<OriginalRootPanic>>,
     registry: LogicalExecutionRuntimeRegistry,
     statements: Arc<crate::session_control::StatementProgressSlot>,
-    statement_native_residual_port: super::StatementNativeResidualPort,
     role_retirement: RoleBackingRetirementObserver,
     shutdown_complete: bool,
 }
@@ -451,7 +450,7 @@ impl LogicalExecutionSupervisor {
     /// Process-health observation is independent of the service task's exit.
     /// The existing registry retains its original cause and source owner.
     pub fn process_failure(&self) -> Option<QueryExecutionError> {
-        self.registry.statement_native_health()
+        self.registry.process_health()
     }
 
     /// Borrows the original source's same cause; no absence or root task
@@ -583,8 +582,6 @@ impl LogicalExecutionSupervisor {
         let role_retirement = bank.retirement_observer();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let registry = LogicalExecutionRuntimeRegistry::new(runtime.clone());
-        let statement_native_residual_port =
-            registry.statement_native_residual_port(config.remote_cleanup_timeout());
         let registry_handle = registry.handle();
         let query_ids = Arc::new(ProcessQueryIdAllocator::new(namespace));
         let driver = QueryExecutionDriverHandle {
@@ -616,7 +613,6 @@ impl LogicalExecutionSupervisor {
                 original_root_panic: std::mem::ManuallyDrop::new(Some(original_root)),
                 registry,
                 statements,
-                statement_native_residual_port,
                 role_retirement,
                 shutdown_complete: false,
             },
@@ -629,12 +625,6 @@ impl LogicalExecutionSupervisor {
     /// retained by health may keep its footer charged beyond the root's exit.
     pub fn role_retirement(&self) -> &RoleBackingRetirementObserver {
         &self.role_retirement
-    }
-
-    /// Registers only original statement Native responsibility; no actor gate,
-    /// logical success, or second business admission is granted by this port.
-    pub fn statement_native_residual_port(&self) -> super::StatementNativeResidualPort {
-        self.statement_native_residual_port.clone()
     }
 
     /// Safe borrow; the original failure remains with the actual root owner.
@@ -668,7 +658,7 @@ impl LogicalExecutionSupervisor {
                 Err(_) => {
                     // Preserve the original healthy/error boundary while the
                     // same JoinHandle/Registry still own unresolved local work.
-                    return Err(match self.registry.statement_native_health() {
+                    return Err(match self.registry.process_health() {
                         Some(error) => {
                             LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(
                                 error,
@@ -695,7 +685,7 @@ impl LogicalExecutionSupervisor {
         match self.registry.shutdown_until(deadline).await {
             Ok(()) => {}
             Err(LogicalExecutionRuntimeShutdownError::DeadlineExceeded { .. }) => {
-                return Err(match self.registry.statement_native_health() {
+                return Err(match self.registry.process_health() {
                     Some(error) => {
                         LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(error)
                     }
@@ -707,7 +697,7 @@ impl LogicalExecutionSupervisor {
             }
         }
 
-        if let Some(error) = self.registry.statement_native_health()
+        if let Some(error) = self.registry.process_health()
             && matches!(self.run_outcome, Some(SupervisorRunOutcome::Completed))
         {
             self.run_outcome = Some(SupervisorRunOutcome::Failed(Box::new(error)));
@@ -1236,6 +1226,7 @@ struct NativeLogicalRoleInput {
     shutdown: watch::Receiver<bool>,
 }
 
+// Design: ADR-0092 (docs/adr/ADR-0092-process-scoped-query-execution-attribution.md)
 #[derive(Debug)]
 struct ProcessQueryIdAllocator {
     namespace: QueryProcessNamespace,
@@ -1268,7 +1259,14 @@ impl ProcessQueryIdAllocator {
     }
 
     fn first_execution(&self) -> Result<QueryExecutionId, QueryExecutionError> {
-        let previous = NEXT_PROCESS_QUERY_SEQUENCE
+        self.first_execution_from(&NEXT_PROCESS_QUERY_SEQUENCE)
+    }
+
+    fn first_execution_from(
+        &self,
+        sequence: &AtomicU64,
+    ) -> Result<QueryExecutionId, QueryExecutionError> {
+        let previous = sequence
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current
                     .checked_add(1)
@@ -1288,30 +1286,6 @@ impl ProcessQueryIdAllocator {
         .map_err(|error| {
             QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
         })
-    }
-}
-
-// These are the original statement Native tasks only. Logical roles never
-// enter this JoinSet; they remain in their original bank frame and footer.
-fn observe_residual_join(
-    registry: &LogicalExecutionRuntimeRegistryHandle,
-    result: Result<Result<(), QueryExecutionError>, tokio::task::JoinError>,
-    first: &mut Option<QueryExecutionError>,
-) {
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            first.get_or_insert(error);
-        }
-        Err(error) => {
-            registry.record_native_supervision_join_failure(error);
-            first.get_or_insert_with(|| {
-                QueryExecutionError::new(
-                    QueryExecutionErrorKind::Failed,
-                    "logical execution supervision task panicked",
-                )
-            });
-        }
     }
 }
 
@@ -1454,7 +1428,6 @@ where
     F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
     M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
 {
-    let mut residual_tasks = JoinSet::new();
     let mut task_failure = None;
     let mut stopping = false;
     let mut original_exit_cursor = super::runtime_registry::OriginalExitCursor::default();
@@ -1465,7 +1438,6 @@ where
             // already accepted input is visible; later attempts must refuse.
             bank.stop_ingress();
             statements.close();
-            registry.close_statement_native_admission();
             stopping = true;
         }
 
@@ -1475,17 +1447,6 @@ where
         })
         .await;
         registry.progress_root_ack_tails();
-        for task in registry.statement_native_ready_tasks() {
-            residual_tasks.spawn(task);
-        }
-        // Deterministic finite completed-join service precedes event selection.
-        // Continually ready role inputs cannot starve original residual joins.
-        for _ in 0..turn_budget.get() {
-            let Some(joined) = residual_tasks.try_join_next() else {
-                break;
-            };
-            observe_residual_join(&registry, joined, &mut task_failure);
-        }
         if let Some(completion) = bank.progress_turn(turn_budget) {
             observe_logical_completion(&registry, bank, completion, &mut task_failure);
         }
@@ -1494,13 +1455,11 @@ where
             Poll::Ready(())
         })
         .await;
-        if let Some(error) = registry.statement_native_health() {
+        if let Some(error) = registry.process_health() {
             task_failure.get_or_insert(error);
         }
         if stopping
             && !bank.has_owned_sources_after_stop().map_err(work_error)?
-            && residual_tasks.is_empty()
-            && registry.statement_native_count() == 0
             && registry.root_ack_tail_count() == 0
             && !registry.original_exit_pending()
             && !statements.has_sources()
@@ -1515,12 +1474,7 @@ where
         tokio::select! {
             biased;
             _ = shutdown.changed(), if !stopping => {}
-            _ = registry.statement_native_changed() => {}
-            result = residual_tasks.join_next(), if !residual_tasks.is_empty() => {
-                if let Some(result) = result {
-                    observe_residual_join(&registry, result, &mut task_failure);
-                }
-            }
+            _ = registry.process_health_changed() => {}
             _ = registry.root_ack_tail_changed() => {}
             _ = registry.original_exit_changed() => {}
             _ = std::future::poll_fn(|cx| statements.poll_turn(&mut statement_cursor, turn_budget, cx)) => {}
@@ -3050,6 +3004,16 @@ async fn supervise_rows_inner(
                     mode: description.recovery(),
                     effect: description.effect(),
                     failure: decision.class(),
+                    pre_ready_replacement: decision.pre_ready_replacement().copied().filter(
+                        |witness| {
+                            witness.context().query_execution_id() == attempt.schedule.execution()
+                                && decision
+                                    .error()
+                                    .execution_failure()
+                                    .is_some_and(|input| witness.matches_input(input))
+                                && cancellation.reason().is_none()
+                        },
+                    ),
                     output_visible: false,
                     attempts_started,
                     max_attempts: config.rows.max_attempts.get(),
@@ -9877,6 +9841,62 @@ mod tests {
             .unwrap();
 
         assert_ne!(first, rebuilt);
+    }
+
+    #[test]
+    fn query_id_issuance_keeps_one_namespace_and_positive_continuous_sequences() {
+        let sequence = AtomicU64::new(0);
+        let namespace = QueryProcessNamespace::new(0xfedc_ba98_7654_3210);
+        let allocator = ProcessQueryIdAllocator::new(namespace);
+        let first = allocator.first_execution_from(&sequence).unwrap();
+        let second = allocator.first_execution_from(&sequence).unwrap();
+
+        for (execution, expected) in [(first, 1), (second, 2)] {
+            let attribution = execution.query_id().process_attribution().unwrap();
+            assert_eq!(attribution.namespace(), namespace);
+            assert_eq!(attribution.sequence().get(), expected);
+            assert_eq!(execution.attempt_id(), AttemptId::new(1).unwrap());
+        }
+        assert_ne!(first, second);
+        assert_eq!(sequence.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn query_id_issuance_preserves_distinct_process_namespaces() {
+        let first = ProcessQueryIdAllocator::new(QueryProcessNamespace::new(11))
+            .first_execution_from(&AtomicU64::new(0))
+            .unwrap();
+        let second = ProcessQueryIdAllocator::new(QueryProcessNamespace::new(12))
+            .first_execution_from(&AtomicU64::new(0))
+            .unwrap();
+
+        assert_eq!(first.query_id().low(), second.query_id().low());
+        assert_ne!(first.query_id().high(), second.query_id().high());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn query_id_issuance_exhaustion_never_wraps_or_reuses_the_final_sequence() {
+        let final_sequence = i64::MAX as u64;
+        let sequence = AtomicU64::new(final_sequence - 1);
+        let namespace = QueryProcessNamespace::new(13);
+        let allocator = ProcessQueryIdAllocator::new(namespace);
+        let final_execution = allocator.first_execution_from(&sequence).unwrap();
+        let attribution = final_execution.query_id().process_attribution().unwrap();
+        assert_eq!(attribution.namespace(), namespace);
+        assert_eq!(attribution.sequence().get(), final_sequence);
+
+        // Both the original and rebuilt allocator use the same checked author.
+        // No test changes the process-global issuing counter.
+        for issuer in [allocator, ProcessQueryIdAllocator::new(namespace)] {
+            let error = issuer.first_execution_from(&sequence).unwrap_err();
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            assert_eq!(
+                error.message(),
+                "logical execution query id sequence is exhausted"
+            );
+            assert_eq!(sequence.load(Ordering::Relaxed), final_sequence);
+        }
     }
 
     #[derive(Debug)]

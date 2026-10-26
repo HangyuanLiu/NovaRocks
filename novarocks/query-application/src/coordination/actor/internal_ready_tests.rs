@@ -562,6 +562,7 @@ fn internal_profile_data_and_end_remain_replaceable_until_ready() {
             &capability,
             replacement(first, 2),
             AttemptFailureClass::RecoverableInfrastructure,
+            None,
             false,
         )
         .unwrap();
@@ -586,6 +587,7 @@ fn internal_profile_data_and_end_remain_replaceable_until_ready() {
                 &capability,
                 replacement(first, 2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false
             )
             .unwrap_err(),

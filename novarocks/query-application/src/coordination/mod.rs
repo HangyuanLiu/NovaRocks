@@ -29,7 +29,6 @@ mod root_relay;
 mod runtime_registry;
 mod schedule;
 mod stand_down;
-mod statement_native_residual;
 mod supervisor;
 
 pub(crate) use actor::InternalReadyActorPort;
@@ -51,7 +50,6 @@ pub use root_relay::*;
 pub use runtime_registry::*;
 pub use schedule::*;
 pub use stand_down::*;
-pub use statement_native_residual::*;
 pub use supervisor::*;
 
 /// Enforces a process owner's explicit-shutdown invariant from its `Drop`.

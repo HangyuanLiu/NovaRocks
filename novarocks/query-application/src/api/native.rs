@@ -131,6 +131,86 @@ pub enum NativeAttemptTopologyRequirement {
     ExcludeProcess(BackendProcessId),
 }
 
+/// Independent exact process-replacement evidence retained beside an original
+/// pre-ready Establish refusal. The producer must have observed a real Worker
+/// IdentityMismatch for this operation and a different process at its frozen
+/// endpoint within the ORIGINAL observation horizon. This value does not claim
+/// that the wire identified a particular IdentityField, grant retry, or prove exit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreReadyProcessReplacementWitness {
+    context: novarocks_execution_contract::QueryContextRef,
+    operation_id: novarocks_execution_contract::TaskOperationId,
+    replacement: BackendProcessId,
+    refusal_fact: novarocks_failure_contract::FailureFact,
+}
+impl PreReadyProcessReplacementWitness {
+    pub fn try_new(
+        input: &crate::execution_error::ExecutionFailureInput,
+        context: novarocks_execution_contract::QueryContextRef,
+        operation_id: novarocks_execution_contract::TaskOperationId,
+        replacement: BackendProcessId,
+    ) -> Result<Self, &'static str> {
+        if Self::refusal_operation(input) != Some((context, operation_id))
+            || replacement == context.backend_process_id()
+        {
+            return Err("pre-ready replacement evidence does not match its original refusal");
+        }
+        Ok(Self {
+            context,
+            operation_id,
+            replacement,
+            refusal_fact: input.fact(),
+        })
+    }
+    pub(crate) fn refusal_operation(
+        input: &crate::execution_error::ExecutionFailureInput,
+    ) -> Option<(
+        QueryContextRef,
+        novarocks_execution_contract::TaskOperationId,
+    )> {
+        use crate::execution_error::{
+            ExecutionFailureSite, TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+        };
+        use novarocks_execution_contract::OperationKind;
+        use novarocks_failure_contract::{FailureClass, FailureEvidence};
+        if input.fact().class() != FailureClass::Invariant
+            || input.fact().evidence() != FailureEvidence::Originating
+            || input.fact().reason() != TASK_PROTOCOL_IDENTITY_MISMATCH_REASON
+        {
+            return None;
+        }
+        match input.site() {
+            ExecutionFailureSite::Operation {
+                context,
+                operation_id,
+                kind: OperationKind::UpdateQueryContext,
+            } => Some((context, operation_id)),
+            _ => None,
+        }
+    }
+    pub const fn context(&self) -> novarocks_execution_contract::QueryContextRef {
+        self.context
+    }
+    pub const fn operation_id(&self) -> novarocks_execution_contract::TaskOperationId {
+        self.operation_id
+    }
+    pub const fn replacement_process(&self) -> BackendProcessId {
+        self.replacement
+    }
+    pub(crate) fn matches_input(
+        &self,
+        input: &crate::execution_error::ExecutionFailureInput,
+    ) -> bool {
+        input.fact() == self.refusal_fact
+            && input.site()
+                == (crate::execution_error::ExecutionFailureSite::Operation {
+                    context: self.context,
+                    operation_id: self.operation_id,
+                    kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                })
+    }
+}
+
 /// Runtime failure while preparing one physical attempt.
 ///
 /// Coordination consumes the attempt failure class for recovery policy and
@@ -138,11 +218,13 @@ pub enum NativeAttemptTopologyRequirement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeAttemptPreparationFailure {
     error: QueryExecutionError,
+    pre_ready_replacement: Option<PreReadyProcessReplacementWitness>,
 }
 impl NativeAttemptPreparationFailure {
     pub fn from_input(input: crate::execution_error::ExecutionFailureInput) -> Self {
         Self {
             error: QueryExecutionError::from_execution(input),
+            pre_ready_replacement: None,
         }
     }
     pub fn input(&self) -> &crate::execution_error::ExecutionFailureInput {
@@ -150,8 +232,28 @@ impl NativeAttemptPreparationFailure {
             .execution_failure()
             .expect("typed constructor retains its original failure input")
     }
+    pub fn attach_pre_ready_replacement(
+        &mut self,
+        witness: PreReadyProcessReplacementWitness,
+    ) -> Result<(), &'static str> {
+        if self.pre_ready_replacement.is_some() || !witness.matches_input(self.input()) {
+            return Err("pre-ready replacement witness belongs to another original failure");
+        }
+        self.pre_ready_replacement = Some(witness);
+        Ok(())
+    }
+    pub const fn pre_ready_replacement(&self) -> Option<&PreReadyProcessReplacementWitness> {
+        self.pre_ready_replacement.as_ref()
+    }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.input().topology_requirement()
+        self.pre_ready_replacement.map_or_else(
+            || self.input().topology_requirement(),
+            |witness| {
+                NativeAttemptTopologyRequirement::ExcludeProcess(
+                    witness.context.backend_process_id(),
+                )
+            },
+        )
     }
     pub fn class(&self) -> AttemptFailureClass {
         self.input().attempt_class()
@@ -2502,5 +2604,122 @@ mod tests {
             owner.as_ref().unwrap().as_ref() as *const dyn DormantNativeAttemptOwner,
             original
         ));
+    }
+}
+
+/// Shared typed fixture for the QA carrier, pump, and recovery boundary tests.
+#[cfg(test)]
+pub(crate) fn pre_ready_identity_refusal_test_fixture(
+    context: novarocks_execution_contract::QueryContextRef,
+) -> (
+    crate::execution_error::ExecutionFailureInput,
+    PreReadyProcessReplacementWitness,
+    NativeAttemptPreparationFailure,
+) {
+    use crate::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite, TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+    };
+    use novarocks_execution_contract::{OperationKind, SafeDetail, TaskOperationId};
+    use novarocks_failure_contract::{FailureClass, FailureFact};
+    let operation_id = TaskOperationId::new_v7();
+    let input = ExecutionFailureInput::new(
+        FailureFact::new(
+            FailureClass::Invariant,
+            TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+        ),
+        SafeDetail::truncating("backend process id mismatch"),
+        ExecutionFailureSite::Operation {
+            context,
+            operation_id,
+            kind: OperationKind::UpdateQueryContext,
+        },
+    );
+    let witness = PreReadyProcessReplacementWitness::try_new(
+        &input,
+        context,
+        operation_id,
+        BackendProcessId::new_v7(),
+    )
+    .unwrap();
+    let mut failure = NativeAttemptPreparationFailure::from_input(input.clone());
+    failure.attach_pre_ready_replacement(witness).unwrap();
+    (input, witness, failure)
+}
+
+#[cfg(test)]
+mod pre_ready_replacement_evidence_tests {
+    use super::*;
+    #[test]
+    fn exact_replacement_evidence_keeps_original_refusal_and_rejects_foreign_input() {
+        use crate::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        use novarocks_execution_contract::{
+            QueryContextRef, SafeDetail, failure::FailureProjection,
+        };
+        use novarocks_types::{AttemptId, FrontendProcessId, QueryId};
+        let execution =
+            QueryExecutionId::new(QueryId::new(29, 31), AttemptId::new(1).unwrap()).unwrap();
+        let context = QueryContextRef::new(
+            execution,
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (input, witness, failure) = pre_ready_identity_refusal_test_fixture(context);
+        assert_eq!(failure.input(), &input);
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        assert_eq!(failure.error().execution_failure(), Some(&input));
+        assert_eq!(failure.pre_ready_replacement(), Some(&witness));
+        assert_eq!(
+            failure.topology_requirement(),
+            NativeAttemptTopologyRequirement::ExcludeProcess(context.backend_process_id())
+        );
+        assert!(
+            PreReadyProcessReplacementWitness::try_new(
+                &input,
+                context,
+                witness.operation_id(),
+                context.backend_process_id()
+            )
+            .is_err()
+        );
+        assert!(
+            PreReadyProcessReplacementWitness::try_new(
+                &input,
+                context,
+                novarocks_execution_contract::TaskOperationId::new_v7(),
+                witness.replacement_process()
+            )
+            .is_err()
+        );
+        let foreign = ExecutionFailureInput::new(
+            input.fact(),
+            input.detail().clone(),
+            ExecutionFailureSite::Backend {
+                process: context.backend_process_id(),
+            },
+        );
+        assert!(
+            PreReadyProcessReplacementWitness::try_new(
+                &foreign,
+                context,
+                witness.operation_id(),
+                witness.replacement_process()
+            )
+            .is_err()
+        );
+        let ordinary = ExecutionFailureInput::new(
+            QueryFailureReason::ResultProtocol.failure_fact(),
+            SafeDetail::truncating("another protocol failure"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let mut ordinary_failure = NativeAttemptPreparationFailure::from_input(ordinary.clone());
+        assert!(
+            ordinary_failure
+                .attach_pre_ready_replacement(witness)
+                .is_err()
+        );
+        assert_eq!(ordinary_failure.input(), &ordinary);
+        assert!(ordinary_failure.pre_ready_replacement().is_none());
     }
 }

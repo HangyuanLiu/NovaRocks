@@ -21,6 +21,8 @@
 //! The registry retains both actor ingress and its join handle until a real
 //! join produces the exact move-only receipt required for retirement.
 
+pub(super) mod health;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -43,9 +45,6 @@ use crate::coordination::{
     RegistryContextConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
 };
 use novarocks_coordination_contract::LogicalExecutionActorId;
-
-pub(crate) type StatementNativeResidualTask =
-    Pin<Box<dyn Future<Output = Result<(), crate::api::QueryExecutionError>> + Send>>;
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -103,7 +102,7 @@ struct RegistryInner {
     state: Mutex<RegistryState>,
     progress: Arc<Notify>,
     original_exit_ready: AtomicBool,
-    statement_native: super::StatementNativeResidualRegistry,
+    health: health::LogicalExecutionHealth,
     active_native: super::NativeActiveCustodyRegistry,
 }
 
@@ -655,7 +654,8 @@ impl LogicalExecutionRuntimeRegistry {
                 current.checked_add(1)
             })
             .expect("logical execution runtime registry identity exhausted");
-        let statement_native = super::StatementNativeResidualRegistry::new(id);
+        let health_changed = Arc::new(Notify::new());
+        let health = health::LogicalExecutionHealth::new(Arc::clone(&health_changed));
         let progress = Arc::new(Notify::new());
         Self {
             handle: LogicalExecutionRuntimeRegistryHandle {
@@ -666,10 +666,10 @@ impl LogicalExecutionRuntimeRegistry {
                     progress: Arc::clone(&progress),
                     original_exit_ready: AtomicBool::new(false),
                     active_native: super::NativeActiveCustodyRegistry::new(
-                        statement_native.clone(),
+                        health.clone(),
                         progress,
                     ),
-                    statement_native,
+                    health,
                 }),
             },
             shutdown_complete: false,
@@ -710,7 +710,7 @@ impl LogicalExecutionRuntimeRegistry {
             }
             return Err(error.into());
         }
-        let drain = self.handle.drain_for_shutdown();
+        let drain = self.handle.drain_actors_for_shutdown();
         match tokio::time::timeout_at(deadline.into(), drain).await {
             Ok(Ok(())) => {
                 debug_assert!(self.handle.lock().entries.is_empty());
@@ -745,12 +745,18 @@ impl LogicalExecutionRuntimeRegistry {
     pub fn abandon_for_process_exit(&mut self) {
         self.handle.begin_shutdown();
         self.handle.request_close_for_installed();
-        self.handle.lock().entries.clear();
+        // Detach the original health and entries at one cut. External Drops
+        // may publish later health, so no destructor runs under this lock.
+        let (entries, health) = {
+            let mut state = self.handle.lock();
+            (
+                std::mem::take(&mut state.entries),
+                self.handle.inner.health.take_for_process_exit(),
+            )
+        };
+        drop(entries);
         self.handle.inner.active_native.abandon_for_process_exit();
-        self.handle
-            .inner
-            .statement_native
-            .abandon_for_process_exit();
+        drop(health);
         self.handle.inner.progress.notify_waiters();
         self.shutdown_complete = true;
     }
@@ -786,26 +792,10 @@ impl LogicalExecutionRuntimeRegistry {
 impl LogicalExecutionRuntimeRegistryHandle {
     fn begin_shutdown(&self) {
         self.lock().accepting = false;
-        self.inner.statement_native.close();
     }
 
-    pub(crate) fn statement_native_residual_port(
-        &self,
-        budget: std::time::Duration,
-    ) -> super::StatementNativeResidualPort {
-        self.inner.statement_native.port(budget)
-    }
-
-    pub(crate) fn statement_native_ready_tasks(&self) -> Vec<StatementNativeResidualTask> {
-        self.inner.statement_native.ready_tasks()
-    }
-
-    pub(crate) async fn statement_native_changed(&self) {
-        self.inner.statement_native.changed().await;
-    }
-
-    pub(crate) fn statement_native_count(&self) -> usize {
-        self.inner.statement_native.len()
+    pub(crate) async fn process_health_changed(&self) {
+        self.inner.health.changed().await;
     }
 
     pub(crate) fn progress_root_ack_tails(&self) {
@@ -820,13 +810,9 @@ impl LogicalExecutionRuntimeRegistryHandle {
         self.inner.active_native.root_ack_tail_count()
     }
 
-    pub(crate) fn close_statement_native_admission(&self) {
-        self.inner.statement_native.close();
-    }
-
-    pub(crate) fn statement_native_health(&self) -> Option<crate::api::QueryExecutionError> {
+    pub(crate) fn process_health(&self) -> Option<crate::api::QueryExecutionError> {
         use novarocks_execution_contract::failure::FailureProjection as _;
-        self.inner.statement_native.health().or_else(|| {
+        self.inner.health.health().or_else(|| {
             let state = self.lock();
             let retained = state.entries.values().any(|entry| match entry {
                 RegistryEntry::Installed(entry) => entry.internal_health.is_some(),
@@ -1078,17 +1064,14 @@ impl LogicalExecutionRuntimeRegistryHandle {
     pub(super) fn publish_original_exit_health_silent(
         &self,
         source: &Arc<OriginalLogicalExit>,
-    ) -> Option<super::statement_native_residual::StatementNativeHealthNotification> {
+    ) -> Option<health::LogicalExecutionHealthNotification> {
         if source.health_published() {
             return None;
         }
         let mut custody: Option<Box<dyn std::any::Any + Send>> = Some(Box::new(
             super::original_exit::LogicalExitHealthCustody::new(Arc::clone(source)),
         ));
-        let notice = self
-            .inner
-            .statement_native
-            .record_supervision_panic_in(&mut custody);
+        let notice = self.inner.health.record_supervision_panic_in(&mut custody);
         if custody.is_none() {
             source.mark_health_published_silent();
         } else {
@@ -1104,22 +1087,18 @@ impl LogicalExecutionRuntimeRegistryHandle {
     }
 
     pub(crate) fn record_process_failure(&self, failure: crate::api::StatementNativeHealthFailure) {
-        self.inner.statement_native.record_unproven_exit(failure);
+        self.inner.health.record_unproven_exit(failure);
     }
 
     pub(crate) fn record_native_supervision_panic(&self, original: Box<dyn std::any::Any + Send>) {
-        self.inner
-            .statement_native
-            .record_supervision_panic(original);
+        self.inner.health.record_supervision_panic(original);
     }
 
     pub(crate) fn record_native_supervision_join_failure(&self, error: tokio::task::JoinError) {
         if error.is_panic() {
             self.record_native_supervision_panic(error.into_panic());
         } else {
-            self.inner
-                .statement_native
-                .record_supervision_join_failure(error);
+            self.inner.health.record_supervision_join_failure(error);
         }
     }
 
@@ -1129,9 +1108,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
     }
 
     fn entry_count(&self) -> usize {
-        self.lock().entries.len()
-            + self.inner.statement_native.len()
-            + self.inner.active_native.len()
+        self.lock().entries.len() + self.inner.active_native.len()
     }
 
     fn request_close_for_installed(&self) {
@@ -1162,14 +1139,6 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 drop(actor.request_registry_close_for_join(RegistryClose::Shutdown));
             }
         }
-    }
-
-    async fn drain_for_shutdown(&self) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        let (actors, ()) = tokio::join!(
-            self.drain_actors_for_shutdown(),
-            self.inner.statement_native.drain(),
-        );
-        actors
     }
 
     async fn drain_actors_for_shutdown(&self) -> Result<(), LogicalExecutionRuntimeRegistryError> {
@@ -3159,7 +3128,7 @@ mod tests {
             ),
             Ok(()) => (false, None),
         };
-        let safe_health = registry.statement_native_health().is_some();
+        let safe_health = registry.process_health().is_some();
         let after_join = drops.load(Ordering::Acquire);
         // Test-only explicit disposition takes the original fixed field; no
         // production recovery/clear API is introduced by this candidate.
@@ -3218,3 +3187,80 @@ mod tests {
 #[cfg(test)]
 #[path = "original_exit_registry_tests.rs"]
 mod original_exit_registry_tests;
+
+#[cfg(test)]
+mod original_health_migration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_health_survives_runtime_shutdown_until_its_last_original_handle_exits() {
+        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let handle = registry.handle();
+        let cause: Arc<dyn std::error::Error + Send + Sync> =
+            Arc::new(std::io::Error::other("original process failure"));
+        let original = Arc::downgrade(&cause);
+        handle.record_process_failure(
+            crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "original local closure is unproven",
+                cause,
+            ),
+        );
+        let health = handle.inner.health.clone();
+        assert_eq!(
+            health.health().unwrap().message(),
+            "original local closure is unproven"
+        );
+        drop(health);
+        assert_eq!(
+            handle.process_health().unwrap().message(),
+            "original local closure is unproven"
+        );
+        assert!(original.upgrade().is_some());
+        assert!(registry.shutdown().is_ok());
+        assert!(
+            original.upgrade().is_some(),
+            "the same process handle still owns health"
+        );
+        drop(handle);
+        assert!(original.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod process_exit_health_tests {
+    use super::*;
+
+    struct CleanupHealth {
+        handle: LogicalExecutionRuntimeRegistryHandle,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for CleanupHealth {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            self.handle.record_process_failure(
+                crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "original cleanup failed during process exit",
+                    Arc::new(std::io::Error::other("original cleanup cause")),
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_exit_drops_detached_health_outside_locks_and_keeps_later_cleanup_failure() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let handle = registry.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        handle.record_native_supervision_panic(Box::new(CleanupHealth {
+            handle: handle.clone(),
+            dropped: Arc::clone(&dropped),
+        }));
+        registry.abandon_for_process_exit();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            handle.process_health().unwrap().message(),
+            "original cleanup failed during process exit",
+        );
+        assert_eq!(handle.entry_count(), 0);
+    }
+}

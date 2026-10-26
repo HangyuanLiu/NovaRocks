@@ -486,3 +486,7 @@ impl TaskFinalInfoCollector {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "profile_diagnostics/property_tests.rs"]
+mod property_tests;

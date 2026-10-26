@@ -120,6 +120,13 @@ impl CleanupReceipt {
         }
     }
 }
+/// Business readiness retains its original refusal contract. Actual-exit
+/// observation advances the same cells without reclassifying ordinary refusal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressObservation {
+    Business,
+    ActualExit,
+}
 struct Body {
     root: WorkScope,
     initial_dependencies: Vec<SharedDependency>,
@@ -760,18 +767,28 @@ impl MetadataIoAdmission {
         owner: &WorkOwner,
         cx: &mut Context<'_>,
     ) -> Result<bool, WorkError> {
-        self.poll_with_original_owner(Some(owner), cx)
+        self.poll_with_original_owner(Some(owner), cx, ProgressObservation::Business)
     }
     /// Only the same already-positive Root Source may continue after its owner
     /// moved into a stable statement/protocol receiver. Initial construction
     /// still requires that actual owner; aliases cannot enable this method.
     pub(crate) fn poll_continuing(&self, cx: &mut Context<'_>) -> Result<bool, WorkError> {
-        self.poll_with_original_owner(None, cx)
+        self.poll_with_original_owner(None, cx, ProgressObservation::Business)
+    }
+    /// Advance the original requests while another actual-exit observer is
+    /// pending. False still means the first grant never became ready; neither
+    /// readiness nor quiescence is inferred from an ordinary refusal.
+    pub(crate) fn poll_actual_progress_continuing(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Result<bool, WorkError> {
+        self.poll_with_original_owner(None, cx, ProgressObservation::ActualExit)
     }
     fn poll_with_original_owner(
         &self,
         owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
+        observation: ProgressObservation,
     ) -> Result<bool, WorkError> {
         self.wake.register(cx.waker());
         let (result, cells, changed, reobserve) = {
@@ -781,12 +798,12 @@ impl MetadataIoAdmission {
             let body = original.body.as_mut().unwrap();
             body.changed = false;
             body.reobserve = false;
-            let mut result = Self::progress(body, owner, cx);
+            let mut result = Self::progress(body, owner, cx, observation);
             if let Err(error) = &result {
                 body.failure.get_or_insert_with(|| error.clone());
                 // Once physical requests exist, refusal stops new admission;
                 // it never turns surviving F/body/cleanup into actual exit.
-                if body.first_ready {
+                if observation == ProgressObservation::Business && body.first_ready {
                     result = Ok(true);
                 }
             }
@@ -816,6 +833,7 @@ impl MetadataIoAdmission {
         body: &mut Body,
         owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
+        observation: ProgressObservation,
     ) -> Result<bool, WorkError> {
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1259,7 +1277,10 @@ impl MetadataIoAdmission {
                     .as_slice()
                     .iter()
                     .all(|route| body.bound.contains(route)));
-        if !body.first_ready {
+        // These refusals were received into the same cells above. They are
+        // business observations, not structural failures of this progress turn.
+        // Actual-exit consumers still inspect every admission, stream and alias.
+        if observation == ProgressObservation::Business && !body.first_ready {
             if let Some(error) = &body.failure {
                 return Err(error.clone());
             }
@@ -1586,7 +1607,7 @@ impl MetadataIoAdmission {
         if let Some(failure) = self.health_failure() {
             return Poll::Ready(Err(failure));
         }
-        let observed = self.poll_quiescence_with_owner(None, cx);
+        let observed = self.poll_quiescence_with_owner(None, cx, ProgressObservation::ActualExit);
         // Progress may just have observed the original stream poll/Drop panic.
         // Preserve that same Source/cause even when the normal exit is Pending.
         if let Some(failure) = self.health_failure() {
@@ -1607,15 +1628,16 @@ impl MetadataIoAdmission {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), WorkError>> {
         // Keep the original business-error contract for unmigrated callers.
-        self.poll_quiescence_with_owner(owner, cx)
+        self.poll_quiescence_with_owner(owner, cx, ProgressObservation::Business)
             .map(|result| result.and_then(|observed| observed.ordinary_failure.map_or(Ok(()), Err)))
     }
     fn poll_quiescence_with_owner(
         &self,
         owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
+        observation: ProgressObservation,
     ) -> Poll<Result<MetadataIoQuiescence, WorkError>> {
-        if let Err(error) = self.poll_with_original_owner(owner, cx) {
+        if let Err(error) = self.poll_with_original_owner(owner, cx, observation) {
             return Poll::Ready(Err(error));
         }
         let Some(mut original) = loan(&self.original) else {
@@ -2824,6 +2846,152 @@ mod original_governor_tests {
         assert!(
             control.shutdown().is_ok(),
             "same WC really drains; ordinary refusal is not fake running"
+        );
+    }
+
+    #[test]
+    fn cancelled_first_action_keeps_positive_payload_and_real_readiness_until_actual_exit() {
+        use novarocks_workload_control::CancellationReason;
+
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        // Drive only until the actual initial reply is installed. Its first
+        // AsyncIo proposal has been submitted, but the driver has not run it.
+        let mut installed = false;
+        for _ in 0..256 {
+            assert!(!source.poll_progress(&root.owner, &mut cx).unwrap());
+            installed = source.original.lock().unwrap().as_ref().unwrap().started;
+            if installed {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(
+            installed,
+            "the real initial admission must install its payload"
+        );
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert!(body.payload.is_some());
+            assert!(!body.first_ready);
+            let cell = body.cells[0].original.lock().unwrap();
+            let cell = cell.as_ref().unwrap();
+            assert!(
+                cell.admission.is_some(),
+                "the same first action is still pending"
+            );
+            assert!(cell.grant.is_none());
+        }
+        assert!(source.withdraw_unstarted_in().unwrap().is_none());
+        assert!(source.poll_read_source_ready(&mut cx).is_pending());
+        assert!(!source.poll_actual_progress_continuing(&mut cx).unwrap());
+        // This is a real request alias, not a manually injected cell or grant.
+        let request = source.request(SharedDependency::LocalHost).unwrap();
+        let mut permit = None;
+        assert!(request.poll_admitted_in(&mut permit, &mut cx).is_pending());
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let mut refused = false;
+        for _ in 0..256 {
+            drive_original(&mut driver);
+            match source.poll_progress(&root.owner, &mut cx) {
+                Err(WorkError::Cancelled(CancellationReason::DeadlineExceeded)) => {
+                    refused = true;
+                    break;
+                }
+                Ok(false) => {}
+                other => panic!("unexpected first-action observation: {other:?}"),
+            }
+        }
+        assert!(
+            refused,
+            "receive the actual cancelled admission before retiring it"
+        );
+        assert!(matches!(
+            request.poll_admitted_in(&mut permit, &mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert!(
+            permit.is_none(),
+            "cancelled requests never start physical I/O"
+        );
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert!(body.started && body.payload.is_some());
+            assert!(
+                !body.first_ready,
+                "a refusal is never first-grant readiness"
+            );
+            let cell = body.cells[0].original.lock().unwrap();
+            let cell = cell.as_ref().unwrap();
+            assert!(
+                cell.admission.is_some(),
+                "the original reply remains retained"
+            );
+            assert!(cell.grant.is_none());
+            assert!(matches!(cell.failure, Some(WorkError::Cancelled(_))));
+        }
+        assert!(matches!(
+            source.poll_continuing(&mut cx),
+            Err(WorkError::Cancelled(_))
+        ));
+        assert!(!source.poll_actual_progress_continuing(&mut cx).unwrap());
+        assert!(source.health_failure().is_none());
+        assert!(
+            source
+                .poll_actual_quiescent_continuing(&mut cx)
+                .is_pending(),
+            "ordinary refusal cannot retire a live original request alias"
+        );
+        drop(request);
+        let observed = match source.poll_actual_quiescent_continuing(&mut cx) {
+            Poll::Ready(Ok(observed)) => observed,
+            other => panic!("actual cancelled admissions and aliases must retire: {other:?}"),
+        };
+        assert!(matches!(
+            observed.into_ordinary_failure(),
+            Some(WorkError::Cancelled(_))
+        ));
+        assert!(source.health_failure().is_none());
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert!(
+                body.started && body.payload.is_some(),
+                "actual I/O exit does not release Root payload"
+            );
+            assert!(!body.first_ready);
+            for cell in &body.cells {
+                let state = cell.original.lock().unwrap();
+                let state = state.as_ref().unwrap();
+                assert!(state.admission.is_none() && state.grant.is_none());
+            }
+        }
+        assert!(
+            matches!(
+                source.poll_quiescent(&root.owner, &mut cx),
+                Poll::Ready(Err(_))
+            ),
+            "the legacy business-refusal contract remains intact"
+        );
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(
+            control.shutdown().is_ok(),
+            "the same original governor actually drains"
         );
     }
 

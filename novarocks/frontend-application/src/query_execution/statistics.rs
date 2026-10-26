@@ -38,13 +38,11 @@ use arrow::datatypes::Schema;
 #[cfg(test)]
 use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorRequestContext,
-    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsRequiredAggregation,
+    ConnectorControlPlanningLease, ConnectorReadSelector, StatisticsArtifactDraft,
+    StatisticsArtifactIdentity, StatisticsRequiredAggregation,
 };
 
-use crate::query_execution::contract::{
-    DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
-};
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 
 /// Rejection from the original statistics decoder. Typed producers retain
 /// their concrete source; local contract diagnostics have no invented fact.
@@ -324,71 +322,6 @@ impl<'a> CompletedStatisticsPlanningServices<'a> {
             static_plan_carrier,
         }
     }
-}
-
-/// Plan one statistics collection as a completed physical plan.
-///
-/// A collection is not a statement: the provider says what must be measured,
-/// so there is no text to parse, no name to resolve and no shape to choose.
-/// What it *is* is an ordinary provider read followed by ordinary aggregation,
-/// and both halves go through exactly the contracts a statement's go through
-/// -- the read is negotiated and frozen through the provider-read protocol,
-/// and what that produces is the same validated `PhysicalPlan`, put on the
-/// wire by the same encoder.
-///
-/// The read is frozen before the plan is built because the plan addresses its
-/// scan by the occurrence the freeze accounted for. Building the plan first
-/// would mean naming an occurrence nothing had been frozen for yet.
-pub fn prepare_completed_statistics_collection(
-    services: CompletedStatisticsPlanningServices<'_>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    context: ConnectorRequestContext,
-    identity: &StatisticsRelationIdentity,
-    program: StatisticsCollectionProgram,
-    planning_lease: ConnectorControlPlanningLease,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    use novarocks_query_application::preparation::ReadAccessSink;
-
-    let CompletedStatisticsPlanningServices {
-        typed_connector_control,
-        functions,
-        constant_policy,
-        static_plan_carrier,
-    } = services;
-    let (bindings, scan) =
-        preparation::prepare_statistics_scan(execution, identity, &program, planning_lease)?;
-
-    // Freeze the read. The capability this leaves is deposited as it is taken,
-    // so the plan and what performs its read are accounted for together.
-    let need = novarocks_sql::planning::dml::statistics_provider_read_need(&scan)
-        .map_err(contract_violation)?;
-    let session =
-        crate::query_execution::compiler::typed_connector_session().map_err(contract_violation)?;
-    let sink = ReadAccessSink::new();
-    let fact = crate::query_execution::provider_read_facts::freeze_one_read(
-        &need,
-        typed_connector_control.as_ref(),
-        bindings.as_ref(),
-        &session,
-        &context,
-        &sink.deposits(),
-    )
-    .map_err(contract_violation)?;
-    let access = sink
-        .try_into_access()
-        .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
-
-    let assembly = preparation::build_statistics_assembly(
-        execution,
-        scan,
-        fact,
-        access,
-        program,
-        functions,
-        constant_policy,
-        static_plan_carrier,
-    )?;
-    assembly.into_legacy_request(execution)
 }
 
 /// How much one collection's scan may return in a batch.

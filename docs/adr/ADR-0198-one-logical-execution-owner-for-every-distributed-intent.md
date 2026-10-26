@@ -49,7 +49,11 @@ code-anchors:
   - "novarocks/table-maintenance/src/runtime.rs (installed original exit observations and safe history retirement)"
   - "novarocks/table-maintenance/src/gc_observation.rs (same maturity algorithm with an explicit original execution context)"
   - "novarocks/frontend-application/src/query/mv_action.rs (registered multi-step MV action; migration anchor)"
-  - "novarocks/frontend-application/src/dml/runner.rs (legacy synchronous runner still present; retirement pending)"
+  - "novarocks/frontend-application/src/query/mv_read_action.rs (SHOW and EXPLAIN original read Action and local result custody)"
+  - "novarocks/query-application/src/coordination/runtime_registry/health.rs (same original health packet, cause and after-lock notification)"
+  - "novarocks/mv-application/src/service.rs (single business operations owner separate from background lifecycle)"
+  - "novarocks/mv-application/src/process_runtime.rs (async background events and original borrowed joins)"
+  - "novarocks/frontend-application/src/mv/service/background_original.rs (same scheduler Source and Management Root)"
   - "novarocks/frontend-application/src/query_execution/write_session.rs (provider session and retained access; migration anchor)"
   - "novarocks/frontend-application/src/query_execution/write_session/publication_call.rs (original Provider Future, needed-ready receiving and actual exit; migration anchor)"
   - "novarocks/spi/src/connector/write_stack/session.rs (canonical needed-ready and separate cleanup completion; migration anchor)"
@@ -77,13 +81,15 @@ code-anchors:
 
 ## 背景与执行事实
 
-本条记录已接受的目标契约；代码切换与原生验证尚待完成。上列锚点是已有迁移入口，集成时须核对最终模块和承重注释，不能用本条的 active 状态证明实现或测试通过。
+本条记录已接受的契约及其源码接缝。旧同步协调器、runner 和专属第二身份来源已从执行组合退役；这只是结构事实，不能用本条的 active 状态证明整族实现、原生接线或测试通过。implementation pending 保留，最终全工作区与原生验证及已有失败的处置仍未完成。
 
 当前源码已有普通 Read、Internal 写入、Statistics、Rewrite/Cleanup 与多步骤 MV 的 governed Action 接缝。Statistics 的前台 capture 保留原请求与 CPU/Provider source，capture 实际关闭后才把同一 query permit 交给 job 的稳定接收格，再通知原串行 worker；不是先持一个许可等待第二个许可。后台计算沿同一逻辑执行 owner，统计 Ready 在移走 payload 前续接原 statement retention，计算退出与后续 publication/清理分别观察。
 
 维护 SQL 的 Action 选择原 Rewrite、Cleanup 或 metadata Source；OPTIMIZE 后台 job 沿原 runtime 的稳定接收格保管 Root、Provider/CPU 来源和真实退出观察。GC first-observation 使用显式执行 context 的 StateStore 路径，记录仍只是可重建的成熟度事实，不授予删除权。
 
-这些是当前源码接缝，不是各语句族的完整验收结论。旧 `coordinator/**`、同步 runner 与部分控制调用面仍须逐项核对并完成迁移、删旧；本条保持 implementation pending。最终调用图、旧路径退役、目标二进制及原生验证完成之前，不能据新入口存在或局部检查宣称全族迁移完成。
+MV 的数据、控制与只读语句使用同 Root 的 Action；原准备 CPU、Provider publication 与 Current/StateStore 步骤由各自稳定 Source 借用推进。异步后台沿同 scheduler 和业务闸门进入统一执行 owner，业务 operations 与进程后台生命周期分开，活动 Source 不反向强持 runtime wrapper。取消等待保留同一原件和真实退出观察，不把业务终态当作 Join 或库存已处置。
+
+这些是当前源码接缝，不是各语句族的完整验收结论。仍存的未触及 CALL/Host 辅助路径不因名称相关而自动成为本条的全域异步完成主张。最终组合、目标二进制、完整原生场景及失败处置须分别核对；局部类型检查、离树候选和组件通过不能提升 implementation pending。
 
 | 责任 | 唯一 owner | 不拥有的权力 |
 |---|---|---|

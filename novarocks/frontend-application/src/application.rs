@@ -59,7 +59,6 @@ use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessName
 use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
-use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::{
     FrontendLifecycleDiagnostics, QueryLifecycleConvergenceReader,
@@ -2254,43 +2253,12 @@ impl FrontendApplicationHost {
             .map(StateStoreHost::provider_id)
     }
 
-    /// Materializes the query-execution service while Server constructs the
-    /// immutable role products. The coordinator has no independent process
-    /// lifecycle: its runtime is the Host-owned execution supervisor and its
-    /// only production consumer is the role graph.
+    /// Builds the stateless provider rewrite sealing author. Native execution
+    /// and process identity remain owned by the existing QA supervisor.
     pub(crate) fn build_query_execution_service(
         &self,
     ) -> Result<QueryExecutionService, FrontendApplicationError> {
-        let config = self.query_runtime;
-        let coordinator = FrontendDistributedQueryCoordinator::new(
-            config.runtime_filter_worker_count,
-            config.native_compatibility_id,
-            config.task_update_retry_policy,
-            config.split_initial_wait_cap,
-            config.coordination_budgets,
-            config.transport_budget.into_codec(),
-            self.backend_topology_port(),
-            self.data_runtime.clone(),
-            self.execution_runtime_owner.lifecycle_diagnostics(),
-            self.execution_runtime_owner.internal_result_cpu(),
-            Arc::clone(self.topology())
-                as novarocks_query_application::api::BackendProcessObservationService,
-            self.execution_runtime_owner
-                .supervisor
-                .statement_native_residual_port(),
-        )
-        .map_err(FrontendApplicationError::server)?;
-        #[cfg(novarocks_dev_controls)]
-        let coordinator = match &self.test_session {
-            Some(session) => coordinator.with_test_controls(
-                session.native.clone(),
-                session.observation.clone(),
-                session.statement.clone(),
-            ),
-            None => coordinator,
-        };
-        let coordinator = Arc::new(coordinator);
-        Ok(QueryExecutionService::new(coordinator))
+        Ok(QueryExecutionService::new())
     }
 
     /// Cloneable submission handle for the process-owned CPU preparation pool.

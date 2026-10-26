@@ -104,6 +104,21 @@ impl DmlExecutionError {
         }
     }
 
+    pub(crate) fn from_completion(
+        error: novarocks_query_application::preparation::FinalPlanCompletionError,
+    ) -> Self {
+        use novarocks_query_application::preparation::FinalPlanCompletionError as E;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            E::Cancelled { .. } => Self::Control(CompileControlError::Cancelled),
+            E::DeadlineExceeded => Self::Control(CompileControlError::DeadlineExceeded),
+            E::ResourceExhausted => Self::Control(CompileControlError::ResourceExhausted),
+            E::Source { source } => Self::Compilation(source),
+            E::Analyze { error } => Self::from_compile(error.into()),
+            error => Self::Engine(error.to_string()),
+        }
+    }
+
     pub(crate) fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
         match error {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
@@ -233,7 +248,9 @@ pub struct DmlStagedCreateFailure {
 }
 
 impl DmlError {
-    pub(crate) fn from_application(error: novarocks_query_application::session_error::QueryServiceError) -> Self {
+    pub(crate) fn from_application(
+        error: novarocks_query_application::session_error::QueryServiceError,
+    ) -> Self {
         Self {
             kind: DmlErrorKind::Executor,
             body: DmlErrorBody::Application(error),
@@ -529,6 +546,156 @@ impl std::error::Error for DmlError {
 mod compile_control_tests {
     use super::*;
     use novarocks_type_contract::CompileControlError;
+
+    fn completed_sql_source() -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+        use novarocks_sql::compiler::*;
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([84; 16]).unwrap(),
+            SqlStatementInput::sql("SELECT 1"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    enable_materialized_view_rewrite: Some(false),
+                    ..SessionOptimizerSettings::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            noop_constant_evaluator(),
+            crate::application::test_constant_policy(),
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        match SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap() {
+            SqlCompileProgress::Complete(completed) => completed.into_plan(),
+            SqlCompileProgress::Incomplete(_) => panic!("table-free source must complete"),
+        }
+    }
+
+    #[test]
+    fn actual_candidate_validation_preserves_control_and_source_until_dml_terminal() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
+        use novarocks_sql::compiler::{SqlCompileControl, SqlCompileError};
+        use novarocks_type_contract::{CompilePhase, PureCompileControl};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Refuse {
+            cause: CompileControlError,
+            calls: AtomicUsize,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(self.cause.clone())
+            }
+        }
+
+        let mut policy = novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+        policy.max_rows = 0;
+        let domain = novarocks_functions::ConstantValue::from_i64(
+            Arc::new(Field::new("value", DataType::Int64, false)),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            1,
+            policy,
+            CompilePhase::Validate,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        let expected_fact = domain.failure_fact();
+        let SqlCompileError::CompilationSource(original) = SqlCompileError::from(domain) else {
+            panic!("constant refusal must retain its actual source");
+        };
+        let plan = completed_sql_source();
+        CompletedPhysicalPlanCandidate::for_sql_program(
+            plan.clone(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(original.clone()),
+        ] {
+            let control = Refuse {
+                cause: cause.clone(),
+                calls: AtomicUsize::new(0),
+            };
+            // Refuse the real candidate validator after SQL has authored the
+            // source, rather than manufacturing a completion error variant.
+            let error = CompletedPhysicalPlanCandidate::for_sql_program(plan.clone(), &control)
+                .and_then(|candidate| {
+                    candidate.freeze_root_output(
+                        novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                            novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                        ),
+                    )
+                })
+                .map_err(DmlExecutionError::from_completion)
+                .unwrap_err()
+                .into_dml_error(None);
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(error.compile_control_error(), Some(cause.clone()));
+            assert_eq!(error.kind(), DmlErrorKind::Executor);
+            assert!(error.publication_terminal().is_none());
+            assert!(error.user_error().is_none());
+            if let CompileControlError::Source(source) = cause {
+                assert_eq!(source, original);
+                assert_eq!(error.execution_failure().unwrap().fact(), expected_fact);
+                let Some(CompileControlError::Source(carried)) = error.compile_control_error()
+                else {
+                    panic!("candidate boundary must retain the original source");
+                };
+                assert_eq!(carried, original);
+                assert!(
+                    carried
+                        .downcast_ref::<novarocks_functions::ConstantError>()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_root_sealing_refusal_does_not_acquire_control_authority() {
+        use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
+        let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
+            completed_sql_source(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let retained = candidate.clone();
+        let error = candidate
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
+            .map_err(DmlExecutionError::from_completion)
+            .unwrap_err()
+            .into_dml_error(None);
+        assert_eq!(error.compile_control_error(), None);
+        assert!(error.execution_failure().is_none());
+        assert!(error.publication_terminal().is_none());
+        assert_eq!(error.kind(), DmlErrorKind::Executor);
+        // The ordinary refusal leaves the retained source's original root intact.
+        assert!(retained.original_public_result_port().is_some());
+    }
 
     #[test]
     fn encode_capability_refusal_keeps_its_identity_through_dml_projection() {

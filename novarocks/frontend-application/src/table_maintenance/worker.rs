@@ -22,15 +22,13 @@ use std::sync::{Arc, Mutex, Weak};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorTableObjectId, ConnectorWriteOperationId, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorTableObjectId, ExternalMutationOutcome,
 };
 use novarocks_table_maintenance::job_service::{CapturedOptimizeTarget, OptimizeTargetCapturePort};
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
 use novarocks_table_maintenance::product::{
     CleanupCandidate, CleanupOwnedRefFact, CleanupSession, CleanupTerminal,
-    DistributedRewriteSession, RewriteCommit, RewriteIntent, RewritePlanFacts, RewriteReceiptFacts,
-    TableMaintenanceEffectPort,
+    DistributedRewriteSession, RewriteIntent, TableMaintenanceEffectPort,
 };
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 use novarocks_table_maintenance::worker::{
@@ -46,8 +44,6 @@ use novarocks_workload_control::{
 };
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
-
-use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 
 /// Frontend provider/native-query adapter for the neutral maintenance product.
 /// It keeps opaque connector sessions and fragment encoding here, while the
@@ -65,14 +61,6 @@ impl<'a> LegacyMaintenanceEffects<'a> {
         Self {
             engine,
             state: Some(state),
-        }
-    }
-    // Synchronous rewrite has no metadata action row and cannot acquire one
-    // implicitly through an unrelated effect capability.
-    pub(crate) fn for_rewrite(engine: &'a dyn TableMaintenanceEngine) -> Self {
-        Self {
-            engine,
-            state: None,
         }
     }
 }
@@ -157,73 +145,15 @@ impl TableMaintenanceEffectPort for LegacyMaintenanceEffects<'_> {
 
     fn begin_rewrite<'a>(
         &'a self,
-        target: &'a MaintenanceTarget,
-        intent: RewriteIntent,
+        _target: &'a MaintenanceTarget,
+        _intent: RewriteIntent,
     ) -> novarocks_table_maintenance::product::MaintenanceFuture<
         'a,
         Result<Box<dyn DistributedRewriteSession + 'a>, String>,
     > {
-        Box::pin(async move {
-            let intent = match intent {
-                RewriteIntent::DataFiles { rewrite_all } => {
-                    DistributedRewriteIntent::DataFiles { rewrite_all }
-                }
-                RewriteIntent::PositionDeletes {
-                    rewrite_all,
-                    min_input_files,
-                } => DistributedRewriteIntent::PositionDeletes {
-                    rewrite_all,
-                    min_input_files,
-                },
-            };
-            let session = self.engine.plan_distributed_rewrite(
-                target,
-                ConnectorWriteOperationId::new(),
-                intent,
-            )?;
-            Ok(Box::new(LegacyFrontendDistributedRewriteSession {
-                engine: self.engine,
-                session,
-                committed_receipt: None,
-            }) as Box<dyn DistributedRewriteSession + 'a>)
-        })
-    }
-
-    fn begin_rewrite_with_id<'a>(
-        &'a self,
-        target: &'a MaintenanceTarget,
-        intent: RewriteIntent,
-        effect_id: MaintenanceEffectId,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<Box<dyn DistributedRewriteSession + 'a>, OptimizeTerminalError>,
-    > {
-        Box::pin(async move {
-            let intent = match intent {
-                RewriteIntent::DataFiles { rewrite_all } => {
-                    DistributedRewriteIntent::DataFiles { rewrite_all }
-                }
-                RewriteIntent::PositionDeletes {
-                    rewrite_all,
-                    min_input_files,
-                } => DistributedRewriteIntent::PositionDeletes {
-                    rewrite_all,
-                    min_input_files,
-                },
-            };
-            let session = self
-                .engine
-                .plan_distributed_rewrite(
-                    target,
-                    ConnectorWriteOperationId::from_bytes(effect_id.to_bytes()),
-                    intent,
-                )
-                .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-            Ok(Box::new(LegacyFrontendDistributedRewriteSession {
-                engine: self.engine,
-                session,
-                committed_receipt: None,
-            }) as Box<dyn DistributedRewriteSession + 'a>)
+        // Metadata commands cannot create the governed rewrite Source.
+        Box::pin(async {
+            Err("metadata command effect cannot dispatch a distributed rewrite".into())
         })
     }
 
@@ -258,12 +188,6 @@ impl TableMaintenanceEffectPort for LegacyMaintenanceEffects<'_> {
     }
 }
 
-struct LegacyFrontendDistributedRewriteSession<'a> {
-    engine: &'a dyn TableMaintenanceEngine,
-    session: crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
-    committed_receipt: Option<novarocks_spi::connector::ConnectorWriteReceipt>,
-}
-
 pub(crate) fn rewrite_compile_terminal(
     error: novarocks_sql::compiler::SqlCompileError,
 ) -> OptimizeTerminalError {
@@ -293,169 +217,6 @@ pub(crate) fn rewrite_compile_terminal(
             )
         }
         error => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
-    }
-}
-
-impl DistributedRewriteSession for LegacyFrontendDistributedRewriteSession<'_> {
-    fn plan_facts(&self) -> RewritePlanFacts {
-        RewritePlanFacts {
-            noop: self.session.is_noop(),
-            cohort_count: self.session.plan().cohorts().len(),
-            input_bytes: self.session.plan().summary().input_bytes,
-        }
-    }
-
-    fn execute_cohort<'a>(
-        &'a mut self,
-        ordinal: usize,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<(), OptimizeTerminalError>,
-    > {
-        Box::pin(async move {
-            let cohort = self.session.plan().cohorts().get(ordinal).ok_or_else(|| {
-                format!("rewrite cohort ordinal {ordinal} is not in the frozen plan")
-            })?;
-            let prepared = self
-                .engine
-                .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())
-                .map_err(rewrite_compile_terminal)?;
-            let completion = prepared.finish()?;
-            self.engine
-                .accumulate_distributed_rewrite_group(&self.session, completion)
-                .map_err(OptimizeTerminalError::pre_dispatch_failed)
-        })
-    }
-
-    fn commit<'a>(
-        &'a mut self,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<RewriteCommit, novarocks_table_maintenance::product::RewriteFailure>,
-    > {
-        Box::pin(async move {
-            match self.engine.commit_distributed_rewrite(&self.session)? {
-                ExternalMutationOutcome::KnownCommitted {
-                    effect,
-                    receipt,
-                    finalization,
-                    cleanup,
-                    ..
-                } => {
-                    if let ExternalMutationFinalization::Failed(error) = &cleanup {
-                        tracing::warn!(%error, "committed rewrite retains incomplete cleanup");
-                    }
-                    self.committed_receipt = Some(receipt);
-                    Ok(RewriteCommit::KnownCommitted {
-                        effect: match effect {
-                            novarocks_spi::connector::ExternalMutationEffect::Applied => {
-                                novarocks_coordination_contract::ExecutionEffect::External
-                            }
-                            novarocks_spi::connector::ExternalMutationEffect::NoOp => {
-                                novarocks_coordination_contract::ExecutionEffect::None
-                            }
-                        },
-                        finalization_failed: match finalization {
-                            ExternalMutationFinalization::Failed(error) => Some(
-                                novarocks_table_maintenance::product::RewriteFailure::from_cause(
-                                    novarocks_failure_contract::SharedFailureCause::new(error),
-                                ),
-                            ),
-                            _ => None,
-                        },
-                    })
-                }
-                ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
-                    Ok(RewriteCommit::KnownUncommitted {
-                        failure: {
-                            let message = crate::connector::mutation::known_uncommitted_message(
-                                failure.clone(),
-                                &cleanup,
-                            );
-                            novarocks_table_maintenance::product::RewriteFailure::from_cause(
-                                novarocks_failure_contract::SharedFailureCause::new(failure),
-                            )
-                            .with_message(message)
-                        },
-                    })
-                }
-                ExternalMutationOutcome::CommitUnknown { failure, .. } => {
-                    Ok(RewriteCommit::CommitUnknown {
-                        failure: novarocks_table_maintenance::product::RewriteFailure::from_cause(
-                            novarocks_failure_contract::SharedFailureCause::new(failure),
-                        ),
-                    })
-                }
-            }
-        })
-    }
-
-    fn finalize_committed<'a>(
-        &'a mut self,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<RewriteReceiptFacts, novarocks_table_maintenance::product::RewriteFailure>,
-    > {
-        Box::pin(async move {
-            let receipt = self.committed_receipt.as_ref().ok_or_else(|| {
-                "distributed rewrite has no committed receipt to finalize".to_string()
-            })?;
-            let receipt = self
-                .engine
-                .finalize_distributed_rewrite(&self.session, receipt)?;
-            let summary = receipt.summary();
-            Ok(RewriteReceiptFacts {
-                target_snapshot_id: summary.target_version,
-                input_data_files: summary.input_data_files,
-                input_delete_files: summary.input_delete_files,
-                output_data_files: summary.output_data_files,
-                output_delete_files: summary.output_delete_files,
-                output_rows: summary.output_rows,
-            })
-        })
-    }
-
-    fn abort<'a>(
-        &'a mut self,
-        _reason: String,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<
-            novarocks_table_maintenance::product::RewriteAbort,
-            novarocks_table_maintenance::product::RewriteFailure,
-        >,
-    > {
-        Box::pin(async move {
-            use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationEffect};
-            use novarocks_table_maintenance::product::RewriteAbort;
-            Ok(
-                match self.engine.abort_distributed_rewrite(&self.session)? {
-                    ConnectorWriteAbortOutcome::KnownUncommitted { .. } => {
-                        RewriteAbort::KnownUncommitted
-                    }
-                    ConnectorWriteAbortOutcome::KnownCommitted { needed, .. } => {
-                        RewriteAbort::KnownCommitted {
-                            effect: match needed.effect() {
-                                ExternalMutationEffect::Applied => {
-                                    novarocks_coordination_contract::ExecutionEffect::External
-                                }
-                                ExternalMutationEffect::NoOp => {
-                                    novarocks_coordination_contract::ExecutionEffect::None
-                                }
-                            },
-                        }
-                    }
-                    ConnectorWriteAbortOutcome::CommitUnknown { failure, .. } => {
-                        RewriteAbort::CommitUnknown {
-                            failure:
-                                novarocks_table_maintenance::product::RewriteFailure::from_cause(
-                                    novarocks_failure_contract::SharedFailureCause::new(failure),
-                                ),
-                        }
-                    }
-                },
-            )
-        })
     }
 }
 

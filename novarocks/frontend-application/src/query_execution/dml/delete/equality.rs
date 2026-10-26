@@ -16,17 +16,13 @@
 // under the License.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::resolve_existing_table_target;
-use crate::query_execution::dml::delete::{
-    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
-};
 use crate::query_execution::kernels::DmlExecutionKernel;
-use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -43,97 +39,6 @@ use novarocks_sql::semantic::{Literal as SqlLiteral, ObjectName as SqlObjectName
 use novarocks_types::schema::ColumnDef;
 
 type Literal = SqlLiteral;
-
-pub(crate) fn prepare_equality_delete_statement(
-    state: &DmlExecutionKernel,
-    stmt: &AddEqualityDelete,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedDelete, String> {
-    let (target, _) = resolve_target(state, stmt, current_catalog, current_database)?;
-    let planning_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control().as_ref(),
-        &target.catalog,
-    )?;
-
-    // Reject a managed materialized view from neutral metadata under an exact
-    // generation, the same way INSERT, TRUNCATE and ADD FILES already do. This
-    // check cannot move into row-mutation admission: incremental MV refresh
-    // drives its own writes through that same admission, so at that level a
-    // user statement is indistinguishable from the MV machinery maintaining its
-    // own target.
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        state.connector_control().as_ref(),
-        state.mv_storage_observation().as_ref(),
-        state.mv_readiness().as_ref(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
-    )?;
-
-    // Provider-owned table and equality-key admission precedes the frontend's
-    // literal carrier checks. UUID and fixed binary share a physical carrier;
-    // only the provider's frozen logical facts can decide which may be written.
-    let table_metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &planning_lease,
-        connector_context.clone(),
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
-
-    let column_names = stmt
-        .columns
-        .iter()
-        .map(|column| column.value.clone())
-        .collect::<Vec<_>>();
-    let rows = stmt
-        .rows
-        .iter()
-        .map(|row| row.iter().map(lower_literal).collect())
-        .collect::<Result<Vec<Vec<_>>, _>>()?;
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
-    let (delete_fields, (current_snapshot_id, write_session)) =
-        prepare_equality_delete_input(&table_metadata, &column_names, &rows, |fields| {
-            // Preserve the journal's original read-before-begin ordering on
-            // this planning generation, before freezing the one write session.
-            let current_snapshot_id =
-                crate::connector::metadata_read_reference_facts_with_planning_lease(
-                    planning_lease.clone(),
-                    connector_context.clone(),
-                    &target.namespace,
-                    &target.table,
-                )?
-                .current_snapshot_id();
-            let session = begin_equality_delete_write_session(
-                state,
-                &target,
-                fields,
-                &planning_lease,
-                &write_lease,
-                connector_context,
-            )?;
-            Ok((current_snapshot_id, session))
-        })?;
-    let values_query = build_equality_delete_sink_query(&delete_fields, &rows)?;
-
-    // Route non-empty input through the distributed sink transaction.
-    prepare_equality_delete_distributed_write(
-        state,
-        &target,
-        current_snapshot_id,
-        values_query,
-        execution,
-        connector_context,
-        planning_lease,
-        write_session,
-        publication_id,
-    )
-}
 
 pub(super) fn resolve_target(
     state: &DmlExecutionKernel,
@@ -282,142 +187,6 @@ fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, St
             "unsupported ADD EQUALITY DELETE hexadecimal literal `{value}`"
         )),
     }
-}
-
-struct DistributedEqualityDeleteWriteExecutor {
-    state: DmlExecutionKernel,
-    target: crate::catalog_application::resolver::TargetBackend,
-    delete_query: Query,
-    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<QueryTableBindingStore>,
-    execution: QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// The one commit authority for this statement.
-    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
-}
-
-impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
-    /// Plan this DELETE's write if it has not been planned, then submit it.
-    ///
-    /// The plan is encoded when it is prepared, so submitting it takes
-    /// nothing the caller has to assemble first.
-    fn run(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        {
-            let mut assembly = self
-                .native_assembly
-                .lock()
-                .expect("prepared equality DELETE native assembly lock poisoned");
-            if assembly.is_none() {
-                *assembly = Some(
-                    crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
-                        &self.state,
-                        Some(&self.target.catalog),
-                        &self.target.namespace,
-                        &self.delete_query,
-                        self.sql_write_input.clone(),
-                        Arc::clone(&self.table_bindings),
-                        None,
-                        novarocks_sql::compiler::RootDistributionRequirement::Any,
-                        Some(&self.execution),
-                        &self.connector_context,
-                        Arc::clone(&self.write_session),
-                    )?,
-                );
-            }
-        }
-        self.native_assembly
-            .lock()
-            .expect("prepared DELETE native assembly lock poisoned")
-            .take()
-            .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string())?
-            .finish()
-    }
-
-    fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.connector_context.clone()
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        self.state.catalog_service().invalidate_table(
-            &self.target.catalog,
-            &self.target.namespace,
-            &self.target.table,
-        )
-    }
-}
-
-fn begin_equality_delete_write_session(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    delete_columns: &[ConnectorWriteFieldRequest],
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
-    let input = ConnectorWriteInputRequest::EqualityDelete {
-        equality_fields: delete_columns.to_vec(),
-    };
-    // One logical equality-delete branch on the generation that resolved the
-    // target. ADD EQUALITY DELETE appends delete files rather than mutating
-    // rows in place, so it is an ordinary write, not a row mutation.
-    crate::query_execution::write_session::begin_connector_write_session(
-        crate::connector::write_target::derive_write_stack_lease(
-            state.typed_connector_control(),
-            planning_lease,
-        )?,
-        write_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
-            target,
-            "main",
-            ConnectorWriteIntent::RowDelta,
-            input,
-            ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
-            connector_context.clone(),
-        )?,
-    )
-}
-
-fn prepare_equality_delete_distributed_write(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    current_snapshot_id: Option<i64>,
-    values_query: Query,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedDelete, String> {
-    let (sql_write_input, table_bindings) =
-        bind_equality_delete_write(target, &planning_lease, &write_session)?;
-
-    let connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId =
-        publication_id.into();
-    let executor = DistributedEqualityDeleteWriteExecutor {
-        state: state.clone(),
-        target: target.clone(),
-        delete_query: values_query,
-        sql_write_input,
-        table_bindings,
-        execution: execution.clone(),
-        connector_context: connector_context.clone(),
-        write_session,
-        native_assembly: Mutex::new(None),
-    };
-    Ok(prepared_delete(
-        DeleteOperation {
-            publication_id,
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            target_ref: "main".to_string(),
-            attempt_id: connector_operation_id.to_string(),
-            base_snapshot_id: current_snapshot_id,
-        },
-        Arc::new(executor),
-    ))
 }
 
 fn bind_equality_delete_write(
@@ -721,6 +490,7 @@ fn resolve_equality_delete_input(
     Ok(EqualityDeleteInput { columns, fields })
 }
 
+#[cfg(test)]
 fn prepare_equality_delete_input<T>(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     names: &[String],

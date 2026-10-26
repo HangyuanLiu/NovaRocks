@@ -1121,8 +1121,6 @@ mod tests {
         assert_eq!(fact.reason().code(), 8);
         assert_eq!(error.kind(), DistributedQueryErrorKind::Failed);
         assert_eq!(error.compile_control_error(), None);
-        assert_eq!(error.pre_ready_topology_outcome(), None);
-        assert!(!error.requires_pre_ready_topology_observation());
         let input = error.into_execution_failure_input();
         assert_eq!(input.fact(), fact);
         assert_eq!(

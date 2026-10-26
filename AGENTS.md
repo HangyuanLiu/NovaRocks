@@ -163,11 +163,13 @@ SQL client
   identities and contracts both roles must agree on; `execution` owns the
   runtime that runs under them.
 
-- `novarocks/coordination-contract/src/**`（已接受的目标边界，接线与验收待完成）
+- `novarocks/coordination-contract/src/**`
   仅共享 FE owner 之间实际使用的身份、时间、消息与中立事实；无 Tokio、领域载荷、
-  session、closure、资源 owner 或恢复算法。恢复属于 Query Application，writer/统计
-  完成证明属于 Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
-  本索引不证明迁移已完成，最终模块与承重代码锚点由集成时核对。
+  session、closure、资源 owner 或恢复算法。Query Application 的 `coordination/supervisor.rs`
+  拥有唯一 query-id 来源、逻辑驱动和恢复政策，`runtime_registry.rs` 与
+  `runtime_registry/health.rs` 保管原任务、真实退出和原始 health；writer/统计完成证明属于
+  Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
+  源码结构与局部测试不证明整族原生或最终全工作区验证完成。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
@@ -224,9 +226,15 @@ SQL client
   额外 schema lifetime 不授予 byte author。same Root 自持数据导致预算不足时 typed 拒绝，
   不等待自己、不建立递归 SDK invoice。完整迁移与原生/最终全工作区验证仍待完成。
 
-- `novarocks/frontend-application/src/dml/runner.rs` 与 `novarocks/frontend-application/src/coordinator/**`
-  旧同步 runner 和协调路径仍在，调用面迁移与删旧尚未完成；不能把新 Action 文件存在或局部检查
-  当作全路径实现、退役或原生验收通过。ADR-0198 保持 implementation pending。
+- `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs` 与
+  `novarocks/frontend-application/src/mv/service/background_original.rs`
+  MV 的 CREATE、DROP、普通 ALTER、Refresh/Repartition 与 SHOW/EXPLAIN 分别走原 Root 的
+  控制、数据或只读 Action；后台沿原 scheduler/runtime 的稳定 Source 提交同一执行 owner。
+  `novarocks/mv-application/src/service.rs` 的 `MvProductOperations` 保同一业务闸门与调度状态，
+  process wrapper 独持 `process_runtime.rs` 的异步后台任务和原 Join；不让活动 Source 强持
+  wrapper 形成循环。借用 future 的取消不丢原 owner，停止等待不替代真实 close。
+  旧同步 runner、协调器及其第二身份来源已退役；未触及的 CALL/Host 辅助入口不能据此称为全域
+  异步完成。ADR-0198 保持 implementation pending，失败处置与最终原生验证仍须独立核对。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
@@ -488,17 +496,20 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.3 Native Distributed Task Execution Path
 
-1. `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs` freezes a
-   `QueryExecutionId` and, from one live backend snapshot, a task graph:
-   `novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
+1. Query Application 的 `coordination/supervisor.rs` 统一预留 query 与 attempt 身份；
+   `novarocks/frontend-application/src/query_execution/logical_execution.rs` 从同一 reservation
+   续接原凭据与 attempt 责任。`native_execution_adapter.rs` 从一个实际 backend snapshot 冻结
+   Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
    `QueryContextRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
-2. ADR-0198 的目标是由 Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与就绪；
-   当前 Read/Internal Action 接缝与旧协调路径并存，完整迁移、删旧和原生验收仍待完成。
-   Frontend 领域提供完整结果的 typed proof，Task 驱动只提供协议事实。
+2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
+   Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
+   稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
+   业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
+   结构退役不代表整族 Native 通过，最终验证与已有失败处置仍待完成。
    ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
    `execute_round_on_task_protocol` establishes every context and creates every
    task through a bounded, fair dispatcher
@@ -1012,10 +1023,10 @@ suspected case against a clean server before attributing it to the change.
   `iceberg_writer.rs`); catalog/table DDL is in
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
   Current governed statement custody starts at `novarocks/frontend-application/src/query/statement_action.rs`;
-  inspect the read/write/mutation/CTAS Actions, shared `statement_computation.rs` and
-  `statement_publication.rs` in that directory. The synchronous `dml/runner.rs` and
-  `coordinator/**` still exist; their retirement and complete caller migration remain pending.
-  Common logical execution policy is in `novarocks/query-application/src/coordination/**`.
+  inspect the read/write/mutation/CTAS/MV Actions, shared `statement_computation.rs` and
+  `statement_publication.rs` in that directory. `QueryExecutionService` only seals the
+  original Provider rewrite; it owns no execution loop or query-id allocator.
+  Common logical execution policy and identity are in `novarocks/query-application/src/coordination/**`.
   Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
   and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
   资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
@@ -1043,13 +1054,16 @@ suspected case against a clean server before attributing it to the change.
   `query_execution/statistics/preparation.rs`, and `query_execution/internal_result_cpu/scoped_statistics.rs`.
   Follow the original Root, query-permit handoff, CPU/Provider source and retained result through actual exit;
   `query_execution/maintenance/io_admission.rs` separates ordinary refusal from actual quiescence.
-  This does not establish completion of Rewrite/MV migration or coordinator retirement.
-- **Materialized views**: inspect `novarocks/mv-application/src/**` and
-  `novarocks/frontend-application/src/mv/**`; MV query rewrite is an optimizer
-  concern under `novarocks/sql/src/optimizer/**`.
+  Structural migration does not establish whole-family Native qualification or resolve recorded failures.
+- **Materialized views**: inspect `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs`,
+  `novarocks/mv-application/src/{service,process_runtime}.rs` and
+  `novarocks/frontend-application/src/mv/service/background_original.rs` for original Action,
+  business-gate and async background custody. Provider publication, Current projection,
+  cumulative effect, necessary finalization and physical retirement retain separate facts.
+  MV query rewrite is an optimizer concern under `novarocks/sql/src/optimizer/**`.
 - **Native distributed task execution**: start with the common execution owner in
   `novarocks/query-application/src/coordination/**` and the minimal boundary in
-  `novarocks/coordination-contract/**` (integration pending; ADR-0198), then inspect
+  `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
   `novarocks/frontend-application/src/task_execution/**`,
   `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,

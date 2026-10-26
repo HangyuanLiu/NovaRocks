@@ -363,7 +363,7 @@ impl MaterializedViewCommand {
 /// statement and immutable admission contexts; role composition supplies the
 /// adapter that owns Connector and query-execution capabilities.
 pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
-    /// Prepare the original asynchronous action for a data refresh command.
+    /// Prepare the original asynchronous action for a parser-admitted MV statement.
     /// The caller retains the existing statement admission and supervision.
     fn prepare_statement_action(
         &self,
@@ -371,13 +371,6 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
         context: RequestContext,
         command_context: CommandContext,
     ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError>;
-
-    fn execute(
-        &self,
-        command: &MaterializedViewCommand,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, CommandError>;
 }
 
 #[cfg(test)]

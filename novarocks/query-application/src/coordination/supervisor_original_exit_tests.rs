@@ -402,7 +402,7 @@ async fn original_root_joins_installed_actor_after_actual_reply_wake_panics_and_
             .shutdown_until(Instant::now() + Duration::from_secs(2))
             .await;
         let actual_remaining = (
-            supervisor.registry.handle().statement_native_count(),
+            supervisor.registry.handle().active_native_custody_count(),
             supervisor.registry.handle().root_ack_tail_count(),
             supervisor.registry.handle().original_exit_pending(),
             supervisor
@@ -1108,6 +1108,319 @@ async fn actual_root_cancel_closes_bank_ingress_after_statement_wake_panics() {
             .unwrap();
         drop(statements);
         retirement.dispose_for_process_exit();
+        control
+    };
+    acknowledge_all_control(&control);
+    control.finish().await;
+}
+
+// The ordinary Root read belongs to the real logical role, not the optional
+// final-ACK tail. This fixture retains the SAME Future until its Drop returns.
+#[derive(Default)]
+struct RootReadDropSignals {
+    expected_window: std::sync::Mutex<Option<novarocks_workload_control::ResultWindowAlias>>,
+    blocked: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    requests: std::sync::Mutex<Vec<novarocks_execution_contract::root_result::RootResultRead>>,
+    polled: AtomicBool,
+    same_window: AtomicBool,
+    drop_entered: AtomicBool,
+    exited: AtomicBool,
+    converged: Arc<AtomicBool>,
+}
+impl fmt::Debug for RootReadDropSignals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RootReadDropSignals")
+    }
+}
+struct RootReadDropRescue(Option<std::sync::mpsc::Sender<()>>);
+impl RootReadDropRescue {
+    fn release(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+impl Drop for RootReadDropRescue {
+    fn drop(&mut self) {
+        // Unwinding a failed observation also rescues the actual Drop gate.
+        self.release();
+    }
+}
+struct RootReadDropBody {
+    signals: Arc<RootReadDropSignals>,
+    release: std::sync::mpsc::Receiver<()>,
+    window: Option<novarocks_workload_control::ResultWindowAlias>,
+}
+impl std::future::Future for RootReadDropBody {
+    type Output = Result<crate::api::RetainedRootReply, super::super::RootResultFetchFailure>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.signals.polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Pending
+    }
+}
+impl Drop for RootReadDropBody {
+    fn drop(&mut self) {
+        self.signals.drop_entered.store(true, Ordering::SeqCst);
+        let _ = self.release.recv();
+        drop(self.window.take());
+        self.signals.exited.store(true, Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct RootReadDropPort(Arc<RootReadDropSignals>);
+impl crate::api::BoundedRootReadPort for RootReadDropPort {
+    fn read(
+        &self,
+        request: novarocks_execution_contract::root_result::RootResultRead,
+        window: novarocks_workload_control::ResultWindowAlias,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        crate::api::RetainedRootReply,
+                        super::super::RootResultFetchFailure,
+                    >,
+                > + Send,
+        >,
+    > {
+        self.0.requests.lock().unwrap().push(request);
+        let expected = self.0.expected_window.lock().unwrap().take().unwrap();
+        self.0
+            .same_window
+            .store(window.shares_capacity_with(&expected), Ordering::SeqCst);
+        drop(expected);
+        Box::pin(RootReadDropBody {
+            signals: Arc::clone(&self.0),
+            release: self.0.blocked.lock().unwrap().take().unwrap(),
+            window: Some(window),
+        })
+    }
+    fn seal(
+        &self,
+        _: novarocks_execution_contract::root_lifetime::RootReadSealed,
+    ) -> Result<(), QueryExecutionError> {
+        Ok(())
+    }
+}
+#[derive(Debug)]
+struct RootReadDropPreparation {
+    signals: Arc<RootReadDropSignals>,
+    window: Option<TestWindow>,
+    backend: BackendProcessId,
+}
+impl TestRowsPreparationPort for RootReadDropPreparation {
+    fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+        *self.signals.expected_window.lock().unwrap() = Some(window.clone());
+        self.window = Some(TestWindow(window));
+    }
+}
+impl NativeAttemptPreparationPort for RootReadDropPreparation {
+    fn prepare_in<'a>(
+        &'a mut self,
+        request: &'a mut crate::api::NativeAttemptPreparationWork,
+    ) -> NativeAttemptPreparationFuture<'a> {
+        request.stage_fixture_owner(RootReadDropDormant {
+            inner: RowsDormantOwner {
+                relay_window: self.window.as_ref().unwrap().clone(),
+                backend: self.backend,
+                converged: Arc::clone(&self.signals.converged),
+            },
+            signals: Arc::clone(&self.signals),
+        });
+        Box::pin(async move {
+            let scheduling = no_scan_scheduling(&request);
+            request.bind_staged(scheduling).map_err(Into::into)
+        })
+    }
+}
+#[derive(Debug)]
+struct RootReadDropDormant {
+    inner: RowsDormantOwner,
+    signals: Arc<RootReadDropSignals>,
+}
+impl DormantNativeAttemptOwner for RootReadDropDormant {
+    fn poll_bind_qualification(
+        &mut self,
+        schedule: &AttemptSchedule,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+        self.inner.poll_bind_qualification(schedule, cx)
+    }
+    fn eligible_backends(&self) -> &[BackendProcessId] {
+        self.inner.eligible_backends()
+    }
+    fn activate<'a>(
+        &'a mut self,
+        schedule: &'a AttemptSchedule,
+        admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> NativeAttemptActivationFuture<'a> {
+        let signals = Arc::clone(&self.signals);
+        let activation = self.inner.activate(schedule, admissions, cancellation);
+        Box::pin(async move {
+            let activated = activation.await?;
+            let (inner, runtime) = activated.into_parts();
+            let mut runtime = runtime.expect("the original Rows owner carries its runtime");
+            runtime.binding.port = Arc::new(RootReadDropPort(signals));
+            Ok(ActivatedNativeAttempt::relayed_rows(
+                RootReadDropActive(inner),
+                runtime.binding,
+                runtime.statuses,
+            ))
+        })
+    }
+    fn converge<'a>(
+        &'a mut self,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a> {
+        self.inner.converge(cancellation)
+    }
+}
+#[derive(Debug)]
+struct RootReadDropActive(Box<dyn ActiveNativeAttemptOwner>);
+impl ActiveNativeAttemptOwner for RootReadDropActive {
+    fn run<'a>(
+        &'a mut self,
+        drive: &'a NativeAttemptDrive,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> NativeAttemptRunFuture<'a> {
+        self.0.run(drive, cancellation)
+    }
+    fn converge<'a>(
+        &'a mut self,
+        request: NativeActiveConvergenceRequest,
+    ) -> NativeActiveAttemptConvergenceFuture<'a> {
+        self.0.converge(request)
+    }
+}
+async fn root_read_drop_fact(flag: &AtomicBool) -> Result<(), &'static str> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !flag.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "the original Root read did not reach its fixture phase")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_ordinary_root_read_keeps_same_window_until_its_actual_future_drop_exits() {
+    let (release, blocked) = std::sync::mpsc::channel();
+    // This sender is owned outside every awaited observation. Normal teardown
+    // and unwind both release the worker blocked in the original Future Drop.
+    let mut rescue = RootReadDropRescue(Some(release));
+    let (control, root) = governance().await;
+    let mut control = {
+        let scope = root.owner.scope();
+        let retirement = root.owner.retirement_observer().unwrap();
+        let requester = root.owner.cancellation_requester();
+        let signals = Arc::new(RootReadDropSignals::default());
+        *signals.blocked.lock().unwrap() = Some(blocked);
+        let attempts = RootReadDropPreparation {
+            signals: Arc::clone(&signals),
+            window: None,
+            backend: BackendProcessId::new_v7(),
+        };
+        let (mut supervisor, client) = test_supervisor(
+            &control,
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x97),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let request = rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts);
+        let capacity = scope.result_capacity().unwrap();
+        let mut input = Some(
+            client
+                .prepare_observed_start(request, None)
+                .unwrap_or_else(|original| std::panic::panic_any(original)),
+        );
+        let mut owner = Some(root.owner);
+        let mut ready = None;
+        let mut exit = None;
+        client
+            .start_observed_in(&mut input, &mut owner, &mut ready, &mut exit)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut observer = exit.take().unwrap();
+        let mut handle = tokio::time::timeout(Duration::from_secs(2), ready.take().unwrap())
+            .await
+            .expect("the original Rows handle must be handed off")
+            .unwrap();
+        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+            panic!("the original request must retain Rows output");
+        };
+        root_read_drop_fact(&signals.polled).await.unwrap();
+        requester.request(CancellationReason::Requested).unwrap();
+        let entered = root_read_drop_fact(&signals.drop_entered).await;
+        let actual_exit_pending =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(observer.poll_exit(cx).is_pending()))
+                .await;
+        let window_held = capacity.snapshot().held_positions[0] == 1;
+        let body_still_held = !signals.exited.load(Ordering::SeqCst);
+        let same_window = signals.same_window.load(Ordering::SeqCst);
+        let requests_before_release = signals.requests.lock().unwrap().clone();
+        // Rescue precedes all assertions, so a failed negative oracle cannot
+        // strand the real role inside its destructor or prevent runtime join.
+        rescue.release();
+        let terminal = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+        drop(stream);
+        drop(handle);
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| observer.poll_exit(cx)),
+        )
+        .await
+        .expect("the same original role must finish actual Drop and convergence")
+        .unwrap();
+        let actual_drop_exited = signals.exited.load(Ordering::SeqCst);
+        let native_converged = signals.converged.load(Ordering::SeqCst);
+        let local = receipt.local_disposition();
+        let remote = receipt.remote_disposition();
+        let native_body_exited = receipt.view().native_preparation_exited();
+        let same_requests = signals.requests.lock().unwrap().len() == requests_before_release.len();
+        root.business.release();
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        let footer_still_held = !retirement.is_reclaimed().unwrap();
+        drop(receipt);
+        drop(observer);
+        acknowledge_all_control(&control);
+        let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
+        assert!(entered.is_ok());
+        assert!(actual_exit_pending && body_still_held && window_held && same_window);
+        assert_eq!(requests_before_release.len(), 1);
+        assert!(requests_before_release[0].wanted().is_some());
+        assert_eq!(requests_before_release[0].consumed(), 0);
+        assert!(
+            same_requests,
+            "cancellation must not issue a next read or an ACK-only request"
+        );
+        assert!(
+            matches!(terminal, Ok(Err(_))),
+            "the real cancelled stream must retain failure"
+        );
+        assert!(actual_drop_exited && native_converged && native_body_exited);
+        assert_eq!(
+            local,
+            crate::api::LocalExecutionDisposition::OriginalPaidOwnerReturn
+        );
+        assert_eq!(
+            remote,
+            crate::api::RemoteExecutionDisposition::RemoteNotReported
+        );
+        assert!(shutdown.is_ok() && settled.is_ok());
+        assert!(
+            footer_still_held,
+            "the actual receipt remains the original footer owner"
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         control
     };
     acknowledge_all_control(&control);

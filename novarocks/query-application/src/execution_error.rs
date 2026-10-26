@@ -33,6 +33,12 @@ use novarocks_user_error::{
 };
 use std::num::NonZeroU16;
 
+/// Shared identity-refusal reason authored by the FE Task protocol projector.
+/// It describes identity-refusal semantics, not remote provenance, a specific
+/// identity field, pre-ready state, or independent process replacement.
+pub const TASK_PROTOCOL_IDENTITY_MISMATCH_REASON: FailureReason =
+    FailureReason::new(domain::QUERY, NonZeroU16::new(15).unwrap());
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionFailureSite {
     Task {

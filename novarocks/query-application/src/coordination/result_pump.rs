@@ -106,11 +106,13 @@ impl NativeAttemptTerminalSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RootResultFetchFailure {
     error: QueryExecutionError,
+    pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
 }
 impl RootResultFetchFailure {
     pub fn from_input(input: crate::execution_error::ExecutionFailureInput) -> Self {
         Self {
             error: QueryExecutionError::from_execution(input),
+            pre_ready_replacement: None,
         }
     }
     pub fn input(&self) -> &crate::execution_error::ExecutionFailureInput {
@@ -118,8 +120,26 @@ impl RootResultFetchFailure {
             .execution_failure()
             .expect("typed constructor retains its original failure input")
     }
+    fn from_preparation_failure(failure: crate::api::NativeAttemptPreparationFailure) -> Self {
+        Self {
+            error: failure.error().clone(),
+            pre_ready_replacement: failure.pre_ready_replacement().copied(),
+        }
+    }
+    pub const fn pre_ready_replacement(
+        &self,
+    ) -> Option<&crate::api::PreReadyProcessReplacementWitness> {
+        self.pre_ready_replacement.as_ref()
+    }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.input().topology_requirement()
+        self.pre_ready_replacement.map_or_else(
+            || self.input().topology_requirement(),
+            |witness| {
+                NativeAttemptTopologyRequirement::ExcludeProcess(
+                    witness.context().backend_process_id(),
+                )
+            },
+        )
     }
     pub fn class(&self) -> AttemptFailureClass {
         self.input().attempt_class()
@@ -478,6 +498,11 @@ pub struct ResultPumpDecision {
 }
 
 impl ResultPumpDecision {
+    pub const fn pre_ready_replacement(
+        &self,
+    ) -> Option<&crate::api::PreReadyProcessReplacementWitness> {
+        self.failure.pre_ready_replacement()
+    }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
         self.failure.topology_requirement()
     }
@@ -528,6 +553,7 @@ impl ResultPumpDecision {
                 permit,
                 class,
                 self.failure.error().clone(),
+                self.failure.pre_ready_replacement().copied(),
                 replacement,
                 replacement_contexts,
             )
@@ -616,7 +642,7 @@ impl PumpRuntime {
                 Ok(())
             }
             Ok(NativeAttemptTerminal::Failed(failure)) => Err(PumpInterruption::Decision(
-                RootResultFetchFailure::from_input(failure.input().clone()),
+                RootResultFetchFailure::from_preparation_failure(failure),
             )),
             Err(error) => Err(PumpInterruption::Decision(contract_failure(error))),
         }
@@ -3487,5 +3513,61 @@ mod tests {
         // The failed item was never acknowledged as consumed.
         assert!(port.requests().iter().all(|(_, consumed)| *consumed == 0));
         drop((stream, actor, owner, window, status_sender));
+    }
+    #[tokio::test]
+    async fn native_terminal_keeps_exact_replacement_witness_through_real_root_pump() {
+        let (
+            Harness {
+                control: _control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            },
+            window,
+        ) = relay_harness(79).await;
+        let (_sender, statuses) = accepted_root_status_projection(root);
+        let port = ScriptedRootPort::new(Vec::new());
+        let context = QueryContextRef::new(
+            root.query_execution_id(),
+            novarocks_types::FrontendProcessId::new_v7(),
+            root.backend_process_id(),
+        );
+        let (input, witness, native) = crate::api::pre_ready_identity_refusal_test_fixture(context);
+        let (terminal_sender, terminal) = native_attempt_terminal_channel();
+        terminal_sender.publish(NativeAttemptTerminal::Failed(native));
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_root_relay(
+                permit,
+                root,
+                scope,
+                relay_binding(root, port.clone(), &window),
+                statuses,
+                terminal,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let ResultPumpFailure::DecisionPending(decision) = error else {
+            panic!("the original attempt authority must remain available");
+        };
+        assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+        assert_eq!(decision.error().execution_failure(), Some(&input));
+        assert_eq!(decision.pre_ready_replacement(), Some(&witness));
+        assert_eq!(
+            decision.topology_requirement(),
+            NativeAttemptTopologyRequirement::ExcludeProcess(root.backend_process_id())
+        );
+        assert_eq!(
+            decision.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        assert!(port.requests().is_empty());
+        drop((stream, actor, owner, window));
     }
 }

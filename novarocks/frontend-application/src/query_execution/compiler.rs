@@ -868,38 +868,9 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
 }
 
 #[cfg(test)]
-struct RejectingTestDistributedQueryCoordinator;
-
-#[cfg(test)]
-impl crate::query_execution::contract::DistributedQueryCoordinator
-    for RejectingTestDistributedQueryCoordinator
-{
-    fn execute(
-        &self,
-        request: crate::query_execution::contract::DistributedQueryRequest,
-    ) -> Result<
-        crate::query_execution::outcome::DistributedQueryOutcome,
-        crate::query_execution::contract::DistributedQueryError,
-    > {
-        let intent = request.intent();
-        Err(
-            crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
-                format!(
-                    "core unit-test query coordinator does not execute native {intent:?} fragments; \
-                 assert request shaping locally or use Backend/all-in-one integration coverage"
-                ),
-            ),
-        )
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn test_query_execution_service()
 -> crate::query_execution::service::QueryExecutionService {
-    crate::query_execution::service::QueryExecutionService::new(std::sync::Arc::new(
-        RejectingTestDistributedQueryCoordinator,
-    ))
+    crate::query_execution::service::QueryExecutionService::new()
 }
 
 #[cfg(test)]
@@ -1444,7 +1415,6 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
             handle: write_handle,
         },
         query_opts,
-        execution,
         write_session,
         &compile_control,
     )
@@ -1504,11 +1474,6 @@ pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
     )
 }
 
-/// Core-sealed one-shot DML request awaiting Frontend native wire assembly.
-///
-/// The encoder can only borrow the frozen input. Once Frontend returns its
-/// bundle, `finish` consumes that same input to construct and execute the
-/// request, so no caller can substitute another plan/preparation pair.
 /// One admitted write, planned and encoded, waiting to be submitted.
 ///
 /// The plan and the session that commits it are held together because they
@@ -1518,8 +1483,6 @@ pub(crate) struct PreparedDmlWriteAssembly {
     description: novarocks_query_application::preparation::FrozenExecutionDescription,
     template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
     query_options: Option<QueryOptions>,
-    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    query_execution: crate::query_execution::service::QueryExecutionService,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
@@ -1528,8 +1491,6 @@ impl PreparedDmlWriteAssembly {
         encoded: crate::query_execution::physical_encoding::EncodedCompletedPlan,
         version: novarocks_physical_plan::PlanVersionId,
         query_options: Option<QueryOptions>,
-        execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        query_execution: crate::query_execution::service::QueryExecutionService,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Result<Self, String> {
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
@@ -1558,8 +1519,6 @@ impl PreparedDmlWriteAssembly {
             description,
             template,
             query_options,
-            execution,
-            query_execution,
             write_session,
         })
     }
@@ -1591,46 +1550,6 @@ impl PreparedDmlWriteAssembly {
             initial,
             runtime,
         )
-    }
-
-    /// Consume this one-shot assembly into its exact distributed write
-    /// request.
-    pub(crate) fn into_request(
-        self,
-    ) -> Result<
-        (
-            crate::query_execution::service::QueryExecutionService,
-            crate::query_execution::contract::DistributedQueryRequest,
-        ),
-        crate::dml::error::DmlExecutionError,
-    > {
-        let request = crate::query_execution::contract::build_request_from_finalized_execution(
-            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
-                self.description,
-                self.template,
-            ),
-            self.query_options,
-            crate::query_execution::contract::DistributedQueryIntent::Write,
-            &self.execution,
-            None,
-        )
-        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
-        let request = crate::query_execution::contract::with_connector_write_session(
-            request,
-            self.write_session,
-        )
-        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
-        Ok((self.query_execution, request))
-    }
-
-    pub(crate) fn finish(
-        self,
-    ) -> Result<
-        crate::query_execution::outcome::QueryExecutionResult,
-        crate::dml::error::DmlExecutionError,
-    > {
-        let (query_execution, request) = self.into_request()?;
-        execute_distributed_write_request(&query_execution, request)
     }
 }
 
@@ -1843,7 +1762,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             handle: write_handle,
         },
         query_opts,
-        execution,
         write_session,
         &completion_control,
     )
@@ -1862,7 +1780,6 @@ fn finish_prepared_iceberg_write_assembly(
     >,
     target: novarocks_sql::planning::dml::DmlFinalizedWriteTarget,
     query_opts: Option<QueryOptions>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
@@ -1892,7 +1809,7 @@ fn finish_prepared_iceberg_write_assembly(
                 ),
             )
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::dml::error::DmlExecutionError::from_completion)?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -1908,8 +1825,6 @@ fn finish_prepared_iceberg_write_assembly(
         encoded,
         version,
         query_opts,
-        execution.clone(),
-        state.query_execution().clone(),
         write_session,
     )?)
 }
@@ -1922,158 +1837,11 @@ const fn dml_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChangeStreamWriteEntrypoint {
-    PhysicalPlan,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ChangeStreamWriteBuildObservation {
-    entrypoint: ChangeStreamWriteEntrypoint,
-    effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
-    writer_fragment_ids: Vec<Option<novarocks_physical_plan::FragmentId>>,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct ChangeStreamWriteTestObserverState {
-    short_circuit_after_build: bool,
-    observations: Vec<ChangeStreamWriteBuildObservation>,
-}
-
-#[cfg(test)]
-fn change_stream_write_test_observer()
--> &'static std::sync::Mutex<Option<ChangeStreamWriteTestObserverState>> {
-    static OBSERVER: std::sync::OnceLock<
-        std::sync::Mutex<Option<ChangeStreamWriteTestObserverState>>,
-    > = std::sync::OnceLock::new();
-    OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Test observer guard is retained for cross-module change-stream write assertions."
-)]
-pub(crate) struct ChangeStreamWriteTestObserverGuard;
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Test observer guard exposes captured change-stream build observations."
-)]
-impl ChangeStreamWriteTestObserverGuard {
-    fn take_observations(&self) -> Vec<ChangeStreamWriteBuildObservation> {
-        std::mem::take(
-            &mut change_stream_write_test_observer()
-                .lock()
-                .expect("change-stream write test observer lock")
-                .as_mut()
-                .expect("change-stream write test observer installed")
-                .observations,
-        )
-    }
-}
-
-#[cfg(test)]
-impl Drop for ChangeStreamWriteTestObserverGuard {
-    fn drop(&mut self) {
-        *change_stream_write_test_observer()
-            .lock()
-            .expect("change-stream write test observer lock") = None;
-    }
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Test-only observer installation is retained for cross-module change-stream write assertions."
-)]
-pub(crate) fn install_change_stream_write_test_observer(
-    short_circuit_after_build: bool,
-) -> ChangeStreamWriteTestObserverGuard {
-    let mut observer = change_stream_write_test_observer()
-        .lock()
-        .expect("change-stream write test observer lock");
-    assert!(
-        observer.is_none(),
-        "change-stream write test observer already installed"
-    );
-    *observer = Some(ChangeStreamWriteTestObserverState {
-        short_circuit_after_build,
-        observations: Vec::new(),
-    });
-    ChangeStreamWriteTestObserverGuard
-}
-
-#[cfg(test)]
-pub(crate) fn observe_change_stream_write_build_for_test(
-    writer_routes: &[novarocks_sql::planning::dml::DmlFinalChangeStreamWriterRoute],
-) -> Option<crate::query_execution::outcome::QueryExecutionResult> {
-    let mut observer = change_stream_write_test_observer()
-        .lock()
-        .expect("change-stream write test observer lock");
-    let observer = observer.as_mut()?;
-    observer
-        .observations
-        .push(ChangeStreamWriteBuildObservation {
-            entrypoint: ChangeStreamWriteEntrypoint::PhysicalPlan,
-            effects: writer_routes
-                .iter()
-                .flat_map(|route| route.accepted_effects.iter().copied())
-                .collect(),
-            writer_fragment_ids: writer_routes
-                .iter()
-                .map(|route| Some(route.writer_fragment_id))
-                .collect(),
-        });
-    if observer.short_circuit_after_build {
-        Some(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_session: None,
-            fragment_profiles: Vec::new(),
-        })
-    } else {
-        None
-    }
-}
-
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) assembly: PreparedDmlWriteAssembly,
     /// SQL owns the mutable change-stream topology.  Core retains only the
     /// sealed writer-route projection required for operation registration.
     pub(crate) writer_routes: Vec<novarocks_sql::planning::dml::DmlFinalChangeStreamWriterRoute>,
-}
-
-#[allow(
-    dead_code,
-    reason = "Test-only execution helper preserves bound distributed write terminal-path assertions."
-)]
-fn execute_bound_distributed_write_request(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    request: crate::query_execution::contract::DistributedQueryRequest,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    query_execution
-        .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
-        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
-        .map_err(|error| error.to_string())
-}
-
-fn execute_distributed_write_request(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    request: crate::query_execution::contract::DistributedQueryRequest,
-) -> Result<
-    crate::query_execution::outcome::QueryExecutionResult,
-    crate::dml::error::DmlExecutionError,
-> {
-    query_execution
-        .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
-        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
-        .map_err(crate::dml::error::DmlExecutionError::from_distributed)
 }
 
 #[cfg(test)]

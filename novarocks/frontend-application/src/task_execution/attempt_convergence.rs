@@ -139,17 +139,30 @@ impl NativeAttemptConvergenceOwner {
     }
 
     pub(crate) fn process_replaced(&self, backend: novarocks_types::BackendProcessId) -> bool {
-        let Some(target) = self
+        self.replacement_process(backend).is_some()
+    }
+
+    /// Preserve the observed replacement identity from the same frozen
+    /// endpoint. Missing, unhealthy or equal identities are not replacement.
+    pub(crate) fn replacement_process(
+        &self,
+        backend: novarocks_types::BackendProcessId,
+    ) -> Option<novarocks_types::BackendProcessId> {
+        let target = self
             .targets
             .iter()
-            .find(|target| target.context.backend_process_id() == backend)
-        else {
-            return false;
-        };
-        matches!(
-            self.source.observe_process_at_endpoint(backend, &target.endpoint),
-            Ok(BackendProcessObservation::Replaced { current_process }) if current_process != backend
-        )
+            .find(|target| target.context.backend_process_id() == backend)?;
+        match self
+            .source
+            .observe_process_at_endpoint(backend, &target.endpoint)
+        {
+            Ok(BackendProcessObservation::Replaced { current_process })
+                if current_process != backend =>
+            {
+                Some(current_process)
+            }
+            _ => None,
+        }
     }
 
     /// Read only facts already accepted by the original covered owner, plus

@@ -568,14 +568,10 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
             Arc::clone(&ports.management_entrance),
             ports.constant_policy,
         );
-    let backend = Arc::new(
-        crate::mv::domain::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
-    );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
         ports.refresh_service,
         Arc::clone(&ports.storage_observation),
-        backend,
         ports.management_continuation,
         ports.management_audit,
     )

@@ -69,7 +69,7 @@ use super::context_owner::{
 use super::creation::tests as creation_tests;
 use super::dispatch::OperationDispatcher;
 use super::error::{CapacityBound, TaskExecutionError};
-use super::execution::{AbortSubmission, QueryTaskExecution};
+use super::execution::QueryTaskExecution;
 use super::graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, TaskNode, build_task_graph,
 };
@@ -5100,43 +5100,6 @@ fn terminal_status_withdraws_preparing_input_before_queue_reopens() {
     );
     assert_eq!(sink.reserve_attempts(), attempts);
     assert_eq!(sink.live_queue_permits(), 0);
-}
-
-#[test]
-fn an_abort_jumps_the_queue_without_preempting_a_released_operation() {
-    let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
-    let mut harness = Harness::new(&leaves, &[0], 512);
-    let released_before = harness
-        .establish_all(Duration::from_secs(10))
-        .into_iter()
-        .map(|intent| intent.operation_id())
-        .collect::<Vec<_>>();
-    assert!(!released_before.is_empty());
-
-    let context = *harness
-        .execution
-        .graph()
-        .contexts()
-        .next()
-        .expect("the attempt has a context");
-    let submission = harness
-        .execution
-        .abort_context(context, AbortCause::QueryFailed)
-        .expect("an abort is admitted");
-    assert_eq!(submission, AbortSubmission::Accepted);
-    let batches = harness.sink.take();
-    let [(lane, operations)] = batches.as_slice() else {
-        panic!("the accepted abort must reach exactly one transport batch");
-    };
-    assert_eq!(*lane, DispatchLane::Lifecycle);
-    assert_eq!(operations.len(), 1);
-    assert_eq!(operations[0].kind(), OperationKind::AbortQueryContext);
-
-    // Nothing already released was withdrawn: it is still tracked in flight.
-    assert!(
-        harness.execution.dispatcher().in_flight_operations() > released_before.len(),
-        "an abort adds an operation rather than revoking released ones"
-    );
 }
 
 #[test]
@@ -10743,13 +10706,15 @@ pub(crate) fn synchronous_root_control_round() -> (
     (round, status, clock)
 }
 
-fn original_establish_observation_round() -> (
+fn original_establish_observation_round_with_requests() -> (
     TaskRoundForTest,
     Arc<ManualClock>,
     crate::native::task_transport::TaskAckIntakeHandle,
     Arc<RecordingSink>,
     OperationIntent,
     Arc<RecordingSubscriptions>,
+    novarocks_execution::task_execution::AcquireQueryContextAdmissionTicket,
+    QueryContextAdmissionTicketReceipt,
 ) {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;
@@ -10769,7 +10734,16 @@ fn original_establish_observation_round() -> (
     round.turn().unwrap();
     let admissions = released_admissions(&sink);
     assert_eq!(admissions.len(), 1);
-    acks.publish(admission_ack(&admissions[0]));
+    let OperationIntent::AcquireQueryContextAdmissionTicket(admission) = &admissions[0] else {
+        unreachable!()
+    };
+    let admission = *admission;
+    let admission_result = admission_ack(&admissions[0]);
+    let AckPayload::AdmissionTicket(ticket) = admission_result.payload() else {
+        unreachable!()
+    };
+    let ticket = *ticket;
+    acks.publish(admission_result);
     round.turn().unwrap();
     let mut establishes = released_establishes(&sink);
     assert_eq!(establishes.len(), 1);
@@ -10780,12 +10754,135 @@ fn original_establish_observation_round() -> (
         sink,
         establishes.pop().unwrap(),
         subscriptions,
+        admission,
+        ticket,
     )
+}
+
+fn original_establish_observation_round() -> (
+    TaskRoundForTest,
+    Arc<ManualClock>,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Arc<RecordingSink>,
+    OperationIntent,
+    Arc<RecordingSubscriptions>,
+) {
+    let (round, clock, acks, sink, establish, subscriptions, _, _) =
+        original_establish_observation_round_with_requests();
+    (round, clock, acks, sink, establish, subscriptions)
 }
 
 pub(crate) fn pre_ready_observation_round() -> (TaskRoundForTest, Arc<ManualClock>) {
     let (round, clock, _, _, _, _) = original_establish_observation_round();
     (round, clock)
+}
+
+/// Drive the existing admission/Establish owner to its actual correlated
+/// negative receipt; no private phase or observation horizon is manufactured.
+pub(crate) fn pre_ready_identity_rejected_observation_round()
+-> (TaskRoundForTest, Arc<ManualClock>, TaskExecutionError) {
+    let (mut round, clock, acks, sink, establish, _) = original_establish_observation_round();
+    clock.advance(Duration::from_secs(3));
+    acks.publish(OperationAcknowledgement::worker_receipt(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+        OperationOutcome::IdentityMismatch,
+        AckPayload::None,
+    ));
+    let error = round.receive_without_dispatch().unwrap_err();
+    assert!(
+        matches!(&error, TaskExecutionError::PreReadyEstablishRejected {
+        operation_id, rejection, ..
+    } if *operation_id == establish.operation_id()
+        && rejection.outcome() == OperationOutcome::IdentityMismatch)
+    );
+    assert!(sink.take().is_empty());
+    (round, clock, error)
+}
+
+/// The same released admission and Establish are borrowed by the actual QA
+/// actor in Manifest tests; no second operation or ticket is reconstructed.
+pub(crate) fn pre_ready_original_establish_requests() -> (
+    TaskRoundForTest,
+    Arc<ManualClock>,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    novarocks_execution::task_execution::AcquireQueryContextAdmissionTicket,
+    QueryContextAdmissionTicketReceipt,
+    Arc<novarocks_execution::task_execution::EstablishQueryContext>,
+) {
+    let (round, clock, acks, _, establish, _, admission, ticket) =
+        original_establish_observation_round_with_requests();
+    let OperationIntent::EstablishQueryContext(request) = establish else {
+        unreachable!()
+    };
+    (round, clock, acks, admission, ticket, request)
+}
+
+#[test]
+fn rejected_establish_preserves_only_its_original_ticket_observation_horizon() {
+    let (round, clock, error) = pre_ready_identity_rejected_observation_round();
+    let TaskExecutionError::PreReadyEstablishRejected {
+        context,
+        operation_id,
+        ..
+    } = error
+    else {
+        unreachable!()
+    };
+    let execution = round.execution();
+    assert_eq!(
+        execution.pre_ready_observation_remaining(context.backend_process_id()),
+        None
+    );
+    assert_eq!(
+        execution.rejected_establish_observation_remaining(context, operation_id),
+        Some(super::context_owner::ADMISSION_TICKET_VALID_FOR - Duration::from_secs(3))
+    );
+    assert_eq!(
+        execution.rejected_establish_observation_remaining(context, TaskOperationId::new_v7()),
+        None
+    );
+    let foreign = QueryContextRef::new(
+        context.query_execution_id(),
+        FrontendProcessId::new_v7(),
+        context.backend_process_id(),
+    );
+    assert_eq!(
+        execution.rejected_establish_observation_remaining(foreign, operation_id),
+        None
+    );
+    clock.advance(super::context_owner::ADMISSION_TICKET_VALID_FOR);
+    assert_eq!(
+        execution.rejected_establish_observation_remaining(context, operation_id),
+        Some(Duration::ZERO)
+    );
+}
+
+#[test]
+fn locally_rejected_establish_has_no_worker_replacement_observation() {
+    let (mut round, _, acks, _, establish, _) = original_establish_observation_round();
+    let original = super::error::local_protocol_refusal(
+        OperationKind::UpdateQueryContext,
+        OperationOutcome::IdentityMismatch,
+    );
+    acks.publish(OperationAcknowledgement::local_refusal(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+        original.clone(),
+    ));
+    let error = round.receive_without_dispatch().unwrap_err();
+    assert_eq!(error, TaskExecutionError::Execution(original));
+    let context = *round.execution().graph().contexts().next().unwrap();
+    assert_eq!(
+        round
+            .execution()
+            .rejected_establish_observation_remaining(context, establish.operation_id()),
+        None
+    );
+    assert!(
+        !round.execution().owner(context).unwrap().is_released(),
+        "a local refusal cannot supply a Worker exit receipt"
+    );
 }
 
 pub(crate) fn manifest_preparing_observation_round() -> TaskRoundForTest {
@@ -11726,4 +11823,56 @@ fn actual_batch_limit_keeps_the_whole_configured_method_run() {
     let batch = dispatcher.take_batch().unwrap();
     assert_eq!(batch.operations().len(), count);
     assert_eq!(dispatcher.queued_items(), 0);
+}
+
+/// Supplies both original inputs before a single TaskRound receiver cut.
+/// No Native terminal has been published when either input arrives.
+pub(crate) fn manifest_task_and_subscription_failure_round(
+    observation_first: bool,
+    subscription_state: crate::native::task_transport::SubscriptionState,
+) -> TaskRoundForTest {
+    use novarocks_failure_contract::FailureProjection;
+    let (mut round, _, acks, sink, establish, subscriptions) =
+        original_establish_observation_round();
+    acks.publish(establish_ack(&establish));
+    round.turn().unwrap();
+    let creates = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .filter(|intent| intent.kind() == OperationKind::CreateTask)
+        .collect::<Vec<_>>();
+    assert_eq!(creates.len(), round.execution().graph().tasks().count());
+    for create in creates {
+        acks.publish(accepted_create_ack(&create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    let status = round.execution().intake().handle();
+    let original = TaskStatus::try_new_with_installed(
+        root,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Failing,
+        Some(TerminationDetail::Failed(
+            novarocks_execution_contract::TaskFailure::new_in_phase(
+                novarocks_query_application::execution_error::QueryFailureReason::PreparationFailed
+                    .failure_fact(),
+                novarocks_execution_contract::SafeDetail::truncating(
+                    "same-cut original Task failure",
+                ),
+                novarocks_execution_contract::TaskFailurePhase::Preparation,
+            ),
+        )),
+        TaskOutputFacts::new(false),
+        false,
+    )
+    .unwrap();
+    if observation_first {
+        *subscriptions.settled.lock().unwrap() = Some(subscription_state);
+        status.publish(StatusEvent::Published(Box::new(original)));
+    } else {
+        status.publish(StatusEvent::Published(Box::new(original)));
+        *subscriptions.settled.lock().unwrap() = Some(subscription_state);
+    }
+    round
 }

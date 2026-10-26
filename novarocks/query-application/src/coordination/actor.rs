@@ -380,6 +380,20 @@ impl RunningAttemptDriveAuthority {
         self.activation
     }
 
+    pub(crate) async fn may_observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<bool, LogicalExecutionActorError> {
+        request(&self.mailbox, |reply| {
+            ActorCommand::MayObservePreReadyReplacement {
+                activation: self.activation,
+                refusal: refusal.clone(),
+                reply,
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn begin_admission_issue(
         &self,
         request_to_issue: AcquireQueryContextAdmissionTicket,
@@ -1672,6 +1686,7 @@ enum ActorCommand {
     BeginReplacement {
         permit: RunningAttemptPermit,
         failure: AttemptFailureClass,
+        pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
         terminal_error: Option<QueryExecutionError>,
         replacement: QueryExecutionId,
         replacement_contexts: Vec<QueryContextRef>,
@@ -1680,6 +1695,11 @@ enum ActorCommand {
     ActivateReplacement {
         qualification: ReplacementQualification,
         reply: ActorReply<AttemptInstantiationPermit>,
+    },
+    MayObservePreReadyReplacement {
+        activation: AttemptActivationIdentity,
+        refusal: crate::execution_error::ExecutionFailureInput,
+        reply: ActorReply<bool>,
     },
     BeginAdmissionIssue {
         activation: AttemptActivationIdentity,
@@ -1920,6 +1940,7 @@ impl LogicalExecutionActor {
         request(&self.sender, |reply| ActorCommand::BeginReplacement {
             permit,
             failure,
+            pre_ready_replacement: None,
             terminal_error: None,
             replacement,
             replacement_contexts,
@@ -1933,12 +1954,14 @@ impl LogicalExecutionActor {
         permit: RunningAttemptPermit,
         failure: AttemptFailureClass,
         terminal_error: QueryExecutionError,
+        pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
         replacement: QueryExecutionId,
         replacement_contexts: Vec<QueryContextRef>,
     ) -> Result<ReplacementQualification, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::BeginReplacement {
             permit,
             failure,
+            pre_ready_replacement,
             terminal_error: Some(terminal_error),
             replacement,
             replacement_contexts,
@@ -5048,6 +5071,7 @@ fn handle_command(
         ActorCommand::BeginReplacement {
             permit,
             failure,
+            pre_ready_replacement,
             terminal_error,
             replacement: replacement_execution,
             replacement_contexts,
@@ -5055,6 +5079,17 @@ fn handle_command(
         } => {
             let activation = permit.identity();
             let (capability, lifetime, mailbox_liveness) = permit.into_parts();
+            if pre_ready_replacement.is_some_and(|witness| {
+                witness.context().query_execution_id() != activation.execution()
+                    || !terminal_error
+                        .as_ref()
+                        .and_then(QueryExecutionError::execution_failure)
+                        .is_some_and(|input| witness.matches_input(input))
+            }) {
+                settle_refused_attempt(&lifetime, LogicalExecutionActorError::WrongExecution);
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongExecution));
+                return;
+            }
             if let Err(error) = validate_attempt_command(state, &capability)
                 .and_then(|()| verify_running_activation(state, activation))
             {
@@ -5115,22 +5150,27 @@ fn handle_command(
                     return;
                 }
             };
-            let token =
-                match state.begin_replacement(&capability, replacement_execution, failure, false) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        if state
-                            .conclude(&capability, LogicalConclusion::Failed)
-                            .is_ok()
-                            && let (Some(runtime), Some(error)) = (result_runtime, terminal_error)
-                        {
-                            runtime.accepted_error = Some(error);
-                        }
-                        lifetime.settle();
-                        let _ = reply.send(Err(error.into()));
-                        return;
+            let token = match state.begin_replacement(
+                &capability,
+                replacement_execution,
+                failure,
+                pre_ready_replacement,
+                false,
+            ) {
+                Ok(token) => token,
+                Err(error) => {
+                    if state
+                        .conclude(&capability, LogicalConclusion::Failed)
+                        .is_ok()
+                        && let (Some(runtime), Some(error)) = (result_runtime, terminal_error)
+                    {
+                        runtime.accepted_error = Some(error);
                     }
-                };
+                    lifetime.settle();
+                    let _ = reply.send(Err(error.into()));
+                    return;
+                }
+            };
             if let Some(runtime) = result_runtime.as_deref_mut() {
                 internal_ready::retire(runtime, activation);
                 if let Some(error) = terminal_error {
@@ -5225,6 +5265,41 @@ fn handle_command(
                 mailbox_liveness,
                 reply,
             });
+        }
+        ActorCommand::MayObservePreReadyReplacement {
+            activation,
+            refusal,
+            reply,
+        } => {
+            let result = verify_running_activation(state, activation).map(|()| {
+                let Some((context, operation_id)) =
+                    crate::api::PreReadyProcessReplacementWitness::refusal_operation(&refusal)
+                else {
+                    return false;
+                };
+                if context.query_execution_id() != activation.execution() {
+                    return false;
+                }
+                let Some(attempt) = attempts.get(&activation.execution()) else {
+                    return false;
+                };
+                // This is correlation with the original actor-issued operation,
+                // not authentication of the remote verdict. The Native author
+                // still owns wire provenance and the ORIGINAL finite horizon.
+                let matches_issue = attempt
+                    .establish
+                    .snapshot(context)
+                    .and_then(|snapshot| snapshot.identity())
+                    .is_some_and(|identity| {
+                        identity.activation() == activation
+                            && identity.context() == context
+                            && identity.operation_id() == operation_id
+                    });
+                matches_issue
+                    && work_cancellation.reason().is_none()
+                    && state.may_observe_pre_ready_replacement(false)
+            });
+            let _ = reply.send(result);
         }
         ActorCommand::BeginAdmissionIssue {
             activation,
@@ -10441,6 +10516,7 @@ mod tests {
                     running,
                     AttemptFailureClass::RecoverableInfrastructure,
                     original.clone(),
+                    None,
                     second,
                     Vec::new(),
                 )
@@ -11384,5 +11460,201 @@ mod tests {
             reserve_calls_after_failure,
             "a failed attempt must retain its ledger without issuing another Abort effect"
         );
+    }
+    #[tokio::test]
+    async fn actor_replacement_accepts_exact_process_witness_without_reclassifying_original_error()
+    {
+        let first = execution(12_170);
+        let second = replacement(first, 2);
+        let context = QueryContextRef::new(
+            first,
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (input, witness, failure) =
+            crate::api::pre_ready_identity_refusal_test_fixture(context);
+        let original = failure.error().clone();
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let config = recovery_config(first, port, 2);
+        let scope = config.work_owner.as_ref().unwrap().scope();
+        let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
+        let (actor, join) = owner.into_test_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("recovery rows must retain their original result stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        running
+            .freeze_result_attempt_failure(original.clone())
+            .await
+            .unwrap();
+        let qualification = actor
+            .begin_replacement_with_error(
+                running,
+                failure.class(),
+                original.clone(),
+                Some(witness),
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        assert!(matches!(
+            actor.snapshot().await.unwrap().phase,
+            ExecutionPhase::Replacing { .. }
+        ));
+        submissions
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("same actor issued qualification")
+            .rejected();
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        let observed = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("the original failure remains selected"),
+        };
+        assert_eq!(observed, original);
+        assert_eq!(observed.execution_failure(), Some(&input));
+        drop((qualification, stream, actor));
+        tokio::time::timeout(Duration::from_secs(1), join)
+            .await
+            .expect("the original actor actually exits")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
+            .await
+            .expect("original Root releases after actor exit");
+    }
+    #[tokio::test]
+    async fn native_drive_observation_uses_exact_issue_and_current_owner_policy() {
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        for recovery in [false, true] {
+            let first = execution(if recovery { 12_181 } else { 12_180 });
+            let context = QueryContextRef::new(
+                first,
+                FrontendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+            );
+            let config = if recovery {
+                recovery_config_with_contexts(
+                    first,
+                    vec![context],
+                    Arc::new(DelayedQualificationPort::default()),
+                    2,
+                )
+            } else {
+                let (work_owner, stage) = test_governed_work();
+                LogicalExecutionActorConfig::single_attempt_read_rows(
+                    first,
+                    NonZeroUsize::new(4).unwrap(),
+                    vec![context],
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroUsize::new(2).unwrap(),
+                    work_owner,
+                    stage,
+                    result_schema(),
+                    NonZeroUsize::new(1).unwrap(),
+                    result_carrier(),
+                )
+                .unwrap()
+            }
+            .with_abort_query_context_effect_port(
+                super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+            let (owner, initial, output) =
+                spawn_logical_execution_actor(&Handle::current(), config)
+                    .unwrap()
+                    .into_parts();
+            let actor = owner.actor().clone();
+            let running = actor.activate(initial.ready()).await.unwrap();
+            let drive = super::super::NativeAttemptDrive::new(&running);
+            let (unissued, _, _) = crate::api::pre_ready_identity_refusal_test_fixture(context);
+            assert!(
+                !drive
+                    .may_observe_pre_ready_replacement(&unissued)
+                    .await
+                    .unwrap()
+            );
+            let ticket = admission_ticket(context, 72);
+            let admission = drive
+                .begin_admission_issue(admission_request(context, 72))
+                .await
+                .unwrap();
+            drive
+                .settle_admission_issue(
+                    admission,
+                    AdmissionIssueSettlement::applied(
+                        admission.operation_id(),
+                        OperationOutcome::Accepted,
+                        ticket,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let request = establish_request(context, ticket, 72);
+            let input = ExecutionFailureInput::new(
+                unissued.fact(),
+                unissued.detail().clone(),
+                ExecutionFailureSite::Operation {
+                    context,
+                    operation_id: request.envelope().operation_id(),
+                    kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                },
+            );
+            let issue = drive
+                .authorize_establish(request, NativeCompatibilityId::new([72; 32]))
+                .await
+                .unwrap();
+            let transport = HoldingEstablishTransport::default();
+            assert_eq!(
+                issue.try_submit(&transport).unwrap(),
+                EstablishIssueSubmit::Accepted
+            );
+            transport
+                .take()
+                .worker_settled(OperationOutcome::ContextConflict)
+                .unwrap();
+            // The real actor retains the exact issued operation even after its
+            // rejection. QA tests eligibility; remote QUERY15 provenance and
+            // finite topology observation are exercised by the Native owner.
+            assert_eq!(
+                drive
+                    .may_observe_pre_ready_replacement(&input)
+                    .await
+                    .unwrap(),
+                recovery
+            );
+            assert!(
+                !drive
+                    .may_observe_pre_ready_replacement(&unissued)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+            let error = QueryExecutionError::from_execution(input.clone());
+            actor.fail_attempt_with_error(running, error).await.unwrap();
+            assert!(
+                drive
+                    .may_observe_pre_ready_replacement(&input)
+                    .await
+                    .is_err()
+            );
+            drop((drive, actor, output));
+            let residual = owner.into_residual_stand_down_supervisor();
+            residual
+                .observe_worker_stopped_and_context_fenced(context)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), residual.join())
+                .await
+                .expect("the actual actor and original context converge")
+                .unwrap();
+        }
     }
 }

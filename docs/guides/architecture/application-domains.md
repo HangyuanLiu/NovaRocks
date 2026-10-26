@@ -27,12 +27,15 @@ under the License.
 [ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 和
 [ADR-0147](../../adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 为准；Task 的 wire/lifecycle、创建载体、按 identity 重放与一次激活以 ADR-0161 为准。
-ADR-0198 的统一执行契约已接受，代码切换与原生验收尚待完成；下文对应目标边界不构成实现完成证明。
+ADR-0198 的统一执行契约已接受；源码索引反映旧同步协调路径退役后的组合，
+不构成整族原生验收或最终验证完成证明。ADR 保持 implementation pending，已记录失败仍须单独处置。
 
 当前入口可从 `novarocks/frontend-application/src/query/statement_action.rs` 的稳定语句 custody，
 `read_action.rs`、`write_action.rs`、`mutation_action.rs` 和 `ctas_action.rs` 的实际 Action，以及
-`statement_computation.rs`、`statement_publication.rs` 的共享接缝核对。旧 `coordinator/**`
-和 `dml/runner.rs` 仍在；全部调用面迁移与删旧尚未完成，不能把上述源码存在解释为已贯通或已验收。
+`statement_computation.rs`、`statement_publication.rs` 的共享接缝核对。Query Application 的
+`coordination/supervisor.rs` 拥有统一 query-id 来源、逻辑驱动与恢复；Frontend 的
+`QueryExecutionService` 只保原 Provider rewrite 封存，不再拥有另一执行循环或 ID 来源。
+原 credentials、RF 与 Profile 的共享事实/作者仍由实际消费者保留。
 Statistics 的现有 Action 入口在 `statistics_jobs/{service,attempt_executor}.rs`：前台 capture 实际关闭
 CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原 worker；后台沿共享计算 owner
 推进。`query_execution/internal_result_cpu/scoped_statistics.rs` 持封闭 scoped CPU source，
@@ -42,9 +45,13 @@ CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原
 维护 SQL 的实际 Action 选择位于 `query/maintenance_action.rs`；后台 Rewrite 与 Cleanup 原来源在
 `query_execution/maintenance/{rewrite_job,cleanup_action}.rs`，共享产品算法仍在
 `novarocks/table-maintenance/src/product.rs`。`query/mv_action.rs` 保管同 SQL Root 的多步骤 MV
-编排，数据步骤借共享 Native 计算，控制/publication 仍由相应原 Source 推进。这些接缝不证明全部
-历史调用已切换；旧 coordinator、同步 runner、剩余控制调用与最终模块锚点仍须按实际调用图核对，
-实现状态及最终原生验收保持未完成。
+编排，数据步骤借共享 Native 计算，控制/publication 由相应原 Source 推进；
+`query/mv_read_action.rs` 保只读 SHOW/EXPLAIN 与原本地结果交接。MV 后台由
+`mv-application/src/process_runtime.rs` 的异步任务保原事件与 Join，Frontend 的
+`mv/service/background_original.rs` 保稳定调度 Source/同 Root。`MvProductOperations` 与唯一
+runtime wrapper 分开，仍共用同业务闸门和调度状态，不弱化 Unknown 保管来断开强引用循环。
+未触及的 CALL/Host 辅助入口不在此处承诺全域异步完成；最终原生接线、全工作区验证和
+失败处置仍须逐项取证。
 
 ## 先判定 owner，再选 crate
 
@@ -133,9 +140,11 @@ descriptor 广告的 per-context 准备位置 P；两端预算分别由各自 ow
 
 ## 计算就绪、语句结果与资源分别收敛
 
-`LogicalExecutionSupervisor` 与 actor 管理当前 progressing attempt、旧 residual、恢复预算、
-可见性、计算结论与资源义务。语句/job owner 在 prepare 前登记并编排整个业务；领域与 Provider
-决定外部 publication。Task terminal、ComputationReady、外部提交和语句成功不能互换。
+`LogicalExecutionSupervisor` 与 actor 管理当前 progressing attempt、原 residual、恢复预算、
+可见性、计算结论与资源义务。`runtime_registry/health.rs` 保原首个 health、typed cause 和完整
+panic packet，silent 接收完成后才在 caller 锁外通知；真实 active Native、rows 与原 ACK Join
+继续由各自原记录保管，health 不是实际退出证明。语句/job owner 在 prepare 前登记并编排整个业务；
+领域与 Provider 决定外部 publication。Task terminal、ComputationReady、外部提交和语句成功不能互换。
 
 内部结果完成解码、领域 proof 与协议事实闭合、接收方保管已预留后，才能接受一次
 ComputationReady。随后领域业务可立即推进；Native 诊断和收敛继续由原 owner 监督。

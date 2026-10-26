@@ -447,6 +447,7 @@ enum OperationAcknowledgementResult {
         dispatch: OperationDispatchResult,
         payload: AckPayload,
         detail: Option<SafeDetail>,
+        local_failure: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
     },
 }
 static NO_ACK_PAYLOAD: AckPayload = AckPayload::None;
@@ -460,6 +461,7 @@ impl Clone for OperationAcknowledgement {
                     dispatch: OperationDispatchResult::TransportUnknown,
                     payload: AckPayload::None,
                     detail: None,
+                    local_failure: None,
                 },
                 canonical: Some(canonical.clone()),
             };
@@ -537,6 +539,7 @@ impl OperationAcknowledgement {
                 dispatch: OperationDispatchResult::TransportUnknown,
                 payload: AckPayload::None,
                 detail: None,
+                local_failure: None,
             },
             canonical: Some(canonical),
         }
@@ -549,6 +552,37 @@ impl OperationAcknowledgement {
     ) -> Self {
         Self::worker_receipt(operation_id, kind, outcome, payload)
     }
+    /// A local refusal is not a Worker receipt. Its original typed failure
+    /// travels with the existing non-Worker dispatch result.
+    pub(crate) fn local_refusal(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        failure: novarocks_query_application::execution_error::ExecutionFailureInput,
+    ) -> Self {
+        Self {
+            operation_id,
+            kind,
+            canonical: None,
+            result: OperationAcknowledgementResult::NonWorker {
+                dispatch: OperationDispatchResult::NonWorkerRejected,
+                payload: AckPayload::None,
+                detail: None,
+                local_failure: Some(failure),
+            },
+        }
+    }
+
+    pub(crate) fn local_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
+        match self.original_result() {
+            OperationAcknowledgementResult::NonWorker { local_failure, .. } => {
+                local_failure.as_ref()
+            }
+            _ => None,
+        }
+    }
+
     pub fn worker_receipt(
         operation_id: TaskOperationId,
         kind: OperationKind,
@@ -610,6 +644,7 @@ impl OperationAcknowledgement {
                 dispatch,
                 payload,
                 detail: None,
+                local_failure: None,
             },
         };
         Self {

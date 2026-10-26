@@ -218,7 +218,6 @@ struct MvCommandOriginal {
     initialized: bool,
     graph_received: bool,
     selected: Option<Result<(), MvPhaseFailure>>,
-    disposition: Option<StatementExternalEffectDisposition>,
     health: Option<StatementNativeHealthFailure>,
     completion: MvCommandCompletionReceiving,
     performed_publication: bool,
@@ -313,7 +312,6 @@ pub(crate) fn prepare_in(
             initialized: false,
             graph_received: false,
             selected: None,
-            disposition: None,
             health: None,
             completion,
             performed_publication: false,
@@ -364,26 +362,19 @@ impl MvCommandOriginal {
         )
     }
     fn observed_effect(&self) -> Option<StatementExternalEffectDisposition> {
-        let mut observed = fold_effect(
-            self.disposition,
-            self.active
-                .as_ref()
-                .and_then(step::MvStepOriginal::external_effect_disposition),
-        );
+        // Each retained original owns its current publication knowledge. A
+        // dispatched operation may still prove KnownUncommitted or NoOp; its
+        // provisional Unknown must not become a second, permanent fact here.
+        // Retired originals remain retained, including after physical close,
+        // so prior steps still contribute their own actual effects.
+        let mut observed = self
+            .active
+            .as_ref()
+            .and_then(step::MvStepOriginal::external_effect_disposition);
         for original in &self.retired {
             observed = fold_effect(observed, original.external_effect_disposition());
         }
         observed
-    }
-    fn fold_effect(&mut self) {
-        // Cumulative command effects are monotone across serial dependencies.
-        // In particular a later pre-dispatch failure cannot erase an earlier
-        // Applied publication or an actual Current catalog mutation.
-        let incoming = self
-            .active
-            .as_ref()
-            .and_then(step::MvStepOriginal::external_effect_disposition);
-        self.disposition = fold_effect(self.disposition, incoming);
     }
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         self.health
@@ -561,7 +552,6 @@ impl MvCommandOriginal {
                 owner,
                 cx,
             );
-            self.fold_effect();
             match polled {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => {

@@ -84,7 +84,7 @@ impl WriteStatementFamily for InsertFamily {
                 iceberg_writer::IcebergWriteMode::DynamicPartitionOverwrite
             }
         };
-        iceberg_writer::prepare_iceberg_write_with_options_async(
+        iceberg_writer::prepare_iceberg_write_async(
             &input.kernel,
             &input.target,
             &resolved,
@@ -94,7 +94,6 @@ impl WriteStatementFamily for InsertFamily {
             &input.reference,
             input.execution.clone(),
             &context,
-            iceberg_writer::IcebergWritePreparationOptions::new(input.operation_id),
             input.lease.clone(),
             Arc::clone(&input.begin_receiving),
         )
@@ -131,7 +130,6 @@ struct PreparationInput {
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     begin_receiving: Arc<WriteBeginReceiving>,
-    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 }
 pub(crate) fn prepare(
     kernel: crate::query_execution::kernels::DmlExecutionKernel,
@@ -216,7 +214,6 @@ pub(crate) fn prepare(
         execution: input.context.execution().clone(),
         lease,
         begin_receiving: Arc::clone(&begin_receiving),
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId::from(publication_id),
     });
     Ok(write_action::prepare::<InsertFamily>(WriteStatementStart {
         kernel,

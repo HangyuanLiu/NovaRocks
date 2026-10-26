@@ -16,7 +16,9 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 #[cfg(test)]
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringArray};
@@ -28,7 +30,6 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -226,43 +227,6 @@ impl DmlRowMutationEffectSet {
     }
 }
 
-/// Open the write session one merge-on-read change-stream statement writes
-/// through.
-///
-/// The producer emits one row stream carrying both halves of every change
-/// event: the `_file`/`_pos` identity of the row being superseded, and the
-/// after-image of the row replacing it. That is exactly a row-lineage input, so
-/// it is described as one, and the provider decides from it how many branches
-/// the mutation needs and what each accepts. The v3 lineage columns travel with
-/// the data half so an updated row keeps the identity it already had rather
-/// than being re-minted as a fresh row.
-fn begin_mor_change_stream_write_session(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    target_ref: &str,
-    target_columns: &[novarocks_types::schema::ColumnDef],
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Arc<ConnectorWriteSession>, String> {
-    crate::query_execution::write_session::begin_connector_write_session(
-        crate::connector::write_target::derive_write_stack_lease(
-            state.typed_connector_control(),
-            write_planning_lease,
-        )?,
-        write_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
-            target,
-            target_ref,
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            mor_change_stream_input_request(target_columns)?,
-            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
-            connector_context.clone(),
-        )?,
-    )
-}
-
 fn mor_change_stream_input_request(
     target_columns: &[novarocks_types::schema::ColumnDef],
 ) -> Result<novarocks_spi::connector::ConnectorWriteInputRequest, String> {
@@ -311,27 +275,6 @@ fn mor_change_stream_input_request(
             )?,
         ],
     })
-}
-
-/// Release a session whose plan never compiled.
-///
-/// Nothing external has happened -- a begin performs reads only -- but the
-/// provider is holding a session for a plan that will never run, and the
-/// statement's one terminal decision is the only thing that releases it. The
-/// planning failure is what the caller reports, so a failure to release is
-/// logged rather than substituted for it.
-fn release_unplanned_write_session(
-    write_session: &Arc<ConnectorWriteSession>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    statement: &str,
-) {
-    if let Err(error) = write_session.abort(connector_context.clone()) {
-        tracing::warn!(
-            statement,
-            %error,
-            "releasing an unplanned row-mutation write session failed",
-        );
-    }
 }
 
 /// One logical write target of a row-mutation session paired with the routing
@@ -444,115 +387,6 @@ fn bind_change_stream_routes(
     Ok((routes, statistics_targets))
 }
 
-fn compile_dml_change_stream_write(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    query: novarocks_parser::ast::Query,
-    kind: DmlChangeStreamKind,
-    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    crate::dml::error::DmlExecutionError,
-> {
-    let catalog_service_snapshot =
-        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
-    let analyzer_provider =
-        crate::catalog_application::query_materializer::build_catalog_service_provider(
-            Some(&target.catalog),
-            &catalog_service_snapshot,
-            state.connector_control().as_ref(),
-            connector_context.clone(),
-            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-            state.catalog_application().map(Arc::as_ref),
-        );
-    let table_bindings = analyzer_provider.query_table_bindings();
-    let (routes, statistics_targets) = bind_change_stream_routes(
-        target,
-        write_session,
-        &write_planning_lease,
-        table_bindings.as_ref(),
-    )?;
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control =
-        crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            current_catalog: None,
-            current_database: target.namespace.clone(),
-            optimizer_settings: dml_change_stream_optimizer_settings(),
-        },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-        &catalog,
-        state.function_catalog().as_ref(),
-        crate::query_execution::constant_eval::constant_evaluator(),
-        None,
-        state.constant_policy(),
-        compile_control.clone(),
-    );
-    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(crate::dml::error::DmlExecutionError::from_compile)?
-        .into_pending()
-        .map_err(|error| error.to_string())?;
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        state,
-        Arc::clone(&table_bindings),
-        connector_context,
-    )?;
-    let completion_control = compile_control.clone();
-    let optimize_request =
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
-    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-    let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
-        DmlChangeStreamCompileRequest {
-            optimize_request,
-            kind,
-            routes,
-            statistics_targets,
-            pre_expand_keyed_assert,
-            // Every writer is an ordinary dataflow node whose rows gather into
-            // one Root finish fragment; the session, not a terminal sink, owns
-            // the commit.
-            shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
-        },
-        decimal_overflow_policy,
-    )?;
-    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
-    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
-    let mut facts = Vec::with_capacity(needs.len());
-    for need in &needs {
-        facts.push(
-            crate::query_execution::provider_read_facts::freeze_one_read(
-                need,
-                state.typed_connector_control().as_ref(),
-                table_bindings.as_ref(),
-                &connector_session,
-                connector_context,
-                &access_sink.deposits(),
-            )?,
-        );
-    }
-    let access = access_sink
-        .try_into_access()
-        .map_err(|(error, _returned)| error.to_string())?;
-    finish_change_stream_write(
-        state,
-        completion,
-        facts,
-        access,
-        execution,
-        write_session,
-        Some(crate::query_execution::contract::synthetic_statement_query_options(execution)),
-        &completion_control,
-    )
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Finalization pairs the same signed session with its actual read facts and execution context."
@@ -564,7 +398,6 @@ fn finish_change_stream_write(
     access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
         crate::query_execution::provider_read_facts::FrozenProviderRead,
     >,
-    execution: &QueryExecutionContext,
     write_session: &Arc<ConnectorWriteSession>,
     query_options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
@@ -618,7 +451,7 @@ fn finish_change_stream_write(
                 ),
             )
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::dml::error::DmlExecutionError::from_completion)?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -640,144 +473,11 @@ fn finish_change_stream_write(
                 encoded,
                 version,
                 query_options,
-                execution.clone(),
-                state.query_execution().clone(),
                 Arc::clone(write_session),
             )?,
             writer_routes,
         },
     )
-}
-
-/// Core-private staged mutation execution retained behind `MutationEngine`'s
-/// opaque handles.  It intentionally has no journal or SQL routing policy.
-pub(crate) trait MutationExecution: Send + Sync {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution DML recovery and connector wiring."
-    )]
-    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError>;
-    fn needs_abort_on_stage_error(&self) -> bool {
-        false
-    }
-    fn abort_terminal(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String>;
-    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext;
-    fn commit_terminal(
-        &self,
-        completion: MutationCommitCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        match completion {
-            MutationCommitCompletion::Session(completion) => {
-                crate::query_execution::write_session::finish_write_session(
-                    completion,
-                    self.terminal_context(),
-                )
-                .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome)
-                .map_err(|error| error.to_string())
-            }
-            MutationCommitCompletion::AccumulatedSession(session) => session
-                .finish_accumulated(self.terminal_context())
-                .map_err(|error| error.to_string()),
-        }
-    }
-    fn finalize(&self) -> Result<(), String>;
-}
-
-/// The one commit authority a staged mutation hands its statement owner.
-///
-/// Every mutation writes through the NCP-6 write session, but a single-query
-/// mutation hands over the set its last execution produced while a
-/// copy-on-write mutation hands over the session that already accumulated
-/// every query it drove, so the carrier names which one it is instead of
-/// letting a caller guess.
-pub(crate) enum MutationCommitCompletion {
-    /// The write-session carrier of a merge-on-read change-stream mutation.
-    Session(crate::query_execution::outcome::ConnectorWriteSessionCompletion),
-    /// A session that already accumulated every query it drove.
-    ///
-    /// A copy-on-write mutation compiles one query per rewritten file, each
-    /// complete for its own execution graph, and commits their union exactly
-    /// once. There is no last set to hand over here because every one of them
-    /// is already inside the session.
-    AccumulatedSession(Arc<ConnectorWriteSession>),
-}
-
-/// The authority that may resolve a commit whose external outcome is unknown.
-///
-/// It is captured beside the completion because the completion is consumed by
-/// the commit itself, and an unknown outcome must be adjudicated through the
-/// exact authority that issued that commit, never through a replacement.
-pub(crate) enum MutationPublicationAuthority {
-    Session(Arc<ConnectorWriteSession>),
-}
-
-impl MutationCommitCompletion {
-    pub(crate) fn publication_authority(&self) -> MutationPublicationAuthority {
-        match self {
-            Self::Session(completion) => {
-                MutationPublicationAuthority::Session(Arc::clone(completion.session()))
-            }
-            Self::AccumulatedSession(session) => {
-                MutationPublicationAuthority::Session(Arc::clone(session))
-            }
-        }
-    }
-}
-
-impl MutationPublicationAuthority {
-    /// Ask the issuing authority whether the write this evidence describes
-    /// became visible.
-    ///
-    /// `context` is the statement's own terminal context and is what the write
-    /// session reconciles under.
-    pub(crate) fn adjudicate(
-        &self,
-        evidence: novarocks_spi::connector::ExternalMutationEvidence,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        match self {
-            Self::Session(session) => session
-                .reconcile(evidence, context)
-                .map_err(|error| error.to_string()),
-        }
-    }
-}
-
-/// Result of the post-journal mutation staging phase.  The connector
-/// completion stays paired with the exact execution that accepted it, so a
-/// frontend cannot commit a completion through another mutation handle.
-pub(crate) enum MutationStagedWrite {
-    NoOp,
-    AbortRequired {
-        reason: crate::dml::error::DmlExecutionError,
-        execution: Arc<dyn MutationExecution>,
-    },
-    CommitRequired {
-        execution: Arc<dyn MutationExecution>,
-        completion: MutationCommitCompletion,
-    },
-}
-
-fn mutation_stage_abort_required(
-    error: crate::dml::error::DmlExecutionError,
-    execution: Arc<dyn MutationExecution>,
-) -> MutationStagedWrite {
-    MutationStagedWrite::AbortRequired {
-        reason: error,
-        execution,
-    }
 }
 
 /// Frontend-local mutation input lowered from SQLP-5's typed AST.  Expression
@@ -1181,50 +881,6 @@ pub(super) fn resolve_update_target(
     Ok((target, target_ref))
 }
 
-pub(crate) fn prepare_update_mutation(
-    state: &DmlExecutionKernel,
-    stmt: &PreparedUpdateStatement,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedUpdateMutation, String> {
-    let (target, target_ref) =
-        resolve_update_target(state, stmt, current_catalog, current_database)?;
-    // Reject a managed materialized view from neutral metadata under an exact
-    // generation. This cannot move into row-mutation admission: incremental MV
-    // refresh drives its own writes through that same admission, so at that
-    // level a user statement is indistinguishable from the MV machinery
-    // maintaining its own target.
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        state.connector_control().as_ref(),
-        state.mv_storage_observation().as_ref(),
-        state.mv_readiness().as_ref(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update,
-    )?;
-
-    let target_binding = crate::connector::write_target::load_write_target_binding(
-        state.connector_control().as_ref(),
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        connector_context.clone(),
-    )?;
-    finish_update_mutation_preparation(
-        stmt,
-        current_catalog,
-        target,
-        target_ref,
-        target_binding,
-        execution,
-        connector_context,
-        publication_id.into(),
-    )
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Pure mutation admission keeps the exact target, generation, original context and identity distinct."
@@ -1372,46 +1028,6 @@ pub(super) fn resolve_merge_target(
     Ok((target, target_ref))
 }
 
-pub(crate) fn prepare_merge_mutation(
-    state: &DmlExecutionKernel,
-    stmt: &PreparedMergeStatement,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedMergeMutation, String> {
-    let (target, target_ref) =
-        resolve_merge_target(state, stmt, current_catalog, current_database)?;
-    // See the UPDATE path for why this rejection cannot live in row-mutation
-    // admission.
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        state.connector_control().as_ref(),
-        state.mv_storage_observation().as_ref(),
-        state.mv_readiness().as_ref(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge,
-    )?;
-    let target_binding = crate::connector::write_target::load_write_target_binding(
-        state.connector_control().as_ref(),
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        connector_context.clone(),
-    )?;
-    finish_merge_mutation_preparation(
-        stmt,
-        current_catalog,
-        target,
-        target_ref,
-        target_binding,
-        execution,
-        connector_context,
-        publication_id.into(),
-    )
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Pure mutation admission keeps the exact target, generation, original context and identity distinct."
@@ -1449,7 +1065,7 @@ fn finish_merge_mutation_preparation(
         connector_context.clone(),
         operation_id,
     )?;
-    // Same two-route restriction as UPDATE; see `prepare_update_mutation`.
+    // Same two-route restriction as UPDATE; see `finish_update_mutation_preparation`.
     let table_write_mode = match preparations.preparation.strategy() {
         strategy @ (novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
         | novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead) => strategy,
@@ -1524,221 +1140,6 @@ fn finish_merge_mutation_preparation(
         execution: execution.clone(),
         connector_context: connector_context.clone(),
     })
-}
-
-/// Execute the post-intent half of an UPDATE. Preparation above only freezes
-/// validation and connector planning facts; match materialization, cohort
-/// registration and distributed staging happen only here, after the frontend
-/// has persisted its `Preparing` record.
-pub(crate) fn stage_prepared_update_mutation(
-    state: &DmlExecutionKernel,
-    prepared: PreparedUpdateMutation,
-) -> Result<MutationStagedWrite, crate::dml::error::DmlExecutionError> {
-    let PreparedUpdateMutation {
-        stmt,
-        current_catalog,
-        target,
-        target_columns,
-        target_ref,
-        planning_lease,
-        write_lease,
-        cow_preparations,
-        mor_write_target,
-        mode,
-        admitted_base_snapshot_id: _,
-        execution,
-        connector_context,
-    } = prepared;
-    match mode {
-        novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite => {
-            let cow_preparations = cow_preparations.ok_or_else(|| {
-                "COW UPDATE reached stage without its signed row-mutation preparation".to_string()
-            })?;
-            let source_sql =
-                mutation_source_to_sql(state, &stmt.source, current_catalog.as_deref(), &target)?;
-            let query = build_exact_cow_update_selection_query(
-                &target,
-                &stmt,
-                source_sql.as_deref(),
-                &cow_preparations.preparation,
-            )?;
-            let selection = execute_exact_cow_match_query(
-                state,
-                &target,
-                &query,
-                &execution,
-                &connector_context,
-                &cow_preparations.preparation,
-            )?;
-            // The completed match owns its selection. Release the generated
-            // SQL and AST before constructing the next COW transformation.
-            drop(query);
-            drop(source_sql);
-            if selection.row_count() == 0 {
-                return Ok(MutationStagedWrite::NoOp);
-            }
-            // The session is opened only now, after the match query has run:
-            // the provider seals one branch per rewritten file, and which files
-            // those are is exactly what the selection says.
-            let write_session = begin_cow_write_session(
-                state,
-                &target,
-                &cow_preparations.preparation,
-                selection,
-                &write_lease,
-                &planning_lease,
-                &execution,
-                &connector_context,
-            )?;
-            let write = match build_cow_update_distributed_write(
-                state.constant_policy(),
-                &CowMaterializedCompileControl(&connector_context),
-                &target,
-                planning_lease,
-                &cow_preparations.preparation,
-                Arc::clone(&write_session),
-            ) {
-                Ok(write) => write,
-                Err(error) => {
-                    release_unplanned_write_session(
-                        &write_session,
-                        &connector_context,
-                        "COW UPDATE",
-                    );
-                    return Err(error);
-                }
-            };
-            let execution_handle = Arc::new(DistributedCowUpdateExecutor {
-                state: state.clone(),
-                target: target.clone(),
-                write: Mutex::new(Some(write)),
-                write_session: Arc::clone(&write_session),
-                execution,
-                connector_context,
-            });
-            let staged = match execution_handle.run_stage() {
-                Ok(staged) => staged,
-                Err(
-                    error @ (crate::dml::error::DmlExecutionError::Analyze(_)
-                    | crate::dml::error::DmlExecutionError::Control(_)),
-                ) => {
-                    return Err(error);
-                }
-                Err(error) => {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason: error,
-                        execution: execution_handle,
-                    });
-                }
-            };
-            // A statement whose every branch closed without staging an artifact
-            // has no snapshot to publish, so the session is released instead of
-            // committing one that describes nothing.
-            if !staged.staged_any_artifact {
-                if let Err(reason) = execution_handle.release_empty_write_session() {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason: crate::dml::error::DmlExecutionError::Engine(reason),
-                        execution: execution_handle,
-                    });
-                }
-                return Ok(MutationStagedWrite::NoOp);
-            }
-            Ok(MutationStagedWrite::CommitRequired {
-                execution: execution_handle,
-                completion: MutationCommitCompletion::AccumulatedSession(write_session),
-            })
-        }
-        other @ (novarocks_spi::connector::ConnectorRowMutationStrategy::PositionDelete
-        | novarocks_spi::connector::ConnectorRowMutationStrategy::DeletionVector
-        | novarocks_spi::connector::ConnectorRowMutationStrategy::EqualityDelete) => {
-            Err(format!("UPDATE cannot be served by row-mutation strategy {other:?}").into())
-        }
-        novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
-            let PreparedMorUpdateWriteTarget {
-                preparations: _preparations,
-                planning_lease: write_planning_lease,
-            } = mor_write_target.ok_or_else(|| {
-                "MOR UPDATE reached stage without an admitted frozen write target".to_string()
-            })?;
-            // The write lease was derived once at preparation so the
-            // coordinator could fence it before dispatch; re-deriving here
-            // would mint a fresh fence cell and silently discard that fence.
-            let write_session = begin_mor_change_stream_write_session(
-                state,
-                &target,
-                &target_ref,
-                &target_columns,
-                &write_lease,
-                &write_planning_lease,
-                &connector_context,
-            )?;
-            let planned = match build_update_mor_change_stream_write_plan(
-                state,
-                &target,
-                &stmt,
-                current_catalog.as_deref(),
-                &target_columns,
-                &target_ref,
-                &execution,
-                &connector_context,
-                &write_session,
-                write_planning_lease,
-            ) {
-                Ok(planned) => planned,
-                Err(error) => {
-                    release_unplanned_write_session(
-                        &write_session,
-                        &connector_context,
-                        "MOR UPDATE",
-                    );
-                    return Err(error);
-                }
-            };
-            let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
-                state: state.clone(),
-                target: target.clone(),
-                planned: Mutex::new(Some(planned)),
-                execution,
-                connector_context,
-                write_session,
-            });
-            let result = match execution_handle.run_stage() {
-                Ok(result) => result,
-                Err(error) => {
-                    if execution_handle.needs_abort_on_stage_error() {
-                        return Ok(mutation_stage_abort_required(error, execution_handle));
-                    }
-                    return Err(error);
-                }
-            };
-            let Some(completion) = result.write_session else {
-                return Ok(MutationStagedWrite::AbortRequired {
-                    reason: crate::dml::error::DmlExecutionError::Engine(
-                        "MOR UPDATE staged without a write-session completion".to_string(),
-                    ),
-                    execution: execution_handle,
-                });
-            };
-            // An UPDATE that matched nothing produced no commit fragment at
-            // all. Committing that would publish a snapshot describing nothing,
-            // so the session is released instead and the statement reports the
-            // same no-op terminal the staged-report path reached through its
-            // own known-empty check.
-            if completion.is_empty() {
-                if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason: crate::dml::error::DmlExecutionError::Engine(reason),
-                        execution: execution_handle,
-                    });
-                }
-                return Ok(MutationStagedWrite::NoOp);
-            }
-            Ok(MutationStagedWrite::CommitRequired {
-                execution: execution_handle,
-                completion: MutationCommitCompletion::Session(completion),
-            })
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1891,52 +1292,6 @@ fn build_update_mor_producer(
     ))
 }
 
-fn build_update_mor_change_stream_write_plan(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &PreparedUpdateStatement,
-    current_catalog: Option<&str>,
-    target_columns: &[novarocks_types::schema::ColumnDef],
-    target_ref: &str,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    crate::dml::error::DmlExecutionError,
-> {
-    let (mut query, kind, assertion) = build_update_mor_producer(
-        state,
-        target,
-        stmt,
-        current_catalog,
-        target_columns,
-        target_ref,
-    )?;
-    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
-            state,
-            Some(&target.catalog),
-            &target.namespace,
-            &mut query,
-            connector_context,
-        )?;
-    }
-
-    compile_dml_change_stream_write(
-        state,
-        target,
-        query,
-        kind,
-        assertion,
-        execution,
-        connector_context,
-        write_session,
-        write_planning_lease,
-    )
-}
-
 fn update_assignment_projection_sql(
     assignments: &[PreparedMutationAssignment],
     target_columns: &[novarocks_types::schema::ColumnDef],
@@ -2033,172 +1388,6 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-struct MorUpdateChangeStreamExecutor {
-    state: DmlExecutionKernel,
-    target: crate::catalog_application::resolver::TargetBackend,
-    planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
-    execution: QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// The one commit authority of this statement, opened on the exact
-    /// generation that admitted it. The plan's writer nodes carry the recipes
-    /// this session sealed, so the two travel together.
-    write_session: Arc<ConnectorWriteSession>,
-}
-
-struct MorMergeChangeStreamExecutor {
-    state: DmlExecutionKernel,
-    target: crate::catalog_application::resolver::TargetBackend,
-    planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
-    execution: QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// See the corresponding UPDATE executor.
-    write_session: Arc<ConnectorWriteSession>,
-}
-
-/// Run one sealed change-stream plan through the write-session data plane.
-///
-/// The writers are ordinary dataflow nodes: their rows gather into the Root
-/// finish fragment, and the session that sealed their recipes rides along as the
-/// request's single commit authority. No operation, cohort, execution, or
-/// attempt identity reaches the writer data plane.
-fn run_change_stream_write_session_stage(
-    _state: &DmlExecutionKernel,
-    _execution: &QueryExecutionContext,
-    _write_session: &Arc<ConnectorWriteSession>,
-    planned: crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    _statement: &str,
-) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-    let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-        assembly,
-        // The sealed routes are read only by the build observer; the plan the
-        // backends receive carries its writer identities itself.
-        writer_routes: _writer_routes,
-        ..
-    } = planned;
-    #[cfg(test)]
-    if let Some(result) =
-        crate::query_execution::compiler::observe_change_stream_write_build_for_test(
-            &_writer_routes,
-        )
-    {
-        return Ok(result);
-    }
-    assembly.finish()
-}
-
-impl MorUpdateChangeStreamExecutor {
-    /// Release a session whose closed data plane produced no commit fragment.
-    fn release_empty_write_session(
-        &self,
-        completion: &crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    ) -> Result<(), String> {
-        completion
-            .session()
-            .abort(self.connector_context.clone())
-            .map_err(|error| error.to_string())
-            .and_then(crate::query_execution::write_session::require_uncommitted_release)
-            .map_err(|error| format!("release empty MOR UPDATE write session: {error}"))
-    }
-
-    fn run_stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        let planned = self
-            .planned
-            .lock()
-            .expect("MOR UPDATE change-stream plan lock poisoned")
-            .take()
-            .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
-        run_change_stream_write_session_stage(
-            &self.state,
-            &self.execution,
-            &self.write_session,
-            planned,
-            "MOR UPDATE",
-        )
-    }
-}
-
-impl MutationExecution for MorUpdateChangeStreamExecutor {
-    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        self.run_stage()
-    }
-
-    fn needs_abort_on_stage_error(&self) -> bool {
-        true
-    }
-
-    fn abort_terminal(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        self.write_session
-            .abort(self.connector_context.clone())
-            .map_err(|error| format!("abort MOR UPDATE write session: {error}"))
-    }
-
-    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.connector_context.clone()
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
-    }
-}
-
-impl MorMergeChangeStreamExecutor {
-    /// Release a session whose closed data plane produced no commit fragment.
-    fn release_empty_write_session(
-        &self,
-        completion: &crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    ) -> Result<(), String> {
-        completion
-            .session()
-            .abort(self.connector_context.clone())
-            .map_err(|error| error.to_string())
-            .and_then(crate::query_execution::write_session::require_uncommitted_release)
-            .map_err(|error| format!("release empty MOR MERGE write session: {error}"))
-    }
-
-    fn run_stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        let planned = self
-            .planned
-            .lock()
-            .expect("MOR MERGE change-stream plan lock poisoned")
-            .take()
-            .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
-        run_change_stream_write_session_stage(
-            &self.state,
-            &self.execution,
-            &self.write_session,
-            planned,
-            "MOR MERGE",
-        )
-    }
-}
-
-impl MutationExecution for MorMergeChangeStreamExecutor {
-    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        self.run_stage()
-    }
-
-    fn needs_abort_on_stage_error(&self) -> bool {
-        true
-    }
-
-    fn abort_terminal(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        self.write_session
-            .abort(self.connector_context.clone())
-            .map_err(|error| format!("abort MOR MERGE write session: {error}"))
-    }
-
-    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.connector_context.clone()
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
-    }
-}
 #[path = "cow_failure.rs"]
 mod cow_failure;
 #[path = "cow_fe_begin_receipt.rs"]
@@ -2219,6 +1408,7 @@ mod cow_fe_begin_receipt;
 mod cow_necessary_before_begin;
 pub(crate) use cow_failure::CowFailure;
 
+#[cfg(test)]
 fn begin_cow_write_session(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -3033,131 +2223,6 @@ fn build_cow_rewrite_query(
     )
 }
 
-struct DistributedCowUpdateExecutor {
-    state: DmlExecutionKernel,
-    target: crate::catalog_application::resolver::TargetBackend,
-    write: Mutex<Option<CowUpdateDistributedWrite>>,
-    /// The one commit authority of this statement. Every branch's query writes
-    /// through it and it commits their union exactly once.
-    write_session: Arc<ConnectorWriteSession>,
-    execution: QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-}
-
-impl DistributedCowUpdateExecutor {
-    fn run_stage(&self) -> Result<CowStagedWrite, crate::dml::error::DmlExecutionError> {
-        let write = self
-            .write
-            .lock()
-            .expect("COW write plan lock poisoned")
-            .take()
-            .ok_or_else(|| "COW write plan was already consumed".to_string())?;
-        run_cow_target_writes(
-            &self.state,
-            &self.target,
-            write,
-            &self.execution,
-            &self.connector_context,
-        )
-    }
-
-    /// Release a session whose closed data plane produced no commit fragment.
-    fn release_empty_write_session(&self) -> Result<(), String> {
-        self.write_session
-            .abort(self.connector_context.clone())
-            .map_err(|error| error.to_string())
-            .and_then(crate::query_execution::write_session::require_uncommitted_release)
-            .map_err(|error| format!("release empty COW write session: {error}"))
-    }
-}
-
-impl MutationExecution for DistributedCowUpdateExecutor {
-    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        Err(crate::dml::error::DmlExecutionError::Engine(
-            "COW staging produces a multi-branch write result".to_string(),
-        ))
-    }
-
-    fn needs_abort_on_stage_error(&self) -> bool {
-        true
-    }
-
-    fn abort_terminal(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        self.write_session
-            .abort(self.connector_context.clone())
-            .map_err(|error| format!("abort COW write session: {error}"))
-    }
-
-    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.connector_context.clone()
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
-    }
-}
-
-/// What one copy-on-write statement's whole data plane produced.
-///
-/// Emptiness is a statement-level fact, not a per-branch one: a branch whose
-/// every matched row was deleted stages nothing and still has its file retired
-/// by the commit. Only a statement that staged nothing at all has no snapshot
-/// to publish.
-struct CowStagedWrite {
-    staged_any_artifact: bool,
-}
-
-/// Run every sealed branch's query against the one session, then stop.
-///
-/// Each branch is an ordinary distributed write compiled at its own sealed
-/// ordinal: its writers are dataflow nodes, its rows gather into that query's
-/// Root finish fragment, and its prepared write set is complete for its own
-/// execution graph. The session accumulates them and commits their union once,
-/// after every branch has closed.
-fn run_cow_target_writes(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    write: CowUpdateDistributedWrite,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<CowStagedWrite, crate::dml::error::DmlExecutionError> {
-    let CowUpdateDistributedWrite {
-        targets,
-        write_session,
-        planning_lease,
-    } = write;
-    let mut staged_any_artifact = false;
-    for plan in targets {
-        let result = run_one_cow_target(
-            state,
-            target,
-            plan,
-            &planning_lease,
-            &write_session,
-            execution,
-            connector_context,
-        )?;
-        let completion = result
-            .write_session
-            .ok_or_else(|| "COW branch closed without a write-session completion".to_string())?;
-        staged_any_artifact |= !completion.is_empty();
-        let (session, prepared) = completion.into_parts();
-        if !Arc::ptr_eq(&session, &write_session) {
-            return Err("COW branch committed through a substituted write session"
-                .to_string()
-                .into());
-        }
-        session
-            .accumulate(prepared)
-            .map_err(|error| format!("accumulate COW branch write set: {error}"))?;
-    }
-    Ok(CowStagedWrite {
-        staged_any_artifact,
-    })
-}
-
 fn prepare_cow_target_binding(
     target: &crate::catalog_application::resolver::TargetBackend,
     plan: &CowTargetWritePlan,
@@ -3240,43 +2305,6 @@ fn prepare_cow_target_binding(
         Vec::new()
     };
     Ok((sink, table_bindings, overlays))
-}
-
-fn run_one_cow_target(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    plan: CowTargetWritePlan,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    write_session: &Arc<ConnectorWriteSession>,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-    let (sink, table_bindings, overlays) =
-        prepare_cow_target_binding(target, &plan, planning_lease, write_session)?;
-    let assembly =
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_at_write_target(
-            state,
-            Some(&target.catalog),
-            &target.namespace,
-            &plan.query,
-            plan.materialized_site,
-            plan.materialized_rows.clone(),
-            sink,
-            table_bindings,
-            novarocks_sql::compiler::RootDistributionRequirement::Any,
-            Some(execution),
-            connector_context,
-            Arc::clone(write_session),
-            plan.ordinal,
-            &overlays,
-        )?;
-    plan.original.check_active().map_err(|error| {
-        CowFailure::construction(
-            super::cow_closed_ast::BuildError::Original(error),
-            plan.original.clone(),
-        )
-    })?;
-    assembly.finish()
 }
 
 #[cfg(test)]
@@ -3577,7 +2605,7 @@ fn finish_cow_match_plan(
                 ),
             )
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::dml::error::DmlExecutionError::from_completion)?;
     let output =
         novarocks_query_application::preparation::OutputContract::from_completed_candidate(
             novarocks_query_application::api::QueryExecutionKind::Read,
@@ -3619,135 +2647,6 @@ fn finish_cow_match_plan(
             ),
         )?;
     Ok((description, template))
-}
-
-fn execute_exact_cow_match_query(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    query: &novarocks_parser::ast::Query,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-) -> Result<
-    novarocks_spi::connector::ConnectorRowMutationSelection,
-    crate::dml::error::DmlExecutionError,
-> {
-    let capacity = execution.result_capacity().ok_or_else(|| {
-        crate::dml::error::DmlExecutionError::from(
-            "COW match has no admitted Internal result window".to_string(),
-        )
-    })?;
-    crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-        capacity.scope(),
-        &capacity.window_alias(),
-    )?;
-    let (schema, _) = cow_selection_layout(preparation)?;
-    let declaration = cow_selection_execution_types(preparation)?;
-    let consumer =
-        crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_declared_with_capacity(
-            connector_context.clone(),
-            schema,
-            declaration.clone(),
-            preparation.match_contract().clone(),
-            preparation.intent().clone(),
-            capacity,
-        )
-        .map_err(|error| error.to_string())?;
-    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let catalog_service_snapshot =
-        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
-    let analyzer_catalog =
-        crate::catalog_application::query_materializer::build_catalog_service_provider_with_bindings_and_query_local_overlays(
-            Some(&target.catalog),
-            &catalog_service_snapshot,
-            state.connector_control().as_ref(),
-            connector_context.clone(),
-            Arc::clone(&table_bindings),
-            Vec::new(),
-            state.catalog_application().map(Arc::as_ref),
-        );
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-    let compile_control =
-        crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
-        novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            current_catalog: Some(target.catalog.clone()),
-            current_database: target.namespace.clone(),
-            optimizer_settings: execution.optimizer_settings().clone(),
-        },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-        &catalog,
-        state.function_catalog().as_ref(),
-        crate::query_execution::constant_eval::constant_evaluator(),
-        None,
-        state.constant_policy(),
-        compile_control.clone(),
-    )
-    .with_root_output_declaration(declaration.clone())
-    .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
-    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(crate::dml::error::DmlExecutionError::from_compile)?
-        .into_pending()
-        .map_err(|error| error.to_string())?;
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            state,
-            Arc::clone(&table_bindings),
-            connector_context,
-        )?;
-    let completion_control = compile_control.clone();
-    let optimize_request =
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
-    let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
-        optimize_request,
-        execution.optimizer_settings(),
-    )?;
-    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
-    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
-    let mut facts = Vec::with_capacity(needs.len());
-    for need in &needs {
-        facts.push(
-            crate::query_execution::provider_read_facts::freeze_one_read(
-                need,
-                state.typed_connector_control().as_ref(),
-                table_bindings.as_ref(),
-                &connector_session,
-                connector_context,
-                &access_sink.deposits(),
-            )?,
-        );
-    }
-    let access = access_sink
-        .try_into_access()
-        .map_err(|(error, _returned)| error.to_string())?;
-    let (description, template) = finish_cow_match_plan(
-        state,
-        completion,
-        facts,
-        access,
-        &declaration,
-        &completion_control,
-    )?;
-    let request = crate::query_execution::contract::build_request_from_finalized_execution(
-        crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
-            description,
-            template,
-        ),
-        None,
-        crate::query_execution::contract::DistributedQueryIntent::CowMatch,
-        execution,
-        None,
-    )
-    .and_then(|request| request.with_cow_match_consumer(consumer))
-    .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
-    state
-        .query_execution()
-        .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
-        .map_err(crate::dml::error::DmlExecutionError::from_distributed)
 }
 
 #[cfg(test)]
@@ -4114,210 +3013,6 @@ const MERGE_ACTION_MATCHED_UPDATE: i32 = 1;
 const MERGE_ACTION_MATCHED_DELETE: i32 = 2;
 const MERGE_ACTION_NOT_MATCHED_INSERT: i32 = 3;
 
-/// Stage the COW half of a prepared MERGE after frontend durable intent.  The
-/// COW rewrite and optional append share one sealed connector operation and
-/// therefore one aggregate commit handle/snapshot.
-pub(crate) fn stage_prepared_merge_mutation(
-    state: &DmlExecutionKernel,
-    prepared: PreparedMergeMutation,
-) -> Result<MutationStagedWrite, crate::dml::error::DmlExecutionError> {
-    let PreparedMergeMutation {
-        stmt,
-        current_catalog,
-        target,
-        target_columns,
-        target_ref,
-        table_write_mode,
-        planning_lease,
-        write_lease,
-        cow_preparations,
-        mor_write_target,
-        insert_columns_resolved,
-        admitted_base_snapshot_id: _,
-        execution,
-        connector_context,
-    } = prepared;
-    let has_matched_update = matches!(
-        stmt.matched.as_ref().map(|clause| &clause.action),
-        Some(PreparedMergeMatchedAction::Update { .. })
-    );
-    let has_matched_delete = matches!(
-        stmt.matched.as_ref().map(|clause| &clause.action),
-        Some(PreparedMergeMatchedAction::Delete)
-    );
-    let has_not_matched_insert = stmt.not_matched.is_some();
-    if table_write_mode == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead
-        || has_matched_delete
-    {
-        if !has_matched_update && !has_matched_delete && !has_not_matched_insert {
-            return Ok(MutationStagedWrite::NoOp);
-        }
-        let PreparedMorMergeWriteTarget {
-            preparations: _preparations,
-            planning_lease: write_planning_lease,
-        } = mor_write_target.ok_or_else(|| {
-            "MOR MERGE reached stage without an admitted frozen write target".to_string()
-        })?;
-        // The write lease was derived once at preparation so the coordinator
-        // could fence it before dispatch; re-deriving here would mint a fresh
-        // fence cell and silently discard that fence.
-        let write_session = begin_mor_change_stream_write_session(
-            state,
-            &target,
-            &target_ref,
-            &target_columns,
-            &write_lease,
-            &write_planning_lease,
-            &connector_context,
-        )?;
-        let planned = match build_merge_mor_change_stream_write_plan(
-            state,
-            &target,
-            &stmt,
-            current_catalog.as_deref(),
-            &target_columns,
-            insert_columns_resolved.as_deref(),
-            &target_ref,
-            &execution,
-            &connector_context,
-            &write_session,
-            write_planning_lease,
-        ) {
-            Ok(planned) => planned,
-            Err(error) => {
-                release_unplanned_write_session(&write_session, &connector_context, "MOR MERGE");
-                return Err(error);
-            }
-        };
-        let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
-            state: state.clone(),
-            target: target.clone(),
-            planned: Mutex::new(Some(planned)),
-            execution,
-            connector_context,
-            write_session,
-        });
-        let result = match execution_handle.run_stage() {
-            Ok(result) => result,
-            Err(error) => {
-                if execution_handle.needs_abort_on_stage_error() {
-                    return Ok(mutation_stage_abort_required(error, execution_handle));
-                }
-                return Err(error);
-            }
-        };
-        let Some(completion) = result.write_session else {
-            return Ok(MutationStagedWrite::AbortRequired {
-                reason: crate::dml::error::DmlExecutionError::Engine(
-                    "MOR MERGE staged without a write-session completion".to_string(),
-                ),
-                execution: execution_handle,
-            });
-        };
-        // See the MOR UPDATE path: a closed data plane that produced no commit
-        // fragment has nothing to publish, so the session is released rather
-        // than committed.
-        if completion.is_empty() {
-            if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
-                return Ok(MutationStagedWrite::AbortRequired {
-                    reason: crate::dml::error::DmlExecutionError::Engine(reason),
-                    execution: execution_handle,
-                });
-            }
-            return Ok(MutationStagedWrite::NoOp);
-        }
-        return Ok(MutationStagedWrite::CommitRequired {
-            execution: execution_handle,
-            completion: MutationCommitCompletion::Session(completion),
-        });
-    }
-    let cow_preparations = cow_preparations.ok_or_else(|| {
-        "COW MERGE reached stage without its signed row-mutation preparation".to_string()
-    })?;
-    let query = build_exact_cow_merge_selection_query(
-        state,
-        &target,
-        &stmt,
-        current_catalog.as_deref(),
-        insert_columns_resolved.as_deref(),
-        &cow_preparations.preparation,
-    )?;
-    let selection = execute_exact_cow_match_query(
-        state,
-        &target,
-        &query,
-        &execution,
-        &connector_context,
-        &cow_preparations.preparation,
-    )?;
-    // The generated match AST is no longer needed by the owned selection.
-    drop(query);
-    if selection.row_count() == 0 {
-        return Ok(MutationStagedWrite::NoOp);
-    }
-    // See the COW UPDATE path: the session is opened only after the match query
-    // has run, because the provider seals one branch per rewritten file.
-    let write_session = begin_cow_write_session(
-        state,
-        &target,
-        &cow_preparations.preparation,
-        selection,
-        &write_lease,
-        &planning_lease,
-        &execution,
-        &connector_context,
-    )?;
-    let write = match build_cow_update_distributed_write(
-        state.constant_policy(),
-        &CowMaterializedCompileControl(&connector_context),
-        &target,
-        planning_lease,
-        &cow_preparations.preparation,
-        Arc::clone(&write_session),
-    ) {
-        Ok(write) => write,
-        Err(error) => {
-            release_unplanned_write_session(&write_session, &connector_context, "COW MERGE");
-            return Err(error);
-        }
-    };
-    let execution_handle = Arc::new(DistributedCowUpdateExecutor {
-        state: state.clone(),
-        target: target.clone(),
-        write: Mutex::new(Some(write)),
-        write_session: Arc::clone(&write_session),
-        execution,
-        connector_context,
-    });
-    let staged = match execution_handle.run_stage() {
-        Ok(staged) => staged,
-        Err(
-            error @ (crate::dml::error::DmlExecutionError::Analyze(_)
-            | crate::dml::error::DmlExecutionError::Control(_)),
-        ) => {
-            return Err(error);
-        }
-        Err(error) => {
-            return Ok(MutationStagedWrite::AbortRequired {
-                reason: error,
-                execution: execution_handle,
-            });
-        }
-    };
-    if !staged.staged_any_artifact {
-        if let Err(reason) = execution_handle.release_empty_write_session() {
-            return Ok(MutationStagedWrite::AbortRequired {
-                reason: crate::dml::error::DmlExecutionError::Engine(reason),
-                execution: execution_handle,
-            });
-        }
-        return Ok(MutationStagedWrite::NoOp);
-    }
-    Ok(MutationStagedWrite::CommitRequired {
-        execution: execution_handle,
-        completion: MutationCommitCompletion::AccumulatedSession(write_session),
-    })
-}
 pub(crate) struct MergeInsertColumns {
     columns: Vec<MergeInsertColumn>,
 }
@@ -4944,58 +3639,6 @@ fn build_merge_mor_producer(
             message_prefix: "MOR MERGE matched target row".to_string(),
         }),
     ))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The change-stream plan builder keeps mutation facts and connector capabilities explicit through validation; a bundle would duplicate the frozen plan input."
-)]
-fn build_merge_mor_change_stream_write_plan(
-    state: &DmlExecutionKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &PreparedMergeStatement,
-    current_catalog: Option<&str>,
-    target_columns: &[novarocks_types::schema::ColumnDef],
-    insert_columns: Option<&[MergeInsertColumn]>,
-    target_ref: &str,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    crate::dml::error::DmlExecutionError,
-> {
-    let (mut query, kind, assertion) = build_merge_mor_producer(
-        state,
-        target,
-        stmt,
-        current_catalog,
-        target_columns,
-        insert_columns,
-        target_ref,
-    )?;
-    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
-            state,
-            Some(&target.catalog),
-            &target.namespace,
-            &mut query,
-            connector_context,
-        )?;
-    }
-
-    compile_dml_change_stream_write(
-        state,
-        target,
-        query,
-        kind,
-        assertion,
-        execution,
-        connector_context,
-        write_session,
-        write_planning_lease,
-    )
 }
 
 #[cfg(test)]
@@ -6078,107 +4721,6 @@ mod tests {
                 "__nr_cow",
                 "__nr_cow_t_abc",
             ),
-        }
-    }
-
-    struct AbortOutcomeExecution {
-        outcome: novarocks_spi::connector::ConnectorWriteAbortOutcome,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    }
-
-    impl MutationExecution for AbortOutcomeExecution {
-        fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-            Err(crate::dml::error::DmlExecutionError::Engine(
-                "synthetic post-begin staging failure".to_string(),
-            ))
-        }
-
-        fn abort_terminal(
-            &self,
-        ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-            Ok(self.outcome.clone())
-        }
-
-        fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-            self.context.clone()
-        }
-
-        fn finalize(&self) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    fn abort_unknown_evidence() -> novarocks_spi::connector::ExternalMutationEvidence {
-        use novarocks_spi::connector::{
-            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
-            ConnectorProviderId, ExternalMutationEvidence, ProviderBindingEpoch,
-        };
-
-        ExternalMutationEvidence::try_new(
-            1,
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test-provider").expect("provider ID"),
-                instance_id: ConnectorInstanceId::parse("test-instance").expect("instance ID"),
-            },
-            ProviderBindingEpoch::from_bytes([33; 16]),
-            ConnectorMutationOperationId::from_bytes([44; 16]),
-            "row-mutation-abort",
-            bytes::Bytes::from_static(b"uncertain"),
-        )
-        .expect("abort evidence")
-    }
-
-    #[test]
-    fn abort_required_preserves_known_committed_and_commit_unknown_outcomes() {
-        use novarocks_spi::connector::{
-            ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
-            ConnectorWriteReceipt, ExternalMutationFinalization,
-        };
-
-        let outcomes = [
-            ConnectorWriteAbortOutcome::KnownCommitted {
-                cleanup:
-                    novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
-                        novarocks_spi::connector::ExternalMutationFinalization::Complete,
-                    ),
-                needed: Arc::new(
-                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
-                        novarocks_spi::connector::ExternalMutationEffect::Applied,
-                        ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"committed"))
-                            .expect("receipt"),
-                        ExternalMutationFinalization::Complete,
-                    ),
-                ),
-            },
-            ConnectorWriteAbortOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unavailable,
-                    "commit state unavailable",
-                ),
-                evidence: abort_unknown_evidence(),
-            },
-        ];
-
-        for expected in outcomes {
-            let staged = MutationStagedWrite::AbortRequired {
-                reason: crate::dml::error::DmlExecutionError::Engine(
-                    "synthetic post-begin staging failure".to_string(),
-                ),
-                execution: Arc::new(AbortOutcomeExecution {
-                    outcome: expected.clone(),
-                    context: connector_context_for_test(),
-                }),
-            };
-            let MutationStagedWrite::AbortRequired { reason, execution } = staged else {
-                panic!("expected AbortRequired");
-            };
-            assert!(
-                matches!(reason, crate::dml::error::DmlExecutionError::Engine(message) if message == "synthetic post-begin staging failure")
-            );
-            assert_eq!(
-                execution.abort_terminal().expect("typed abort outcome"),
-                expected
-            );
         }
     }
 
@@ -8128,38 +6670,6 @@ mod tests {
         }
     }
 
-    fn empty_session_completion(
-        session: &Arc<ConnectorWriteSession>,
-    ) -> crate::query_execution::outcome::ConnectorWriteSessionCompletion {
-        crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
-            Arc::clone(session),
-            crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(0, Vec::new()),
-        )
-    }
-
-    fn mor_update_executor(
-        session: Arc<ConnectorWriteSession>,
-    ) -> Arc<MorUpdateChangeStreamExecutor> {
-        Arc::new(MorUpdateChangeStreamExecutor {
-            state: test_dml_kernel(),
-            target: iceberg_target(),
-            // No plan: this executor models a stage that never dispatched.
-            planned: Mutex::new(None),
-            execution:
-                novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
-                    novarocks_types::ClusterRole::Fe,
-                    novarocks_query_application::api::BackendTopologySnapshot::empty(3),
-                    None,
-                    novarocks_query_application::cancellation::QueryCancellationSource::new()
-                        .view(),
-                    novarocks_sql::compiler::SessionOptimizerSettings::default(),
-                    novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-                ),
-            connector_context: connector_context_for_test(),
-            write_session: session,
-        })
-    }
-
     /// Each merge-on-read branch feeds the writer holding its own sealed
     /// ordinal, and the router sees them in ordinal order.
     ///
@@ -8209,123 +6719,6 @@ mod tests {
             error.contains("carries no provider routing facts"),
             "{error}"
         );
-    }
-
-    /// A staged merge-on-read write commits its session once, and the terminal
-    /// is single-shot: the connector is not asked a second time.
-    #[test]
-    fn a_staged_mor_write_commits_its_session_exactly_once() {
-        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
-        let execution = mor_update_executor(Arc::clone(&fixture.session));
-        let completion =
-            MutationCommitCompletion::Session(empty_session_completion(&fixture.session));
-
-        execution
-            .commit_terminal(completion)
-            .expect("the session performs the one external commit");
-        assert_eq!(fixture.session.finish_invocations(), 1);
-        assert_eq!(fixture.calls.lock().expect("recorded calls").finish, 1);
-
-        // A second terminal decision on the same session is refused, and the
-        // connector is not asked again.
-        let error = execution
-            .abort_terminal()
-            .expect_err("a committed session cannot also abort");
-        assert!(error.contains("already reached"), "{error}");
-        assert_eq!(fixture.session.finish_invocations(), 1);
-        let calls = fixture.calls.lock().expect("recorded calls");
-        assert_eq!(calls.finish, 1);
-        assert_eq!(calls.abort, 0);
-    }
-
-    /// A merge-on-read write whose data plane never closed reaches the provider
-    /// zero times.
-    ///
-    /// Staging fails before dispatch, the statement takes the abort branch, and
-    /// the session is released. `finish_invocations` is what makes "the
-    /// connector was never asked to commit" an assertable fact rather than an
-    /// inference.
-    #[test]
-    fn a_compiled_refusal_retains_the_post_begin_session_abort_obligation() {
-        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
-        let execution = mor_update_executor(Arc::clone(&fixture.session));
-        let staged = mutation_stage_abort_required(
-            crate::dml::error::DmlExecutionError::from_encode(
-                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                    "FULL OUTER hash join".into(),
-                ),
-            ),
-            execution,
-        );
-        let MutationStagedWrite::AbortRequired { reason, execution } = staged else {
-            panic!("post-begin failure must retain abort ownership");
-        };
-        use novarocks_failure_contract::FailureProjection;
-        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-            "FULL OUTER hash join".into(),
-        );
-        let reason = reason.into_dml_error(None);
-        assert_eq!(
-            reason.execution_failure().unwrap().fact(),
-            original.failure_fact()
-        );
-        assert_eq!(
-            reason.execution_failure().unwrap().fact().class(),
-            novarocks_failure_contract::FailureClass::Unsupported
-        );
-        assert_eq!(fixture.calls.lock().unwrap().abort, 0);
-        assert!(matches!(
-            execution.abort_terminal().unwrap(),
-            novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted { .. }
-        ));
-        assert_eq!(fixture.calls.lock().unwrap().abort, 1);
-        assert_eq!(fixture.calls.lock().unwrap().finish, 0);
-    }
-
-    #[test]
-    fn a_mor_write_whose_data_plane_never_closed_never_reaches_the_provider() {
-        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
-        let execution = mor_update_executor(Arc::clone(&fixture.session));
-
-        let reason = execution
-            .run_stage()
-            .expect_err("a stage with no dispatched plan fails");
-        let crate::dml::error::DmlExecutionError::Engine(reason) = reason else {
-            panic!("an undispatched stage must fail in its owning coordinator: {reason}");
-        };
-        assert!(reason.contains("already consumed"), "{reason}");
-        assert!(execution.needs_abort_on_stage_error());
-        assert_eq!(fixture.session.finish_invocations(), 0);
-
-        assert_eq!(
-            execution.abort_terminal().expect("release the session"),
-            novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted {
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            },
-        );
-        assert_eq!(fixture.session.finish_invocations(), 0);
-        let calls = fixture.calls.lock().expect("recorded calls");
-        assert_eq!(calls.finish, 0);
-        assert_eq!(calls.abort, 1);
-    }
-
-    /// A merge-on-read write that matched nothing produced no commit fragment.
-    /// Committing it would publish a snapshot describing nothing, so the session
-    /// is released and the connector is never asked to commit.
-    #[test]
-    fn an_empty_mor_write_releases_its_session_without_committing() {
-        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
-        let execution = mor_update_executor(Arc::clone(&fixture.session));
-        let completion = empty_session_completion(&fixture.session);
-        assert!(completion.is_empty());
-
-        execution
-            .release_empty_write_session(&completion)
-            .expect("release an empty write session");
-        assert_eq!(fixture.session.finish_invocations(), 0);
-        let calls = fixture.calls.lock().expect("recorded calls");
-        assert_eq!(calls.finish, 0);
-        assert_eq!(calls.abort, 1);
     }
 }
 

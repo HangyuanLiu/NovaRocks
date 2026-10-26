@@ -581,7 +581,10 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
         };
         let (class, code) = match self {
             Self::OperationTimedOut => (FailureClass::Dependency, 14),
-            Self::IdentityMismatch => (FailureClass::Invariant, 15),
+            Self::IdentityMismatch => return FailureFact::new(
+                FailureClass::Invariant,
+                novarocks_query_application::execution_error::TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+            ),
             Self::CompatibilityMismatch => (FailureClass::Invariant, 16),
             Self::ContextNotEstablished => (FailureClass::Invariant, 17),
             Self::ContextConflict => (FailureClass::Invariant, 18),
@@ -601,12 +604,32 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
     }
 }
 
+/// The same protocol reason author preserves a locally refused operation's
+/// fact without claiming that a Worker sent a receipt.
+pub(crate) fn local_protocol_refusal(
+    kind: OperationKind,
+    outcome: OperationOutcome,
+) -> novarocks_query_application::execution_error::ExecutionFailureInput {
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite,
+    };
+    ExecutionFailureInput::new(
+        TaskProtocolFailureReason::terminal_verdict(outcome).failure_fact(),
+        SafeDetail::truncating(&format!("{kind} returned {outcome:?}")),
+        ExecutionFailureSite::Coordinator,
+    )
+}
+
 /// Project only a settled local dispatch refusal; identity, Worker and
 /// cleanup failures keep their original owners and typed branches.
 pub(crate) fn dispatch_rejection(
     acknowledgement: &crate::task_execution::intent::OperationAcknowledgement,
     kind: OperationKind,
 ) -> TaskExecutionError {
+    if let Some(input) = acknowledgement.local_failure() {
+        return TaskExecutionError::Execution(input.clone());
+    }
     if acknowledgement.dispatch_result() == OperationDispatchResult::NonWorkerRejected
         && let Some(cause) = acknowledgement.governance_failure()
     {

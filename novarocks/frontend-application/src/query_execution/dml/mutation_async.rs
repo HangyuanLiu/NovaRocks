@@ -471,7 +471,6 @@ impl PreparedMorMutationWrite {
             completion,
             facts,
             access,
-            self.facts.execution(),
             &self.session,
             options,
             &control,

@@ -64,7 +64,6 @@ mod catalog_controller;
 mod catalog_projection_metrics;
 mod catalog_prune;
 pub(crate) mod connector;
-pub(crate) mod coordinator;
 mod dml;
 pub(crate) mod metrics;
 mod mv;

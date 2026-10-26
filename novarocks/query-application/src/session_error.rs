@@ -144,6 +144,42 @@ impl QueryServiceError {
         failure.failure_cause = Some(cause);
         failure
     }
+    /// Reconcile a local source's stop observation with this query owner's
+    /// actually accepted cancellation. The caller must pass the same query's
+    /// view; the source fact itself carries no Root identity or cancel right.
+    /// Keep the source's original fact and raw cause beside the query verdict.
+    pub fn reconcile_local_stop_observation(
+        mut self,
+        cancellation: &crate::cancellation::QueryCancellationView,
+    ) -> Self {
+        use crate::execution_error::ExecutionFailureSite;
+        use novarocks_failure_contract::{FailureEvidence, FailureProjection};
+
+        let eligible = match (&self.body, &self.failure_cause) {
+            (QueryServiceErrorBody::Execution { input, .. }, Some(cause)) => {
+                matches!(input.site(), ExecutionFailureSite::Coordinator)
+                    && input.fact().evidence() == FailureEvidence::StopObservation
+                    && cause.failure_fact() == input.fact()
+            }
+            _ => false,
+        };
+        if !eligible {
+            return self;
+        }
+        let Some(reason) = cancellation.reason() else {
+            return self;
+        };
+        let input = crate::session_outcome::cancellation_failure_input(reason);
+        let user_error = input.user_error();
+        self.body = QueryServiceErrorBody::Execution {
+            input: Box::new(input),
+            message: user_error.to_string(),
+            user_error,
+        };
+        self.render_execution_message();
+        self
+    }
+
     pub fn failure_cause(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
         self.failure_cause.as_ref()
     }
@@ -213,15 +249,19 @@ impl QueryServiceError {
                 }
                 message.push(')');
             }
-            let label = match self.external_effect_disposition {
-                Some(StatementExternalEffectDisposition::CommitUnknown) => Some("CommitUnknown"),
-                Some(StatementExternalEffectDisposition::KnownCommitted) => Some("KnownCommitted"),
-                Some(StatementExternalEffectDisposition::KnownUncommitted) | None => None,
-            };
-            if let Some(label) = label {
+            if let Some(disposition) = self.external_effect_disposition {
+                let label = match disposition {
+                    StatementExternalEffectDisposition::KnownUncommitted => "KnownUncommitted",
+                    StatementExternalEffectDisposition::CommitUnknown => "CommitUnknown",
+                    StatementExternalEffectDisposition::KnownCommitted => "KnownCommitted",
+                };
                 use std::fmt::Write;
-                write!(message, " (external effect disposition={label} do_not_retry=true; do not retry statement)")
+                write!(message, " (external effect disposition={label}")
                     .expect("writing to a String cannot fail");
+                if disposition.do_not_retry() {
+                    message.push_str(" do_not_retry=true; do not retry statement");
+                }
+                message.push(')');
             }
         }
     }
@@ -251,18 +291,17 @@ impl QueryServiceError {
             QueryServiceErrorBody::Execution { .. } => unreachable!("handled above"),
         };
         let label = match disposition {
-            StatementExternalEffectDisposition::KnownUncommitted => None,
-            StatementExternalEffectDisposition::CommitUnknown => Some("CommitUnknown"),
-            StatementExternalEffectDisposition::KnownCommitted => Some("KnownCommitted"),
+            StatementExternalEffectDisposition::KnownUncommitted => "KnownUncommitted",
+            StatementExternalEffectDisposition::CommitUnknown => "CommitUnknown",
+            StatementExternalEffectDisposition::KnownCommitted => "KnownCommitted",
         };
-        if let Some(label) = label {
-            use std::fmt::Write;
-            write!(
-                message,
-                " (external effect disposition={label} do_not_retry=true; do not retry statement)"
-            )
+        use std::fmt::Write;
+        write!(message, " (external effect disposition={label}")
             .expect("writing to a String cannot fail");
+        if disposition.do_not_retry() {
+            message.push_str(" do_not_retry=true; do not retry statement");
         }
+        message.push(')');
         self
     }
 
@@ -782,6 +821,10 @@ mod publication_message_tests {
         let primary = selected.user_error().unwrap().clone();
         for (effect, effect_label) in [
             (
+                StatementExternalEffectDisposition::KnownUncommitted,
+                "KnownUncommitted",
+            ),
+            (
                 StatementExternalEffectDisposition::KnownCommitted,
                 "KnownCommitted",
             ),
@@ -804,8 +847,13 @@ mod publication_message_tests {
                 } else {
                     ""
                 };
+                let effect_guard = if effect.do_not_retry() {
+                    " do_not_retry=true; do not retry statement"
+                } else {
+                    ""
+                };
                 let expected = format!(
-                    "{primary} (lake publication id={} family=write disposition={label}{guard}) (external effect disposition={effect_label} do_not_retry=true; do not retry statement)",
+                    "{primary} (lake publication id={} family=write disposition={label}{guard}) (external effect disposition={effect_label}{effect_guard})",
                     terminal.header().publication_id()
                 );
                 let effect_first = selected
@@ -842,7 +890,7 @@ mod publication_message_tests {
                     assert_eq!(service.message().matches("lake publication id=").count(), 1);
                     assert_eq!(
                         service.message().matches("do_not_retry=true").count(),
-                        1 + usize::from(knowledge.do_not_retry())
+                        usize::from(effect.do_not_retry()) + usize::from(knowledge.do_not_retry())
                     );
                     for private in [
                         "private provider diagnostic",
@@ -854,8 +902,8 @@ mod publication_message_tests {
                     ] {
                         assert!(!service.message().contains(private));
                     }
-                    // The first cumulative effect is immutable; neither a
-                    // repeated terminal nor a later negative offer erases it.
+                    // The selected owner's terminal effect is immutable;
+                    // repeated attachments cannot replace its received fact.
                     let repeated = service
                         .attach_publication_terminal(terminal.clone())
                         .attach_external_effect_disposition(
@@ -891,6 +939,161 @@ mod publication_message_tests {
             Cow::Borrowed("application")
         ));
     }
+
+    fn original_stop_root() -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::RootWork,
+        crate::cancellation::QueryCancellationView,
+    ) {
+        use novarocks_workload_control::{
+            ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let cancellation = crate::cancellation::QueryCancellationView::governed(
+            root.owner.scope().cancellation().unwrap(),
+            Some(250),
+        );
+        (control, root, cancellation)
+    }
+
+    fn original_stop_cause() -> novarocks_failure_contract::SharedFailureCause {
+        novarocks_failure_contract::SharedFailureCause::from_static_detail(
+            novarocks_workload_control::WorkError::Cancelled(
+                novarocks_workload_control::CancellationReason::Requested,
+            ),
+            "state store original physical execution failed",
+        )
+    }
+
+    #[test]
+    fn local_stop_requires_actual_root_cancellation_and_preserves_original_source() {
+        use novarocks_execution_contract::failure::FailureEvidence;
+        use novarocks_workload_control::{CancellationReason, WorkError};
+        let (_control, root, cancellation) = original_stop_root();
+        let source = original_stop_cause();
+        let original = QueryServiceError::from_failure_cause(source.clone());
+        let observed = original.execution_failure().unwrap().clone();
+        assert_eq!(observed.fact().evidence(), FailureEvidence::StopObservation);
+        assert_eq!(
+            original
+                .clone()
+                .reconcile_local_stop_observation(&cancellation),
+            original,
+        );
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let expected = crate::session_outcome::cancellation_failure_input(
+            cancellation
+                .reason()
+                .expect("same Root accepted cancellation"),
+        );
+        let selected = original.reconcile_local_stop_observation(&cancellation);
+        assert_eq!(selected.execution_failure(), Some(&expected));
+        assert_eq!(selected.kind(), QueryServiceErrorKind::Timeout);
+        assert_eq!(selected.failure_cause(), Some(&source));
+        let retained = selected.failure_cause().unwrap();
+        assert_eq!(retained.failure_fact(), observed.fact());
+        assert_eq!(retained.detail(), observed.detail().as_str());
+        assert!(matches!(
+            retained.downcast_ref::<WorkError>(),
+            Some(WorkError::Cancelled(CancellationReason::Requested))
+        ));
+        assert_eq!(
+            selected
+                .clone()
+                .reconcile_local_stop_observation(&cancellation),
+            selected,
+            "the accepted query verdict is not another stop observation",
+        );
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+    }
+
+    #[test]
+    fn local_stop_reconciliation_retains_both_knowledge_fields_and_compile_sidecars() {
+        use novarocks_workload_control::CancellationReason;
+        let (_control, root, cancellation) = original_stop_root();
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let source = original_stop_cause();
+        let terminal = publication(LakePublicationDisposition::KnownUncommitted);
+        let original = QueryServiceError::from_failure_cause(source.clone())
+            .with_compile_control(Some(
+                novarocks_type_contract::CompileControlError::Cancelled,
+            ))
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted)
+            .attach_publication_terminal(terminal.clone());
+        let control = original.compile_control_error();
+        let provenance = original.compile_provenance;
+        let selected = original.reconcile_local_stop_observation(&cancellation);
+        assert_eq!(selected.failure_cause(), Some(&source));
+        assert_eq!(selected.compile_control_error(), control);
+        assert_eq!(selected.compile_provenance, provenance);
+        assert_eq!(selected.publication_terminal(), Some(&terminal));
+        assert_eq!(
+            selected.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        assert!(selected.message().contains("disposition=KnownUncommitted)"));
+        assert!(selected.message().contains(
+            "external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)"
+        ));
+        assert_eq!(selected.message().matches("do_not_retry=true").count(), 1);
+        assert!(!selected.message().contains("private-catalog"));
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+    }
+
+    #[test]
+    fn local_stop_reconciliation_refuses_foreign_site_missing_or_mismatched_source() {
+        use novarocks_workload_control::CancellationReason;
+        let (_control, root, cancellation) = original_stop_root();
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let source = original_stop_cause();
+        let mut foreign = QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+            source.failure_fact(),
+            SafeDetail::truncating(source.detail()),
+            ExecutionFailureSite::Backend {
+                process: novarocks_types::BackendProcessId::new_v7(),
+            },
+        ));
+        foreign.failure_cause = Some(source.clone());
+        let missing = QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+            source.failure_fact(),
+            SafeDetail::truncating(source.detail()),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let mut mismatched = QueryServiceError::from_failure_cause(source);
+        mismatched.failure_cause = Some(novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_workload_control::WorkError::ForeignAuthority,
+        ));
+        let originating = QueryServiceError::from_failure_cause(
+            novarocks_failure_contract::SharedFailureCause::new(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "original business failure",
+            )),
+        );
+        for original in [foreign, missing, mismatched, originating] {
+            assert_eq!(
+                original
+                    .clone()
+                    .reconcile_local_stop_observation(&cancellation),
+                original,
+            );
+        }
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+    }
 }
 
 #[cfg(test)]
@@ -915,6 +1118,11 @@ mod external_effect_companion_tests {
             assert_eq!(service.kind(), original.kind());
             assert_eq!(service.external_effect_disposition(), Some(disposition));
             assert_eq!(service.publication_terminal(), None);
+            assert!(
+                service
+                    .message()
+                    .contains(&format!("external effect disposition={disposition:?}"))
+            );
             assert!(!service.message().contains("maintenance publication"));
             assert!(!service.message().contains("lake publication"));
             assert_eq!(
@@ -926,6 +1134,20 @@ mod external_effect_companion_tests {
                 .attach_external_effect_disposition(disposition);
             assert_eq!(repeated.message(), service.message());
             assert_eq!(repeated.execution_failure(), Some(&input));
+            let message =
+                QueryServiceError::new(QueryServiceErrorKind::Internal, "selected failure")
+                    .attach_external_effect_disposition(disposition);
+            let suffix = if disposition.do_not_retry() {
+                " do_not_retry=true; do not retry statement"
+            } else {
+                ""
+            };
+            assert_eq!(
+                message.message(),
+                format!("selected failure (external effect disposition={disposition:?}{suffix})")
+            );
+            assert_eq!(message.external_effect_disposition(), Some(disposition));
+            assert!(message.publication_terminal().is_none());
         }
     }
 }

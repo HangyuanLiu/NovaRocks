@@ -21,9 +21,7 @@ use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvCreateDistribution, MvCreatePartitionField,
     MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
 };
-use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use novarocks_mv_application::activity::MvActivityOwner;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
@@ -31,10 +29,9 @@ use novarocks_parser::ast::{
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
     ObjectName as TypedObjectName,
 };
-use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
+use novarocks_query_application::admitted_query_context::RequestContext;
 use novarocks_query_application::api::{
     CommandContext, MaterializedViewCommand, MaterializedViewCommandConsumer,
-    build_string_query_result,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -43,9 +40,6 @@ use novarocks_types::naming::normalize_identifier;
 
 use super::FrontendMvProductAdapter;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
-use crate::mv::domain::{
-    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
-};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -53,7 +47,6 @@ pub struct MvCommandExecutor {
     execution_services: Option<crate::query::mv_action::MvExecutionServices>,
     ports: IcebergMvCorePorts,
     refresh_service: Arc<FrontendMvProductAdapter>,
-    mv_backend: Arc<IcebergMvBackend>,
     /// The one process-local owner of management continuation. Absent only on
     /// a composition with no management authority at all, where the management
     /// procedures have nothing to report and say so.
@@ -68,7 +61,6 @@ impl MvCommandExecutor {
         ports: IcebergMvCorePorts,
         refresh_service: Arc<FrontendMvProductAdapter>,
         _storage_observation: Arc<dyn MvStorageObservationPort>,
-        mv_backend: Arc<IcebergMvBackend>,
         continuation: Option<
             Arc<novarocks_mv_application::management::ManagementContinuationService>,
         >,
@@ -80,7 +72,6 @@ impl MvCommandExecutor {
             execution_services: None,
             ports,
             refresh_service,
-            mv_backend,
             continuation,
             management_audit,
         }
@@ -214,115 +205,6 @@ impl MvCommandExecutor {
         )
     }
 
-    /// Executes one parser-admitted MV command through explicit ports. Refresh
-    /// and repartition receive the request's already-admitted execution
-    /// context; they never capture a second topology or cancellation scope.
-    // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
-    pub fn execute(
-        &self,
-        statement: &MaterializedViewStatement,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
-        match statement {
-            MaterializedViewStatement::Create(statement) => {
-                let statement = lower_typed_create(statement)?;
-                let target = resolve_refresh_mv_target(
-                    current_catalog,
-                    current_database,
-                    &statement.name_parts,
-                )?;
-                self.refresh_service
-                    .execute_serialized(&target, MvActivityOwner::Create, execution, || {
-                        create_mv_with_ports(
-                            &self.ports,
-                            self.refresh_service.as_ref(),
-                            current_catalog,
-                            current_database,
-                            &statement,
-                            connector_context,
-                        )
-                    })
-                    .map_err(mv_command_error)
-            }
-            MaterializedViewStatement::Drop(statement) => {
-                let statement = MvDropStatement {
-                    name_parts: lower_typed_name_parts(&statement.name)?,
-                    if_exists: statement.if_exists,
-                };
-                let target = resolve_refresh_mv_target(
-                    current_catalog,
-                    current_database,
-                    &statement.name_parts,
-                )?;
-                self.refresh_service
-                    .execute_serialized(&target, MvActivityOwner::Drop, execution, || {
-                        drop_mv_with_ports(
-                            self.refresh_service.product_service(),
-                            &self.ports,
-                            current_catalog,
-                            current_database,
-                            &statement,
-                            connector_context,
-                        )
-                    })
-                    .map_err(novarocks_query_application::api::CommandError::from)
-            }
-            MaterializedViewStatement::Alter(statement)
-                if !matches!(&statement.action, TypedAlterAction::Repartition(_)) =>
-            {
-                let statement = lower_typed_alter(statement)?;
-                let target = resolve_refresh_mv_target(
-                    current_catalog,
-                    current_database,
-                    &statement.name_parts,
-                )?;
-                self.refresh_service
-                    .execute_serialized(&target, MvActivityOwner::Alter, execution, || {
-                        alter_mv_with_ports(
-                            &self.ports,
-                            current_catalog,
-                            current_database,
-                            &statement,
-                            connector_context,
-                        )
-                    })
-                    .map_err(novarocks_query_application::api::CommandError::from)
-            }
-            MaterializedViewStatement::Alter(statement) => self.execute_repartition(
-                current_catalog,
-                current_database,
-                &lower_typed_alter(statement)?,
-                connector_context,
-                execution,
-            ),
-            MaterializedViewStatement::Refresh(statement) => self.execute_refresh(
-                current_catalog,
-                current_database,
-                &lower_typed_refresh(statement)?,
-                connector_context,
-                execution,
-            ),
-            MaterializedViewStatement::Show(statement) => list_mvs_with_backend(
-                self.mv_backend.as_ref(),
-                current_catalog,
-                &lower_typed_show(statement)?,
-            )
-            .map_err(novarocks_query_application::api::CommandError::from),
-            MaterializedViewStatement::ExplainRefresh(statement) => self
-                .execute_explain_refresh(
-                    current_catalog,
-                    current_database,
-                    &lower_typed_refresh(&statement.refresh)?,
-                    lower_typed_explain_level(statement.level),
-                    connector_context,
-                )
-                .map_err(mv_command_error),
-        }
-    }
-
     /// Executes the MV management procedures and the test-only stateless
     /// rebuild directly from parser-owned `CALL` syntax. Other procedures
     /// remain a route miss.
@@ -387,145 +269,6 @@ impl MvCommandExecutor {
             let _ = (current_database, connector_context);
             Ok(None)
         }
-    }
-
-    fn execute_explain_refresh(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        statement: &MvRefreshRequest,
-        level: novarocks_sql::compiler::ExplainLevel,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
-        let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-            &self.ports,
-            current_catalog,
-            current_database,
-            statement,
-            level,
-            connector_context,
-        )?;
-        build_string_query_result("Explain String", lines)
-            .map(StatementResult::Query)
-            .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
-    }
-
-    fn execute_repartition(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        statement: &MvAlterStatement,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
-        let MvAlterAction::Repartition(fields) = &statement.action else {
-            return Err("MV repartition executor received a non-repartition action"
-                .to_string()
-                .into());
-        };
-        let target =
-            resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
-        let refresh_statement = MvRefreshRequest {
-            name_parts: statement.name_parts.clone(),
-            full: false,
-        };
-        let repartition_fields = fields
-            .iter()
-            .map(IcebergPartitionFieldExpr::from)
-            .collect::<Vec<_>>();
-        let preparation =
-            crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_repartition_with_ports(
-                &self.ports,
-                current_catalog,
-                current_database,
-                &refresh_statement,
-                &repartition_fields,
-                connector_context,
-            );
-        self.refresh_service
-            .prepare_and_execute_refresh(
-                &preparation,
-                refresh_statement.sql_refresh_statement(),
-                target,
-                MvActivityOwner::Repartition,
-                connector_context.clone(),
-                execution,
-            )
-            .map(|()| StatementResult::Ok)
-            .map_err(mv_application_command_error)
-    }
-
-    fn execute_refresh(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        statement: &MvRefreshRequest,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
-        let requested_target =
-            resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
-        let target_catalog = requested_target.catalog.as_deref().ok_or_else(|| {
-            "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
-                .to_string()
-        })?;
-        let requested_object = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
-            target_catalog,
-            &requested_target.database,
-            &requested_target.name,
-        );
-        let steps =
-            crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness(
-                self.ports.readiness().as_ref(),
-                &requested_object,
-            )?;
-        let mut step_context = connector_context.clone();
-        let mut last_result = None;
-        for step in steps {
-            if !step.is_iceberg() {
-                return Err(format!(
-                    "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views: {}",
-                    step.display_name().trim_start_matches("mv:")
-                ).into());
-            }
-            let target = step.into_target();
-            let target_catalog = target.catalog.clone();
-            let target_database = target.database.clone();
-            let target_name = target.name.clone();
-            let step_statement = MvRefreshRequest {
-                name_parts: vec![target_database.clone(), target_name],
-                full: statement.full && target == requested_target,
-            };
-            let preparation =
-                crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_with_ports(
-                    &self.ports,
-                    target_catalog.as_deref(),
-                    &target_database,
-                    &step_statement,
-                    &step_context,
-                );
-            last_result = Some(
-                self.refresh_service
-                    .prepare_and_execute_refresh(
-                        &preparation,
-                        step_statement.sql_refresh_statement(),
-                        target,
-                        MvActivityOwner::ManualRefresh,
-                        step_context.clone(),
-                        execution,
-                    )
-                    .map(|()| StatementResult::Ok)
-                    .map_err(mv_application_command_error)?,
-            );
-            // The next dependency must observe the upstream commit, not the
-            // request-local metadata snapshot frozen before this step.
-            step_context = step_context.after_external_effect();
-        }
-        last_result.ok_or_else(|| {
-            novarocks_query_application::api::CommandError::from(
-                "MV refresh dependency planner returned no steps".to_string(),
-            )
-        })
     }
 }
 
@@ -601,21 +344,6 @@ impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
     > {
         self.executor
             .prepare_statement_action(command.statement(), &context, &command_context)
-    }
-
-    fn execute(
-        &self,
-        command: &MaterializedViewCommand,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
-        self.executor.execute(
-            command.statement(),
-            context.session().current_catalog(),
-            context.session().current_database(),
-            command_context.connector_context(),
-            context.execution(),
-        )
     }
 }
 

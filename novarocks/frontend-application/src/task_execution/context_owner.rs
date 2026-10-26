@@ -198,6 +198,9 @@ pub struct QueryContextOwner {
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
     establish: Option<ReleasedEstablish>,
+    /// The original rejected Establish may only observe replacement until its
+    /// already accepted ticket horizon. It grants no replay or Worker lease.
+    rejected_establish_observation: Option<(TaskOperationId, MonotonicInstant)>,
     establish_send_started: bool,
     establish_acknowledged: bool,
     renewal: Option<ReleasedLease>,
@@ -275,6 +278,7 @@ impl QueryContextOwner {
             lease_sequence: LeaseSequence::INITIAL,
             renew_schedule: None,
             establish: None,
+            rejected_establish_observation: None,
             establish_send_started: false,
             establish_acknowledged: false,
             renewal: None,
@@ -546,6 +550,16 @@ impl QueryContextOwner {
             .as_ref()
             .and_then(|released| released.observation_expiry)
             .map(|expiry| expiry.saturating_duration_since(now))
+    }
+
+    pub(crate) fn rejected_establish_observation_remaining(
+        &self,
+        operation_id: TaskOperationId,
+        now: MonotonicInstant,
+    ) -> Option<Duration> {
+        let (original_operation, expiry) = self.rejected_establish_observation?;
+        (original_operation == operation_id && !self.establish_acknowledged)
+            .then(|| expiry.saturating_duration_since(now))
     }
 
     /// The next renewal, if one is due.
@@ -1040,6 +1054,26 @@ impl QueryContextOwner {
             return Ok(());
         }
         if is_establish {
+            // Preserve this exact request's observation horizon before retiring
+            // the dispatched request. A local refusal or a foreign ACK cannot
+            // create this candidate; neither can another Worker verdict.
+            if self.quiesce_receipt.is_none()
+                && matches!(
+                    ack.worker_header(),
+                    Some(
+                        novarocks_execution_contract::operation::OperationResult::Verdict {
+                            outcome: OperationOutcome::IdentityMismatch,
+                            ..
+                        }
+                    )
+                )
+            {
+                self.rejected_establish_observation = self
+                    .establish
+                    .as_ref()
+                    .and_then(|released| released.observation_expiry)
+                    .map(|expiry| (ack.operation_id(), expiry));
+            }
             self.establish = None;
             if self.quiesce_receipt.is_some() {
                 // The normal fence has already settled whether this Context

@@ -634,6 +634,20 @@ impl NativeAttemptDrive {
         self.authority.identity()
     }
 
+    /// Ask the current logical owner whether this exact refusal may wait for
+    /// independent process-replacement evidence within its ORIGINAL horizon.
+    /// A positive answer grants no retry, topology, terminal, or exit authority;
+    /// callers must ask again before continuing a pending observation. Refusal
+    /// or a stale drive leaves the original failure unchanged.
+    pub async fn may_observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<bool, LogicalExecutionActorError> {
+        self.authority
+            .may_observe_pre_ready_replacement(refusal)
+            .await
+    }
+
     pub async fn begin_admission_issue(
         &self,
         request: AcquireQueryContextAdmissionTicket,
@@ -728,6 +742,25 @@ mod tests {
             Ok(None),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn empty_eligible_backend_set_refuses_distributed_scheduling() {
+        let error = build_attempt_schedule(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &[],
+            &scan_edge_inputs(NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            }),
+            #[cfg(novarocks_dev_controls)]
+            Ok(None),
+        )
+        .expect_err("distributed scheduling requires an eligible backend");
+        assert_eq!(
+            error.to_string(),
+            "attempt scheduling requires at least one eligible backend",
+        );
     }
 
     #[test]

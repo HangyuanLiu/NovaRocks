@@ -73,7 +73,6 @@ pub mod statistics;
 pub(crate) mod write_barrier;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
-pub(crate) mod write_transaction;
 
 pub mod compiler;
 #[cfg(test)]

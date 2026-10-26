@@ -5487,9 +5487,11 @@ impl
         operation: novarocks_mv_application::product::MvOperationContext,
         guard: novarocks_mv_application::readiness::MvKeyedProjectionDeleteGuard,
     ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
-        validate_drop_installation(self.readiness
-            .delete_after_provider_drop(operation.operation_id, guard)
-            .map_err(drop_provider_failure)?)
+        validate_drop_installation(
+            self.readiness
+                .delete_after_provider_drop(operation.operation_id, guard)
+                .map_err(drop_provider_failure)?,
+        )
     }
 }
 

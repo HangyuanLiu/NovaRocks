@@ -897,12 +897,15 @@ impl NativeTaskOperationSink {
         lease_renewal: bool,
         outcome: OperationOutcome,
     ) {
-        observe_settled(kind, lease_renewal, outcome);
-        self.acks.publish(OperationAcknowledgement::new(
+        observe_dispatch_result(
+            kind,
+            lease_renewal,
+            OperationDispatchResult::NonWorkerRejected,
+        );
+        self.acks.publish(OperationAcknowledgement::local_refusal(
             operation_id,
             kind,
-            outcome,
-            AckPayload::None,
+            crate::task_execution::error::local_protocol_refusal(kind, outcome),
         ));
     }
 
@@ -5735,14 +5738,48 @@ mod tests {
         submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 1).await;
 
+        assert_eq!(acks[0].worker_outcome(), None);
         assert_eq!(
-            acks[0].worker_outcome(),
-            Some(OperationOutcome::IdentityMismatch)
+            acks[0].dispatch_result(),
+            OperationDispatchResult::NonWorkerRejected
         );
+        let original = acks[0]
+            .local_failure()
+            .expect("original local identity fact");
+        assert_eq!(
+            original.fact().reason(),
+            novarocks_query_application::execution_error::TASK_PROTOCOL_IDENTITY_MISMATCH_REASON
+        );
+        assert_eq!(
+            crate::task_execution::error::dispatch_rejection(&acks[0], acks[0].kind())
+                .preparation_input(),
+            *original
+        );
+        assert_eq!(acks[0].clone().local_failure(), Some(original));
         assert!(
             fixture.loopback.peer.applied().is_empty(),
             "a replaced process is never retried elsewhere"
         );
+
+        // The same outcome arriving through an actual validated response
+        // retains its Worker branch; local refusal does not widen that branch.
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::Outcomes(vec![
+                OperationOutcome::IdentityMismatch,
+            ]));
+        submit_batch(
+            &fixture,
+            released_batch(frozen, vec![cancel_intent(2, frozen)]),
+        );
+        let remote = settled(&fixture.acks, 1).await;
+        assert_eq!(
+            remote[0].worker_outcome(),
+            Some(OperationOutcome::IdentityMismatch)
+        );
+        assert!(remote[0].local_failure().is_none());
+        assert_eq!(fixture.loopback.peer.applied().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

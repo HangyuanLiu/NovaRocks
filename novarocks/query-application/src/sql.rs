@@ -113,7 +113,7 @@ pub trait SpecializedStatementRoute: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Build a data refresh action under the already admitted statement.
+    /// Build an MV action under the already admitted statement.
     fn prepare_materialized_view_statement_action(
         &self,
         _statement: novarocks_parser::ast::MaterializedViewStatement,
@@ -125,22 +125,6 @@ pub trait SpecializedStatementRoute: Send + Sync {
             crate::api::CommandErrorKind::Unsupported,
             "materialized view action route is unavailable",
         ))
-    }
-
-    /// Executes the deliberately specialized, complete MV parser input.
-    /// MV must not acquire a second semantic command mirror.
-    fn execute_materialized_view(
-        &self,
-        _statement: &novarocks_parser::ast::MaterializedViewStatement,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> CommandFuture {
-        Box::pin(async {
-            Err(crate::api::CommandError::new(
-                crate::api::CommandErrorKind::Unsupported,
-                "materialized view command route is unavailable",
-            ))
-        })
     }
 
     /// Executes the query-owned View family, which is outside the product

@@ -17,8 +17,8 @@
 
 //! Statement-specific reverse port for frontend-local CTAS orchestration.
 //!
-//! The frontend owns one non-durable statement attempt. Core owns pure SQL
-//! preparation, the exact admitted execution context, source execution, and connector calls.
+//! The supervised CTAS Action owns the statement lifecycle. These authors
+//! prepare SQL, preserve the exact execution context, and drive connector originals.
 //! Opaque handles ensure the frontend cannot inspect or reconstruct compiler,
 //! writer, or provider-private staged-table state.
 
@@ -37,8 +37,7 @@ use novarocks_spi::connector::{
     ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
     ConnectorUnanchoredCtasCleanupLease, ConnectorWriteAdmissionPurpose,
     ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease, CreatePolicy,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    LakePublicationId,
+    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -489,11 +488,6 @@ pub trait CtasPreparedTarget: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub trait CtasPreparedWrite: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-    fn execution_identity(&self) -> [u8; 32];
-}
-
 /// Crash-only CTAS target facts.  Unlike the legacy fenced facts, this is
 /// deliberately only the exact staged-create identity that can reach the
 /// single publish frontier.  It contains no branch, fence, locator or cleanup
@@ -530,12 +524,6 @@ pub enum StandardCtasStageOutcome {
     CommitUnknown {
         failure: CtasFailure,
     },
-}
-
-pub struct PreparedStandardCtasWrite {
-    pub target_facts: StandardCtasTargetFacts,
-    pub execution_identity: [u8; 32],
-    pub handle: Arc<dyn CtasPreparedWrite>,
 }
 
 pub enum StandardCtasPublishOutcome {
@@ -608,28 +596,6 @@ pub trait CtasEngine: Send + Sync {
         ))
     }
 
-    /// Crash-only standard staged-create preflight.  The standard path is
-    /// intentionally separate from the legacy fenced surface while T50 still
-    /// compiles the historical recovery implementation.
-    fn preflight_standard_ctas_target(
-        &self,
-        _statement: &CreateTableAsSelect,
-        _source: &str,
-        _command: &CtasCommand,
-        _current_catalog: Option<&str>,
-        _current_database: &str,
-    ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
-
-    fn prepare_standard_ctas_source(
-        &self,
-        _preflight: &dyn CtasPreparedTargetPreflight,
-        _request: PrepareCtasSourceRequest,
-    ) -> Result<PreparedCtasSource, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
-
     fn prepare_standard_ctas_target(
         &self,
         _source: &dyn CtasPreparedSource,
@@ -637,30 +603,6 @@ pub trait CtasEngine: Send + Sync {
         _policy: CreatePolicy,
     ) -> Result<PreparedStandardCtasCatalogAction, CtasFailure> {
         Err(standard_ctas_unsupported())
-    }
-
-    fn stage_standard_ctas_target(
-        &self,
-        _action: &dyn CtasPreparedCatalogAction,
-    ) -> Result<StandardCtasStageOutcome, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
-
-    fn prepare_standard_ctas_write(
-        &self,
-        _source: &dyn CtasPreparedSource,
-        _target: &dyn CtasPreparedTarget,
-    ) -> Result<PreparedStandardCtasWrite, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
-
-    fn execute_standard_ctas_write(
-        &self,
-        _prepared: &dyn CtasPreparedWrite,
-    ) -> StandardCtasWriteOutcome {
-        StandardCtasWriteOutcome::KnownUncommitted {
-            failure: standard_ctas_unsupported(),
-        }
     }
 
     fn prepare_standard_publish_ctas(
@@ -671,28 +613,10 @@ pub trait CtasEngine: Send + Sync {
     ) -> Result<PreparedStandardCtasCatalogAction, CtasFailure> {
         Err(standard_ctas_unsupported())
     }
-
-    fn publish_standard_ctas(
-        &self,
-        _action: &dyn CtasPreparedCatalogAction,
-    ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
-
-    /// Read-only, exact-evidence publication adjudication. Callers receive
-    /// this permission only after one publish outcome reported `CommitUnknown`.
-    fn adjudicate_standard_ctas_publication(
-        &self,
-        _target: &dyn CtasPreparedTarget,
-        _evidence: ExternalMutationEvidence,
-    ) -> Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
 }
 
-/// Core-private guard embedded in concrete prepared source/write handles.
-/// It proves preparation is inert, preserves one execution identity, and
-/// rejects any second execution before reaching the coordinator.
+/// Private guard retained by the governed source and prepared write.
+/// It preserves one execution identity and rejects a second computation claim.
 pub(crate) struct CtasSourceExecutionGate {
     execution_identity: [u8; 32],
     executed: AtomicBool,
@@ -708,232 +632,6 @@ pub(crate) struct PlannedCtasSourceQuery {
     source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
-}
-
-fn plan_query_for_ctas_source(
-    state: &DmlExecutionKernel,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &Query,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PlannedCtasSourceQuery, CtasFailure> {
-    let mut query = query.clone();
-    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
-            state,
-            current_catalog,
-            current_database,
-            &mut query,
-            connector_context,
-        )
-        .map_err(|error| match error {
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
-                error,
-            ) => internal_failure(error),
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Analyze(
-                error,
-            ) => CtasFailure::analyze(error),
-        })?;
-    }
-    let catalog_service_snapshot =
-        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
-    let analyzer_provider =
-        crate::catalog_application::query_materializer::build_catalog_service_provider(
-            current_catalog,
-            &catalog_service_snapshot,
-            state.connector_control().as_ref(),
-            connector_context.clone(),
-            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-            state.catalog_application().map(Arc::as_ref),
-        );
-    let table_bindings = analyzer_provider.query_table_bindings();
-    let catalog_snapshot =
-        novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control =
-        crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-        novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
-            root_distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
-        },
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-            optimizer_settings: execution.optimizer_settings().clone(),
-        },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-        &catalog_snapshot,
-        state.function_catalog().as_ref(),
-        crate::query_execution::constant_eval::constant_evaluator(),
-        None,
-        state.constant_policy(),
-        compile_control.clone(),
-    );
-    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(CtasFailure::from_compile)?
-        .into_pending()
-        .map_err(|error| internal_failure(error.to_string()))?;
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            state,
-            Arc::clone(&table_bindings),
-            connector_context,
-        )
-        .map_err(internal_failure)?;
-    let optimize_request =
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
-    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-    let source = novarocks_sql::planning::dml::compile_ctas_source(optimize_request)
-        .map_err(CtasFailure::from_compile)?;
-    Ok(PlannedCtasSourceQuery {
-        decimal_overflow_policy,
-        source,
-        table_bindings,
-        optimizer_settings: execution.optimizer_settings().clone(),
-    })
-}
-
-fn prepare_planned_ctas_connector_write(
-    state: &DmlExecutionKernel,
-    planned: &PlannedCtasSourceQuery,
-    target: &CoreStandardCtasTargetSession,
-    execution: &QueryExecutionContext,
-    query_options: Option<QueryOptions>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-) -> Result<
-    crate::query_execution::compiler::PreparedDmlWriteAssembly,
-    crate::dml::error::DmlExecutionError,
-> {
-    let completion_control =
-        crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    // The session both selects this plan shape and owns the writer recipes it
-    // carries, so the two are sealed together rather than by two independent
-    // choices that could disagree. Sealing first also means the plan's write
-    // target ordinal is read off the session instead of assumed.
-    let sealed = session
-        .seal_write_targets()
-        .map_err(|error| error.to_string())?;
-    let write_target_ordinal = sealed.sole_target_ordinal()?;
-    let write_target = session
-        .targets()
-        .iter()
-        .find(|write_target| write_target.ordinal() == write_target_ordinal)
-        .ok_or_else(|| "CTAS session omitted its sealed write target".to_string())?;
-    let target_binding =
-        crate::query_execution::planning::write_sink::admit_session_connector_write_target(
-            planned.table_bindings.as_ref(),
-            novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
-                target.target.catalog.clone(),
-                target.target.namespace.clone(),
-                target.target.table.clone(),
-            ),
-            write_target,
-            target.planning_lease.clone(),
-        )?;
-    let sink =
-        crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
-            planned.table_bindings.as_ref(),
-            target_binding,
-            novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
-            novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        )?;
-
-    let (completion, needs) = novarocks_sql::planning::dml::begin_final_ctas_connector_write_plan(
-        &planned.source,
-        sink,
-        write_target_ordinal,
-        session
-            .statistics_requirements(write_target_ordinal)
-            .map_err(|error| error.to_string())?,
-        &planned.optimizer_settings,
-        planned.decimal_overflow_policy,
-        &completion_control,
-    )?;
-    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
-    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
-    let mut facts = Vec::with_capacity(needs.len());
-    for need in &needs {
-        facts.push(
-            crate::query_execution::provider_read_facts::freeze_one_read(
-                need,
-                state.typed_connector_control().as_ref(),
-                planned.table_bindings.as_ref(),
-                &connector_session,
-                connector_context,
-                &access_sink.deposits(),
-            )?,
-        );
-    }
-    let access = access_sink
-        .try_into_access()
-        .map_err(|(error, _returned)| error.to_string())?;
-    let reads =
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
-            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                fact,
-                read_budget: novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-                },
-            },
-        ))?;
-    let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
-        novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
-            ordinal: write_target_ordinal,
-            handle: session
-                .encode_writer_handle_payload(write_target.handle())
-                .map_err(|error| error.to_string())?,
-        },
-    ])?;
-    let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let plan = completion.finish(
-        version,
-        crate::query_execution::contract::completed_plan_dop_domain(query_options.as_ref())?,
-        reads,
-        targets,
-        &completion_control,
-    )?;
-    let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
-            plan,
-            &completion_control,
-        )
-        .and_then(|candidate| {
-            candidate.freeze_root_output(
-                novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                ),
-            )
-        })
-        .map_err(|error| error.to_string())?;
-    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
-        candidate, access,
-    )
-    .map_err(|(error, _returned)| error.to_string())?;
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-        paired,
-        state.static_plan_carrier(),
-        state.constant_policy(),
-        Some(
-            &crate::query_execution::physical_encoding::WriteTargetFacts {
-                session: session.as_ref(),
-            },
-        ),
-        &completion_control,
-    )?;
-    Ok(
-        crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
-            encoded,
-            version,
-            query_options,
-            execution.clone(),
-            state.query_execution().clone(),
-            session,
-        )?,
-    )
 }
 
 enum CoreCtasCatalogActionKind {
@@ -983,8 +681,6 @@ struct CoreStandardCtasTargetPreflight {
     unanchored_ctas_cleanup_lease: novarocks_spi::connector::ConnectorUnanchoredCtasCleanupLease,
     write_lease: ConnectorWriteLease,
     target_catalog_properties: novarocks_spi::connector::CatalogProperties,
-    attempt_reservation:
-        Arc<Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>>,
 }
 
 impl CtasPreparedTargetPreflight for CoreStandardCtasTargetPreflight {
@@ -1000,7 +696,6 @@ struct CorePreparedStandardCtasSource {
     target: crate::catalog_application::resolver::TargetBackend,
     query_options: Option<QueryOptions>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
     source_columns: Vec<novarocks_sql::planning::dml::DmlSourceColumn>,
     output_columns: Vec<ConnectorColumnDefinition>,
     target_session: Arc<Mutex<Option<Arc<CoreStandardCtasTargetSession>>>>,
@@ -1094,17 +789,9 @@ impl CtasPreparedTarget for CoreStandardCtasTargetSession {
 
 /// What a staged CTAS target lets its write do.
 ///
-/// Opening the session and binding its result are the whole surface: the target
-/// hands the session the frozen facts a catalog load would otherwise have
-/// returned, and takes back the one receipt that session produced.
+/// The target binds the original receipt or latches an unresolved write.
+/// Session admission stays with the asynchronous target author.
 trait CtasWriteTarget: Send + Sync {
-    fn begin_write_session(
-        &self,
-        host: &novarocks_catalog_application::ConnectorControlHost,
-        source_columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>;
-
     /// Bind the sealed writer receipt and transfer the attempt's terminal
     /// storage capability to staged-create publication.
     fn bind_write(
@@ -1117,68 +804,6 @@ trait CtasWriteTarget: Send + Sync {
 }
 
 impl CtasWriteTarget for CoreStandardCtasTargetSession {
-    fn begin_write_session(
-        &self,
-        host: &novarocks_catalog_application::ConnectorControlHost,
-        source_columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
-    {
-        if self.write_unknown_latched.load(Ordering::Acquire) {
-            return Err(CtasFailure {
-                kind: CtasFailureKind::Unavailable,
-                message: "standard CTAS writer outcome is unresolved".to_string(),
-                user_error: None,
-            });
-        }
-        if self
-            .write_plan_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(internal_failure(
-                "standard CTAS staged target write has already been prepared",
-            ));
-        }
-        // The staged target vends the opaque table facts the session opens on.
-        // This is the only way to reach them: the catalog will not know this
-        // table until the publication commits.
-        let binding = self
-            .lease
-            .plan_write(ConnectorStagedWritePlanningRequest {
-                handle: self.handle.clone(),
-                context,
-            })
-            .map_err(connector_failure)?;
-        let stack =
-            crate::connector::write_target::derive_write_stack_lease(host, &self.planning_lease)
-                .map_err(internal_failure)?;
-        let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
-            table: Arc::from(format!("{}.{}", self.target.namespace, self.target.table).as_str()),
-            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-            intent: ConnectorWriteIntent::Append,
-            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            input: ConnectorWriteInputRequest::Data {
-                fields: crate::query_execution::dml::iceberg_ctas::source_columns_to_write_fields(
-                    source_columns,
-                )
-                .map_err(connector_failure)?,
-            },
-            base: None,
-            flavor:
-                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
-                    binding.table().clone(),
-                ),
-            context: binding.context().clone(),
-        };
-        crate::query_execution::write_session::begin_connector_write_session(
-            stack,
-            &self.write_lease,
-            request,
-        )
-        .map_err(internal_failure)
-    }
-
     fn bind_write(
         &self,
         write: ConnectorStagedWriteProof,
@@ -1351,26 +976,6 @@ fn internal_failure(message: impl Into<String>) -> CtasFailure {
     }
 }
 
-struct CorePreparedCtasWrite {
-    state: DmlExecutionKernel,
-    gate: Arc<CtasSourceExecutionGate>,
-    target: Arc<dyn CtasWriteTarget>,
-    assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
-    terminal_context: novarocks_spi::connector::ConnectorRequestContext,
-    attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
-    execution_identity: [u8; 32],
-}
-
-impl CtasPreparedWrite for CorePreparedCtasWrite {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn execution_identity(&self) -> [u8; 32] {
-        self.execution_identity
-    }
-}
-
 fn downcast_standard_source(
     source: &dyn CtasPreparedSource,
 ) -> Result<&CorePreparedStandardCtasSource, CtasFailure> {
@@ -1393,47 +998,6 @@ fn downcast_standard_preflight(
         })
 }
 
-fn sweep_unanchored_ctas_roots(
-    kernel: &DmlExecutionKernel,
-    lease: &ConnectorUnanchoredCtasCleanupLease,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), CtasFailure> {
-    let policy = kernel.lake_publication_runtime_policy().ok_or_else(|| CtasFailure {
-        kind: CtasFailureKind::Unsupported,
-        message: "standard CTAS is unsupported until the shared lake publication GC policy is installed"
-            .to_string(),
-        user_error: None,
-    })?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| internal_failure("system clock is before Unix epoch"))?;
-    let now_ms = i64::try_from(now.as_millis())
-        .map_err(|_| internal_failure("system clock exceeds i64 milliseconds"))?;
-    let safe_age_ms = i64::try_from(policy.safe_gc_age().as_millis())
-        .map_err(|_| internal_failure("lake publication safe GC age exceeds i64 milliseconds"))?;
-    let cutoff_ms = now_ms
-        .checked_sub(safe_age_ms)
-        .ok_or_else(|| internal_failure("lake publication safe GC cutoff underflows"))?;
-    let warehouse_root = lease.warehouse_root().map_err(connector_failure)?;
-    let candidates = lease
-        .discover_unanchored_ctas(warehouse_root.clone(), cutoff_ms, context.clone())
-        .map_err(connector_failure)?;
-    for provenance in candidates {
-        // An exact delete whose acknowledgement is uncertain stays an aged
-        // residue for a later GC pass. It never grants this new CTAS attempt
-        // authority to reconcile, retry, or infer the old publication.
-        let _ = lease
-            .inspect_then_delete_unanchored_ctas(
-                warehouse_root.clone(),
-                cutoff_ms,
-                provenance,
-                context.clone(),
-            )
-            .map_err(connector_failure)?;
-    }
-    Ok(())
-}
-
 fn downcast_catalog_action(
     action: &dyn CtasPreparedCatalogAction,
 ) -> Result<&CoreCtasCatalogAction, CtasFailure> {
@@ -1454,13 +1018,6 @@ fn downcast_standard_target(
         })
 }
 
-fn downcast_write(write: &dyn CtasPreparedWrite) -> Result<&CorePreparedCtasWrite, CtasFailure> {
-    write
-        .as_any()
-        .downcast_ref::<CorePreparedCtasWrite>()
-        .ok_or_else(|| internal_failure("CTAS write handle does not belong to the core engine"))
-}
-
 fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
@@ -1469,82 +1026,6 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
         digest.update(part);
     }
     digest.finalize().into()
-}
-
-/// Turn one completed write session into the proof its publication needs.
-///
-/// This is the whole terminal of a staged CTAS write: seal exactly once, take
-/// the rows only if the seal is known to have succeeded, and bind the resulting
-/// receipt to the staged target. Every failure below is proven-uncommitted --
-/// a staged seal touches no catalog, so the target still does not exist.
-fn seal_ctas_write(
-    target: &dyn CtasWriteTarget,
-    execution_identity: [u8; 32],
-    completion: Option<crate::query_execution::outcome::ConnectorWriteSessionCompletion>,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> StandardCtasWriteOutcome {
-    // An empty prepared write set arrives here exactly like a full one. Whether
-    // an empty CTAS publishes an empty table is the provider's decision, and it
-    // cannot make it if the frontend short-circuits on "there were no
-    // fragments".
-    let Some(completion) = completion else {
-        return staged_write_failed(target, "CTAS write produced no sealed write set");
-    };
-    let committed = match crate::query_execution::write_session::finish_write_session_for_following_terminal_action(
-        completion,
-        context,
-    ) {
-            Ok(committed) => committed,
-            Err(error) => {
-                return staged_write_failed(
-                    target,
-                    format!("CTAS write set could not be sealed: {error}"),
-                );
-            }
-    };
-    let (outcome, affected_rows, terminal_context) = committed.into_parts();
-    // Rows become reportable exactly here, and only on an outcome known to
-    // have succeeded.
-    let Some(row_count) = affected_rows else {
-        let message = match outcome {
-            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
-                format!(
-                    "CTAS write was not sealed: {}",
-                    crate::connector::mutation::known_uncommitted_message(failure, &cleanup)
-                )
-            }
-            ExternalMutationOutcome::CommitUnknown { failure, .. } => format!(
-                "CTAS write sealing outcome is unresolved: {}",
-                failure.message()
-            ),
-            ExternalMutationOutcome::KnownCommitted { .. } => {
-                "CTAS write sealed without reporting its rows".to_string()
-            }
-        };
-        return staged_write_failed(target, message);
-    };
-    let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
-        return staged_write_failed(target, "CTAS write reported rows without a receipt");
-    };
-    let proof = match ConnectorStagedWriteProof::try_new(receipt, row_count) {
-        Ok(proof) => proof,
-        Err(error) => {
-            return staged_write_failed(
-                target,
-                format!("CTAS write receipt is not publishable: {error}"),
-            );
-        }
-    };
-    if let Err(error) = target.bind_write(proof.clone(), terminal_context) {
-        return staged_write_failed(
-            target,
-            format!("CTAS target refused its sealed write: {error}"),
-        );
-    }
-    StandardCtasWriteOutcome::Completed {
-        write: proof,
-        execution_identity,
-    }
 }
 
 /// Close a staged target whose write never produced a publishable receipt.
@@ -1600,239 +1081,6 @@ impl CtasEngine for DmlExecutionKernel {
         crate::query::ctas_action::prepare(self.clone(), input)
     }
 
-    fn preflight_standard_ctas_target(
-        &self,
-        _statement: &CreateTableAsSelect,
-        _source: &str,
-        command: &CtasCommand,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
-        let target = crate::catalog_application::resolver::resolve_table_target(
-            self,
-            &ObjectName {
-                parts: command.target_parts.clone(),
-            },
-            current_catalog,
-            current_database,
-        )
-        .map_err(internal_failure)?;
-        // CTAS reaches the target catalog before its distributed writer is
-        // built. Reserve the one native attempt here so target preflight,
-        // source planning, staged creation, and the eventual writer share one
-        // request-local vended credential authority.
-        let attempt_reservation = self
-            .query_execution()
-            .reserve_initial_attempt()
-            .map_err(|error| internal_failure(error.to_string()))?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| connector_failure(error.into()))?;
-        let planning = self
-            .connector_control()
-            .acquire_current(&instance_id)
-            .map_err(connector_failure)?;
-        // The standard staged-create capability is the only mutation
-        // authority.  Acquiring it before source planning preserves the
-        // unsupported-at-zero-side-effect boundary.
-        let lease = planning
-            .derive_staged_create_lease()
-            .map_err(connector_failure)?;
-        let unanchored_ctas_cleanup_lease = planning
-            .derive_unanchored_ctas_cleanup_lease()
-            .map_err(connector_failure)?;
-        let write_lease = planning.derive_write_lease().map_err(connector_failure)?;
-        if !lease.matches_write_lease(&write_lease)
-            || lease.control_runtime_id() != unanchored_ctas_cleanup_lease.control_runtime_id()
-        {
-            return Err(internal_failure(
-                "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
-            ));
-        }
-        // The provider's staged-create publication contract is the only
-        // authority allowed to decide whether IF NOT EXISTS is a no-op. A
-        // frontend metadata read is not a substitute for its exact commit
-        // result and would race the publication frontier.
-        let binding = planning.binding();
-        let target_catalog_properties = binding
-            .catalog_properties()
-            .map_err(connector_failure)?
-            .clone();
-        Ok(CtasTargetPreflightOutcome::Ready(
-            PreparedCtasTargetPreflight {
-                facts: CtasTargetPreflightFacts {
-                    provider_id: binding.descriptor().provider_id.as_str().to_string(),
-                    instance_id: binding.descriptor().instance_id.as_str().to_string(),
-                    control_runtime_id: lease.control_runtime_id().to_bytes(),
-                    capability_version:
-                        novarocks_spi::connector::CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
-                    target_namespace: target.namespace.clone(),
-                    target_table: target.table.clone(),
-                },
-                handle: Arc::new(CoreStandardCtasTargetPreflight {
-                    target,
-                    lease,
-                    planning_lease: planning.clone(),
-                    unanchored_ctas_cleanup_lease,
-                    write_lease,
-                    target_catalog_properties,
-                    attempt_reservation: Arc::new(Mutex::new(Some(attempt_reservation))),
-                }),
-            },
-        ))
-    }
-
-    fn prepare_standard_ctas_source(
-        &self,
-        preflight: &dyn CtasPreparedTargetPreflight,
-        request: PrepareCtasSourceRequest,
-    ) -> Result<PreparedCtasSource, CtasFailure> {
-        let preflight = downcast_standard_preflight(preflight)?;
-        let target = crate::catalog_application::resolver::resolve_table_target(
-            self,
-            &ObjectName {
-                parts: request.command.target_parts.clone(),
-            },
-            request.current_catalog.as_deref(),
-            &request.current_database,
-        )
-        .map_err(internal_failure)?;
-        if target != preflight.target {
-            return Err(CtasFailure {
-                kind: CtasFailureKind::InvalidRequest,
-                message: "standard CTAS source target does not match its exact preflight"
-                    .to_string(),
-                user_error: None,
-            });
-        }
-        let connector_context = self
-            .connector_request_context_for_execution(
-                request.query_options.as_ref(),
-                &request.execution,
-            )
-            .map_err(internal_failure)?;
-        let connector_context = {
-            let reservation = preflight.attempt_reservation.lock().map_err(|error| {
-                internal_failure(format!("CTAS attempt reservation lock: {error}"))
-            })?;
-            let reservation = reservation.as_ref().ok_or_else(|| {
-                internal_failure("standard CTAS attempt reservation was already consumed")
-            })?;
-            reservation
-                .connector_request_context(
-                    connector_context,
-                    #[cfg(novarocks_dev_controls)]
-                    request.execution.test_statement_nomination(),
-                )
-                .map_err(internal_failure)?
-                .with_vended_credential_lease_collection(
-                    preflight.target_catalog_properties.clone(),
-                )
-                .map_err(|error| internal_failure(error.to_string()))?
-        };
-        let planned = plan_query_for_ctas_source(
-            self,
-            request.current_catalog.as_deref(),
-            &request.current_database,
-            &request.command.source,
-            &request.execution,
-            &connector_context,
-        )?;
-        if planned.source.has_private_output_domain() {
-            return Err(internal_failure(
-                "CTAS source contains an unsupported internal opaque value domain",
-            ));
-        }
-        let source_columns = planned.source.output_columns();
-        if source_columns.is_empty() {
-            return Err(CtasFailure {
-                kind: CtasFailureKind::InvalidRequest,
-                message: "CTAS source has no output columns".to_string(),
-                user_error: None,
-            });
-        }
-        crate::query_execution::dml::iceberg_ctas::validate_source_domains(&source_columns)
-            .map_err(internal_failure)?;
-        let output_schema = Arc::new(arrow::datatypes::Schema::new(
-            source_columns
-                .iter()
-                .map(|column| {
-                    arrow::datatypes::Field::new(
-                        &column.name,
-                        column.value_type.data_type().clone(),
-                        column.value_type.nullable(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ));
-        let table_columns =
-            crate::query_execution::dml::iceberg_ctas::source_columns_to_table_column_defs(
-                &source_columns,
-            )
-            .map_err(internal_failure)?;
-        let output_columns = table_columns
-            .iter()
-            .map(crate::catalog_application::statement::connector_column)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(internal_failure)?;
-        let schema_text = format!("{output_schema:?}");
-        let optimized_fingerprint = planned.source.capture_fingerprint();
-        let settings_material =
-            novarocks_sql::planning::dml::optimizer_settings_stable_digest_material(
-                &planned.optimizer_settings,
-            );
-        let binding_material = planned.table_bindings.stable_digest_material();
-        let execution_nonce = uuid::Uuid::now_v7();
-        let execution_identity =
-            sha256(&[b"novarocks.ctas-execution.v1", execution_nonce.as_bytes()]);
-        let plan_digest = sha256(&[
-            b"novarocks.ctas-plan.v1",
-            printer::print_query(&request.command.source).as_bytes(),
-            optimized_fingerprint.as_slice(),
-            settings_material.as_slice(),
-            binding_material.as_slice(),
-        ]);
-        let schema_digest = sha256(&[schema_text.as_bytes()]);
-        let gate = Arc::new(CtasSourceExecutionGate::new(
-            execution_identity,
-            Arc::new(planned),
-            request.execution,
-        ));
-        let attempt_reservation = preflight
-            .attempt_reservation
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS attempt reservation lock: {error}")))?
-            .take()
-            .ok_or_else(|| {
-                internal_failure("standard CTAS attempt reservation was already consumed")
-            })?;
-        Ok(PreparedCtasSource {
-            facts: CtasPreparedSourceFacts {
-                target_catalog: target.catalog.clone(),
-                target_namespace: target.namespace.clone(),
-                target_table: target.table.clone(),
-                source_catalog: request.current_catalog.clone(),
-                source_database: request.current_database.clone(),
-                plan_digest,
-                schema_digest,
-                execution_identity,
-                output_columns: output_columns.clone(),
-            },
-            handle: Arc::new(CorePreparedStandardCtasSource {
-                gate,
-                preflight: preflight.clone(),
-                command: request.command,
-                target,
-                query_options: request.query_options,
-                connector_context,
-                attempt_reservation: Mutex::new(Some(attempt_reservation)),
-                source_columns,
-                output_columns,
-                target_session: Arc::new(Mutex::new(None)),
-                target_prepare_started: AtomicBool::new(false),
-            }),
-        })
-    }
-
     fn prepare_standard_ctas_target(
         &self,
         source: &dyn CtasPreparedSource,
@@ -1879,247 +1127,6 @@ impl CtasEngine for DmlExecutionKernel {
         })
     }
 
-    fn stage_standard_ctas_target(
-        &self,
-        action: &dyn CtasPreparedCatalogAction,
-    ) -> Result<StandardCtasStageOutcome, CtasFailure> {
-        let action = downcast_catalog_action(action)?;
-        let CoreCtasCatalogActionKind::StandardStage {
-            preflight,
-            request,
-            target_slot,
-        } = &action.kind
-        else {
-            return Err(internal_failure(
-                "CTAS catalog action is not a standard stage action",
-            ));
-        };
-        action.begin_dispatch()?;
-        match preflight
-            .lease
-            .prepare(request.as_ref().clone())
-            .map_err(connector_failure)?
-        {
-            ConnectorStagedCreatePrepareOutcome::Prepared {
-                handle,
-                receipt,
-                finalization,
-            } => {
-                let target = Arc::new(CoreStandardCtasTargetSession {
-                    lease: preflight.lease.clone(),
-                    write_lease: preflight.write_lease.clone(),
-                    planning_lease: preflight.planning_lease.clone(),
-                    target: preflight.target.clone(),
-                    handle,
-                    stage_receipt: receipt.clone(),
-                    stage_finalization: finalization.clone(),
-                    publication_id: request.publication_id,
-                    context: Mutex::new(request.context.clone()),
-                    write_plan_started: AtomicBool::new(false),
-                    write_unknown_latched: AtomicBool::new(false),
-                    publish_started: AtomicBool::new(false),
-                });
-                // A vended catalog cannot clean its warehouse before staged
-                // creation: the staged response is the first place it can
-                // disclose this request's storage authority. Run the same
-                // maintenance step only after that response has populated the
-                // request-local lease collector. This ordering is universal,
-                // so static and vended catalogs retain one CTAS lifecycle.
-                if let Err(failure) = sweep_unanchored_ctas_roots(
-                    self,
-                    &preflight.unanchored_ctas_cleanup_lease,
-                    request.context.clone(),
-                ) {
-                    return Ok(StandardCtasStageOutcome::AppliedButUnusable {
-                        receipt,
-                        finalization: ExternalMutationFinalization::Failed(
-                            novarocks_spi::connector::ConnectorMutationFailure::new(
-                                novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
-                                failure.message,
-                            ),
-                        ),
-                    });
-                }
-                *target_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&target));
-                Ok(StandardCtasStageOutcome::Prepared {
-                    target: PreparedStandardCtasTarget {
-                        facts: target.facts(),
-                        handle: target,
-                    },
-                })
-            }
-            ConnectorStagedCreatePrepareOutcome::Conflict { failure }
-            | ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } => {
-                Ok(StandardCtasStageOutcome::KnownUncommitted {
-                    failure: mutation_failure(failure),
-                })
-            }
-            ConnectorStagedCreatePrepareOutcome::CommitUnknown { failure, .. } => {
-                Ok(StandardCtasStageOutcome::CommitUnknown {
-                    failure: mutation_failure(failure),
-                })
-            }
-            ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
-                receipt,
-                finalization,
-            } => Ok(StandardCtasStageOutcome::AppliedButUnusable {
-                receipt,
-                finalization,
-            }),
-        }
-    }
-
-    fn prepare_standard_ctas_write(
-        &self,
-        source: &dyn CtasPreparedSource,
-        target: &dyn CtasPreparedTarget,
-    ) -> Result<PreparedStandardCtasWrite, CtasFailure> {
-        let source = downcast_standard_source(source)?;
-        let target = downcast_standard_target(target)?;
-        if source.gate.execution_identity() != source.execution_identity() {
-            return Err(internal_failure(
-                "standard CTAS source execution identity drift",
-            ));
-        }
-        let target_arc = source
-            .target_session
-            .lock()
-            .map_err(|error| {
-                internal_failure(format!("standard CTAS target session lock: {error}"))
-            })?
-            .clone()
-            .ok_or_else(|| {
-                internal_failure("standard CTAS source has no retained target session")
-            })?;
-        if !std::ptr::eq(target_arc.as_ref(), target) {
-            return Err(internal_failure(
-                "standard CTAS target does not match the source-retained exact session",
-            ));
-        }
-        // The session is opened before the plan is compiled, because it owns
-        // the writer recipes that plan's writer node carries.
-        let session = target.begin_write_session(
-            self.typed_connector_control(),
-            &source.source_columns,
-            source.connector_context.clone(),
-        )?;
-        let planned = source
-            .gate
-            .source_artifact()
-            .downcast_ref::<PlannedCtasSourceQuery>()
-            .ok_or_else(|| {
-                internal_failure("standard CTAS retained source artifact type mismatch")
-            })?;
-        let assembly = prepare_planned_ctas_connector_write(
-            self,
-            planned,
-            target_arc.as_ref(),
-            &source.gate.execution_for_plan()?,
-            source.query_options.clone(),
-            &source.connector_context,
-            session,
-        )
-        .map_err(CtasFailure::from_dml)?;
-        let attempt_reservation = source
-            .attempt_reservation
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS attempt reservation lock: {error}")))?
-            .take()
-            .ok_or_else(|| {
-                internal_failure("standard CTAS attempt reservation was already consumed")
-            })?;
-        let identity = source.gate.execution_identity();
-        let target_facts = target_arc.facts();
-        let target_for_write: Arc<dyn CtasWriteTarget> = target_arc;
-        Ok(PreparedStandardCtasWrite {
-            target_facts,
-            execution_identity: identity,
-            handle: Arc::new(CorePreparedCtasWrite {
-                state: self.clone(),
-                gate: Arc::clone(&source.gate),
-                target: target_for_write,
-                assembly: Mutex::new(Some(assembly)),
-                terminal_context: source.connector_context.clone(),
-                attempt_reservation: Mutex::new(Some(attempt_reservation)),
-                execution_identity: identity,
-            }),
-        })
-    }
-
-    fn execute_standard_ctas_write(
-        &self,
-        prepared: &dyn CtasPreparedWrite,
-    ) -> StandardCtasWriteOutcome {
-        let prepared = match downcast_write(prepared) {
-            Ok(prepared) => prepared,
-            Err(failure) => return StandardCtasWriteOutcome::KnownUncommitted { failure },
-        };
-        let result = prepared
-            .gate
-            .execute_once(prepared.execution_identity, |_, _execution| {
-                let assembly = prepared
-                    .assembly
-                    .lock()
-                    .map_err(|error| {
-                        internal_failure(format!("CTAS prepared write lock: {error}"))
-                    })?
-                    .take()
-                    .ok_or_else(|| internal_failure("CTAS prepared write was already consumed"))?;
-                let (_service, request) = assembly.into_request().map_err(CtasFailure::from_dml)?;
-                let attempt_reservation = prepared
-                    .attempt_reservation
-                    .lock()
-                    .map_err(|error| {
-                        internal_failure(format!("CTAS attempt reservation lock: {error}"))
-                    })?
-                    .take()
-                    .ok_or_else(|| {
-                        internal_failure("CTAS attempt reservation was already consumed")
-                    })?;
-                // Nothing below can leave the publication in doubt. A staged
-                // write session seals its artifacts without touching the
-                // catalog, so every failure here is proven-uncommitted: the
-                // target still does not exist, and the objects the backends
-                // staged are collected by the unanchored-CTAS sweep.
-                let outcome = match prepared
-                    .state
-                    .query_execution()
-                    .execute_reserved(request, attempt_reservation)
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        return Ok(staged_write_failed_with_failure(
-                            prepared.target.as_ref(),
-                            CtasFailure::from_dml(DmlExecutionError::from_distributed(error)),
-                        ));
-                    }
-                };
-                let write = match outcome.into_write() {
-                    Ok(write) => write,
-                    Err(error) => {
-                        return Ok(staged_write_failed_with_failure(
-                            prepared.target.as_ref(),
-                            CtasFailure::from_dml(DmlExecutionError::from_distributed(error)),
-                        ));
-                    }
-                };
-                // The data plane closed and every participant succeeded, so
-                // the session is asked to seal.
-                Ok(seal_ctas_write(
-                    prepared.target.as_ref(),
-                    prepared.execution_identity,
-                    write.into_write_session(),
-                    prepared.terminal_context.clone(),
-                ))
-            });
-        match result {
-            Ok(outcome) => outcome,
-            Err(failure) => StandardCtasWriteOutcome::KnownUncommitted { failure },
-        }
-    }
-
     fn prepare_standard_publish_ctas(
         &self,
         target: &dyn CtasPreparedTarget,
@@ -2158,77 +1165,6 @@ impl CtasEngine for DmlExecutionKernel {
                 dispatched: AtomicBool::new(false),
             }),
         })
-    }
-
-    fn publish_standard_ctas(
-        &self,
-        action: &dyn CtasPreparedCatalogAction,
-    ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
-        let action = downcast_catalog_action(action)?;
-        let CoreCtasCatalogActionKind::StandardPublish { target, request } = &action.kind else {
-            return Err(internal_failure(
-                "CTAS catalog action is not a standard publish action",
-            ));
-        };
-        action.begin_dispatch()?;
-        match target
-            .lease
-            .publish(request.as_ref().clone())
-            .map_err(connector_failure)?
-        {
-            ConnectorStagedCreatePublishOutcome::Applied { finalization, .. } => {
-                Ok(StandardCtasPublishOutcome::Applied { finalization })
-            }
-            ConnectorStagedCreatePublishOutcome::NoOp { finalization, .. } => {
-                Ok(StandardCtasPublishOutcome::NoOp { finalization })
-            }
-            ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup }
-            | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup } => {
-                Ok(StandardCtasPublishOutcome::KnownUncommitted {
-                    failure: Box::new(mutation_failure(failure)),
-                    cleanup,
-                })
-            }
-            ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence } => {
-                Ok(StandardCtasPublishOutcome::CommitUnknown {
-                    failure: Box::new(mutation_failure(failure)),
-                    evidence,
-                })
-            }
-        }
-    }
-
-    fn adjudicate_standard_ctas_publication(
-        &self,
-        target: &dyn CtasPreparedTarget,
-        evidence: ExternalMutationEvidence,
-    ) -> Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure> {
-        let target = downcast_standard_target(target)?;
-        let outcome = target
-            .lease
-            .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
-                target_operation_id:
-                    novarocks_spi::connector::ConnectorStagedCreateOperationId::from_bytes(
-                        target.publication_id.to_bytes(),
-                    ),
-                evidence,
-                context: target
-                    .context
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            })
-            .map_err(connector_failure)?;
-        match outcome {
-            ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
-                finalization, ..
-            } => Ok(StandardCtasPublicationAdjudicationOutcome::Published { finalization }),
-            ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
-                failure, ..
-            } => Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown {
-                failure: Box::new(mutation_failure(failure)),
-            }),
-        }
     }
 }
 
@@ -2435,7 +1371,7 @@ async fn prepare_planned_ctas_connector_write_async(
                 ),
             )
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::dml::error::DmlExecutionError::from_completion)?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -2456,8 +1392,6 @@ async fn prepare_planned_ctas_connector_write_async(
             encoded,
             version,
             query_options,
-            execution.clone(),
-            state.query_execution().clone(),
             session,
         )?,
     )
@@ -2650,7 +1584,6 @@ impl DmlExecutionKernel {
                     unanchored_ctas_cleanup_lease,
                     write_lease,
                     target_catalog_properties,
-                    attempt_reservation: Arc::new(Mutex::new(None)),
                 }),
             },
         ))
@@ -2664,16 +1597,6 @@ impl DmlExecutionKernel {
         provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
     ) -> Result<PreparedCtasSource, CtasFailure> {
         let preflight = downcast_standard_preflight(preflight)?;
-        if preflight
-            .attempt_reservation
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS attempt reservation lock: {error}")))?
-            .is_some()
-        {
-            return Err(internal_failure(
-                "governed CTAS source cannot consume a legacy initial reservation",
-            ));
-        }
         let target = crate::catalog_application::resolver::resolve_table_target(
             self,
             &ObjectName {
@@ -2783,7 +1706,6 @@ impl DmlExecutionKernel {
                 target,
                 query_options: request.query_options,
                 connector_context,
-                attempt_reservation: Mutex::new(None),
                 source_columns,
                 output_columns,
                 target_session: Arc::new(Mutex::new(None)),
@@ -3293,7 +2215,6 @@ mod tests {
     use novarocks_spi::connector::ConnectorError;
 
     use super::*;
-    use crate::query_execution::write_session::tests as write_session_fixture;
 
     /// A staged target that only records what the write terminal asked of it.
     #[derive(Default)]
@@ -3303,16 +2224,6 @@ mod tests {
     }
 
     impl CtasWriteTarget for RecordingTarget {
-        fn begin_write_session(
-            &self,
-            _host: &novarocks_catalog_application::ConnectorControlHost,
-            _source_columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
-            _context: novarocks_spi::connector::ConnectorRequestContext,
-        ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
-        {
-            unreachable!("these tests drive the write terminal, not admission")
-        }
-
         fn bind_write(
             &self,
             write: ConnectorStagedWriteProof,
@@ -3340,138 +2251,6 @@ mod tests {
         }
     }
 
-    fn completion(
-        session: &Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-        row_count: u64,
-    ) -> crate::query_execution::outcome::ConnectorWriteSessionCompletion {
-        crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
-            Arc::clone(session),
-            crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(
-                row_count,
-                Vec::new(),
-            ),
-        )
-    }
-
-    /// The whole CTAS write terminal on a successful seal: the session is asked
-    /// exactly once, the rows it made durable travel with the receipt, and the
-    /// staged target binds that receipt so nothing else can publish under it.
-    #[test]
-    fn a_sealed_ctas_write_binds_one_receipt_and_carries_its_rows() {
-        let fixture = write_session_fixture::fixture_with_outcome(
-            1,
-            16,
-            write_session_fixture::known_committed(),
-        );
-        let target = RecordingTarget::default();
-        assert_eq!(fixture.session.finish_invocations(), 0);
-
-        let outcome = seal_ctas_write(
-            &target,
-            [9; 32],
-            Some(completion(&fixture.session, 11)),
-            write_session_fixture::request_context(),
-        );
-
-        let StandardCtasWriteOutcome::Completed {
-            write,
-            execution_identity,
-        } = outcome
-        else {
-            panic!("a known-committed seal must complete");
-        };
-        assert_eq!(execution_identity, [9; 32]);
-        assert_eq!(write.row_count(), 11);
-        assert_eq!(fixture.session.finish_invocations(), 1);
-        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
-        assert_eq!(target.bound(), vec![write]);
-        assert_eq!(target.unknown.load(Ordering::SeqCst), 0);
-    }
-
-    /// An unresolved seal reports no rows and binds nothing, so the publication
-    /// has nothing to publish -- and the target is latched closed, because a
-    /// process that does not know what its write left behind must not abort it
-    /// either.
-    #[test]
-    fn an_unresolved_ctas_write_reports_no_rows_and_leaves_nothing_to_publish() {
-        let fixture = write_session_fixture::fixture_with_outcome(
-            1,
-            16,
-            write_session_fixture::commit_unknown(),
-        );
-        let target = RecordingTarget::default();
-
-        let outcome = seal_ctas_write(
-            &target,
-            [9; 32],
-            Some(completion(&fixture.session, 11)),
-            write_session_fixture::request_context(),
-        );
-
-        assert!(matches!(
-            outcome,
-            StandardCtasWriteOutcome::KnownUncommitted { .. }
-        ));
-        assert_eq!(fixture.session.finish_invocations(), 1);
-        assert!(target.bound().is_empty());
-        assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
-    }
-
-    /// A write that staged no artifact still reaches the provider's seal.
-    ///
-    /// Whether an empty CTAS publishes an empty table is the provider's call;
-    /// the frontend must not make it by short-circuiting on "there were no
-    /// fragments".
-    #[test]
-    fn a_ctas_write_that_staged_nothing_still_reaches_the_provider() {
-        let fixture = write_session_fixture::fixture_with_outcome(
-            1,
-            16,
-            write_session_fixture::known_committed(),
-        );
-        let target = RecordingTarget::default();
-
-        let outcome = seal_ctas_write(
-            &target,
-            [9; 32],
-            Some(completion(&fixture.session, 0)),
-            write_session_fixture::request_context(),
-        );
-
-        let StandardCtasWriteOutcome::Completed { write, .. } = outcome else {
-            panic!("an empty staged write is still the provider's decision");
-        };
-        assert_eq!(write.row_count(), 0);
-        assert_eq!(fixture.session.finish_invocations(), 1);
-        assert_eq!(target.bound().len(), 1);
-    }
-
-    /// A write whose data plane never closed has no session to seal, so the
-    /// connector is never asked at all.
-    #[test]
-    fn a_ctas_write_without_a_closed_data_plane_never_reaches_the_connector() {
-        let fixture = write_session_fixture::fixture_with_outcome(
-            1,
-            16,
-            write_session_fixture::known_committed(),
-        );
-        let target = RecordingTarget::default();
-
-        let outcome = seal_ctas_write(
-            &target,
-            [9; 32],
-            None,
-            write_session_fixture::request_context(),
-        );
-
-        assert!(matches!(
-            outcome,
-            StandardCtasWriteOutcome::KnownUncommitted { .. }
-        ));
-        assert_eq!(fixture.session.finish_invocations(), 0);
-        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
-        assert!(target.bound().is_empty());
-    }
     #[test]
     fn a_runtime_failed_ctas_write_keeps_the_input_and_latches_its_original_target() {
         use crate::dml::error::DmlExecutionError;
@@ -3490,7 +2269,13 @@ mod tests {
         let StandardCtasWriteOutcome::KnownUncommitted { failure } = outcome else {
             panic!("a failed runtime write cannot publish a table");
         };
-        assert_eq!(failure.execution_failure(), Some(input));
+        assert_eq!(failure.execution_failure(), Some(input.clone()));
+        let error = failure.into_governed_dml_error("CREATE TABLE dst AS SELECT 1");
+        assert_eq!(error.execution_failure(), Some(&input));
+        assert_eq!(
+            (input.descriptor().errno, input.descriptor().sqlstate),
+            (1041, "HY000")
+        );
         assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
         assert!(target.bound().is_empty());
     }
@@ -3503,6 +2288,64 @@ mod typed_compile_source_tests {
         FailureClass, FailureProjection, SharedFailureCause,
     };
     use std::error::Error;
+    #[test]
+    fn compiled_ctas_refusal_preserves_capability_identity_before_publication_wrapping() {
+        use crate::query_execution::dml::ctas::CtasUserError;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "change-stream router".into(),
+        );
+        let expected = original.failure_fact();
+        let source = SharedFailureCause::new(original);
+        let failure = CtasFailure {
+            kind: CtasFailureKind::Internal,
+            message: source.detail().to_owned(),
+            user_error: Some(CtasUserError::Compilation(source.clone())),
+        };
+        let error = failure.into_governed_dml_error("CREATE TABLE AS SELECT ...");
+        assert_eq!(error.execution_failure().unwrap().fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Unsupported);
+        assert_eq!(
+            error.compile_control_error(),
+            Some(novarocks_type_contract::CompileControlError::Source(source))
+        );
+        let failure = internal_failure("unsupported text does not imply capability");
+        assert_eq!(
+            failure.into_governed_dml_error("").engine_error_code(),
+            Some(
+                novarocks_query_application::engine_error::EngineErrorCode::CommitKnownUncommitted
+            )
+        );
+    }
+
+    #[test]
+    fn a_compilation_source_preserves_its_fact_at_the_ctas_statement_boundary() {
+        use novarocks_execution_contract::failure::{FailureProjection, SharedFailureCause};
+        let source = SharedFailureCause::new(novarocks_functions::ConstantError::Limit(
+            "finite constant policy",
+        ));
+        let cause = CtasFailure {
+            kind: CtasFailureKind::Internal,
+            message: "local compilation diagnostics".to_owned(),
+            user_error: Some(
+                crate::query_execution::dml::ctas::CtasUserError::Compilation(source.clone()),
+            ),
+        };
+        let failure = cause.into_governed_dml_error("CREATE TABLE dst AS SELECT 1");
+        let input = failure
+            .execution_failure()
+            .expect("the CTAS boundary must retain the domain fact");
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(
+            input.detail().as_str(),
+            "pure SQL compilation failed in its source domain"
+        );
+        assert_eq!(
+            (input.descriptor().errno, input.descriptor().sqlstate),
+            (1041, "HY000")
+        );
+    }
+
     #[test]
     fn typed_compile_source_stays_available_without_minting_a_control_intent() {
         let source = SharedFailureCause::new(novarocks_functions::ConstantError::Limit(

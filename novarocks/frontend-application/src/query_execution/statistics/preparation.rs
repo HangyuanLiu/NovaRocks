@@ -24,7 +24,7 @@ use super::{
 use crate::query_execution::{
     artifact::PreparedDistributedAttemptTemplate,
     completion_facts::{CompletionFactOwners, FrontendCompletionCustody, StatementFactScope},
-    contract::{DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest},
+    contract::{DistributedQueryError, DistributedQueryErrorKind},
     internal_consumer::decoded::{DecodedConsumerRuntime, StatisticsComputationOutput},
     logical_execution::{InitialComputationReservation, PreparedLogicalComputation},
     package_freeze::CompiledPackageCarrier,
@@ -164,24 +164,6 @@ impl PreparedStatisticsComputationAssembly {
                 QueryExecutionError::from_execution(error.into_execution_failure_input())
             })?;
         Ok((prepared, reserved, output))
-    }
-
-    // Only the existing public entry uses this while its caller migrates. Both
-    // entries share the exact plan/encode author below, not two planners.
-    pub(super) fn into_legacy_request(
-        self,
-        execution: &QueryExecutionContext,
-    ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-        crate::query_execution::contract::build_request_from_finalized_execution(
-            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
-                self.description,
-                self.template,
-            ),
-            Some(self.options),
-            crate::query_execution::contract::DistributedQueryIntent::Statistics,
-            execution,
-            Some(self.program),
-        )
     }
 }
 
