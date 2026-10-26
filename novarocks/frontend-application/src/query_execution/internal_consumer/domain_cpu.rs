@@ -154,6 +154,7 @@ impl DomainCpuCustody {
         let value = InternalResultValue::try_produce(binding.scope(), window, |_| {
             Ok(InternalDomainSlot::Collecting {
                 state: Box::new(domain),
+                #[cfg(test)]
                 receipt: None,
             })
         })

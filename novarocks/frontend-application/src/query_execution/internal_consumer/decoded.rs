@@ -193,14 +193,12 @@ pub(crate) struct StatisticsComputationOutput {
 }
 
 pub(crate) struct ReadyCowComputation {
-    pub(crate) ready: ComputationReadyToken,
     pub(crate) binding: QueryResultCapacityBinding,
     pub(crate) selection: ConnectorRowMutationSelection,
     pub(crate) _credentials: Option<Arc<AttemptCredentialStorage>>,
     _initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
 }
 pub(crate) struct ReadyStatisticsComputation {
-    pub(crate) ready: ComputationReadyToken,
     pub(crate) _binding: QueryResultCapacityBinding,
     pub(crate) artifacts: Vec<StatisticsArtifactDraft>,
     pub(crate) _credentials: Option<Arc<AttemptCredentialStorage>>,
@@ -217,7 +215,6 @@ impl CowComputationOutput {
             _ => unreachable!("closed COW receiver checked its payload before transfer"),
         });
         Ok(ReadyCowComputation {
-            ready: token,
             binding: self.binding.clone().into_statement_retention().map_err(|error| {
                 use novarocks_execution_contract::failure::FailureProjection;
                 QueryExecutionError::from_execution(
@@ -268,7 +265,6 @@ impl StatisticsComputationOutput {
             _ => unreachable!("closed statistics receiver checked its payload before transfer"),
         });
         Ok(ReadyStatisticsComputation {
-            ready: token,
             _binding: binding,
             artifacts,
             _credentials: staged._credentials,

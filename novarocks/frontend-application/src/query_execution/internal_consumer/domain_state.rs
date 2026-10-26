@@ -114,6 +114,7 @@ pub(crate) enum InternalDomainCompletion {
 
 pub(crate) struct InternalDomainEof {
     completion: InternalDomainCompletion,
+    #[cfg(test)]
     end: RootResultEnd,
 }
 
@@ -123,6 +124,7 @@ pub(crate) enum InternalDomainSlot {
     ProviderCreatorFinished,
     Collecting {
         state: Box<InternalDomainState>,
+        #[cfg(test)]
         receipt: Option<u64>,
     },
     Eof(Box<InternalDomainEof>),
@@ -155,7 +157,13 @@ impl InternalDomainSlot {
         let Self::Collecting { mut state, .. } = self else {
             return Err("internal domain received data after EOF".into());
         };
-        let RootReplyView::Data { sequence, body, .. } = reply.outcome() else {
+        let RootReplyView::Data {
+            #[cfg(test)]
+            sequence,
+            body,
+            ..
+        } = reply.outcome()
+        else {
             return Err("internal domain data owner has no data".into());
         };
         let result = match &mut *state {
@@ -175,6 +183,7 @@ impl InternalDomainSlot {
         result?;
         Ok(Self::Collecting {
             state,
+            #[cfg(test)]
             receipt: Some(sequence.get() - 1),
         })
     }
@@ -202,7 +211,11 @@ impl InternalDomainSlot {
                 InternalDomainCompletion::Cow((*consumer).finish()?)
             }
         };
-        Ok(Self::Eof(Box::new(InternalDomainEof { completion, end })))
+        Ok(Self::Eof(Box::new(InternalDomainEof {
+            completion,
+            #[cfg(test)]
+            end,
+        })))
     }
     pub(crate) fn finish_statistics(self) -> Result<Self, InternalDomainFailure> {
         let Self::Eof(eof) = self else {

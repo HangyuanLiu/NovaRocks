@@ -862,12 +862,6 @@ impl Drop for SplitAssignmentPump {
         // Original TaskRound/role bank retains this owner until real close.
         // Whole-owner destruction is never a detached publisher or exit proof.
         self.stop.stop();
-        if let Some(job) = &mut self.enumeration {
-            job.request_close();
-        }
-        if let Some(job) = &mut self.close_job {
-            job.request_close();
-        }
     }
 }
 
@@ -1883,21 +1877,40 @@ mod tests {
             panic_profile: false,
         };
         let (opened, open) = mpsc::channel();
-        let mut job = supervisor.prepare_cpu_pinned(vec![pin], move || {
+        struct OpenOriginalSource {
+            source: Option<ObservedSource>,
+            responsibility: Option<ConnectorBlockingIoResponsibility>,
+            backing: Option<ConnectorBlockingIoBacking>,
+            opened: mpsc::Sender<()>,
+        }
+        fn open_original_source(
+            input: &mut OpenOriginalSource,
+            _: &crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>,
+        ) -> Option<OpenedRoundSplitSource> {
             let outcome = OpenedRoundSplitSource {
                 scan: ScanNodeKey::new(FragmentId::from(1u32), 7),
                 source: Some(SupervisedSplitSource::new(
-                    Box::new(source),
+                    Box::new(input.source.take().unwrap()),
                     7,
-                    responsibility,
+                    input.responsibility.take().unwrap(),
                 )),
                 encoder: Some(Arc::new(CleanupTestEncoder)),
                 feedback_bindings: Vec::new(),
-                backing: Some(backing),
+                backing: input.backing.take(),
             };
-            opened.send(()).expect("original open returned");
-            outcome
-        });
+            input.opened.send(()).expect("original open returned");
+            Some(outcome)
+        }
+        let mut job = supervisor.prepare_cpu_owned(
+            vec![pin],
+            OpenOriginalSource {
+                source: Some(source),
+                responsibility: Some(responsibility),
+                backing: Some(backing),
+                opened,
+            },
+            open_original_source,
+        );
         runtime.block_on(std::future::poll_fn(|cx| {
             let _ = job.poll_progress(cx);
             std::task::Poll::Ready(())

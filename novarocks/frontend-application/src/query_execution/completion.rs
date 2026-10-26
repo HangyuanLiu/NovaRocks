@@ -27,7 +27,9 @@ use crate::query_execution::lifecycle_plan::{
 use novarocks_query_application::api::build_string_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
-use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+use novarocks_types::QueryExecutionId;
+#[cfg(test)]
+use novarocks_types::{AttemptId, QueryId};
 use std::sync::Arc;
 
 /// FE-local identity for one distributed attempt.
@@ -36,8 +38,6 @@ use std::sync::Arc;
 /// this first-attempt credential custody to that same move-only reservation.
 /// Credential collection and terminal material remain Frontend-owned.
 pub struct QueryAttemptReservation {
-    query_id: QueryId,
-    execution_id: QueryExecutionId,
     credential_collector: Arc<AttemptCredentialLeaseCollector>,
     request_scope: ConnectorRequestScope,
     #[cfg(novarocks_dev_controls)]
@@ -53,12 +53,7 @@ impl QueryAttemptReservation {
         self.test_nomination.get().cloned()
     }
 
-    pub(crate) fn first(
-        query_id: QueryId,
-    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
-        Self::for_round(query_id, 1)
-    }
-
+    #[cfg(test)]
     pub(crate) fn retry(
         query_id: QueryId,
         attempt: u32,
@@ -66,6 +61,7 @@ impl QueryAttemptReservation {
         Self::for_round(query_id, attempt)
     }
 
+    #[cfg(test)]
     fn for_round(
         query_id: QueryId,
         attempt: u32,
@@ -107,8 +103,6 @@ impl QueryAttemptReservation {
 
     fn for_execution(execution_id: QueryExecutionId) -> Self {
         Self {
-            query_id: execution_id.query_id(),
-            execution_id,
             credential_collector: AttemptCredentialLeaseCollector::new(execution_id),
             request_scope: ConnectorRequestScope::new(),
             #[cfg(novarocks_dev_controls)]
@@ -124,14 +118,6 @@ impl QueryAttemptReservation {
         &self,
     ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
         self.credential_collector.seal_for_terminal().map(|_| ())
-    }
-
-    pub(crate) const fn query_id(&self) -> QueryId {
-        self.query_id
-    }
-
-    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
-        self.execution_id
     }
 
     pub(crate) fn credential_lease_sink(
@@ -181,13 +167,6 @@ impl QueryAttemptReservation {
         self.credential_collector.has_collected_leases()
     }
 
-    pub(crate) fn into_credential_leases(
-        self,
-    ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
-    {
-        self.drain_credential_leases()
-    }
-
     /// The initializer borrows its original reservation through the one-shot
     /// Native drain. The reservation continues to anchor terminal material.
     pub(crate) fn drain_credential_leases(
@@ -224,13 +203,6 @@ impl PreparedQueryOperation {
     /// operation constructor to application callers.
     pub fn immediate(result: StatementResult) -> Self {
         Self::Immediate(PreparedImmediateQuery::new(result))
-    }
-
-    /// Build the canonical single-column response used by EXPLAIN.
-    pub fn explain_lines(lines: Vec<String>) -> Result<Self, String> {
-        Ok(Self::immediate(StatementResult::Query(
-            build_string_query_result("Explain String", lines)?,
-        )))
     }
 }
 

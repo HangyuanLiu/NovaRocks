@@ -1241,12 +1241,13 @@ mod tests {
 
     impl FixtureInitializationState {
         fn open_fixture_source(
-            recipe: AttemptSourceRecipe<FixtureSourceRecipe>,
-        ) -> Result<OpenedAttemptSource<ProtectedCleanup>, DistributedQueryError> {
+            input: &mut Option<AttemptSourceRecipe<FixtureSourceRecipe>>,
+            _: &crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>,
+        ) -> Option<Result<OpenedAttemptSource<ProtectedCleanup>, DistributedQueryError>> {
             let AttemptSourceRecipe {
                 identity,
                 mut recipe,
-            } = recipe;
+            } = input.take().expect("one original fixture source recipe");
             if let Some(started) = recipe.started.take() {
                 started.send(()).expect("publish source-open start");
             }
@@ -1256,10 +1257,25 @@ mod tests {
             drop(recipe.connector_context.take());
             recipe.cleanup.armed = true;
             let identity = recipe.reported_identity.take().unwrap_or(identity);
-            Ok(OpenedAttemptSource {
+            Some(Ok(OpenedAttemptSource {
                 identity,
                 opened: recipe.cleanup,
-            })
+            }))
+        }
+
+        fn close_fixture_sources(
+            accepted: &mut Vec<ProtectedCleanup>,
+            _: &crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>,
+        ) -> Option<()> {
+            for mut cleanup in accepted.drain(..) {
+                cleanup.armed = false;
+                if let Some(closed) = cleanup.closed.take() {
+                    closed
+                        .send(())
+                        .expect("publish actual original source close");
+                }
+            }
+            Some(())
         }
     }
 
@@ -1291,7 +1307,7 @@ mod tests {
             recipe: AttemptSourceRecipe<Self::Recipe>,
             supervisor: &ConnectorBlockingIoSupervisor,
         ) -> Self::Opening {
-            supervisor.prepare_cpu_pinned(Vec::new(), move || Self::open_fixture_source(recipe))
+            supervisor.prepare_cpu_owned(Vec::new(), Some(recipe), Self::open_fixture_source)
         }
         fn poll_open_in(
             opening: &mut Self::Opening,
@@ -1340,16 +1356,11 @@ mod tests {
             }
             let supervisor = self.accepted[0].supervisor.clone();
             let accepted = std::mem::take(&mut self.accepted);
-            *job = Some(supervisor.prepare_cpu_source_close(Vec::new(), move |_| {
-                for mut cleanup in accepted {
-                    cleanup.armed = false;
-                    if let Some(closed) = cleanup.closed.take() {
-                        closed
-                            .send(())
-                            .expect("publish actual original source close");
-                    }
-                }
-            }));
+            *job = Some(supervisor.prepare_cpu_retirement(
+                Vec::new(),
+                accepted,
+                Self::close_fixture_sources,
+            ));
         }
     }
 

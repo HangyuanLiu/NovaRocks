@@ -834,7 +834,6 @@ mod tests {
         let mut tracker = StatisticsProtocolTracker::from_initial(&initial).unwrap();
         assert!(!tracker.all_terminal());
         assert!(!tracker.all_success_compatible());
-        assert!(tracker.failure_message().unwrap().contains("state=MISSING"));
         let canceling = TaskStatus::try_new(
             identity(2),
             TaskStatusVersion::new(2).unwrap(),
@@ -873,7 +872,6 @@ mod tests {
         tracker.observe(&compatible).unwrap();
         assert!(tracker.all_terminal());
         assert!(tracker.all_success_compatible());
-        assert!(tracker.failure_message().is_none());
         assert!(tracker.observe(&initial).is_err());
         let failure = SelectedTaskTermination::new(
             identity(3),
@@ -885,16 +883,78 @@ mod tests {
         tracker.observe(&take(&mut receiver)).unwrap();
         assert!(tracker.all_terminal());
         assert!(!tracker.all_success_compatible());
-        assert!(
-            tracker
-                .failure_message()
-                .unwrap()
-                .contains("round_failure_cause=ABORTED(cause=QUERY_FAILED)")
-        );
+        assert_eq!(tracker.selected_failure(), Some(&failure));
         let (mut foreign, mut foreign_receiver) = pair(&[]);
         foreign.bind_identity(activation(1)).unwrap();
         foreign.publish_updates(0, vec![], None, false).unwrap();
         assert!(tracker.observe(&take(&mut foreign_receiver)).is_err());
+    }
+
+    #[test]
+    fn statistics_incompatible_terminal_tasks_refuse_without_a_selected_failure() {
+        use crate::query_execution::statistics::completion::StatisticsProtocolTracker;
+        use novarocks_execution_contract::{SafeDetail, TaskFailure};
+
+        for termination in [
+            TerminationDetail::Aborted(AbortCause::QueryFailed),
+            TerminationDetail::Failed(TaskFailure::new(
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Resource,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(5).unwrap(),
+                    ),
+                ),
+                SafeDetail::new("memory pool exhausted").unwrap(),
+            )),
+        ] {
+            let (mut publisher, mut receiver) = pair(&[]);
+            publisher.bind_identity(activation(1)).unwrap();
+            publisher
+                .publish_updates(
+                    1,
+                    vec![
+                        update(1, status(1, 2)),
+                        update(2, running(2, 2)),
+                        update(3, status(3, 2)),
+                    ],
+                    None,
+                    false,
+                )
+                .unwrap();
+            let mut tracker =
+                StatisticsProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
+            assert!(!tracker.all_terminal());
+            assert!(!tracker.all_success_compatible());
+
+            let state = match &termination {
+                TerminationDetail::Aborted(_) => TaskState::Aborted,
+                TerminationDetail::Failed(_) => TaskState::Failed,
+                _ => unreachable!("only incompatible terminal cases"),
+            };
+            let terminal = TaskStatus::try_new(
+                identity(2),
+                TaskStatusVersion::new(3).unwrap(),
+                state,
+                Some(termination.clone()),
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            publisher
+                .publish_updates(2, vec![update(2, terminal)], None, false)
+                .unwrap();
+            let terminal = take(&mut receiver);
+            assert_eq!(terminal.tasks().len(), 1);
+            assert_eq!(terminal.tasks()[0].identity(), identity(2));
+            assert_eq!(
+                terminal.tasks()[0].status().unwrap().termination(),
+                Some(&termination),
+            );
+            tracker.observe(&terminal).unwrap();
+            assert!(tracker.all_terminal());
+            assert_eq!(tracker.selected_failure(), None);
+            assert!(!tracker.all_success_compatible());
+        }
     }
 
     #[test]

@@ -587,7 +587,6 @@ async fn run_case(case: Case) {
                     .unwrap()
                     .unwrap();
                 let ready = output.take_ready(token).unwrap();
-                assert_eq!(ready.ready, token);
                 assert_eq!(ready.artifacts.len(), 1);
                 assert_eq!(ready.artifacts[0].body().as_ref(), b"original artifact");
                 assert!(Arc::ptr_eq(

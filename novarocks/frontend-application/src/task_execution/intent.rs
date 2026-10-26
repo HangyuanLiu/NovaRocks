@@ -312,6 +312,7 @@ impl TaskOperationQueueRequest {
         self
     }
 
+    #[cfg(test)]
     pub const fn lane(self) -> DispatchLane {
         self.lane
     }
@@ -441,6 +442,10 @@ pub struct OperationAcknowledgement {
     canonical: Option<crate::native::apply_send_owner::CanonicalAcknowledgement>,
 }
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Canonical replies use the original boxed cell array and intake messages box the whole acknowledgement; keeping the complete result inline preserves by-value construction and clone paths without an additional result allocation."
+)]
 enum OperationAcknowledgementResult {
     Worker(novarocks_execution_contract::operation::OperationResult<AckPayload>),
     NonWorker {
@@ -544,6 +549,7 @@ impl OperationAcknowledgement {
             canonical: Some(canonical),
         }
     }
+    #[cfg(test)]
     pub fn new(
         operation_id: TaskOperationId,
         kind: OperationKind,

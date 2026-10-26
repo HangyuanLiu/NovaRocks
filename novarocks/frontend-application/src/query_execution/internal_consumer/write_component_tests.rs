@@ -310,10 +310,9 @@ async fn run_case(fail_writer: bool) {
                 .unwrap()
                 .unwrap();
             let ready = output.take_ready(token).unwrap();
-            assert_eq!(ready.ready, token);
-            assert_eq!(ready.ready.end(), end);
-            assert_eq!(ready.ready.root(), attempt.root);
-            assert_eq!(ready.ready.activation().execution(), execution);
+            assert_eq!(token.end(), end);
+            assert_eq!(token.root(), attempt.root);
+            assert_eq!(token.activation().execution(), execution);
             assert_eq!(ready.accepted.row_count(), 3);
             assert!(!ready.accepted.is_empty());
             assert!(ready.accepted.belongs_to(&session));

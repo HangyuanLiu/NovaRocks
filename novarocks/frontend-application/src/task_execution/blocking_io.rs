@@ -52,9 +52,15 @@ enum OriginalFailureCause {
     WorkerJoin(tokio::task::JoinError),
     Preserving(novarocks_query_application::cpu::QueryBlockingFailure),
     Admission(WorkError),
-    CpuPublication(novarocks_query_application::cpu::QueryCpuPublishRefusal),
-    BlockingReserve(novarocks_query_application::cpu::QueryBlockingReserveRefusal),
-    BlockingPublication(novarocks_query_application::cpu::QueryBlockingPublishRefusal),
+    CpuPublication {
+        _refusal: novarocks_query_application::cpu::QueryCpuPublishRefusal,
+    },
+    BlockingReserve {
+        _refusal: novarocks_query_application::cpu::QueryBlockingReserveRefusal,
+    },
+    BlockingPublication {
+        _refusal: novarocks_query_application::cpu::QueryBlockingPublishRefusal,
+    },
     OutcomeDrop(#[allow(dead_code)] Mutex<Box<dyn std::any::Any + Send>>),
 }
 
@@ -75,9 +81,9 @@ impl std::error::Error for OriginalFailure {
             OriginalFailureCause::WorkerJoin(error) => Some(error),
             OriginalFailureCause::Preserving(error) => Some(error),
             OriginalFailureCause::Admission(error) => Some(error),
-            OriginalFailureCause::CpuPublication(_)
-            | OriginalFailureCause::BlockingReserve(_)
-            | OriginalFailureCause::BlockingPublication(_)
+            OriginalFailureCause::CpuPublication { .. }
+            | OriginalFailureCause::BlockingReserve { .. }
+            | OriginalFailureCause::BlockingPublication { .. }
             | OriginalFailureCause::OutcomeDrop(_) => None,
         }
     }
@@ -102,9 +108,9 @@ impl std::error::Error for ConnectorBlockingIoError {
             OriginalFailureCause::WorkerJoin(error) => Some(error),
             OriginalFailureCause::Preserving(error) => Some(error),
             OriginalFailureCause::Admission(error) => Some(error),
-            OriginalFailureCause::CpuPublication(_)
-            | OriginalFailureCause::BlockingReserve(_)
-            | OriginalFailureCause::BlockingPublication(_)
+            OriginalFailureCause::CpuPublication { .. }
+            | OriginalFailureCause::BlockingReserve { .. }
+            | OriginalFailureCause::BlockingPublication { .. }
             | OriginalFailureCause::OutcomeDrop(_) => None,
         }
     }

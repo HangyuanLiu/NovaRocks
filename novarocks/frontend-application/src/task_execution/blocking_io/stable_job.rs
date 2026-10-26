@@ -82,9 +82,6 @@ struct Header<T: Send + 'static> {
     callback_failure: Mutex<Option<novarocks_query_application::cpu::QueryBlockingFailure>>,
     source_drop_unproven: AtomicBool,
     pins: Box<[ConnectorBlockingIoJoinPin]>,
-    closing: AtomicBool,
-    // An already registered close obligation is not new business work.
-    settlement: bool,
     poisoned: AtomicBool,
 }
 fn make_work<T: Send + 'static>(header: Arc<Header<T>>) -> impl FnOnce() + Send + 'static {
@@ -129,19 +126,10 @@ fn make_work<T: Send + 'static>(header: Arc<Header<T>>) -> impl FnOnce() + Send 
         drop(lease.call.take());
     }
 }
-fn run_once<T, F: FnOnce() -> T>(
-    input: &mut Option<F>,
-    _: &ConnectorSourceCloseResult<'_>,
-) -> Option<T> {
-    Some(input.take().expect("one original fixture call")())
-}
-fn run_close<F: FnOnce(&ConnectorSourceCloseResult<'_>)>(
-    input: &mut Option<F>,
-    result: &ConnectorSourceCloseResult<'_>,
-) -> Option<()> {
-    input.take().expect("one original fixture close call")(result);
-    Some(())
-}
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Dispatch stays inline in the original ConnectorOperationJob slot; its blocking quote includes that complete row, avoiding a second allocation for the call phase."
+)]
 enum Dispatch {
     Cpu {
         prepared: Option<QueryCpuPreparedJob>,
@@ -169,46 +157,6 @@ pub(crate) struct ConnectorOperationJob<T: Send + 'static> {
     secondary: [Option<ConnectorBlockingIoError>; 2],
 }
 impl ConnectorBlockingIoSupervisor {
-    /// Closed first-party preparation/enumeration/close authors call this only
-    /// after their physical preparation is async and remaining work is local.
-    /// It does not mint the InternalResultClosedFactory qualification.
-    pub(crate) fn prepare_cpu_pinned<T, F>(
-        &self,
-        pins: Vec<ConnectorBlockingIoJoinPin>,
-        call: F,
-    ) -> ConnectorOperationJob<T>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.prepare_operation(
-            pins,
-            false,
-            Box::new(OriginalInput {
-                input: Some(call),
-                apply: run_once::<T, F>,
-            }),
-            None,
-        )
-    }
-    pub(crate) fn prepare_cpu_source_close<F>(
-        &self,
-        pins: Vec<ConnectorBlockingIoJoinPin>,
-        call: F,
-    ) -> ConnectorOperationJob<()>
-    where
-        F: FnOnce(&ConnectorSourceCloseResult<'_>) + Send + 'static,
-    {
-        self.prepare_operation(
-            pins,
-            true,
-            Box::new(OriginalInput {
-                input: Some(call),
-                apply: run_close::<F>,
-            }),
-            None,
-        )
-    }
     /// Production uses a closed function item borrowing its same original
     /// input Box. The sole assignment/source never moves into a FnOnce F.
     pub(crate) fn prepare_cpu_owned<I, T>(
@@ -221,7 +169,7 @@ impl ConnectorBlockingIoSupervisor {
         I: Send + 'static,
         T: Send + 'static,
     {
-        self.prepare_operation(pins, false, Box::new(OriginalInput { input, apply }), None)
+        self.prepare_operation(pins, Box::new(OriginalInput { input, apply }), None)
     }
     pub(crate) fn prepare_cpu_retirement<I, T>(
         &self,
@@ -233,7 +181,7 @@ impl ConnectorBlockingIoSupervisor {
         I: Send + 'static,
         T: Send + 'static,
     {
-        self.prepare_operation(pins, true, Box::new(OriginalInput { input, apply }), None)
+        self.prepare_operation(pins, Box::new(OriginalInput { input, apply }), None)
     }
     /// Same original responsibility is both the full-D source and the pin;
     /// an unrelated source/pin vector cannot be paired with this job.
@@ -254,27 +202,6 @@ impl ConnectorBlockingIoSupervisor {
             apply,
             destination,
             novarocks_workload_control::joint_admission::JointLane::Foreground,
-        )
-    }
-    /// Only an already registered source/output retirement uses Settlement;
-    /// it remains the SAME active responsibility after business cancellation.
-    pub(crate) fn prepare_blocking_retirement_in<I, T>(
-        &self,
-        responsibility: &ConnectorBlockingIoResponsibility,
-        input: &mut Option<I>,
-        apply: fn(&mut I, &ConnectorSourceCloseResult<'_>) -> Option<T>,
-        destination: &mut Option<ConnectorOperationJob<T>>,
-    ) -> Result<(), WorkError>
-    where
-        I: Send + 'static,
-        T: Send + 'static,
-    {
-        self.prepare_genuine_in(
-            responsibility,
-            input,
-            apply,
-            destination,
-            novarocks_workload_control::joint_admission::JointLane::Settlement,
         )
     }
     fn prepare_genuine_in<I, T>(
@@ -306,7 +233,6 @@ impl ConnectorBlockingIoSupervisor {
         let original = input.take().unwrap();
         *destination = Some(self.prepare_operation(
             pins,
-            lane == novarocks_workload_control::joint_admission::JointLane::Settlement,
             Box::new(OriginalInput {
                 input: original,
                 apply,
@@ -318,7 +244,6 @@ impl ConnectorBlockingIoSupervisor {
     fn prepare_operation<T: Send + 'static>(
         &self,
         pins: Vec<ConnectorBlockingIoJoinPin>,
-        settlement: bool,
         call: Call<T>,
         blocking: Option<(BlockingActionSource, ConnectorBlockingIoActionQuote)>,
     ) -> ConnectorOperationJob<T> {
@@ -330,8 +255,6 @@ impl ConnectorBlockingIoSupervisor {
                 callback_failure: Mutex::new(None),
                 source_drop_unproven: AtomicBool::new(false),
                 pins: pins.into_boxed_slice(),
-                closing: AtomicBool::new(false),
-                settlement,
                 poisoned: AtomicBool::new(false),
             })),
             supervisor: self.clone(),
@@ -496,7 +419,9 @@ impl<T: Send + 'static> ConnectorOperationJob<T> {
                     executors
                         .cpu
                         .publish_cpu_preserving_in(prepared)
-                        .map_err(OriginalFailureCause::CpuPublication)?;
+                        .map_err(|refusal| OriginalFailureCause::CpuPublication {
+                            _refusal: refusal,
+                        })?;
                     self.published = true;
                     Ok(true)
                 }
@@ -532,7 +457,7 @@ impl<T: Send + 'static> ConnectorOperationJob<T> {
                                 return Ok(false);
                             }
                             Err(novarocks_query_application::cpu::QueryBlockingReserveRefusal::Closed)=>return Err(OriginalFailureCause::Admission(WorkError::Closed)),
-                            Err(other)=>return Err(OriginalFailureCause::BlockingReserve(other)),
+                            Err(other)=>return Err(OriginalFailureCause::BlockingReserve { _refusal: other }),
                         };
                         let notification = match offer.accept_in(&mut raw, grant) {
                             Ok(notification) => notification,
@@ -556,15 +481,17 @@ impl<T: Send + 'static> ConnectorOperationJob<T> {
                                     make_work(Arc::clone(&header)),
                                     receipt,
                                 )
-                                .map_err(|refusal| {
-                                    OriginalFailureCause::BlockingPublication(refusal.reason())
+                                .map_err(|refusal| OriginalFailureCause::BlockingPublication {
+                                    _refusal: refusal.reason(),
                                 })?,
                         );
                     }
                     let notification = executors
                         .blocking
                         .publish_joint_in(grant, prepared)
-                        .map_err(OriginalFailureCause::BlockingPublication)?;
+                        .map_err(|refusal| OriginalFailureCause::BlockingPublication {
+                            _refusal: refusal,
+                        })?;
                     self.published = true;
                     notification.notify();
                     Ok(true)
@@ -711,9 +638,6 @@ impl<T: Send + 'static> ConnectorOperationJob<T> {
     }
     pub(crate) fn actual_exit_observed(&self) -> bool {
         self.actual_exited
-    }
-    pub(crate) fn request_close(&mut self) {
-        self.header().closing.store(true, Ordering::Release);
     }
 }
 impl<T: Send + 'static> Drop for ConnectorOperationJob<T> {

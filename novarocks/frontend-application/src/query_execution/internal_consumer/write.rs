@@ -197,7 +197,6 @@ pub(crate) struct WriteComputationOutput {
     holder: Arc<Holder>,
 }
 pub(crate) struct ReadyWriteComputation {
-    pub(crate) ready: ComputationReadyToken,
     pub(crate) accepted: AcceptedWriteSegment,
     pub(crate) session: Arc<ConnectorWriteSession>,
     pub(crate) _credentials: Arc<AttemptCredentialStorage>,
@@ -214,7 +213,6 @@ impl WriteComputationOutput {
     ) -> Result<ReadyWriteComputation, QueryExecutionError> {
         let staged = self.holder.take(token)?;
         Ok(ReadyWriteComputation {
-            ready: token,
             accepted: staged.accepted,
             session: Arc::clone(&self.holder.session),
             _credentials: staged.credentials,

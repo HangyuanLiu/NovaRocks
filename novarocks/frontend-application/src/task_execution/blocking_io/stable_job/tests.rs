@@ -106,7 +106,7 @@ async fn dropped_borrowed_wait_keeps_the_same_real_input_and_receipt() {
         .unwrap();
 }
 struct PanicInput {
-    drops: Probe,
+    _drops: Probe,
     cause: Option<Probe>,
 }
 fn panicking_apply(input: &mut PanicInput, _: &ConnectorSourceCloseResult<'_>) -> Option<()> {
@@ -120,7 +120,7 @@ async fn apply_unwind_restores_the_same_input_box_and_original_opaque_cause() {
     let mut job = supervisor.prepare_cpu_owned(
         Vec::new(),
         PanicInput {
-            drops: Probe(Arc::clone(&input_drops)),
+            _drops: Probe(Arc::clone(&input_drops)),
             cause: Some(Probe(Arc::clone(&cause_drops))),
         },
         panicking_apply,
