@@ -178,8 +178,7 @@ async fn prepare_create_inner(
 #[cfg(test)]
 mod tests {
     use super::super::refresh_preparation::{
-        async_original::{MvRefreshPreparationOriginal, MvRefreshPreparationOutput},
-        driver::MvRefreshTurnCustody,
+        async_original::MvRefreshPreparationOriginal, driver::MvRefreshTurnCustody,
         io_gate::MvRefreshPreparationServices,
     };
     use super::*;

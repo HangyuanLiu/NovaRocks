@@ -49,7 +49,7 @@ pub use ledger::{
 pub use ledger::{JointClaimChange, JointDependency};
 
 use crate::{WorkClass, WorkError};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 
 /// Independently constrained resource coordinates. Byte values describe owned
 /// backing or an explicit reserved envelope, never allocator metadata or RSS.
@@ -87,8 +87,6 @@ impl SourceKind {
         self == Self::Plain
     }
 }
-const CLASS_COUNT: usize = 5;
-const LANE_COUNT: usize = 3;
 
 /// A request or a checked profile. Constructing a vector grants no capacity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -115,12 +113,6 @@ impl JointResources {
         Ok(result)
     }
 
-    fn component_max(self, other: Self) -> Self {
-        Self(std::array::from_fn(|index| {
-            self.0[index].max(other.0[index])
-        }))
-    }
-
     fn checked_sub(self, other: Self) -> Result<Self, WorkError> {
         let mut result = Self::ZERO;
         for index in 0..RESOURCE_COUNT {
@@ -129,13 +121,6 @@ impl JointResources {
                 .ok_or(WorkError::Conflict)?;
         }
         Ok(result)
-    }
-
-    fn covers(self, required: Self) -> bool {
-        self.0
-            .iter()
-            .zip(required.0)
-            .all(|(have, need)| *have >= need)
     }
 }
 

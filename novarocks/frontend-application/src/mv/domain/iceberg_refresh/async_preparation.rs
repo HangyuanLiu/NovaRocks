@@ -43,8 +43,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     // carrier facts remain identical. This observation cannot recover an old
     // document format or reopen management without explicit readmission.
     if reobserve_current_management_before_refresh(io, source, &iceberg_target, connector_context)
-        .await
-        .map_err(RefreshError::from)?
+        .await?
     {
         return Err(RefreshError::user(
             "MV Current marker names another process incarnation; management is closed".to_string(),
@@ -97,8 +96,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             None,
             connector_context,
         )
-        .await
-        .map_err(RefreshError::from)?;
+        .await?;
     // One exact target generation serves the whole plan: the snapshot fence
     // above, the state baseline, the L bindings, and the typed partition facts
     // every sub-planner reads. Re-resolving `latest` per fact could split one
@@ -214,12 +212,10 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             .map_err(RefreshError::from)?;
         let left_observation = io
             .schema(source, &left_occurrence.table, connector_context)
-            .await
-            .map_err(RefreshError::from)?;
+            .await?;
         let right_observation = io
             .schema(source, &right_occurrence.table, connector_context)
-            .await
-            .map_err(RefreshError::from)?;
+            .await?;
         // The join validator demands D occurrence order, which is not the
         // join's own left/right order, so the observations are re-paired with
         // their occurrences rather than with the join sides. By occurrence, not
@@ -261,8 +257,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             source.connector_control(),
             connector_context,
         )
-        .await
-        .map_err(RefreshError::from)?;
+        .await?;
         let previous_snapshots = &previous.snapshots;
         let refresh_label = format!(
             "iceberg join MV {}.{}.{}",
@@ -379,8 +374,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         source.connector_control(),
         connector_context,
     )
-    .await
-    .map_err(RefreshError::from)?;
+    .await?;
     let previous_snapshot_id = previous
         .snapshots
         .get(&base_occurrence.occurrence_id)
@@ -403,10 +397,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         stmt.full,
     )
     .map_err(RefreshError::from)?;
-    let base_observation = io
-        .schema(source, base_ref, connector_context)
-        .await
-        .map_err(RefreshError::from)?;
+    let base_observation = io.schema(source, base_ref, connector_context).await?;
     let renames = validate_schema_contract(
         &mv_definition,
         occurrence,
@@ -518,10 +509,7 @@ pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
             .current_base(source, base_ref, connector_context)
             .await
             .map_err(RefreshError::from)?;
-        let base_observation = io
-            .schema(source, base_ref, connector_context)
-            .await
-            .map_err(RefreshError::from)?;
+        let base_observation = io.schema(source, base_ref, connector_context).await?;
         validate_union_projection_schema_contract_for_base(
             iceberg_target,
             mv_definition,
@@ -543,8 +531,7 @@ pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
         source.connector_control(),
         connector_context,
     )
-    .await
-    .map_err(RefreshError::from)?;
+    .await?;
     let previous_snapshots = &previous.snapshots;
     let previous_table_object_ids = &previous.table_object_ids;
     let has_previous_snapshots = base_occurrences
@@ -710,10 +697,7 @@ pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
             .current_base(source, base_ref, connector_context)
             .await
             .map_err(RefreshError::from)?;
-        let base_observation = io
-            .schema(source, base_ref, connector_context)
-            .await
-            .map_err(RefreshError::from)?;
+        let base_observation = io.schema(source, base_ref, connector_context).await?;
         let renames = validate_aggregate_schema_contract_for_base(
             mv_definition,
             occurrence,
@@ -732,8 +716,7 @@ pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
         source.connector_control(),
         connector_context,
     )
-    .await
-    .map_err(RefreshError::from)?;
+    .await?;
     let previous_snapshots = &previous.snapshots;
     let refresh_kind_label = if is_branch_union {
         "branch UNION ALL aggregate"
@@ -893,10 +876,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                 .current_base(source, base_ref, connector_context)
                 .await
                 .map_err(RefreshError::from)?;
-            let base_observation = io
-                .schema(source, base_ref, connector_context)
-                .await
-                .map_err(RefreshError::from)?;
+            let base_observation = io.schema(source, base_ref, connector_context).await?;
             let renames = validate_schema_contract(
                 mv_definition,
                 occurrence,
@@ -912,8 +892,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                 source.connector_control(),
                 connector_context,
             )
-            .await
-            .map_err(RefreshError::from)?;
+            .await?;
             let previous = previous_locators
                 .snapshots
                 .get(&base_occurrence.occurrence_id)
@@ -990,12 +969,10 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                 .map_err(RefreshError::from)?;
             let left_observation = io
                 .schema(source, &left_occurrence.table, connector_context)
-                .await
-                .map_err(RefreshError::from)?;
+                .await?;
             let right_observation = io
                 .schema(source, &right_occurrence.table, connector_context)
-                .await
-                .map_err(RefreshError::from)?;
+                .await?;
             // The join validator demands D occurrence order, which is not the
             // join's own left/right order, so the observations are re-paired
             // with their occurrences rather than with the join sides. By
@@ -1046,8 +1023,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                 source.connector_control(),
                 connector_context,
             )
-            .await
-            .map_err(RefreshError::from)?;
+            .await?;
             let previous_snapshots = &previous_locators.snapshots;
             let refresh_label = format!(
                 "iceberg join aggregate MV {}.{}.{}",

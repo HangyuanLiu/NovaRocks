@@ -868,10 +868,10 @@ impl Drop for IcebergFsFileWrite {
                     // Whole concrete refusal retains all original custody in
                     // the same Source's original panic packet, never strings.
                     std::panic::panic_any(GovernedCleanupRefusal {
-                        cleanup,
-                        stream,
-                        error,
-                        phase: self._phase.take(),
+                        _cleanup: cleanup,
+                        _stream: stream,
+                        _error: error,
+                        _phase: self._phase.take(),
                     });
                 }
                 self._phase.take();
@@ -2825,11 +2825,12 @@ pub(crate) mod manifest_stream_tests {
     }
 }
 
+// The panic packet owns these originals until its receiving owner disposes it.
 struct GovernedCleanupRefusal {
-    cleanup: Option<novarocks_spi::connector::ConnectorIoCleanupFuture>,
-    stream: novarocks_spi::connector::ConnectorIoStreamCustody,
-    error: ConnectorError,
-    phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
+    _cleanup: Option<novarocks_spi::connector::ConnectorIoCleanupFuture>,
+    _stream: novarocks_spi::connector::ConnectorIoStreamCustody,
+    _error: ConnectorError,
+    _phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
 }
 async fn governed_writer_abort(
     mut writer: crate::opendal::Writer,
@@ -2841,10 +2842,10 @@ async fn governed_writer_abort(
         Err(cause) => {
             if let Err(cause) = phase.record_cleanup_failure(Box::new(cause)) {
                 std::panic::panic_any(GovernedAbortErrorRefusal {
-                    cause,
-                    writer,
-                    permit,
-                    phase,
+                    _cause: cause,
+                    _writer: writer,
+                    _permit: permit,
+                    _phase: phase,
                 });
             }
             Err(ConnectorError::new(
@@ -2893,9 +2894,10 @@ pub(crate) fn governed_writer_backing_bytes() -> std::result::Result<usize, Conn
         })
 }
 
+// This original failure also owns the writer and its pending exit responsibility.
 struct GovernedAbortErrorRefusal {
-    cause: Box<dyn std::any::Any + Send>,
-    writer: crate::opendal::Writer,
-    permit: Option<WritePermit>,
-    phase: novarocks_spi::connector::ConnectorIoWeakPhase,
+    _cause: Box<dyn std::any::Any + Send>,
+    _writer: crate::opendal::Writer,
+    _permit: Option<WritePermit>,
+    _phase: novarocks_spi::connector::ConnectorIoWeakPhase,
 }

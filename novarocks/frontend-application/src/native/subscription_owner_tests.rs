@@ -364,15 +364,8 @@ async fn stale_lease_drop_cannot_abort_recycled_original_position() {
     let original_scope = {
         let state = owner.core.state.lock().unwrap();
         let record = state.records[reservation.index].as_ref().unwrap();
-        let scope = record
-            .backing
-            .owner
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .scope();
-        scope
+        let backing_owner = record.backing.owner.lock().unwrap();
+        backing_owner.as_ref().unwrap().scope()
     };
     let stale = reservation.start(async {}).unwrap();
     // The reaper removes the role slot before dropping its original backing

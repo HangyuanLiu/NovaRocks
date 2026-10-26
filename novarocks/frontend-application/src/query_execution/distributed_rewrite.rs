@@ -31,65 +31,16 @@ use novarocks_spi::connector::write_stack::{ConnectorWriteTargetPlan, WriteTarge
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteCohortId,
-    ConnectorWriteReceipt, ExternalMutationOutcome,
+    ConnectorRequestContext, ConnectorWriteCohortId, ConnectorWriteReceipt,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::connector::distributed_rewrite_application::{
-    DistributedRewriteApplicationSession, DistributedRewriteSealing, SealedDistributedRewrite,
-};
 use crate::query_execution::cohort_read::{QueryPinnedFileSetRead, QueryRewriteGroupRead};
-use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan,
 };
-
-/// The Frontend-owned maintenance session shape produced by query assembly.
-pub(crate) type DistributedRewriteMaintenanceSession =
-    DistributedRewriteApplicationSession<ConnectorDistributedRewriteSession>;
-
-impl SealedDistributedRewrite for ConnectorDistributedRewriteSession {
-    fn plan(&self) -> &ConnectorDistributedRewritePlan {
-        ConnectorDistributedRewriteSession::plan(self)
-    }
-
-    fn is_noop(&self) -> bool {
-        ConnectorDistributedRewriteSession::is_noop(self)
-    }
-}
-
-impl DistributedRewriteSealing for QueryExecutionService {
-    type Sealed = ConnectorDistributedRewriteSession;
-
-    fn seal_distributed_rewrite(
-        &self,
-        plan: ConnectorDistributedRewritePlan,
-        lease: ConnectorDistributedRewriteLease,
-        write_stack: novarocks_catalog_application::ConnectorWriteStackLease,
-        table: &novarocks_spi::connector::ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<Self::Sealed, String> {
-        self.begin_distributed_rewrite_operation_with_lease(
-            plan,
-            lease,
-            write_stack,
-            table,
-            context,
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    fn seal_noop_distributed_rewrite(
-        &self,
-        plan: ConnectorDistributedRewritePlan,
-        lease: ConnectorDistributedRewriteLease,
-    ) -> Result<Self::Sealed, String> {
-        ConnectorDistributedRewriteSession::noop(plan, lease).map_err(|error| error.to_string())
-    }
-}
 
 /// Admit the synthetic source used by one pinned rewrite cohort read.
 pub(crate) fn admit_pinned_rewrite_scan_binding(
@@ -231,14 +182,6 @@ struct ConnectorDistributedRewriteSessionInner {
 }
 
 impl ConnectorDistributedRewriteSession {
-    /// Validate a provider-frozen plan and open one write session covering
-    /// every frozen group.
-    ///
-    /// The provider re-derives its own branches at begin, so this checks that
-    /// the target set it sealed agrees with the group set this plan froze. A
-    /// disagreement means the table moved between planning and begin, and the
-    /// two halves would silently write past each other -- so it fails closed
-    /// here rather than at commit.
     /// A plan that froze no group. It writes nothing, so it deliberately has no
     /// write session and never derives a write-stack lease -- there is nothing
     /// for one to admit.
@@ -257,44 +200,6 @@ impl ConnectorDistributedRewriteSession {
                 plan: Arc::new(plan),
                 lease,
                 write_session: None,
-            }),
-        })
-    }
-
-    pub fn try_begin(
-        plan: ConnectorDistributedRewritePlan,
-        lease: ConnectorDistributedRewriteLease,
-        write_stack: novarocks_catalog_application::ConnectorWriteStackLease,
-        table: &novarocks_spi::connector::ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        lease.validate_plan(&plan)?;
-
-        let write_session = if plan.cohorts().is_empty() {
-            None
-        } else {
-            let write_lease = lease.derive_write_lease()?;
-            let session = crate::query_execution::write_session::begin_connector_write_session(
-                write_stack,
-                &write_lease,
-                rewrite_begin_request(&plan, table, context).map_err(invalid)?,
-            )
-            .map_err(invalid)?;
-            validate_rewrite_target_groups(
-                &plan,
-                session
-                    .targets()
-                    .iter()
-                    .map(|target| (target.ordinal(), target.rewrite_group_digest())),
-            )?;
-            Some(session)
-        };
-
-        Ok(Self {
-            inner: Arc::new(ConnectorDistributedRewriteSessionInner {
-                plan: Arc::new(plan),
-                lease,
-                write_session,
             }),
         })
     }
@@ -390,34 +295,6 @@ impl ConnectorDistributedRewriteSession {
             .ok_or_else(|| invalid("distributed rewrite session did not seal this group's target"))
     }
 
-    /// Take one finished group's prepared write set into the session.
-    ///
-    /// Each group runs as its own distributed query, so the session collects
-    /// their prepared sets and commits the union once. Budgets are charged on
-    /// that union, not per group.
-    pub(crate) fn accumulate(
-        &self,
-        prepared: crate::query_execution::write_result::DecodedPreparedWriteSet,
-    ) -> Result<(), ConnectorError> {
-        self.require_write_session()?.accumulate(prepared)
-    }
-
-    /// Commit every accumulated group through the same exact control lease.
-    pub fn commit(
-        &self,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        self.require_write_session()?.finish_accumulated(context)
-    }
-
-    /// Abort the whole rewrite through the same control lease.
-    pub fn abort(
-        &self,
-        context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-        self.require_write_session()?.abort(context)
-    }
-
     /// Project a known-committed receipt only through the provider that froze
     /// this operation.  Callers must not decode the receipt in core.
     pub fn finalize_committed(
@@ -489,6 +366,7 @@ fn validate_rewrite_target_groups(
     Ok(())
 }
 
+#[cfg(test)]
 fn rewrite_begin_request(
     plan: &ConnectorDistributedRewritePlan,
     table: &novarocks_spi::connector::ConnectorTableMetadata,

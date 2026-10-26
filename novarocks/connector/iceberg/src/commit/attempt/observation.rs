@@ -823,6 +823,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     /// Pure observation of the actual final whole-operation cleanup report.
     /// That author covers all prior retry objects except the published set.
     /// An absent report, Unknown, or an unconcluded entry proves no disposal.
+    #[cfg(test)]
     pub(crate) fn cleanup_is_complete(&self) -> bool {
         let state = self
             .state

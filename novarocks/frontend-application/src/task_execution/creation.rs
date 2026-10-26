@@ -600,7 +600,6 @@ impl TaskCreationSeed {
         array!(proto::TaskScanRanges, self.initial_scan_ranges.len());
         array!(proto::ScanRangeParams, range_count);
         array!(u32, self.sink_edges.len());
-        drop(add_array);
         requested = add(requested, host_bytes.checked_mul(2).ok_or_else(failure)?)?;
         requested = add(requested, metadata)?;
         Ok(CreationSizing {

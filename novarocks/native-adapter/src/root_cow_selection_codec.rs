@@ -181,7 +181,6 @@ impl std::error::Error for CowOwnedDecodeError {
 }
 impl novarocks_execution_contract::failure::FailureProjection for CowOwnedDecodeError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::FailureProjection;
         match self {
             Self::Codec(error) => error.failure_fact(),
             Self::Source(error) => error.failure_fact(),

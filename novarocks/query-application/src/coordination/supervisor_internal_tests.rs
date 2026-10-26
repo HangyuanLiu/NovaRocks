@@ -60,14 +60,15 @@ mod internal_supervisor_tests {
         release_cleanup: tokio::sync::Notify,
     }
 
+    type ReadyObservation =
+        watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>;
+
     #[derive(Debug, Default)]
     struct CheckedCountConsumer {
         decoded: AtomicBool,
         local_closed: AtomicBool,
         accepted: std::sync::Mutex<Option<ComputationReadyToken>>,
-        ready_observation: std::sync::Mutex<
-            Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
-        >,
+        ready_observation: std::sync::Mutex<Option<ReadyObservation>>,
     }
 
     #[derive(Debug)]
@@ -254,7 +255,7 @@ mod internal_supervisor_tests {
                     ))
                 });
             }
-            let scheduling = no_scan_scheduling(&request);
+            let scheduling = no_scan_scheduling(request);
             let owner = InternalCountDormant {
                 backend: self.backend,
                 window: self.window.clone(),
@@ -1110,7 +1111,7 @@ mod internal_supervisor_tests {
 
     #[derive(Clone, Debug)]
     enum RegisteredConsumerOutcome {
-        Error(ExecutionFailureInput),
+        Error(Box<ExecutionFailureInput>),
         Panic,
     }
 
@@ -1188,7 +1189,7 @@ mod internal_supervisor_tests {
                 end_seen.store(true, Ordering::SeqCst);
                 match outcome {
                     RegisteredConsumerOutcome::Error(input) => {
-                        Err(QueryExecutionError::from_execution(input))
+                        Err(QueryExecutionError::from_execution(*input))
                     }
                     RegisteredConsumerOutcome::Panic => {
                         std::panic::panic_any(RegisteredConsumerPanic {
@@ -1346,7 +1347,7 @@ mod internal_supervisor_tests {
     async fn registered_consumer_error_preserves_original_input_before_cleanup() {
         let expected = fixture_execution_input("injected registered computation consumer failure");
         assert_registered_consumer_failure_before_cleanup(
-            RegisteredConsumerOutcome::Error(expected.clone()),
+            RegisteredConsumerOutcome::Error(Box::new(expected.clone())),
             expected,
             0x74,
         )
@@ -1394,7 +1395,7 @@ mod internal_supervisor_tests {
             &'a mut self,
             request: &'a mut crate::api::NativeAttemptPreparationWork,
         ) -> NativeAttemptPreparationFuture<'a> {
-            let scheduling = no_scan_scheduling(&request);
+            let scheduling = no_scan_scheduling(request);
             let dormant = HeldInternalActivationDormant {
                 inner: InternalCountDormant {
                     backend: self.backend,
@@ -1621,7 +1622,7 @@ mod internal_supervisor_tests {
             &'a mut self,
             request: &'a mut crate::api::NativeAttemptPreparationWork,
         ) -> NativeAttemptPreparationFuture<'a> {
-            let scheduling = no_scan_scheduling(&request);
+            let scheduling = no_scan_scheduling(request);
             let owner = FactoryPanickingDormant {
                 inner: HeldInternalActivationDormant {
                     inner: InternalCountDormant {

@@ -222,7 +222,6 @@ fn rewrite_table_factor<'a>(
 mod tests {
     use super::*;
     use std::{
-        future::Future,
         sync::atomic::{AtomicBool, Ordering},
         task::{Context, Poll, Waker},
         time::{Duration, Instant},

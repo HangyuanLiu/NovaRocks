@@ -28,14 +28,15 @@ use novarocks_query_application::{
     },
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorIoAdmissionPort;
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteLease, ConnectorIoAdmissionPort, ConnectorOperationControl,
-    ConnectorRequestContext, ConnectorTableJobAdmissionRequest, ConnectorTableJobKind,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
-    ProviderMetadataCpuPort,
+    ConnectorDistributedRewriteLease, ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorTableJobAdmissionRequest, ConnectorTableJobKind, ConnectorTableObjectCaptureRequest,
+    ConnectorTableObjectSelector, ConnectorTableResolution, ProviderMetadataCpuPort,
 };
 use novarocks_table_maintenance::{
-    OptimizeCompletionMode, OptimizeJob,
+    OptimizeCompletionMode,
     activity::{MaintenanceActivityFamily, MaintenanceActivityPermit},
     product::TableMaintenanceProduct,
     runtime::JobCreate,
@@ -149,13 +150,13 @@ pub(crate) fn prepare(
     let lease = kernel
         .connector_control()
         .acquire_current_distributed_rewrite(&identity.instance_id)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let dependencies = lease
         .planning_initial_dependencies()
-        .map_err(|error| TerminalError::from_original_cause(error))?;
+        .map_err(TerminalError::from_original_cause)?;
     let origin = capacity
         .try_window_alias()
-        .map_err(|error| TerminalError::from_original_cause(error))?;
+        .map_err(TerminalError::from_original_cause)?;
     let connector = connector.clone();
     let source = Arc::new(tokio::sync::Mutex::new(SubmissionBody {
         engine: RequestScopedMaintenanceEngine::new(
@@ -363,7 +364,7 @@ impl OptimizeSubmissionState {
                 .take()
                 .expect("same Optimize observation")
                 .map(|_| StatementActionValue::Ok)
-                .map_err(|e| super::rewrite_job::computation_service_error(e)),
+                .map_err(super::rewrite_job::computation_service_error),
         )
     }
     fn poll_close(
@@ -536,7 +537,7 @@ async fn prepare_original_submission(
             job: ConnectorTableJobKind::RewriteDataFiles,
             context: original.context.clone(),
         })
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let (captured, snapshot) = metadata
         .capture_table_object_with_snapshot_cpu(
             ConnectorTableObjectCaptureRequest {
@@ -548,7 +549,7 @@ async fn prepare_original_submission(
             original.cpu.as_ref().unwrap().clone(),
         )
         .await
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     #[cfg(novarocks_dev_controls)]
     if let Some(receipt) = &original.receipt {
         receipt
@@ -561,11 +562,11 @@ async fn prepare_original_submission(
     original
         .context
         .check_active()
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let root = original
         .roots
         .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     original.pending_owner = Some(root.owner);
     original.originals = Some(
         OptimizeJobOriginals::take_prepared_root_in(&mut original.pending_owner)

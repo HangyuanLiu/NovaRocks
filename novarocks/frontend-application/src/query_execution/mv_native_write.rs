@@ -26,14 +26,10 @@
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteLease, ConnectorWriteReceipt,
+    ConnectorWriteReceipt,
 };
 
-use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::query_execution::kernels::QueryPreparationKernel;
-use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
 use novarocks_mv_application::publication::{MvRefreshCommittedFacts, MvRefreshPublicationIntent};
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// Exact completed-plan inputs for one Frontend-owned MV native assembly.
 ///
@@ -52,30 +48,6 @@ pub struct PreparedMvNativeWriteAssembly {
 }
 
 impl PreparedMvNativeWriteAssembly {
-    pub(crate) fn session(
-        encoded: crate::query_execution::physical_encoding::EncodedCompletedPlan,
-        version: novarocks_physical_plan::PlanVersionId,
-        query_options: Option<QueryOptions>,
-        write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    ) -> Result<Self, String> {
-        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
-        let description = mv_write_description(
-            candidate,
-            template
-                .attempt_scheduling_facts()?
-                .fragments
-                .iter()
-                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
-                .collect(),
-        )?;
-        Ok(Self {
-            description,
-            template,
-            query_options,
-            session: write_session,
-        })
-    }
-
     /// The commit authority of this write, so a caller that fails between
     /// assembly and dispatch can release it rather than leaving the provider
     /// holding a session for a plan that will never run.
@@ -191,105 +163,6 @@ fn mv_write_description(
     )
 }
 
-/// Complete one MV write after its SQL producer has stated every provider read.
-/// The sink contracts supply field names; the session supplies the exact
-/// handles it sealed for the writer nodes.
-pub(crate) fn prepare_completed_mv_write(
-    kernel: &QueryPreparationKernel,
-    execution: &QueryExecutionContext,
-    bindings: &QueryTableBindingStore,
-    connector_context: &ConnectorRequestContext,
-    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    needs: Box<[novarocks_sql::compiler::ProviderReadNeed]>,
-    finish: impl FnOnce(
-        novarocks_physical_plan::PlanVersionId,
-        novarocks_physical_plan::PipelineDopDomain,
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet,
-        novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet,
-    ) -> Result<
-        novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
-        novarocks_sql::compiler::SqlCompileError,
-    >,
-    control: &novarocks_sql::compiler::SqlCompileControl,
-) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-    let session = crate::query_execution::compiler::typed_connector_session()?;
-    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
-    let mut facts = Vec::with_capacity(needs.len());
-    for need in &needs {
-        facts.push(
-            crate::query_execution::provider_read_facts::freeze_one_read(
-                need,
-                kernel.typed_connector_control().as_ref(),
-                bindings,
-                &session,
-                connector_context,
-                &access_sink.deposits(),
-            )?,
-        );
-    }
-    let access = access_sink
-        .try_into_access()
-        .map_err(|(error, _returned)| error.to_string())?;
-    let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new(
-        write_session
-            .targets()
-            .iter()
-            .map(|target| {
-                Ok(novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
-                    ordinal: target.ordinal(),
-                    handle: write_session
-                        .encode_writer_handle_payload(target.handle())
-                        .map_err(|error| error.to_string())?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-    )?;
-    let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
-    let reads =
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
-            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                fact,
-                read_budget: novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-                },
-            },
-        ))?;
-    let plan = finish(version, dop_domain, reads, targets)?;
-    let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
-            plan, control,
-        )
-        .and_then(|candidate| {
-            candidate.freeze_root_output(
-                novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                ),
-            )
-        })
-        .map_err(|error| error.to_string())?;
-    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
-        candidate, access,
-    )
-    .map_err(|(error, _returned)| error.to_string())?;
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-        paired,
-        kernel.static_plan_carrier(),
-        kernel.constant_policy(),
-        Some(
-            &crate::query_execution::physical_encoding::WriteTargetFacts {
-                session: write_session.as_ref(),
-            },
-        ),
-        control,
-    )
-    .map_err(encode_compile_error)?;
-    let options = crate::query_execution::contract::synthetic_statement_query_options(execution);
-    PreparedMvNativeWriteAssembly::session(encoded, version, Some(options), write_session)
-        .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
-}
-
 pub(crate) fn encode_compile_error(
     error: novarocks_plan_codec::PhysicalEncodeError,
 ) -> novarocks_sql::compiler::SqlCompileError {
@@ -313,29 +186,6 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         &self,
         request: crate::query_execution::mv_assembly::OriginalMvWritePreparationRequest,
     ) -> crate::query_execution::mv_assembly::MvWritePreparationCustody;
-
-    fn activate_write(
-        &self,
-        prepared: PreparedMvRefreshWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        execution: &QueryExecutionContext,
-        connector_context: ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError>;
-
-    /// Open the session one metadata-only publication commits through.
-    ///
-    /// It returns a session rather than a write assembly because there is no
-    /// plan to assemble: a refresh whose inputs did not move reads nothing, so
-    /// no fragment, writer or cohort ever exists. Everything after this point
-    /// -- bind P, finish, interpret the receipt -- is the data path's own tail.
-    fn activate_metadata_only_publication(
-        &self,
-        prepared: &crate::query_execution::mv_assembly::refresh_artifact::PreparedMvMetadataOnlyWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        connector_context: ConnectorRequestContext,
-    ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String>;
 
     fn interpret_write_commit(
         &self,

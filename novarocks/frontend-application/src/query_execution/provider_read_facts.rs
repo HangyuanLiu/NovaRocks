@@ -41,7 +41,9 @@ pub(crate) use error::{ProviderReadCpuFailure, ProviderReadError};
 
 use novarocks_query_application::api::RuntimeSplitPlacement;
 
-use super::internal_result_cpu::{InternalResultCpu, ProviderCreatorCpuSource, ProviderReadCpuJob};
+#[cfg(test)]
+use super::internal_result_cpu::InternalResultCpu;
+use super::internal_result_cpu::{ProviderCreatorCpuSource, ProviderReadCpuJob};
 use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoResponsibility,
 };
@@ -455,8 +457,7 @@ impl FrontendProviderReadFacts {
                         .control_binding
                         .poll(self.capacity.scope(), factory.as_ref(), cx)
                 })
-                .await
-                .map_err(ProviderReadError::from)?;
+                .await?;
                 if source.admission.is_none() {
                     source.admission = Some(
                         ConnectorBlockingIoResponsibility::request(
@@ -709,16 +710,15 @@ fn prepare_read_opening(
     // resolved while answering -- the sealed access is then a view of that pin
     // -- and asking through a second control would seal against a request that
     // was never asked anything.
-    let request_control = request_control_for(&read, context).map_err(|error| {
-        ProviderReadError::from(error).context(format!("provider read of {name}"))
-    })?;
+    let request_control = request_control_for(&read, context)
+        .map_err(|error| error.context(format!("provider read of {name}")))?;
     // A provider spells one of its metadata relations as the base relation
     // plus the kind's suffix; the plan states the two separately, because
     // which metadata relation this is belongs to the read and not to the
     // name. Put them back together where the provider is asked.
-    let table = admitted.provider_relation(relation).map_err(|error| {
-        ProviderReadError::from(error).context(format!("provider read of {name}"))
-    })?;
+    let table = admitted
+        .provider_relation(relation)
+        .map_err(|error| error.context(format!("provider read of {name}")))?;
 
     Ok(ReadOpening {
         name,
@@ -857,8 +857,8 @@ async fn prepare_observation(
     let prepared = metadata
         .prepare_relation(session, &request)
         .await
-        .map_err(|error| relation_open_error(need.relation(), &opening, error))?
-        .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
+        .map_err(|error| relation_open_error(need.relation(), opening, error))?
+        .ok_or_else(|| relation_open_missing(need.relation(), opening))?;
     *observation = Some(ReadObservation::Physical(prepared));
     Ok(())
 }
@@ -1022,8 +1022,8 @@ fn finish_prepared_read_borrowed(
         ReadObservation::Physical(prepared) => {
             let relation = metadata
                 .create_prepared_relation(prepared)
-                .map_err(|error| relation_open_error(need.relation(), &opening, error))?
-                .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
+                .map_err(|error| relation_open_error(need.relation(), opening, error))?
+                .ok_or_else(|| relation_open_missing(need.relation(), opening))?;
             let (handle, hint) = relation.into_parts();
             let (placement, kind) =
                 if let ProviderReadRelationNeed::Metadata { kind, .. } = need.relation() {
@@ -1128,7 +1128,7 @@ fn finish_read_from_opened(
             ProviderReadError::from(error)
                 .context(format!("provider read of {name} cannot read its columns"))
         })?;
-    let assignments = assignments_for(need.columns(), &column_bindings, &name)?;
+    let assignments = assignments_for(need.columns(), &column_bindings, name)?;
     let columns_by_ordinal = assignments
         .iter()
         .enumerate()
@@ -1206,7 +1206,7 @@ fn finish_read_from_opened(
     let (enforced_predicate, unenforced_predicate, remaining_expression) =
         filter_responsibility(&offer, &negotiated.outcomes);
     let (schema, named_columns) =
-        column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
+        column_facts(need.columns(), &assignments, encoder.as_ref(), name)?;
     let catalog_properties = planning_lease
         .binding()
         .catalog_properties()
@@ -1218,7 +1218,7 @@ fn finish_read_from_opened(
 
     // 6. Take the capability and account for it in the same breath.
     let access = read
-        .seal_attempt_access(&request_control, &negotiated.handle)
+        .seal_attempt_access(request_control, &negotiated.handle)
         .map_err(|error| {
             ProviderReadError::from(error).context(format!(
                 "provider read of {name} cannot seal its per-attempt access"
@@ -1288,7 +1288,7 @@ fn finish_read_from_opened(
         schema,
         predicates: predicate_facts(need, &offer, &negotiated.outcomes),
         limit: limit_fact(need, &offer, &negotiated.outcomes),
-        provided_properties: read_properties(frozen.properties(), &columns_by_ordinal, &name)?,
+        provided_properties: read_properties(frozen.properties(), &columns_by_ordinal, name)?,
         coverage_evidence: frozen.coverage_evidence().into(),
     };
     ProviderReadFact::negotiated(need, contract).map_err(|error| {

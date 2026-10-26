@@ -24,7 +24,6 @@
 //! stop, so cancellation and drop never join or block an OS thread.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1058,6 +1057,7 @@ pub(crate) use tests::failure_observation_plan;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
 

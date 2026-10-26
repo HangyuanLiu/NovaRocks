@@ -483,6 +483,53 @@ impl Service for S3PresignService {
     }
 }
 
+/// Explicit per-request context over the same pooled transport. The typed
+/// extension belongs to this actual HTTP Request, not an authority lookup.
+pub(super) struct GovernedRequestTransport {
+    inner: opendal::HttpTransporter,
+    request: novarocks_spi::connector::ConnectorRequestContext,
+}
+impl GovernedRequestTransport {
+    pub(super) fn new(
+        inner: opendal::HttpTransporter,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self { inner, request }
+    }
+}
+impl HttpTransport for GovernedRequestTransport {
+    async fn fetch(&self, mut request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
+        if request
+            .extensions()
+            .get::<novarocks_spi::connector::ConnectorRequestContext>()
+            .is_none()
+        {
+            request.extensions_mut().insert(self.request.clone());
+        }
+        self.inner.fetch(request).await
+    }
+}
+fn retain_response_phase(
+    response: Response<HttpBody>,
+    phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
+) -> Response<HttpBody> {
+    let Some(phase) = phase else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    // The original body validates content length. The wrapper retains its
+    // paid alias through actual body/F Drop, including partial reads/unwind.
+    let stream = futures::stream::try_unfold((body, phase), |(mut body, phase)| async move {
+        let chunk = opendal::raw::oio::ReadStream::read(&mut body).await?;
+        if chunk.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((chunk, (body, phase))))
+        }
+    });
+    Response::from_parts(parts, HttpBody::new(Box::pin(stream), None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{ObjectStoreEndpointConfig, ObjectStoreSecretMaterial};
@@ -500,10 +547,12 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Instant;
 
+    type ReplyQueue = VecDeque<(StatusCode, Option<&'static str>)>;
+
     #[derive(Clone, Default)]
     struct CapturedHttp {
         requests: Arc<Mutex<Vec<(Uri, http::HeaderMap)>>>,
-        replies: Arc<Mutex<VecDeque<(StatusCode, Option<&'static str>)>>>,
+        replies: Arc<Mutex<ReplyQueue>>,
         rotate_on_redirect: Arc<Mutex<Option<Arc<StorageAuthority>>>>,
     }
     impl HttpTransport for CapturedHttp {
@@ -850,51 +899,4 @@ mod tests {
             );
         }
     }
-}
-
-/// Explicit per-request context over the same pooled transport. The typed
-/// extension belongs to this actual HTTP Request, not an authority lookup.
-pub(super) struct GovernedRequestTransport {
-    inner: opendal::HttpTransporter,
-    request: novarocks_spi::connector::ConnectorRequestContext,
-}
-impl GovernedRequestTransport {
-    pub(super) fn new(
-        inner: opendal::HttpTransporter,
-        request: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Self {
-        Self { inner, request }
-    }
-}
-impl HttpTransport for GovernedRequestTransport {
-    async fn fetch(&self, mut request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
-        if request
-            .extensions()
-            .get::<novarocks_spi::connector::ConnectorRequestContext>()
-            .is_none()
-        {
-            request.extensions_mut().insert(self.request.clone());
-        }
-        self.inner.fetch(request).await
-    }
-}
-fn retain_response_phase(
-    response: Response<HttpBody>,
-    phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
-) -> Response<HttpBody> {
-    let Some(phase) = phase else {
-        return response;
-    };
-    let (parts, body) = response.into_parts();
-    // The original body validates content length. The wrapper retains its
-    // paid alias through actual body/F Drop, including partial reads/unwind.
-    let stream = futures::stream::try_unfold((body, phase), |(mut body, phase)| async move {
-        let chunk = opendal::raw::oio::ReadStream::read(&mut body).await?;
-        if chunk.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some((chunk, (body, phase))))
-        }
-    });
-    Response::from_parts(parts, HttpBody::new(Box::pin(stream), None))
 }

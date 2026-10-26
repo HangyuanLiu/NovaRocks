@@ -148,6 +148,7 @@ impl<I, C> SharedIngress<I, C> {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn attempt(
         self: &Arc<Self>,
         owner: &mut Option<WorkOwner>,

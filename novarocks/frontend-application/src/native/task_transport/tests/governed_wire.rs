@@ -432,8 +432,7 @@ async fn unpublished_paid_input_withdrawal_recycles_queue_but_keeps_retained_pay
     // independent original payload. The real unique process owner is returned.
     let failure = control
         .shutdown()
-        .err()
-        .expect("retained input still owns its paid record");
+        .expect_err("retained input still owns its paid record");
     assert_eq!(failure.error(), WorkloadShutdownError::NotDrained);
     let (_, control) = failure.into_parts();
     drop(retained_input.take());

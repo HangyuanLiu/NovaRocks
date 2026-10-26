@@ -218,16 +218,17 @@ async fn subscription_refuses_exhausted_cohort_without_individual_admission() {
         reservation.index,
         &mut Context::from_waker(Waker::noop())
     ));
-    let state = owner.core.state.lock().unwrap();
-    let record = state.records[reservation.index].as_ref().unwrap();
-    assert!(matches!(
-        record.state,
-        OriginalState::ChildFailed(RegistrationError::Work(WorkError::Capacity(
-            "Native Source cohort exhausted"
-        )))
-    ));
-    assert!(record.backing.owner.lock().unwrap().is_none());
-    drop(state);
+    {
+        let state = owner.core.state.lock().unwrap();
+        let record = state.records[reservation.index].as_ref().unwrap();
+        assert!(matches!(
+            record.state,
+            OriginalState::ChildFailed(RegistrationError::Work(WorkError::Capacity(
+                "Native Source cohort exhausted"
+            )))
+        ));
+        assert!(record.backing.owner.lock().unwrap().is_none());
+    }
     drop(reservation);
     owner.core.state.lock().unwrap().started = false;
     owner.start_reaper().unwrap();

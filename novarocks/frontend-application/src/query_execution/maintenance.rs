@@ -65,7 +65,6 @@ pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance servi
 pub struct PreparedDistributedRewriteCohort {
     description: novarocks_query_application::preparation::FrozenExecutionDescription,
     template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    query_execution: crate::query_execution::service::QueryExecutionService,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
@@ -1652,7 +1651,6 @@ fn finish_rewrite_cohort_recipe(
     access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
         crate::query_execution::provider_read_facts::FrozenProviderRead,
     >,
-    query_execution: &crate::query_execution::service::QueryExecutionService,
 ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
     // Same access was already checked by prepare_access; bind is infallible.
     let template = parts
@@ -1662,7 +1660,6 @@ fn finish_rewrite_cohort_recipe(
     Ok(PreparedDistributedRewriteCohort {
         description: parts.description,
         template,
-        query_execution: query_execution.clone(),
         execution: recipe.execution.clone(),
         write_session: recipe
             .session

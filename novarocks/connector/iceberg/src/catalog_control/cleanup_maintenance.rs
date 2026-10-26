@@ -38,9 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::cleanup_candidates::{
-    ScannedFile, canonical_object_mtime_ms, collect_orphan_candidates,
-};
+use super::cleanup_candidates::canonical_object_mtime_ms;
 use super::owned_ref_cleanup::{
     OwnedRefCandidate, collect_owned_ref_candidates, matches_owned_ref_candidate,
 };
@@ -60,7 +58,7 @@ const RECEIPT_DOMAIN: &[u8] = b"novarocks.iceberg.orphan-cleanup.receipt.v1\0";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PlanPayload {
+pub(super) struct PlanPayload {
     version: u16,
     namespace: String,
     table: String,
@@ -93,7 +91,7 @@ struct FrozenCleanupManifest {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManifestRecord {
+pub(super) struct ManifestRecord {
     ordinal: u32,
     candidate: ManifestCandidate,
 }
@@ -153,7 +151,7 @@ struct ReceiptPayload {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReceiptRecord {
+pub(super) struct ReceiptRecord {
     ordinal: u32,
     outcome: ObjectOutcome,
     reason: Option<String>,
@@ -392,57 +390,6 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
     }
 }
 
-fn records_from_candidates(
-    files: &[ScannedFile],
-    table: &crate::iceberg::table::Table,
-    binding: &crate::access_binding::IcebergReadBinding,
-) -> Result<Vec<ManifestRecord>, ConnectorError> {
-    let supports_version =
-        crate::fs_io::resolve_access_for_location(table.metadata().location(), binding)
-            .map_err(unavailable)?
-            .operator()
-            .info()
-            .capability()
-            .delete_with_version;
-    files
-        .iter()
-        .enumerate()
-        .map(|(ordinal, file)| {
-            let size = file
-                .size
-                .ok_or_else(|| invalid("orphan candidate has no reliable size"))?;
-            if file.last_modified_ms == i64::MAX {
-                return Err(invalid(
-                    "orphan candidate has no reliable modification time",
-                ));
-            }
-            let identity = match (&file.version, &file.etag) {
-                (Some(version), _) if supports_version => ObjectIdentity::Version {
-                    version: version.clone(),
-                    size,
-                    mtime_ms: file.last_modified_ms,
-                },
-                (_, Some(etag)) => ObjectIdentity::Etag {
-                    etag: etag.clone(),
-                    size,
-                    mtime_ms: file.last_modified_ms,
-                },
-                _ => ObjectIdentity::SizeMtime {
-                    size,
-                    mtime_ms: file.last_modified_ms,
-                },
-            };
-            Ok(ManifestRecord {
-                ordinal: ordinal as u32,
-                candidate: ManifestCandidate::Object {
-                    location: file.path.clone(),
-                    identity,
-                },
-            })
-        })
-        .collect()
-}
-
 /// Ref candidates and object candidates are deliberately never mixed in one
 /// cleanup manifest. A successful ref drop changes the table live set, so the
 /// following object pass must begin at `plan_cleanup` and reload metadata.
@@ -659,10 +606,7 @@ fn execute_owned_ref(
     created_at_ms: i64,
     context: &ConnectorRequestContext,
 ) -> Result<ReceiptRecord, ConnectorError> {
-    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
-    use novarocks_spi::connector::{
-        ConnectorMutationOperationId, ExternalMutationEvidence, ExternalMutationOutcome,
-    };
+    use novarocks_spi::connector::ExternalMutationOutcome;
     let prepared = runtime.resources().catalog_runtime().observe_preparation(
         || {
             let prepare = || -> Result<_, ConnectorError> {
@@ -1094,6 +1038,273 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 
 fn exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
+}
+
+fn plan_loaded(
+    adapter: &IcebergCleanupMaintenanceAdapter,
+    request: &ConnectorCleanupPlanningRequest,
+    target: IcebergTablePayload,
+    table: crate::iceberg::table::Table,
+) -> Result<ConnectorCleanupPlan, ConnectorError> {
+    let older_than_ms = request.operation().older_than_ms();
+    // A ref retirement is a separate GC phase. Once a Catalog ref is
+    // removed, the live set used by object discovery is stale by
+    // definition; a later operation must reload metadata before sweeping.
+    let owned_refs = collect_owned_ref_candidates(
+        table.metadata(),
+        &target.namespace,
+        &target.table,
+        older_than_ms,
+    );
+    let owned_ref_records =
+        selected_owned_ref_manifest_records(owned_refs, request.owned_ref_selection());
+    let (phase, records) =
+        if cleanup_phase_for_owned_refs(request.owned_ref_selection(), owned_ref_records.len())
+            == CleanupPhase::OwnedRefRetire
+        {
+            // A second selected-ref plan is never eligible for object
+            // discovery. Missing/stale/drifted selections become an empty ref
+            // manifest and leak until a later observation, rather than
+            // destructively falling through to the object pass.
+            (CleanupPhase::OwnedRefRetire, owned_ref_records)
+        } else if owned_ref_records.is_empty() {
+            adapter.scan_gc_safety().require_scanned_object_gc()?;
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "scanned orphan cleanup has no admitted Provider safety proof",
+            ));
+        } else {
+            (CleanupPhase::OwnedRefRetire, owned_ref_records)
+        };
+    if records.len() > MAX_RECORDS {
+        return Err(exhausted("Iceberg cleanup manifest exceeds 262144 records"));
+    }
+    let logical = LogicalManifest {
+        version: ARTIFACT_VERSION,
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+        table_uuid: table.metadata().uuid().to_string(),
+        older_than_ms,
+        phase,
+        records,
+    };
+    let logical_bytes = canonical(&logical)?;
+    if logical_bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(exhausted("Iceberg cleanup manifest exceeds 64 MiB"));
+    }
+    let manifest_digest = domain_digest(MANIFEST_DOMAIN, &logical_bytes);
+    let summary = ConnectorCleanupPlanSummary::try_new(
+        logical.records.len() as u64,
+        logical.records.iter().map(manifest_record_size).sum(),
+        logical.records.len().div_ceil(MAX_BATCH_OBJECTS) as u32,
+    )?;
+    let state = state_digest(
+        table.metadata().uuid().to_string().as_bytes(),
+        table.metadata_location(),
+        table.metadata().current_snapshot_id(),
+        table.metadata().current_schema_id(),
+        table.metadata().default_partition_spec_id(),
+    );
+    let payload = PlanPayload {
+        version: ARTIFACT_VERSION,
+        namespace: target.namespace,
+        table: target.table,
+        table_uuid: table.metadata().uuid().to_string(),
+    };
+    let plan = ConnectorCleanupPlan::try_new(
+        request,
+        state,
+        manifest_digest,
+        summary,
+        canonical(&payload)?,
+        ConnectorProcessLocalPayload::new(
+            adapter.key.clone(),
+            Arc::new(FrozenCleanupManifest {
+                records: logical.records.into(),
+                manifest_digest,
+            }),
+        ),
+    )?;
+    Ok(plan)
+}
+
+fn manifest_loaded(
+    key: &ConnectorProviderBindingKey,
+    plan: &ConnectorCleanupPlan,
+    payload: &PlanPayload,
+    table: &crate::iceberg::table::Table,
+) -> Result<Arc<[ManifestRecord]>, ConnectorError> {
+    if table.metadata().uuid().to_string() != payload.table_uuid {
+        return Err(corrupt(
+            "Iceberg cleanup table incarnation no longer matches its frozen manifest",
+        ));
+    }
+    let manifest = plan
+        .manifest()
+        .value::<FrozenCleanupManifest>(key.instance_id())?;
+    if manifest.manifest_digest != plan.manifest_digest() {
+        return Err(internal(
+            "Iceberg cleanup manifest payload digest is invalid",
+        ));
+    }
+    Ok(Arc::clone(&manifest.records))
+}
+
+fn prepare_from_records(
+    key: &ConnectorProviderBindingKey,
+    request: &ConnectorCleanupPrepareRequest,
+    records: &[ManifestRecord],
+) -> Result<PreparedBatch, ConnectorError> {
+    let start = request.batch_ordinal as usize * MAX_BATCH_OBJECTS;
+    let end = (start + MAX_BATCH_OBJECTS).min(records.len());
+    let batch = records
+        .get(start..end)
+        .filter(|batch| !batch.is_empty())
+        .ok_or_else(|| invalid("Iceberg cleanup batch is outside its manifest"))?;
+    let digest = batch_digest(batch);
+    PreparedBatch::try_new(
+        key.clone(),
+        request.plan.operation_id(),
+        request.plan.plan_digest(),
+        request.plan.manifest_digest(),
+        request.batch_ordinal,
+        digest,
+        canonical(&PreparedPayload {
+            version: ARTIFACT_VERSION,
+            batch_ordinal: request.batch_ordinal,
+            first_ordinal: start as u32,
+            record_count: batch.len() as u32,
+            batch_digest_hex: hex_encode(digest),
+        })?,
+    )
+}
+
+fn page_from_records(
+    key: &ConnectorProviderBindingKey,
+    request: &ConnectorCleanupCandidatePageRequest,
+    records: &[ManifestRecord],
+    table_uuid: uuid::Uuid,
+) -> Result<CandidatePage, ConnectorError> {
+    let start = request.offset as usize;
+    if start > records.len() {
+        return Err(invalid("Iceberg cleanup page offset exceeds its manifest"));
+    }
+    let end = (start + request.limit as usize).min(records.len());
+    CandidatePage::try_new(
+        key.clone(),
+        request.plan.operation_id(),
+        request.plan.manifest_digest(),
+        request.offset,
+        records[start..end]
+            .iter()
+            .map(|record| manifest_candidate_projection(record, table_uuid))
+            .collect::<Result<Vec<_>, _>>()?,
+        end == records.len(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exact ref provenance remains explicit at the original freeze author."
+)]
+fn freeze_owned_ref_on_table(
+    _owner: &ConnectorProviderBindingKey,
+    operation_id: novarocks_spi::connector::ConnectorCleanupOperationId,
+    payload: &PlanPayload,
+    ordinal: u32,
+    name: &str,
+    expected_head_snapshot_id: i64,
+    provenance_version: u16,
+    provenance_digest_hex: Option<&str>,
+    created_at_ms: i64,
+    context: &ConnectorRequestContext,
+    table: &crate::iceberg::table::Table,
+) -> Result<Option<crate::commit::model::FrozenRequest>, ConnectorError> {
+    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+    use novarocks_spi::connector::ConnectorMutationOperationId;
+    let expected = OwnedRefCandidate {
+        name: name.to_string(),
+        head_snapshot_id: expected_head_snapshot_id,
+        provenance_version,
+        provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
+        created_at_ms,
+    };
+    if table.metadata().uuid().to_string() != payload.table_uuid
+        || !matches_owned_ref_candidate(
+            table.metadata(),
+            &payload.namespace,
+            &payload.table,
+            &expected,
+        )
+    {
+        return Ok(None);
+    }
+    let Some(change) = crate::commit::RefActionPlan::prepare_exact_drop(
+        table,
+        &payload.table_uuid,
+        name,
+        expected_head_snapshot_id,
+    ) else {
+        return Ok(None);
+    };
+    let token = OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes(
+        operation_id.to_bytes(),
+    ));
+    let frozen = crate::commit::staging::freeze_existing_change(
+        table.identifier().clone(),
+        "main",
+        table.metadata(),
+        table.metadata_location().ok_or_else(|| {
+            invalid("Owned ref retirement has no authoritative metadata location")
+        })?,
+        RequestShape::RefRetention,
+        AttemptToken::new(token, ordinal),
+        change,
+        context,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    Ok(Some(frozen))
+}
+
+fn ref_journal(
+    runtime: &IcebergMetadataContext,
+    owner: &ConnectorProviderBindingKey,
+    operation_id: novarocks_spi::connector::ConnectorCleanupOperationId,
+    payload: &PlanPayload,
+    ordinal: u32,
+    name: &str,
+    expected_head_snapshot_id: i64,
+    frozen: &crate::commit::model::FrozenRequest,
+) -> Result<crate::commit::attempt::observation::PublicationJournal<ReceiptRecord>, ConnectorError>
+{
+    use novarocks_spi::connector::{ConnectorMutationOperationId, ExternalMutationEvidence};
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")?,
+        instance_id: owner.instance_id.clone(),
+    };
+    let external_evidence = ExternalMutationEvidence::try_new(
+        1,
+        descriptor,
+        owner.incarnation,
+        ConnectorMutationOperationId::from_bytes(operation_id.to_bytes()),
+        "cleanup-owned-ref-retire",
+        canonical(
+            &serde_json::json!({"ordinal":ordinal,"namespace":payload.namespace,"table":payload.table,"table_uuid":payload.table_uuid,"ref":name,"head":expected_head_snapshot_id}),
+        )?,
+    )?;
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+        frozen.artifacts().attempt().operation(),
+        runtime.resources().catalog_runtime(),
+    );
+    journal
+        .record_for_effects(
+            external_evidence,
+            receipt(ordinal, ObjectOutcome::Deleted, None)?,
+            receipt(ordinal, ObjectOutcome::AlreadyAbsent, None)?,
+            frozen,
+        )
+        .map_err(|error| internal(error.to_string()))?;
+    Ok(journal)
 }
 
 #[cfg(test)]
@@ -2175,271 +2386,4 @@ mod tests {
             assert_admission_left_no_io(&warehouse, &listener);
         }
     }
-}
-
-fn plan_loaded(
-    adapter: &IcebergCleanupMaintenanceAdapter,
-    request: &ConnectorCleanupPlanningRequest,
-    target: IcebergTablePayload,
-    table: crate::iceberg::table::Table,
-) -> Result<ConnectorCleanupPlan, ConnectorError> {
-    let older_than_ms = request.operation().older_than_ms();
-    // A ref retirement is a separate GC phase. Once a Catalog ref is
-    // removed, the live set used by object discovery is stale by
-    // definition; a later operation must reload metadata before sweeping.
-    let owned_refs = collect_owned_ref_candidates(
-        table.metadata(),
-        &target.namespace,
-        &target.table,
-        older_than_ms,
-    );
-    let owned_ref_records =
-        selected_owned_ref_manifest_records(owned_refs, request.owned_ref_selection());
-    let (phase, records) =
-        if cleanup_phase_for_owned_refs(request.owned_ref_selection(), owned_ref_records.len())
-            == CleanupPhase::OwnedRefRetire
-        {
-            // A second selected-ref plan is never eligible for object
-            // discovery. Missing/stale/drifted selections become an empty ref
-            // manifest and leak until a later observation, rather than
-            // destructively falling through to the object pass.
-            (CleanupPhase::OwnedRefRetire, owned_ref_records)
-        } else if owned_ref_records.is_empty() {
-            adapter.scan_gc_safety().require_scanned_object_gc()?;
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "scanned orphan cleanup has no admitted Provider safety proof",
-            ));
-        } else {
-            (CleanupPhase::OwnedRefRetire, owned_ref_records)
-        };
-    if records.len() > MAX_RECORDS {
-        return Err(exhausted("Iceberg cleanup manifest exceeds 262144 records"));
-    }
-    let logical = LogicalManifest {
-        version: ARTIFACT_VERSION,
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-        table_uuid: table.metadata().uuid().to_string(),
-        older_than_ms,
-        phase,
-        records,
-    };
-    let logical_bytes = canonical(&logical)?;
-    if logical_bytes.len() > MAX_ARTIFACT_BYTES {
-        return Err(exhausted("Iceberg cleanup manifest exceeds 64 MiB"));
-    }
-    let manifest_digest = domain_digest(MANIFEST_DOMAIN, &logical_bytes);
-    let summary = ConnectorCleanupPlanSummary::try_new(
-        logical.records.len() as u64,
-        logical.records.iter().map(manifest_record_size).sum(),
-        logical.records.len().div_ceil(MAX_BATCH_OBJECTS) as u32,
-    )?;
-    let state = state_digest(
-        table.metadata().uuid().to_string().as_bytes(),
-        table.metadata_location(),
-        table.metadata().current_snapshot_id(),
-        table.metadata().current_schema_id(),
-        table.metadata().default_partition_spec_id(),
-    );
-    let payload = PlanPayload {
-        version: ARTIFACT_VERSION,
-        namespace: target.namespace,
-        table: target.table,
-        table_uuid: table.metadata().uuid().to_string(),
-    };
-    let plan = ConnectorCleanupPlan::try_new(
-        &request,
-        state,
-        manifest_digest,
-        summary,
-        canonical(&payload)?,
-        ConnectorProcessLocalPayload::new(
-            adapter.key.clone(),
-            Arc::new(FrozenCleanupManifest {
-                records: logical.records.into(),
-                manifest_digest,
-            }),
-        ),
-    )?;
-    Ok(plan)
-}
-
-fn manifest_loaded(
-    key: &ConnectorProviderBindingKey,
-    plan: &ConnectorCleanupPlan,
-    payload: &PlanPayload,
-    table: &crate::iceberg::table::Table,
-) -> Result<Arc<[ManifestRecord]>, ConnectorError> {
-    if table.metadata().uuid().to_string() != payload.table_uuid {
-        return Err(corrupt(
-            "Iceberg cleanup table incarnation no longer matches its frozen manifest",
-        ));
-    }
-    let manifest = plan
-        .manifest()
-        .value::<FrozenCleanupManifest>(key.instance_id())?;
-    if manifest.manifest_digest != plan.manifest_digest() {
-        return Err(internal(
-            "Iceberg cleanup manifest payload digest is invalid",
-        ));
-    }
-    Ok(Arc::clone(&manifest.records))
-}
-
-fn prepare_from_records(
-    key: &ConnectorProviderBindingKey,
-    request: &ConnectorCleanupPrepareRequest,
-    records: &[ManifestRecord],
-) -> Result<PreparedBatch, ConnectorError> {
-    let start = request.batch_ordinal as usize * MAX_BATCH_OBJECTS;
-    let end = (start + MAX_BATCH_OBJECTS).min(records.len());
-    let batch = records
-        .get(start..end)
-        .filter(|batch| !batch.is_empty())
-        .ok_or_else(|| invalid("Iceberg cleanup batch is outside its manifest"))?;
-    let digest = batch_digest(batch);
-    PreparedBatch::try_new(
-        key.clone(),
-        request.plan.operation_id(),
-        request.plan.plan_digest(),
-        request.plan.manifest_digest(),
-        request.batch_ordinal,
-        digest,
-        canonical(&PreparedPayload {
-            version: ARTIFACT_VERSION,
-            batch_ordinal: request.batch_ordinal,
-            first_ordinal: start as u32,
-            record_count: batch.len() as u32,
-            batch_digest_hex: hex_encode(digest),
-        })?,
-    )
-}
-
-fn page_from_records(
-    key: &ConnectorProviderBindingKey,
-    request: &ConnectorCleanupCandidatePageRequest,
-    records: &[ManifestRecord],
-    table_uuid: uuid::Uuid,
-) -> Result<CandidatePage, ConnectorError> {
-    let start = request.offset as usize;
-    if start > records.len() {
-        return Err(invalid("Iceberg cleanup page offset exceeds its manifest"));
-    }
-    let end = (start + request.limit as usize).min(records.len());
-    CandidatePage::try_new(
-        key.clone(),
-        request.plan.operation_id(),
-        request.plan.manifest_digest(),
-        request.offset,
-        records[start..end]
-            .iter()
-            .map(|record| manifest_candidate_projection(record, table_uuid))
-            .collect::<Result<Vec<_>, _>>()?,
-        end == records.len(),
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Exact ref provenance remains explicit at the original freeze author."
-)]
-fn freeze_owned_ref_on_table(
-    _owner: &ConnectorProviderBindingKey,
-    operation_id: novarocks_spi::connector::ConnectorCleanupOperationId,
-    payload: &PlanPayload,
-    ordinal: u32,
-    name: &str,
-    expected_head_snapshot_id: i64,
-    provenance_version: u16,
-    provenance_digest_hex: Option<&str>,
-    created_at_ms: i64,
-    context: &ConnectorRequestContext,
-    table: &crate::iceberg::table::Table,
-) -> Result<Option<crate::commit::model::FrozenRequest>, ConnectorError> {
-    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
-    use novarocks_spi::connector::ConnectorMutationOperationId;
-    let expected = OwnedRefCandidate {
-        name: name.to_string(),
-        head_snapshot_id: expected_head_snapshot_id,
-        provenance_version,
-        provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
-        created_at_ms,
-    };
-    if table.metadata().uuid().to_string() != payload.table_uuid
-        || !matches_owned_ref_candidate(
-            table.metadata(),
-            &payload.namespace,
-            &payload.table,
-            &expected,
-        )
-    {
-        return Ok(None);
-    }
-    let Some(change) = crate::commit::RefActionPlan::prepare_exact_drop(
-        &table,
-        &payload.table_uuid,
-        name,
-        expected_head_snapshot_id,
-    ) else {
-        return Ok(None);
-    };
-    let token = OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes(
-        operation_id.to_bytes(),
-    ));
-    let frozen = crate::commit::staging::freeze_existing_change(
-        table.identifier().clone(),
-        "main",
-        table.metadata(),
-        table.metadata_location().ok_or_else(|| {
-            invalid("Owned ref retirement has no authoritative metadata location")
-        })?,
-        RequestShape::RefRetention,
-        AttemptToken::new(token, ordinal),
-        change,
-        context,
-    )
-    .map_err(|error| invalid(error.to_string()))?;
-    Ok(Some(frozen))
-}
-
-fn ref_journal(
-    runtime: &IcebergMetadataContext,
-    owner: &ConnectorProviderBindingKey,
-    operation_id: novarocks_spi::connector::ConnectorCleanupOperationId,
-    payload: &PlanPayload,
-    ordinal: u32,
-    name: &str,
-    expected_head_snapshot_id: i64,
-    frozen: &crate::commit::model::FrozenRequest,
-) -> Result<crate::commit::attempt::observation::PublicationJournal<ReceiptRecord>, ConnectorError>
-{
-    use novarocks_spi::connector::{ConnectorMutationOperationId, ExternalMutationEvidence};
-    let descriptor = ConnectorInstanceDescriptor {
-        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")?,
-        instance_id: owner.instance_id.clone(),
-    };
-    let external_evidence = ExternalMutationEvidence::try_new(
-        1,
-        descriptor,
-        owner.incarnation,
-        ConnectorMutationOperationId::from_bytes(operation_id.to_bytes()),
-        "cleanup-owned-ref-retire",
-        canonical(
-            &serde_json::json!({"ordinal":ordinal,"namespace":payload.namespace,"table":payload.table,"table_uuid":payload.table_uuid,"ref":name,"head":expected_head_snapshot_id}),
-        )?,
-    )?;
-    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
-        frozen.artifacts().attempt().operation(),
-        runtime.resources().catalog_runtime(),
-    );
-    journal
-        .record_for_effects(
-            external_evidence,
-            receipt(ordinal, ObjectOutcome::Deleted, None)?,
-            receipt(ordinal, ObjectOutcome::AlreadyAbsent, None)?,
-            frozen,
-        )
-        .map_err(|error| internal(error.to_string()))?;
-    Ok(journal)
 }

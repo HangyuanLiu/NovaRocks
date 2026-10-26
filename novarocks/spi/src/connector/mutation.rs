@@ -1650,22 +1650,23 @@ impl ConnectorCatalogMutationReceiving {
                     Ok(())
                 }),
         };
-        if result.is_ok() && state.needed_committed.is_none() && state.needed_validation.is_none() {
-            if let Some(Ok(ExternalMutationOutcome::KnownCommitted {
+        if result.is_ok()
+            && state.needed_committed.is_none()
+            && state.needed_validation.is_none()
+            && let Some(Ok(ExternalMutationOutcome::KnownCommitted {
                 effect,
                 receipt,
                 finalization,
                 ..
             })) = &state.raw
-            {
-                let needed = ConnectorCatalogMutationNeededCommitted {
-                    effect: *effect,
-                    receipt: receipt.clone(),
-                    finalization: finalization.clone(),
-                };
-                state.needed_committed = Some(needed);
-                state.needed_validation = Some(Ok(()));
-            }
+        {
+            let needed = ConnectorCatalogMutationNeededCommitted {
+                effect: *effect,
+                receipt: receipt.clone(),
+                finalization: finalization.clone(),
+            };
+            state.needed_committed = Some(needed);
+            state.needed_validation = Some(Ok(()));
         }
         assert!(
             state.validation.is_none(),
@@ -1893,20 +1894,20 @@ impl ConnectorCatalogMutationReceiving {
     }
 }
 
-struct CatalogMutationChild<'a> {
-    future: Option<
-        std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
-                            ConnectorError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        >,
+type CatalogMutationFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+                    ConnectorError,
+                >,
+            > + Send
+            + 'a,
     >,
+>;
+
+struct CatalogMutationChild<'a> {
+    future: Option<CatalogMutationFuture<'a>>,
     receiving: &'a ConnectorCatalogMutationReceiving,
 }
 impl CatalogMutationChild<'_> {

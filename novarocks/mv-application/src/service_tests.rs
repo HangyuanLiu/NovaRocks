@@ -192,8 +192,8 @@ struct RefreshExecutionEffects {
     projection_polls: usize,
     drops: Arc<AtomicUsize>,
     observed: Option<(MvTarget, crate::product::MvRefreshAttemptIdentity)>,
-    execution_panic: Option<Arc<&'static str>>,
-    projection_panic: Option<Arc<&'static str>>,
+    execution_panic: Option<Arc<str>>,
+    projection_panic: Option<Arc<str>>,
 }
 
 impl RefreshExecutionEffects {
@@ -983,7 +983,7 @@ async fn a_foreign_refresh_unwind_retains_the_received_fact_and_never_repolls_or
         let attempt = service.reserve_refresh_attempt();
         let published = finalization_facts(&target, &attempt);
         let mut execution = RefreshExecutionEffects::new(Arc::clone(&effects), published);
-        let cause = Arc::new("original foreign refresh panic");
+        let cause: Arc<str> = Arc::from("original foreign refresh panic");
         if during_projection {
             execution.projection_panic = Some(Arc::clone(&cause));
         } else {
@@ -996,9 +996,7 @@ async fn a_foreign_refresh_unwind_retains_the_received_fact_and_never_repolls_or
             service.poll_refresh(&mut cx, &mut transition, &mut execution)
         }))
         .expect_err("the original Source receives the foreign panic");
-        let raw = raw
-            .downcast::<Arc<&'static str>>()
-            .expect("same raw cause type");
+        let raw = raw.downcast::<Arc<str>>().expect("same raw cause type");
         assert!(Arc::ptr_eq(raw.as_ref(), &cause));
         assert!(execution.execution_outcome().unwrap().is_ok());
         assert_eq!(execution.projection.is_some(), during_projection);

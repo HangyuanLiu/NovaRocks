@@ -424,10 +424,10 @@ struct PendingDebts<'a> {
 
 impl Drop for PendingDebts<'_> {
     fn drop(&mut self) {
-        if !self.entries.is_empty() {
-            if let Ok(mut debt) = self.supervisor.debt.lock() {
-                debt.append(&mut self.entries);
-            }
+        if !self.entries.is_empty()
+            && let Ok(mut debt) = self.supervisor.debt.lock()
+        {
+            debt.append(&mut self.entries);
         }
     }
 }

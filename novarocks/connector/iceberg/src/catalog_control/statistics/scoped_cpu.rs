@@ -165,7 +165,7 @@ impl IcebergMetadataCpuOriginal {
     ) -> Arc<Self> {
         Self::new(descriptor, incarnation, CpuBody::Cleanup(Box::new(work)))
     }
-    pub(crate) fn take_cleanup_output(
+    pub(in crate::catalog_control) fn take_cleanup_output(
         &self,
     ) -> Result<
         crate::catalog_control::cleanup_maintenance::async_original::CpuOutput,

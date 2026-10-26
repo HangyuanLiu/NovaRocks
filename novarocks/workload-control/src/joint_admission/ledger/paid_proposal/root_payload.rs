@@ -18,7 +18,6 @@
 //! Monotone retained Root backing and its in-flight async rows, one paid batch.
 use super::super::typed_custody::{payload_capture_view, payload_growth_view, same_payload_grant};
 use super::*;
-use std::num::NonZeroU64;
 
 #[derive(Clone, Copy)]
 pub(in crate::joint_admission::ledger) struct RootPayloadFence {

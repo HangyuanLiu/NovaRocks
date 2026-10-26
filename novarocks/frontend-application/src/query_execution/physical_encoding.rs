@@ -404,7 +404,7 @@ fn encode_static_packages(
     };
     let packages = extract_checked_packages(
         &candidate,
-        &encodings,
+        encodings,
         &writes,
         statement_constant_policy,
         carrier.admission(),
@@ -425,11 +425,11 @@ fn encode_static_packages(
     )?;
     // Scan scheduling and the attempt's scan facts are read from the plan and
     // the freezes; no wire encoding is consulted.
-    let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
+    let scheduling = completed_plan_scheduling_facts(plan, encodings, &topology, provenance)?;
     let plan_facts = AttemptPlanFacts::from_completed(
         scheduling,
         completed_plan_edge_facts(plan)?,
-        completed_plan_scan_facts(plan, &encodings)?,
+        completed_plan_scan_facts(plan, encodings)?,
         submission,
         // The attempt deploys the plan's filters by the same plan-global
         // binding numbering each package's cuts carry.
@@ -2005,8 +2005,8 @@ mod tests {
         let template = encoded.into_attempt_template(version);
 
         let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-        let first = template.instantiate();
-        let recovery = template.instantiate();
+        let first = template.instantiate_static_fragment_fixture();
+        let recovery = template.instantiate_static_fragment_fixture();
         assert_eq!(
             crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
             freezes,

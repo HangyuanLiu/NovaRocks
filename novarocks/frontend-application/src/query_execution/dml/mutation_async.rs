@@ -39,10 +39,6 @@ pub(crate) enum PreparedMutationFacts {
     Merge(PreparedMergeMutation),
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The action passes original statement, target, generation, context and operation authority unchanged."
-)]
 pub(crate) async fn prepare_mutation_facts_async(
     state: &DmlExecutionKernel,
     statement: &OwnedMutationStatement,

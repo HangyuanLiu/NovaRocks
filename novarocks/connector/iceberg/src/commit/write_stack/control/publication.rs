@@ -714,20 +714,18 @@ impl IcebergWriteSessionControl {
         if let Some(evidence) = journal
             .current_entry()
             .and_then(|entry| journal.entry_evidence(entry))
+            && let Err(error) = handle.retain_recovery_evidence(evidence)
         {
-            if let Err(error) = handle.retain_recovery_evidence(evidence) {
-                // A local custody error cannot erase the journal's original
-                // dispatch fact. Unknown retains its existing checked evidence.
-                match &mut outcome {
-                    WritePublicationVerdict::KnownCommitted { finalization, .. } => {
-                        *finalization =
-                            add_finalization_failure(finalization.clone(), error.message());
-                    }
-                    WritePublicationVerdict::KnownUncommitted { cleanup, .. } => {
-                        *cleanup = add_finalization_failure(cleanup.clone(), error.message());
-                    }
-                    WritePublicationVerdict::CommitUnknown { .. } => {}
+            // A local custody error cannot erase the journal's original
+            // dispatch fact. Unknown retains its existing checked evidence.
+            match &mut outcome {
+                WritePublicationVerdict::KnownCommitted { finalization, .. } => {
+                    *finalization = add_finalization_failure(finalization.clone(), error.message());
                 }
+                WritePublicationVerdict::KnownUncommitted { cleanup, .. } => {
+                    *cleanup = add_finalization_failure(cleanup.clone(), error.message());
+                }
+                WritePublicationVerdict::CommitUnknown { .. } => {}
             }
         }
         let WritePublicationVerdict::KnownCommitted {

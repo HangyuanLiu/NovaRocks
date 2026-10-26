@@ -50,9 +50,6 @@ pub(crate) mod stateless_rebuild;
 pub mod storage_observation;
 #[cfg(test)]
 pub(crate) mod test_admission;
-pub use flow::{
-    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
-};
 #[cfg(novarocks_dev_controls)]
 pub use stateless_rebuild::execute_typed_novarocks_imv_stateless_rebuild;
 

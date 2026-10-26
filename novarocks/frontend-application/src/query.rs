@@ -42,7 +42,6 @@ use crate::query_execution::logical_execution::LogicalExecutionLauncher;
 use crate::query_execution::maintenance::command::{
     MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
 };
-use crate::query_execution::service::QueryExecutionService;
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::view::command::ViewCommandExecutor;
 use async_trait::async_trait;
@@ -1280,7 +1279,6 @@ pub struct FrontendQueryService {
     product_command_router: ProductCommandRouter,
     query_control: QueryControlService,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
-    query_execution: QueryExecutionService,
     logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
     workload_root_admission: RootAdmissionHandle,
     role: ClusterRole,
@@ -1342,7 +1340,6 @@ impl FrontendQueryService {
         mv_command_executor: MvCommandExecutor,
         query_control: QueryControlService,
         client_connection_control: Arc<dyn ClientConnectionControlPort>,
-        query_execution: QueryExecutionService,
         logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
         workload_root_admission: RootAdmissionHandle,
         role: ClusterRole,
@@ -1379,7 +1376,6 @@ impl FrontendQueryService {
             product_command_router,
             query_control,
             client_connection_control,
-            query_execution,
             logical_execution_launcher,
             workload_root_admission,
             role,

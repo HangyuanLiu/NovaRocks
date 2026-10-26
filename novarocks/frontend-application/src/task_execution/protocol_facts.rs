@@ -49,11 +49,10 @@ impl FrozenAttemptProtocol {
         let mut seen = BTreeSet::new();
         let writers = graph
             .tasks()
-            .filter_map(|task| {
-                fragments.contains(&task.fragment_id()).then(|| {
-                    seen.insert(task.fragment_id());
-                    task.identity()
-                })
+            .filter(|task| fragments.contains(&task.fragment_id()))
+            .map(|task| {
+                seen.insert(task.fragment_id());
+                task.identity()
             })
             .collect();
         if &seen != fragments {

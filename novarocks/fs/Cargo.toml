@@ -37,19 +37,8 @@ bytes.workspace = true
 crc32c.workspace = true
 futures.workspace = true
 http.workspace = true
-h2.workspace = true
 hdfs-native = "=0.14.6"
 http-body = "1"
-http-body-util = "0.1"
-httparse = "=1.10.1"
-hyper = { workspace = true, features = ["client", "http1", "http2"] }
-hyper-util = { workspace = true, features = ["client-legacy", "client-proxy", "client-proxy-system", "http1", "http2", "tokio"] }
-native-tls = "0.2"
-novarocks-transport-io.workspace = true
-rustls = { workspace = true, features = ["ring"] }
-tokio-native-tls = "0.3"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-tower-service = "0.3"
 libc.workspace = true
 opendal = { workspace = true, features = ["services-fs", "services-s3", "services-memory", "executors-tokio", "layers-concurrent-limit", "layers-retry", "layers-timeout"] }
 orc-rust = { version = "0.8.0", default-features = false }
@@ -69,7 +58,6 @@ novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 
 [dev-dependencies]
-rcgen.workspace = true
 novarocks-test-support.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 serde_json.workspace = true

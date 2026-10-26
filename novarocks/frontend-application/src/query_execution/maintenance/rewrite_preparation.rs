@@ -496,7 +496,6 @@ pub(crate) async fn prepare_original_cohort_in(
                 &recipe,
                 parts,
                 access.take().expect("same original access"),
-                engine.kernel.query_execution(),
             )
         }
         Err(error) => Err(error),

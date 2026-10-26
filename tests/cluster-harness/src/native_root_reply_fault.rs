@@ -3758,7 +3758,7 @@ mod tests {
         assert_actual_transparent_response(
             |expected| {
                 Ok(novarocks_task_codec::root_result::encode_response(
-                    &RootReadResponse::Refused(RootReadRefusal::for_request(
+                    &RootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
                         expected,
                         FailureFact::new(
                             FailureClass::Data,
@@ -3768,7 +3768,7 @@ mod tests {
                             ),
                         ),
                         SafeDetail::truncating("component root read domain refusal"),
-                    )),
+                    ))),
                 )?)
             },
             false,

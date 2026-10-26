@@ -1193,6 +1193,109 @@ fn cache_key(namespace_name: &str, table_name: &str) -> Result<(String, String),
     ))
 }
 
+impl IcebergRestVendedS3LeaseRefresher {
+    fn project_refresh(
+        &self,
+        delegation: crate::rest_protocol::deferred::RestDelegation,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        let refreshed = match parse_rest_delegation(delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(invalid(
+                    "vended REST credential refresh returned static access delegation",
+                ));
+            }
+        };
+        if !self.scope.matches_seed(&refreshed) {
+            return Err(invalid(
+                "vended REST credential refresh changed prefix scope or endpoint",
+            ));
+        }
+        let (entries, _) = refreshed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
+    }
+}
+
+impl IcebergRestLoadTableVendedS3LeaseRefresher {
+    fn project_refresh(
+        &self,
+        (observed_uuid, delegation): (
+            Option<String>,
+            crate::rest_protocol::deferred::RestDelegation,
+        ),
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        let observed_uuid = observed_uuid
+            .as_deref()
+            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
+            .ok_or_else(|| invalid("vended REST load-table refresh returned no table UUID"))?;
+        if observed_uuid != self.expected_table_uuid {
+            return Err(invalid(
+                "vended REST load-table refresh returned a different table UUID",
+            ));
+        }
+        let refreshed = match parse_rest_delegation(delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(invalid(
+                    "vended REST load-table refresh returned static access delegation",
+                ));
+            }
+        };
+        if !self.scope.matches_seed(&refreshed) {
+            return Err(invalid(
+                "vended REST load-table refresh changed prefix scope or acquisition path",
+            ));
+        }
+        let (entries, _) = refreshed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
+    }
+}
+
+pub(crate) async fn run_vended_renewal_with_policy_async<T, F, Fut>(
+    policy: VendedS3CredentialRefreshCallPolicy,
+    operation: &'static str,
+    call: F,
+) -> Result<T, ConnectorError>
+where
+    F: Fn() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<T, ConnectorError>> + Send,
+{
+    let deadline = tokio::time::Instant::now() + policy.remaining();
+    let mut attempts = 0_u8;
+    loop {
+        if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+            return Err(refresh_dispatch_fenced(operation));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(refresh_deadline_exhausted(operation));
+        }
+        attempts = attempts.saturating_add(1);
+        let outcome = tokio::time::timeout(remaining, call()).await;
+        match outcome {
+            Err(_) => return Err(refresh_deadline_exhausted(operation)),
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                if !error.retryable_before_progress() || attempts >= policy.max_attempts().get() {
+                    return Err(error);
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining <= policy.retry_backoff() {
+                    return Err(refresh_deadline_exhausted(operation));
+                }
+                tokio::time::sleep(policy.retry_backoff()).await;
+                if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+                    return Err(refresh_dispatch_fenced(operation));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -2297,109 +2400,6 @@ mod tests {
                 2,
                 "retried within the policy"
             );
-        }
-    }
-}
-
-impl IcebergRestVendedS3LeaseRefresher {
-    fn project_refresh(
-        &self,
-        delegation: crate::rest_protocol::deferred::RestDelegation,
-    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
-        let refreshed = match parse_rest_delegation(delegation)? {
-            IcebergAccessDelegation::Vended(seed) => seed,
-            IcebergAccessDelegation::Static => {
-                return Err(invalid(
-                    "vended REST credential refresh returned static access delegation",
-                ));
-            }
-        };
-        if !self.scope.matches_seed(&refreshed) {
-            return Err(invalid(
-                "vended REST credential refresh changed prefix scope or endpoint",
-            ));
-        }
-        let (entries, _) = refreshed
-            .into_vended_s3_credential_lease_contribution()?
-            .into_parts();
-        VendedS3CredentialLeaseRefresh::try_new(entries)
-    }
-}
-
-impl IcebergRestLoadTableVendedS3LeaseRefresher {
-    fn project_refresh(
-        &self,
-        (observed_uuid, delegation): (
-            Option<String>,
-            crate::rest_protocol::deferred::RestDelegation,
-        ),
-    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
-        let observed_uuid = observed_uuid
-            .as_deref()
-            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
-            .ok_or_else(|| invalid("vended REST load-table refresh returned no table UUID"))?;
-        if observed_uuid != self.expected_table_uuid {
-            return Err(invalid(
-                "vended REST load-table refresh returned a different table UUID",
-            ));
-        }
-        let refreshed = match parse_rest_delegation(delegation)? {
-            IcebergAccessDelegation::Vended(seed) => seed,
-            IcebergAccessDelegation::Static => {
-                return Err(invalid(
-                    "vended REST load-table refresh returned static access delegation",
-                ));
-            }
-        };
-        if !self.scope.matches_seed(&refreshed) {
-            return Err(invalid(
-                "vended REST load-table refresh changed prefix scope or acquisition path",
-            ));
-        }
-        let (entries, _) = refreshed
-            .into_vended_s3_credential_lease_contribution()?
-            .into_parts();
-        VendedS3CredentialLeaseRefresh::try_new(entries)
-    }
-}
-
-pub(crate) async fn run_vended_renewal_with_policy_async<T, F, Fut>(
-    policy: VendedS3CredentialRefreshCallPolicy,
-    operation: &'static str,
-    call: F,
-) -> Result<T, ConnectorError>
-where
-    F: Fn() -> Fut + Send,
-    Fut: std::future::Future<Output = Result<T, ConnectorError>> + Send,
-{
-    let deadline = tokio::time::Instant::now() + policy.remaining();
-    let mut attempts = 0_u8;
-    loop {
-        if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
-            return Err(refresh_dispatch_fenced(operation));
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(refresh_deadline_exhausted(operation));
-        }
-        attempts = attempts.saturating_add(1);
-        let outcome = tokio::time::timeout(remaining, call()).await;
-        match outcome {
-            Err(_) => return Err(refresh_deadline_exhausted(operation)),
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(error)) => {
-                if !error.retryable_before_progress() || attempts >= policy.max_attempts().get() {
-                    return Err(error);
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining <= policy.retry_backoff() {
-                    return Err(refresh_deadline_exhausted(operation));
-                }
-                tokio::time::sleep(policy.retry_backoff()).await;
-                if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
-                    return Err(refresh_dispatch_fenced(operation));
-                }
-            }
         }
     }
 }

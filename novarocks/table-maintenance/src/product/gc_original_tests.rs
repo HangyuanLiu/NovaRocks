@@ -183,30 +183,32 @@ async fn owned_ref_cleanup_requires_original_observation_and_never_falls_back_to
         )
         .await
         .unwrap_err();
-    let received = effects.received.lock().unwrap();
-    let received = received
-        .as_ref()
-        .expect("same full original error receiver");
-    let cause = received.original_failure().unwrap();
-    assert_eq!(received.kind(), GcOwnedRefObservationErrorKind::Store);
-    assert!(
-        cause
-            .downcast_ref::<StateStoreOriginalUnsupported>()
-            .is_some()
-    );
-    assert_eq!(terminal.failure_cause.as_ref(), Some(cause));
-    assert_eq!(terminal.selected_failure_fact(), Some(cause.failure_fact()));
-    assert_eq!(effects.observed.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        effects.selected.load(Ordering::SeqCst),
-        0,
-        "no maturity means no selection authority"
-    );
-    assert_eq!(
-        effects.executed.load(Ordering::SeqCst),
-        0,
-        "no original proof means no deletion"
-    );
+    {
+        let received = effects.received.lock().unwrap();
+        let received = received
+            .as_ref()
+            .expect("same full original error receiver");
+        let cause = received.original_failure().unwrap();
+        assert_eq!(received.kind(), GcOwnedRefObservationErrorKind::Store);
+        assert!(
+            cause
+                .downcast_ref::<StateStoreOriginalUnsupported>()
+                .is_some()
+        );
+        assert_eq!(terminal.failure_cause.as_ref(), Some(cause));
+        assert_eq!(terminal.selected_failure_fact(), Some(cause.failure_fact()));
+        assert_eq!(effects.observed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            effects.selected.load(Ordering::SeqCst),
+            0,
+            "no maturity means no selection authority"
+        );
+        assert_eq!(
+            effects.executed.load(Ordering::SeqCst),
+            0,
+            "no original proof means no deletion"
+        );
+    }
     let observation = GcOwnedRefObservation::try_new(
         Uuid::from_u128(71),
         "original-ref".into(),

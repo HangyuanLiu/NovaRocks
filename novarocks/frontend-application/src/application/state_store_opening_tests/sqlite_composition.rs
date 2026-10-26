@@ -90,7 +90,7 @@ async fn open_sqlite(
 }
 
 fn original_control() -> (WorkloadControl, JointProgressDriver) {
-    let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
+    let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: 4,
         business_limit: 4,
         scope_records_limit: 4,

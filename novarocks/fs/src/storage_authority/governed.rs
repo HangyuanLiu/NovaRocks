@@ -126,11 +126,11 @@ impl GovernedRefresh {
                 return Poll::Ready(Err(poisoned()));
             }
         }
-        if let Some(request) = body._request.take() {
-            if let Err(cause) = catch_unwind(AssertUnwindSafe(|| drop(request))) {
-                body.drop_failure = Some(cause);
-                return Poll::Ready(Err(poisoned()));
-            }
+        if let Some(request) = body._request.take()
+            && let Err(cause) = catch_unwind(AssertUnwindSafe(|| drop(request)))
+        {
+            body.drop_failure = Some(cause);
+            return Poll::Ready(Err(poisoned()));
         }
         let Some(shared) = body.shared.upgrade() else {
             return Poll::Ready(Err(poisoned()));
@@ -139,13 +139,13 @@ impl GovernedRefresh {
         // Keep the original header registered until every callback returned.
         // A wake panic leaves output/cause/context reachable from the authority.
         shared.apply_outcome_in(body.generation, &outcome, true);
-        if let Some(sender) = body.sender.as_ref() {
-            if let Err(cause) = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(sender) = body.sender.as_ref()
+            && let Err(cause) = catch_unwind(AssertUnwindSafe(|| {
                 let _ = sender.send(Some(Arc::clone(&outcome)));
-            })) {
-                body.drop_failure = Some(cause);
-                return Poll::Ready(Err(poisoned()));
-            }
+            }))
+        {
+            body.drop_failure = Some(cause);
+            return Poll::Ready(Err(poisoned()));
         }
         body.published = true;
         Poll::Ready(Ok(()))
@@ -190,17 +190,17 @@ impl ConnectorIoProgressSource for InflightRefresh {
                 .as_ref()
                 .is_some_and(|body| body.poll_failure.is_some() || body.drop_failure.is_some())
         });
-        failed.then(|| self as Arc<dyn std::error::Error + Send + Sync>)
+        failed.then_some(self as Arc<dyn std::error::Error + Send + Sync>)
     }
     fn poll_original_progress(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
         let Some(source) = self.asynchronous.as_ref() else {
             return Poll::Ready(Ok(()));
         };
         let result = source.poll(cx);
-        if matches!(result, Poll::Ready(Ok(()))) {
-            if let Some(shared) = source.shared.upgrade() {
-                shared.reap_governed_refresh();
-            }
+        if matches!(result, Poll::Ready(Ok(())))
+            && let Some(shared) = source.shared.upgrade()
+        {
+            shared.reap_governed_refresh();
         }
         result
     }

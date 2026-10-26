@@ -253,7 +253,6 @@ impl JointLedger {
             "collected control slot has no pending reply"
         );
         let from = Arc::clone(&record.facts);
-        let amount = record.amounts;
         let to = Arc::clone(
             self.control_empty_facts[class_index(record.facts.class)]
                 .as_ref()
@@ -276,10 +275,6 @@ impl JointLedger {
 
 #[cfg(test)]
 impl JointLedger {
-    pub(crate) fn config_for_test(&self) -> ResponsibilityConfig {
-        *self.config
-    }
-
     pub(crate) fn control_snapshot_for_test(&self) -> (usize, usize, JointResources, usize) {
         let mut amount = JointResources::ZERO;
         let mut records = 0;
@@ -324,7 +319,6 @@ impl JointLedger {
         assert_eq!(record.owner, ClaimOwner::ControlSlot(slot));
         assert!(record.facts.dependencies.is_empty());
         let from = Arc::clone(&record.facts);
-        let amount = record.amounts;
         let registry = self.dependencies.as_mut().unwrap();
         let dependency = registry
             .lookup(&SharedDependency::LocalHost)

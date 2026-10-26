@@ -96,7 +96,6 @@ pub(super) struct PendingChange {
     selected: Vec<DependencyRef>,
     lane: JointLane,
     amounts: JointResources,
-    additional: usize,
     first_bind: bool,
 }
 
@@ -226,7 +225,7 @@ impl JointAdmissionHandle {
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             node.class
         };
-        let mut proposal = JointProposal {
+        let proposal = JointProposal {
             root_domain: None,
             root_stage: None,
             computation_window: None,
@@ -363,7 +362,6 @@ impl JointProposal {
             selected,
             lane,
             amounts,
-            additional: 0,
             first_bind,
         });
         Ok(())

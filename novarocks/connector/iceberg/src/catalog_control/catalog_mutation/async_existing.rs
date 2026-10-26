@@ -327,13 +327,12 @@ async fn drop_table(
                         else {
                             unreachable!("drop preparation retains its original catalog table")
                         };
-                        let captured = crate::catalog::CatalogDropTableReceipt {
+                        crate::catalog::CatalogDropTableReceipt {
                             table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
                             table_location: Some(Arc::from(loaded.metadata().location())),
                             metadata_location: loaded.metadata_location().map(Arc::from),
                             last_updated_ms: loaded.metadata().last_updated_ms(),
-                        };
-                        captured
+                        }
                     }
                     Err(_) => crate::catalog::CatalogDropTableReceipt {
                         table_uuid: None,
@@ -440,14 +439,14 @@ async fn drop_table(
                 .as_ref()
                 .and_then(|scope| original.journal.applied_drop_witness(entry, scope))
         });
-        if *data_disposition == ConnectorDropTableDataDisposition::Purge {
-            if let Some(cleanup) = witness.as_ref().and_then(|witness| {
+        if *data_disposition == ConnectorDropTableDataDisposition::Purge
+            && let Some(cleanup) = witness.as_ref().and_then(|witness| {
                 crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::from_journal_drop(
                     canonical, &captured, witness,
                 )
-            }) {
-                provider.runtime().drop_cleanup().enqueue(cleanup);
-            }
+            })
+        {
+            provider.runtime().drop_cleanup().enqueue(cleanup);
         }
     }
     Ok(outcome)

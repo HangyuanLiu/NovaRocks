@@ -298,6 +298,56 @@ impl ConnectorVendedS3CredentialLeaseRefresher for ExecutionNodeCredentialsEndpo
     }
 }
 
+impl ExecutionNodeCredentialsEndpointRefresher {
+    fn project_refresh(
+        &self,
+        observed_uuid: Option<String>,
+        delegation: crate::rest_protocol::deferred::RestDelegation,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        // D11b: only the table identity is read from the response, and only to
+        // compare it; no metadata reaches any plan, cache or table state here.
+        if let ExecutionNodeAcquisitionPath::LoadTableDelegation {
+            expected_table_uuid,
+            ..
+        } = &self.path
+        {
+            let observed = observed_uuid
+                .as_deref()
+                .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok());
+            if observed != Some(*expected_table_uuid) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::PermissionDenied,
+                    "load-table credential acquisition answered for a different table",
+                ));
+            }
+        }
+        if !delegation.is_present() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::PermissionDenied,
+                "credential acquisition returned static access delegation",
+            ));
+        }
+        // No prefix-scope equality check here, unlike the coordinator's
+        // refresher. That check exists to keep one admitted attempt's authority
+        // from being widened mid-flight; this node holds one authority per
+        // scope and `IcebergAuthorityMaterialSource` already refuses a response
+        // that does not cover the exact scope it owns (CAD-1 D7).
+        let seed = match parse_rest_delegation(delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::PermissionDenied,
+                    "credential acquisition returned static access delegation",
+                ));
+            }
+        };
+        let (entries, _) = seed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The execution node's acquisition along a frozen routing context
@@ -579,55 +629,5 @@ mod tests {
         )
         .expect_err("a query string is not a route");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    }
-}
-
-impl ExecutionNodeCredentialsEndpointRefresher {
-    fn project_refresh(
-        &self,
-        observed_uuid: Option<String>,
-        delegation: crate::rest_protocol::deferred::RestDelegation,
-    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
-        // D11b: only the table identity is read from the response, and only to
-        // compare it; no metadata reaches any plan, cache or table state here.
-        if let ExecutionNodeAcquisitionPath::LoadTableDelegation {
-            expected_table_uuid,
-            ..
-        } = &self.path
-        {
-            let observed = observed_uuid
-                .as_deref()
-                .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok());
-            if observed != Some(*expected_table_uuid) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::PermissionDenied,
-                    "load-table credential acquisition answered for a different table",
-                ));
-            }
-        }
-        if !delegation.is_present() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::PermissionDenied,
-                "credential acquisition returned static access delegation",
-            ));
-        }
-        // No prefix-scope equality check here, unlike the coordinator's
-        // refresher. That check exists to keep one admitted attempt's authority
-        // from being widened mid-flight; this node holds one authority per
-        // scope and `IcebergAuthorityMaterialSource` already refuses a response
-        // that does not cover the exact scope it owns (CAD-1 D7).
-        let seed = match parse_rest_delegation(delegation)? {
-            IcebergAccessDelegation::Vended(seed) => seed,
-            IcebergAccessDelegation::Static => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::PermissionDenied,
-                    "credential acquisition returned static access delegation",
-                ));
-            }
-        };
-        let (entries, _) = seed
-            .into_vended_s3_credential_lease_contribution()?
-            .into_parts();
-        VendedS3CredentialLeaseRefresh::try_new(entries)
     }
 }

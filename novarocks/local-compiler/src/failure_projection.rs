@@ -24,11 +24,11 @@ use std::{error::Error, num::NonZeroU16};
 
 #[repr(u16)]
 enum Reason {
-    InvalidFragment = 2,
-    InvalidExpression = 12,
-    InvalidChannels = 20,
-    InvalidRepeat = 21,
-    InvalidUnpivot = 22,
+    Fragment = 2,
+    Expression = 12,
+    Channels = 20,
+    Repeat = 21,
+    Unpivot = 22,
 }
 fn fact(class: FailureClass, reason: Reason) -> FailureFact {
     FailureFact::new(
@@ -50,7 +50,7 @@ impl FailureProjection for FragmentCompileError {
                 FailureClass::Unsupported,
                 novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_FRAGMENT,
             ),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidFragment),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Fragment),
         }
     }
 }
@@ -96,7 +96,7 @@ impl FailureProjection for crate::expressions::ExpressionLoweringError {
                 FailureClass::Unsupported,
                 novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_CALL,
             ),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidExpression),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Expression),
         }
     }
 }
@@ -108,7 +108,7 @@ impl FailureProjection for crate::channels::ChannelLoweringError {
             Self::Repeat(source) => source.failure_fact(),
             Self::Unpivot(source) => source.failure_fact(),
             Self::Join(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidChannels),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Channels),
         }
     }
 }
@@ -118,7 +118,7 @@ impl FailureProjection for crate::repeat::RepeatLoweringError {
             Self::Control(source) => source.failure_fact(),
             Self::ValueType(source) => source.failure_fact(),
             Self::Layout(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidRepeat),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Repeat),
         }
     }
 }
@@ -129,7 +129,7 @@ impl FailureProjection for crate::unpivot::UnpivotLoweringError {
             Self::ValueType(source) => source.failure_fact(),
             Self::Layout(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidUnpivot),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Unpivot),
         }
     }
 }

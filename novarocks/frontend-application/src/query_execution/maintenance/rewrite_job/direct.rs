@@ -99,7 +99,7 @@ pub(crate) fn prepare(
     })?;
     let origin = capacity
         .try_window_alias()
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     if !origin.is_for_scope(capacity.root_scope()) || origin.class() != ResultWindowClass::Internal
     {
         return Err(TerminalError::pre_dispatch_failed(
@@ -111,19 +111,19 @@ pub(crate) fn prepare(
     let lease = kernel
         .connector_control()
         .acquire_current_distributed_rewrite(&identity.instance_id)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let mut dependencies = lease
         .planning_initial_dependencies()
-        .map_err(|error| TerminalError::from_original_cause(error))?;
+        .map_err(TerminalError::from_original_cause)?;
     let write = kernel
         .typed_connector_control()
         .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
-        .map_err(|error| TerminalError::from_original_cause(error))?;
+        .map_err(TerminalError::from_original_cause)?;
     dependencies.extend(
         write
             .session()
             .rewrite_begin_initial_dependencies()
-            .map_err(|error| TerminalError::from_original_cause(error))?,
+            .map_err(TerminalError::from_original_cause)?,
     );
     // Borrow the existing Product; this neither creates nor submits a job.
     let product = kernel

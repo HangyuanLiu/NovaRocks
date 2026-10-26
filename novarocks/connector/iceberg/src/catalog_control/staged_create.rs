@@ -3182,6 +3182,35 @@ fn prepared_document_field_bindings(
         .collect()
 }
 
+/// Pure first-party Source backing of the actual staged-create and cleanup
+/// factories. This creates no runtime, lease, catalog, request or dummy Future.
+pub fn staged_create_async_source_bytes() -> Result<u64, ConnectorError> {
+    let frames = [
+        borrowed_future_layout(prepare_entry),
+        borrowed_future_layout(publish_entry),
+        borrowed_future_layout(abort_entry),
+        borrowed_future_layout(adjudicate_publication_entry),
+        owned_future_layout3(settle_cleanup_entry),
+    ]
+    .into_iter()
+    .try_fold(0usize, |bytes, layout| {
+        bytes
+            .checked_add(layout.size())
+            .ok_or_else(|| internal("staged-create future quote overflow"))
+    })?;
+    let bytes = crate::commit::operation::IcebergCommitOperation::fixed_backing_bytes()
+        .map_err(|error| internal(error.to_string()))?
+        .checked_add(crate::commit::attempt::observation::PublicationJournal::<
+            ConnectorStagedCreateReceipt,
+        >::fixed_backing_bytes())
+        .and_then(|bytes| bytes.checked_add(frames))
+        .ok_or_else(|| internal("staged-create fixed source quote overflow"))?;
+    let bytes = bytes
+        .checked_add(super::unanchored_ctas_cleanup::async_source_backing_bytes()?)
+        .ok_or_else(|| internal("CTAS combined source quote overflow"))?;
+    u64::try_from(bytes).map_err(|_| internal("CTAS source quote exceeds u64"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4414,33 +4443,4 @@ mod tests {
                 .is_empty()
         );
     }
-}
-
-/// Pure first-party Source backing of the actual staged-create and cleanup
-/// factories. This creates no runtime, lease, catalog, request or dummy Future.
-pub fn staged_create_async_source_bytes() -> Result<u64, ConnectorError> {
-    let frames = [
-        borrowed_future_layout(prepare_entry),
-        borrowed_future_layout(publish_entry),
-        borrowed_future_layout(abort_entry),
-        borrowed_future_layout(adjudicate_publication_entry),
-        owned_future_layout3(settle_cleanup_entry),
-    ]
-    .into_iter()
-    .try_fold(0usize, |bytes, layout| {
-        bytes
-            .checked_add(layout.size())
-            .ok_or_else(|| internal("staged-create future quote overflow"))
-    })?;
-    let bytes = crate::commit::operation::IcebergCommitOperation::fixed_backing_bytes()
-        .map_err(|error| internal(error.to_string()))?
-        .checked_add(crate::commit::attempt::observation::PublicationJournal::<
-            ConnectorStagedCreateReceipt,
-        >::fixed_backing_bytes())
-        .and_then(|bytes| bytes.checked_add(frames))
-        .ok_or_else(|| internal("staged-create fixed source quote overflow"))?;
-    let bytes = bytes
-        .checked_add(super::unanchored_ctas_cleanup::async_source_backing_bytes()?)
-        .ok_or_else(|| internal("CTAS combined source quote overflow"))?;
-    u64::try_from(bytes).map_err(|_| internal("CTAS source quote exceeds u64"))
 }

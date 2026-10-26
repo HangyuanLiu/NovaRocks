@@ -45,10 +45,9 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorMetadataCleanupResponsibility, ConnectorRequestContext,
-    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
-    LakePublicationStatementTag, LakePublicationTarget,
+    ConnectorWriteAbortOutcome, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, LakePublicationDisposition, LakePublicationFamily,
+    LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
 };
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
@@ -1594,79 +1593,10 @@ fn health() -> StatementNativeHealthFailure {
     )
 }
 
-pub(crate) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-    provider_source_bytes: u64,
-) -> Result<u64, WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use std::alloc::Layout;
-    fn frame<A, F: Future>(_: fn(A) -> F) -> usize {
-        std::mem::size_of::<F>()
-    }
-    let mut bytes = usize::try_from(governed_ctas_fixed_source_bytes(provider_source_bytes)?)
-        .map_err(|_| WorkError::ArithmeticOverflow)?;
-    for layout in [
-        Layout::new::<CtasAction>(),
-        Layout::new::<CtasSource>(),
-        Layout::new::<CtasResidual>(),
-        arc_layout(Layout::new::<CtasExitUnproven>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<CatalogInput>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<CatalogInput>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<AdjudicationInput>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<Mutex<Option<Arc<ConnectorWriteSession>>>>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-    ] {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for value in [
-        frame(stage_original),
-        frame(publish_original),
-        frame(adjudicate_original),
-        frame(close_original),
-        super::statement_computation::heap_source_bytes()?,
-        usize::try_from(MetadataIoAdmission::fixed_backing_bytes(
-            geometry.max_concurrent_io().get(),
-            k,
-        )?)
-        .map_err(|_| WorkError::ArithmeticOverflow)?,
-    ] {
-        bytes = bytes
-            .checked_add(value)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for layout in ConnectorWriteSession::fixed_receiving_layouts()
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .into_iter()
-        .chain(
-            FrontendCompletionCustody::known_layouts()
-                .map_err(|_| WorkError::ArithmeticOverflow)?,
-        )
-        .chain(
-            WritePublicationCall::known_layouts()
-                .map_err(|_| WorkError::ArithmeticOverflow)?
-                .into_iter()
-                .skip(1),
-        )
-    {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for layout in WriteBeginReceiving::known_layouts().map_err(|_| WorkError::ArithmeticOverflow)? {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_spi::connector::ExternalMutationOutcome;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     #[test]
     fn original_provider_cause_reaches_actual_statement_terminal_projection() {

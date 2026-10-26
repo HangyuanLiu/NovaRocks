@@ -746,7 +746,7 @@ pub(super) fn begin_transaction_blocking(
         accounted_bytes: TRANSACTION_ENVELOPE_BYTES,
         limits,
         deadline,
-        cancelled: cancelled,
+        cancelled,
         range_frozen: false,
         interrupt_handle,
         snapshot_established: false,

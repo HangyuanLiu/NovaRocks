@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsColumns, StatisticsFailure,
-    StatisticsJob, StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobPhase,
-    StatisticsJobRepository, StatisticsJobState, StatisticsPublicationFact,
-    StatisticsPublicationOutcome, StatisticsTarget, StatisticsWorker,
+    StatisticsAttemptError, StatisticsColumns, StatisticsFailure, StatisticsJob,
+    StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobPhase, StatisticsJobRepository,
+    StatisticsJobState, StatisticsPublicationFact, StatisticsPublicationOutcome, StatisticsTarget,
+    StatisticsWorker,
 };
 use novarocks_workload_control::{
     ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,

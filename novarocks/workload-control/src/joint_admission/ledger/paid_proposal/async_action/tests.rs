@@ -24,11 +24,6 @@ use std::{
 };
 
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    fixture_with_positions(4)
-}
-fn fixture_with_positions(
-    positions: u64,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new(count, &[]);
     let config = ResponsibilityConfig {
@@ -271,7 +266,7 @@ fn eight_original_async_requests_keep_independent_grants_without_a_q_gate() {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let (control, _, mut driver) = fixture_with_positions(8);
+    let (control, _, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     bind(&scope, &[fact("catalog")], &mut driver);

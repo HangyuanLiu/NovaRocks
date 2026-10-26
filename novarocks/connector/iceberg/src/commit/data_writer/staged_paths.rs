@@ -47,12 +47,6 @@ impl StagedPathJournal {
         paths.pop();
         Ok(())
     }
-    pub(crate) fn inline_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Self>()
-    }
-    pub(crate) fn shared_value_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Mutex<Vec<String>>>()
-    }
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<String> {
         self.paths.lock().unwrap_or_else(|p| p.into_inner()).clone()

@@ -59,10 +59,6 @@ impl SqlLogicalExplainCatalog {
         self.catalog.needs()
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The logical terminal borrows its original pure compiler authors after asynchronous fact observation."
-    )]
     pub fn finish(
         self,
         facts: &[CatalogRelationFact],

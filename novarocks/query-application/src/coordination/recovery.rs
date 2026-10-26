@@ -40,11 +40,11 @@ pub enum RecoveryDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecoveryInput {
+pub struct RecoveryInput<'a> {
     pub mode: RecoveryMode,
     pub effect: ExecutionEffect,
     pub failure: AttemptFailureClass,
-    pub pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
+    pub pre_ready_replacement: Option<&'a crate::api::PreReadyProcessReplacementWitness>,
     pub output_visible: bool,
     pub attempts_started: u32,
     pub max_attempts: u32,
@@ -82,7 +82,7 @@ pub(crate) const fn recovery_window_refusal(input: RecoveryWindowInput) -> Optio
     None
 }
 
-pub const fn evaluate_recovery(input: RecoveryInput) -> RecoveryDecision {
+pub const fn evaluate_recovery(input: RecoveryInput<'_>) -> RecoveryDecision {
     let window = recovery_window_refusal(RecoveryWindowInput {
         mode: input.mode,
         effect: input.effect,
@@ -114,7 +114,7 @@ pub const fn evaluate_recovery(input: RecoveryInput) -> RecoveryDecision {
 mod tests {
     use super::*;
 
-    fn recoverable() -> RecoveryInput {
+    fn recoverable<'a>() -> RecoveryInput<'a> {
         RecoveryInput {
             mode: RecoveryMode::RestartAttemptBeforeVisibility,
             effect: ExecutionEffect::None,
@@ -190,7 +190,7 @@ mod tests {
         let (_, witness, failure) = crate::api::pre_ready_identity_refusal_test_fixture(context);
         let basis = RecoveryInput {
             failure: failure.class(),
-            pre_ready_replacement: Some(witness),
+            pre_ready_replacement: Some(&witness),
             ..recoverable()
         };
         assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);

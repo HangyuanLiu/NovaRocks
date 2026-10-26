@@ -30,7 +30,6 @@ use crate::query_execution::{
 };
 use novarocks_query_application::session_control::GovernedStatementAction;
 use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_workload_control::WorkError;
 
 struct DeleteFamily;
 
@@ -66,12 +65,6 @@ impl WriteStatementFamily for DeleteFamily {
     }
     fn finalize(prepared: &Self::Prepared) -> Result<(), String> {
         prepared.finalize()
-    }
-
-    fn prepared_source_layouts() -> Result<Vec<std::alloc::Layout>, WorkError> {
-        delete::prepared_delete_source_layouts()
-            .map(Vec::from)
-            .map_err(|_| WorkError::ArithmeticOverflow)
     }
 }
 
@@ -112,8 +105,8 @@ pub(crate) fn prepare(
         .map_err(|e| e.to_string())?;
     let profile = stack.session().io_profile().map_err(|e| e.to_string())?;
     drop(stack);
-    // The original fixed per-root Source invoice precedes this allocation.
-    // Only newly formed Provider backing belongs to the later initial grant.
+    // Use the existing Provider profile for this source metadata backing.
+    // Retained payload and Root admission keep their original owners.
     let source_bytes = profile.geometry().metadata_bytes().get();
     let io =
         MetadataIoAdmission::new(root.clone(), profile, source_bytes).map_err(|e| e.to_string())?;
@@ -179,11 +172,4 @@ pub(crate) fn prepare(
         #[cfg(novarocks_dev_controls)]
         observation: input.observation,
     }))
-}
-
-pub(crate) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
-    write_action::fixed_source_bytes::<DeleteFamily>(geometry, k)
 }

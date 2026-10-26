@@ -350,6 +350,7 @@ impl RewriteManifestsPreparer {
             request: Some(request),
         }
     }
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
             reusable: Mutex::new(None),

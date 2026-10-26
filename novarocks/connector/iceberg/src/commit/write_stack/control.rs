@@ -1173,12 +1173,11 @@ impl IcebergWriteSessionControl {
             "publication_settle_exit",
             phase_started,
         );
-        if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome {
-            if let Some(receiving) = needed_ready {
+        if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome
+            && let Some(receiving) = needed_ready {
                 receiving.publish(Arc::clone(needed))?;
                 if deferred_cleanup.is_some() { receiving.cleanup_permitted().await; }
             }
-        }
         if let Some((operation, journal)) = deferred_cleanup {
             self.complete_committed_cleanup(handle, &operation, &journal, context, &mut outcome)
                 .await;
@@ -1214,13 +1213,13 @@ impl IcebergWriteSessionControl {
                 *cleanup = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(ExternalMutationFinalization::Failed(ConnectorMutationFailure::from_connector(error)));
             }
         }
-        if let Some(entry) = journal.current_entry() {
-            if let Some(actual) = journal.observed_entry_cleanup(entry) {
-                if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup, .. }) = outcome {
+        if let Some(entry) = journal.current_entry()
+            && let Some(actual) = journal.observed_entry_cleanup(entry)
+        {
+            if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup, .. }) = outcome {
                     *cleanup = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(actual.clone());
                 }
-                handle.retain_cleanup(actual);
-            }
+            handle.retain_cleanup(actual);
         }
     }
 
@@ -2330,27 +2329,6 @@ impl IcebergWriteSessionControl {
         handle.frozen_old_references()
     }
 
-    /// Complete admission and freeze the write recipe.
-    ///
-    /// Everything external this method touches is a *read*: it loads the table,
-    /// resolves the target ref's head, and enumerates the base snapshot's data
-    /// files. It deliberately does not read a single delete artifact — that is
-    /// the whole point of the NCP-6 inversion — and it performs no external
-    /// mutation, so a failure here leaves nothing started.
-    async fn admit_async(
-        &self,
-        request: &ConnectorWriteBeginRequest,
-    ) -> Result<
-        (
-            IcebergCommitHandle,
-            Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
-            IcebergAdmissionStatisticsMetadata,
-        ),
-        ConnectorError,
-    > {
-        self.admit_async_with_rewrite_io(request, None).await
-    }
-
     async fn admit_async_with_rewrite_io(
         &self,
         request: &ConnectorWriteBeginRequest,
@@ -3031,18 +3009,6 @@ impl IcebergWriteSessionControl {
         })
         .await
         .map_err(unavailable)
-    }
-
-    /// Build writers from the attempt's one frozen selection, preserving cohort order.
-    async fn rewrite_branches_from_frozen_async(
-        &self,
-        table: &crate::iceberg::table::Table,
-        metadata: &TableMetadata,
-        content: &crate::distributed_rewrite::FrozenRewritePlanContent,
-        shape: ConnectorDistributedRewriteShape,
-    ) -> Result<Vec<IcebergFrozenRewriteBranch>, ConnectorError> {
-        self.rewrite_branches_from_frozen_with_io(table, metadata, content, shape, None)
-            .await
     }
 
     async fn rewrite_branches_from_frozen_with_io(
@@ -6017,9 +5983,8 @@ impl IcebergWriteSessionControl {
                 .await.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome)
             }
             outcome => {
-                if let (Some(receiving), Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. })) = (needed_ready, &outcome) {
-                    if receiving.observed().is_none() { receiving.publish(Arc::clone(needed))?; }
-                }
+                if let (Some(receiving), Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. })) = (needed_ready, &outcome)
+                    && receiving.observed().is_none() { receiving.publish(Arc::clone(needed))?; }
                 outcome
             }
         }

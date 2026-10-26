@@ -460,7 +460,7 @@ fn refused(response: NativeRootReadResponse, request: &RootResultRead) -> RootRe
         panic!("expected a domain refusal without an ACK receipt");
     };
     assert_binding(&RootReadResponse::Refused(refused.clone()), request);
-    refused
+    *refused
 }
 fn read_holders_busy() -> RootReadDeferral {
     let positions = NativeResultSupportGeometry::V1.root_live_send_holders;

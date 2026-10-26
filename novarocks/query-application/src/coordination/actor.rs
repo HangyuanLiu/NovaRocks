@@ -5079,7 +5079,7 @@ fn handle_command(
         } => {
             let activation = permit.identity();
             let (capability, lifetime, mailbox_liveness) = permit.into_parts();
-            if pre_ready_replacement.is_some_and(|witness| {
+            if pre_ready_replacement.as_ref().is_some_and(|witness| {
                 witness.context().query_execution_id() != activation.execution()
                     || !terminal_error
                         .as_ref()
@@ -5154,7 +5154,7 @@ fn handle_command(
                 &capability,
                 replacement_execution,
                 failure,
-                pre_ready_replacement,
+                pre_ready_replacement.as_ref(),
                 false,
             ) {
                 Ok(token) => token,
@@ -5685,10 +5685,6 @@ fn verify_running_activation(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the original attempt ledgers fence terminal publication without merging actor owners"
-)]
 fn apply_root_status_observation(
     state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,

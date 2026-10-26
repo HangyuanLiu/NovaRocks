@@ -3834,8 +3834,7 @@ mod plan_splits_pruning_tests {
                 let rejected = provider
                     .begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner)
                     .await
-                    .err()
-                    .expect("same owner receiver cannot be overwritten");
+                    .expect_err("same owner receiver cannot be overwritten");
                 assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
                 assert_eq!(
                     rejected.message(),
@@ -4415,8 +4414,7 @@ mod plan_splits_pruning_tests {
                     context: request.context.clone(),
                 })
                 .await
-                .err()
-                .expect("actual catalog failure");
+                .expect_err("actual catalog failure");
             let current = metadata
                 .capture_table_object_binding_async(request.clone())
                 .await
@@ -4457,7 +4455,6 @@ mod plan_splits_pruning_tests {
     fn stable_metadata_capture_keeps_original_owner_and_waits_for_cpu_footer() {
         use crate::catalog::catalog_request::CatalogPublicationRequest;
         use crate::catalog::error::CatalogOutcome;
-        use std::future::Future;
         use std::sync::atomic::Ordering;
         let (executor, _warehouse, metadata) = provider();
         executor.block_on(async {

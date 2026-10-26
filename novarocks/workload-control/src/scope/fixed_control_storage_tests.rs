@@ -1622,8 +1622,7 @@ fn shutdown_requires_exact_free_inventory_but_keeps_its_prepaid_profiles() {
     drain(&mut driver);
     let failure = control
         .shutdown()
-        .err()
-        .expect("retained backing is not drained");
+        .expect_err("retained backing is not drained");
     assert_eq!(failure.error(), WorkloadShutdownError::NotDrained);
     control = failure.into_parts().1;
     drop(view);

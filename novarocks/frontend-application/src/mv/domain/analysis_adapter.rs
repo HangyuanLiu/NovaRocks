@@ -1183,7 +1183,6 @@ mod captured_create_analysis_tests {
                 .len(),
             1
         );
-        use novarocks_sql::planning::catalog::PlannerTableProvider;
         assert!(
             captured
                 .provider()

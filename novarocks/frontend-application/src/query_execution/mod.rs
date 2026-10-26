@@ -66,7 +66,6 @@ pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;
-pub mod service;
 pub(crate) mod split_assignment;
 pub(crate) mod split_assignment_round;
 pub mod statistics;

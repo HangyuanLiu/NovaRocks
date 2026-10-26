@@ -34,8 +34,6 @@ pub(crate) use supervised_source::SupervisedSplitSource;
 pub(crate) use driver::{
     AssignmentTarget, ScanNodeKey, SplitAssignmentDriverError, SplitAssignmentStop,
 };
-#[cfg(test)]
-pub(crate) use round::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 pub(crate) use round::{
     RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
     RoundSplitEnumerationRequest, RoundSplitEnumerationResult, RoundSplitSource,

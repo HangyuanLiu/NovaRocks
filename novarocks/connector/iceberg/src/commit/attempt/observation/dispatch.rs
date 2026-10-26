@@ -671,6 +671,14 @@ impl<R> DispatchClaim<R> {
     }
 }
 
+impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    /// Actual Box pointee of the original observed preflight wrapper. The
+    /// inner producer's actual Box pointee is quoted by that producer.
+    pub(crate) fn prepared_preflight_future_bytes() -> usize {
+        crate::commit::attempt::RecoveryPreflightFuture::binding_future_bytes::<R>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1992,13 +2000,5 @@ mod tests {
                 );
             }
         }
-    }
-}
-
-impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
-    /// Actual Box pointee of the original observed preflight wrapper. The
-    /// inner producer's actual Box pointee is quoted by that producer.
-    pub(crate) fn prepared_preflight_future_bytes() -> usize {
-        crate::commit::attempt::RecoveryPreflightFuture::binding_future_bytes::<R>()
     }
 }

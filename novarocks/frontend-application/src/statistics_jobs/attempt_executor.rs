@@ -162,7 +162,7 @@ use crate::query_execution::{
     },
 };
 use novarocks_query_application::{
-    admitted_query_context::{QueryExecutionContext, QueryResultCapacityBinding},
+    admitted_query_context::QueryExecutionContext,
     api::{QueryExecutionClient, StatementNativeHealthFailure},
     cancellation::QueryCancellationView,
     session_control::{GovernedActionContext, GovernedBackgroundAction, GovernedStatementResidual},
@@ -1358,10 +1358,10 @@ pub(super) mod tests {
     use super::*;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId, ExternalMutationEffect, ProviderBindingEpoch,
-        StatisticsArtifactIdentity, StatisticsDataVersion, StatisticsEvidenceRevision,
-        StatisticsReceipt, StatisticsSessionFuture,
+        ConnectorError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+        ExternalMutationEffect, ProviderBindingEpoch, StatisticsArtifactIdentity,
+        StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsReceipt,
+        StatisticsSessionFuture,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 

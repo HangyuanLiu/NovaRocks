@@ -460,7 +460,7 @@ async fn full_source_stop_withdraws_without_capacity_and_wakes_only_restored_bor
 #[tokio::test(flavor = "current_thread")]
 async fn accepted_root_cancel_interrupts_once_but_keeps_original_until_actual_exit() {
     let (mut workers, executor) = worker();
-    let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
+    let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: 4,
         business_limit: 4,
         scope_records_limit: 4,
@@ -1364,7 +1364,7 @@ async fn read_request_uses_independent_transaction_time_but_absolute_context_nev
 #[tokio::test(flavor = "current_thread")]
 async fn root_read_requests_keep_independent_limits_and_cancel_waits_for_actual_footer() {
     let (mut workers, executor) = worker();
-    let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
+    let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: 4,
         business_limit: 4,
         scope_records_limit: 4,

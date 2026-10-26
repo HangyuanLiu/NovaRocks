@@ -253,7 +253,7 @@ async fn notification_panic_stays_in_original_failed_worker_after_its_join() {
             .unwrap()
             .workers
             .values()
-            .any(|worker| matches!(worker, ElasticWorkerState::Failed(_)))
+            .any(|worker| matches!(worker, ElasticWorkerState::Failed { .. }))
     );
     assert!(owner.shutdown_until(Instant::now()).await.is_err());
     drop(receipt);

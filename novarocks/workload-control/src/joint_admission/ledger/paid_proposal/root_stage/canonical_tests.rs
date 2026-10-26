@@ -36,7 +36,7 @@ fn canonical_setup() -> (
     RootDomainBinding,
     RetainedPayloadGrant,
 ) {
-    let (control, _, mut driver) = fixture_with_native_resources(4, false, true);
+    let (control, _, mut driver) = fixture();
     let work = root(&control);
     let domains = work.owner.scope().prepare_root_domains().unwrap();
     let source = domains
@@ -338,7 +338,7 @@ fn canonical_pending_root_does_not_authorize_new_inherited_birth_before_rollback
     drop((reply, child));
     drive(&mut driver);
     assert!(
-        control
+        !control
             .inner
             .state
             .lock()
@@ -347,8 +347,7 @@ fn canonical_pending_root_does_not_authorize_new_inherited_birth_before_rollback
             .as_ref()
             .unwrap()
             .requests
-            .get(&ticket)
-            .is_none()
+            .contains_key(&ticket)
     );
     let id = control_id(&control, &installed.as_ref().unwrap().scope());
     assert_eq!(

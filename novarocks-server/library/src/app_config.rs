@@ -785,7 +785,7 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 /// should be refused where it is written, not where it is first used.
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
     if config.cluster.role == ClusterRole::Fe {
-        let _report = crate::composition::validate_frontend_joint_startup(&config.runtime)?;
+        crate::composition::validate_frontend_joint_startup(&config.runtime)?;
     } else {
         crate::sdk_listing_profile::validate_current()?;
     }

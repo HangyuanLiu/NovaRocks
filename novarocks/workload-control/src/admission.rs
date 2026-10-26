@@ -133,10 +133,7 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) {
     // Reject before granting, using the original ordered map rather than a
     // detached allocation. No callback or row insertion can run under State.
     let mut after = 0;
-    loop {
-        let Some((&id, request)) = state.requests.range((Excluded(after), Unbounded)).next() else {
-            break;
-        };
+    while let Some((&id, request)) = state.requests.range((Excluded(after), Unbounded)).next() {
         after = id;
         if request.retired || matches!(request.state, AdmissionState::Rejected(_)) {
             continue;

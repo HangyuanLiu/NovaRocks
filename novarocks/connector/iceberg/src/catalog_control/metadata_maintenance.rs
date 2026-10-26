@@ -883,10 +883,10 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
             .map_err(|_| internal("Maintenance terminal set poisoned"))?
             .get(&request.plan.operation_id())
             .cloned();
-        if let Some(terminal) = &terminal {
-            if terminal.plan_digest != request.plan.plan_digest() {
-                return Err(invalid("Maintenance replay changes the fixed plan"));
-            }
+        if let Some(terminal) = &terminal
+            && terminal.plan_digest != request.plan.plan_digest()
+        {
+            return Err(invalid("Maintenance replay changes the fixed plan"));
         }
         let payload = if terminal.is_none() {
             Some(self.payload_for_plan(&request.plan)?)

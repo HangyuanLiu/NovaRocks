@@ -1111,38 +1111,6 @@ pub(crate) fn frozen_rewrite_scan_schema(
     }
 }
 
-/// Resolve one frozen rewrite group back to the delete artifacts it names, as
-/// the splits that re-encode them.
-///
-/// The group is the authority on which artifacts this procedure instance
-/// rewrites, and the commit replaces exactly that set. Nothing here reselects:
-/// the attempt-owned content is validated by identity, the named group is
-/// looked up inside it, and the only judgement made is whether the pinned
-/// snapshot still holds every artifact the group named. It if does not, the
-/// cohort's commit could no longer replace what this read would consume, so the
-/// read fails rather than producing a delete file for artifacts somebody else
-/// already replaced.
-pub(crate) fn plan_rewrite_position_delete_splits(
-    runtime: &IcebergMetadataContext,
-    table: &crate::iceberg::table::Table,
-    snapshot_id: i64,
-    content: &IcebergFrozenRewriteArtifactV1,
-    group_digest: &str,
-    context: &ConnectorRequestContext,
-) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
-    validate_context(context)?;
-    let group = content.group(group_digest)?;
-    validate_context(context)?;
-    // The table can advance after the TableExecute relation was frozen. Its
-    // later current snapshot must never become a substitute generation for the
-    // immutable rewrite artifact, so fail before split dispatch if that fence
-    // no longer holds.
-    validate_frozen_rewrite_table(content, table.metadata())?;
-    let live = live_delete_file_paths_at_with_control(runtime, table, snapshot_id, Some(context))?;
-    validate_context(context)?;
-    select_rewrite_position_delete_artifacts(group, &live, snapshot_id)
-}
-
 pub(crate) async fn plan_rewrite_position_delete_splits_async(
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
@@ -1228,25 +1196,6 @@ fn live_delete_file_paths(
         return Ok(BTreeSet::new());
     };
     live_delete_file_paths_of(runtime, table, snapshot, Some(context))
-}
-
-/// The delete files alive at one exact snapshot of a relation.
-fn live_delete_file_paths_at_with_control(
-    runtime: &IcebergMetadataContext,
-    table: &crate::iceberg::table::Table,
-    snapshot_id: i64,
-    context: Option<&ConnectorRequestContext>,
-) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
-    let snapshot = table
-        .metadata()
-        .snapshot_by_id(snapshot_id)
-        .cloned()
-        .ok_or_else(|| {
-            corrupt(format!(
-                "Iceberg relation no longer holds snapshot {snapshot_id}, which a rewrite was frozen at"
-            ))
-        })?;
-    live_delete_file_paths_of(runtime, table, snapshot, context)
 }
 
 fn live_delete_file_paths_of(

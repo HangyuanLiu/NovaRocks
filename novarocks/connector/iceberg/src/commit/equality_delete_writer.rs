@@ -42,6 +42,7 @@ use super::write_stack::equality_schema::EqualityDeleteFileTarget;
 
 use super::data_writer::StagedPathJournal;
 
+#[cfg(test)]
 pub(crate) async fn write_equality_delete_file(
     file_io: &FileIO,
     staging_dir: &str,

@@ -25,7 +25,6 @@ pub(crate) mod workload_progress;
 use workload_progress::{FrontendWorkloadDeadlineSupervisor, FrontendWorkloadProgressPolicy};
 
 use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
-use crate::query_execution::service::QueryExecutionService;
 use crate::task_protocol_config::CoordinationBudgets;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::QueryExecutionClient;
@@ -2251,14 +2250,6 @@ impl FrontendApplicationHost {
         self.state_store_host
             .as_ref()
             .map(StateStoreHost::provider_id)
-    }
-
-    /// Builds the stateless provider rewrite sealing author. Native execution
-    /// and process identity remain owned by the existing QA supervisor.
-    pub(crate) fn build_query_execution_service(
-        &self,
-    ) -> Result<QueryExecutionService, FrontendApplicationError> {
-        Ok(QueryExecutionService::new())
     }
 
     /// Cloneable submission handle for the process-owned CPU preparation pool.

@@ -123,7 +123,7 @@ impl RootResultFetchFailure {
     fn from_preparation_failure(failure: crate::api::NativeAttemptPreparationFailure) -> Self {
         Self {
             error: failure.error().clone(),
-            pre_ready_replacement: failure.pre_ready_replacement().copied(),
+            pre_ready_replacement: failure.pre_ready_replacement().cloned(),
         }
     }
     pub const fn pre_ready_replacement(
@@ -132,7 +132,7 @@ impl RootResultFetchFailure {
         self.pre_ready_replacement.as_ref()
     }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.pre_ready_replacement.map_or_else(
+        self.pre_ready_replacement.as_ref().map_or_else(
             || self.input().topology_requirement(),
             |witness| {
                 NativeAttemptTopologyRequirement::ExcludeProcess(
@@ -553,7 +553,7 @@ impl ResultPumpDecision {
                 permit,
                 class,
                 self.failure.error().clone(),
-                self.failure.pre_ready_replacement().copied(),
+                self.failure.pre_ready_replacement().cloned(),
                 replacement,
                 replacement_contexts,
             )
@@ -1072,6 +1072,7 @@ pub(super) async fn run_client_root_relay(
 /// follows the local End consumption proof and the root's terminal facts; it
 /// never waits for the Backend to acknowledge the final item.
 #[doc(hidden)]
+#[cfg(test)]
 pub(crate) async fn run_root_relay(
     permit: RunningAttemptPermit,
     root: TaskIdentity,

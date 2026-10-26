@@ -105,10 +105,6 @@ fn delete_where_sql(
     Ok(novarocks_parser::printer::print_expr(where_clause))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The action retains the exact statement and every admitted authority before this asynchronous phase begins."
-)]
 pub(super) async fn prepare_delete_statement_async(
     state: &DmlExecutionKernel,
     stmt: &Delete,

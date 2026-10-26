@@ -34,11 +34,10 @@ use novarocks_spi::connector::{
     ConnectorCleanupAsyncOutput as Output, ConnectorCleanupAsyncStart,
     ConnectorCleanupAsyncStep as Step, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest,
-    ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
-    ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection, ConnectorCleanupPrepareRequest,
-    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorError,
-    ConnectorOriginalResultScope, ConnectorRequestContext, LakePublicationDisposition,
-    ProviderMetadataCpuPort, SharedDependency,
+    ConnectorCleanupMaintenanceLease, ConnectorCleanupOperationId,
+    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPrepareRequest,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorOriginalResultScope,
+    ConnectorRequestContext, LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
 };
 use novarocks_state_store_api::StateStoreExecutionContext;
 use novarocks_table_maintenance::gc_observation::{

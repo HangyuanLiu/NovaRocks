@@ -23,17 +23,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-fn fixture_with_productions(
-    changes: usize,
-    production: bool,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    fixture_with_native_resources(changes, production, false)
-}
-fn fixture_with_native_resources(
-    changes: usize,
-    production: bool,
-    native: bool,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new(count, &[]);
     let config = ResponsibilityConfig {
@@ -144,21 +134,7 @@ fn setup(
     WorkOwner,
     Option<RetainedPayloadGrant>,
 ) {
-    setup_with_production(unbound_stage, 4, false)
-}
-pub(in crate::joint_admission::ledger::paid_proposal) fn setup_with_production(
-    unbound_stage: bool,
-    changes: usize,
-    production: bool,
-) -> (
-    WorkloadControl,
-    JointAdmissionHandle,
-    JointProgressDriver,
-    crate::RootWork,
-    WorkOwner,
-    Option<RetainedPayloadGrant>,
-) {
-    let (control, handle, mut driver) = fixture_with_productions(changes, production);
+    let (control, handle, mut driver) = fixture();
     let work = root(&control);
     // Exercise the existing empty-base child only while its parent is empty.
     // Neither branch starts a stage or makes an I/O/execution claim.
@@ -168,7 +144,7 @@ pub(in crate::joint_admission::ledger::paid_proposal) fn setup_with_production(
         None
     };
     let a = fact("a");
-    bind(&work.owner.scope(), &[a.clone()], &mut driver);
+    bind(&work.owner.scope(), std::slice::from_ref(&a), &mut driver);
     let mut raw = Some(claim(
         &handle,
         &work.owner,
@@ -485,7 +461,7 @@ fn stale_capture_stage_cancel_and_driver_close_cannot_publish_a_new_stage() {
 
 #[test]
 fn root_stage_original_batch_also_installs_its_roots_unknown_production_domains() {
-    let (control, _, mut driver, work, stage, payload) = setup_with_production(false, 5, true);
+    let (control, _, mut driver, work, stage, payload) = setup(false);
     let payload = payload.unwrap();
     let scope = work.owner.scope();
     let origin: Arc<dyn Send + Sync> = Arc::new(());
@@ -625,7 +601,7 @@ fn typed_rows(control: &WorkloadControl) -> Vec<(u64, JointResources, u64, usize
 #[test]
 fn internal_manifest_binding_reuses_all_four_originals_and_productions_without_new_claims() {
     for received in [false, true] {
-        let (control, _, mut driver, work, stage, payload) = setup_with_production(false, 5, true);
+        let (control, _, mut driver, work, stage, payload) = setup(false);
         let payload = payload.unwrap();
         let scope = work.owner.scope();
         let origin: Arc<dyn Send + Sync> = Arc::new(());

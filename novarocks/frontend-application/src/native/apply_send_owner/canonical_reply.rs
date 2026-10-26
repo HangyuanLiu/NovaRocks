@@ -460,11 +460,11 @@ impl ApplySlot {
         let mut row = self.native_row()?;
         let original = row.original.as_mut().unwrap();
         let native = &mut original.native;
-        if let Some(accepted) = native.accepted.take() {
-            if let Err(accepted) = accepted.transfer_in(&mut native.physical, &mut native.claims) {
-                native.accepted = Some(accepted);
-                return Err(WorkError::Conflict);
-            }
+        if let Some(accepted) = native.accepted.take()
+            && let Err(accepted) = accepted.transfer_in(&mut native.physical, &mut native.claims)
+        {
+            native.accepted = Some(accepted);
+            return Err(WorkError::Conflict);
         }
         let claims = native.claims.as_mut().ok_or(WorkError::Released)?;
         if native.reply_source.is_none() && native.reply.is_none() {

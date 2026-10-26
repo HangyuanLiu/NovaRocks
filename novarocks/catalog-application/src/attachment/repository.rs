@@ -1937,13 +1937,7 @@ fn receiving_error(error: crate::CatalogApplicationError) -> CatalogAttachmentEr
 
 #[cfg(test)]
 impl CatalogAttachmentRepository {
-    pub(crate) fn original_read_fixture() -> (
-        Arc<dyn StateStore>,
-        Arc<dyn novarocks_state_store_api::StateStoreExecutionPort>,
-        StateStoreExecutionContext,
-        Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-        Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    ) {
+    pub(crate) fn original_read_fixture() -> original_tests::OriginalReadFixture {
         original_tests::read_fixture()
     }
 }

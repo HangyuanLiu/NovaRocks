@@ -565,20 +565,20 @@ impl Drop for LogicalExecutionRuntimeReservation {
         } else {
             None
         };
-        if let Some(RegistryEntry::Reserved(entry)) = &removed {
-            if let Some(source) = &entry.original_exit {
-                source.unreserve_silent(OriginalAssociation {
-                    registry: self.registry.inner.id,
-                    initial: self.initial_execution,
-                    generation: self.generation,
-                });
-            }
+        if let Some(RegistryEntry::Reserved(entry)) = &removed
+            && let Some(source) = &entry.original_exit
+        {
+            source.unreserve_silent(OriginalAssociation {
+                registry: self.registry.inner.id,
+                initial: self.initial_execution,
+                generation: self.generation,
+            });
         }
         drop(state);
-        if let Some(RegistryEntry::Reserved(entry)) = &removed {
-            if let Some(source) = &entry.original_exit {
-                source.notify();
-            }
+        if let Some(RegistryEntry::Reserved(entry)) = &removed
+            && let Some(source) = &entry.original_exit
+        {
+            source.notify();
         }
         drop(removed);
         self.registry.inner.progress.notify_one();
@@ -942,10 +942,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 .as_ref()
                 .map_or_else(std::sync::Weak::new, Arc::downgrade),
         );
-        if reserved.is_some() {
-            if let Some(source) = &entry.original_exit {
-                source.native_reserved_silent();
-            }
+        if reserved.is_some()
+            && let Some(source) = &entry.original_exit
+        {
+            source.native_reserved_silent();
         }
         drop(state);
         reserved.ok_or(LogicalExecutionRuntimeRegistryError::InvalidContextSet)

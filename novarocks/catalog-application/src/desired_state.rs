@@ -799,13 +799,6 @@ impl CatalogDesiredStateSource {
     /// wanted.  Only a read issued *after* the local evidence was observed can
     /// separate the two, which is why this exists as its own operation instead
     /// of being answered from the snapshot.
-    pub(crate) async fn locate(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<Option<CatalogDesiredStateEntry>, CatalogApplicationError> {
-        self.locate_with_execution(instance_id, None).await
-    }
-
     pub(crate) async fn locate_with_execution(
         &self,
         instance_id: &ConnectorInstanceId,

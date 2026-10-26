@@ -327,16 +327,15 @@ impl State {
         deadline: Option<Instant>,
     ) -> Result<SlotId, WorkError> {
         let slot = self.cancellations.take_root(class, id, deadline)?;
-        if let Some(claim) = self.cancellations.slots[slot.0].claim {
-            if let Err(error) = self
+        if let Some(claim) = self.cancellations.slots[slot.0].claim
+            && let Err(error) = self
                 .joint
                 .as_mut()
                 .unwrap()
                 .activate_control_slot(slot, claim, class)
-            {
-                self.cancellations.retire(slot);
-                return Err(error);
-            }
+        {
+            self.cancellations.retire(slot);
+            return Err(error);
         }
         Ok(slot)
     }
@@ -364,16 +363,15 @@ impl State {
             }
         }
         let slot = self.cancellations.take_child(parent, class, id, deadline)?;
-        if let Some(claim) = self.cancellations.slots[slot.0].claim {
-            if let Err(error) = self
+        if let Some(claim) = self.cancellations.slots[slot.0].claim
+            && let Err(error) = self
                 .joint
                 .as_mut()
                 .unwrap()
                 .activate_control_slot(slot, claim, class)
-            {
-                self.cancellations.retire(slot);
-                return Err(error);
-            }
+        {
+            self.cancellations.retire(slot);
+            return Err(error);
         }
         Ok(slot)
     }

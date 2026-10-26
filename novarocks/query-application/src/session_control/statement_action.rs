@@ -153,21 +153,23 @@ impl StatementActionReady {
             return Err("protocol destination is occupied");
         }
         let ready = source.as_ref().ok_or("statement receiver is empty")?;
-        if let Ok(StatementActionValue::Local(result)) = &ready.result {
-            if !result.is_for_scope(ready.owner.scope()) {
-                return Err("Local result belongs to another statement");
-            }
+        if let Ok(StatementActionValue::Local(result)) = &ready.result
+            && !result.is_for_scope(ready.owner.scope())
+        {
+            return Err("Local result belongs to another statement");
         }
-        if let Ok(StatementActionValue::Rows(execution)) = &ready.result {
-            if !execution.has_rows_output() {
-                return Err("ordinary Read has no original row output");
-            }
+        if let Ok(StatementActionValue::Rows(execution)) = &ready.result
+            && !execution.has_rows_output()
+        {
+            return Err("ordinary Read has no original row output");
         }
         let ready = source.take().expect("checked original receiver");
         *target = Some(match ready.result {
-            Ok(StatementActionValue::Rows(execution)) => QuerySessionOutput::StreamingQuery(
-                StreamingStatementResult::from_verified_execution(execution, ready.owner),
-            ),
+            Ok(StatementActionValue::Rows(execution)) => {
+                QuerySessionOutput::StreamingQuery(Box::new(
+                    StreamingStatementResult::from_verified_execution(execution, ready.owner),
+                ))
+            }
             Ok(StatementActionValue::Local(result)) => QuerySessionOutput::GovernedQuery(
                 GovernedImmediateStatementResult::from_verified_owned_local(result, ready.owner),
             ),
@@ -886,10 +888,10 @@ impl StatementActionSource {
         if !self.can_retire() {
             return;
         }
-        if let Some(root) = self.wake.root.upgrade() {
-            if let Some(control) = root.control() {
-                let _ = control.port.retire_statement_action_source(self);
-            }
+        if let Some(root) = self.wake.root.upgrade()
+            && let Some(control) = root.control()
+        {
+            let _ = control.port.retire_statement_action_source(self);
         }
     }
     fn finish_abandoned(self: &Arc<Self>) {

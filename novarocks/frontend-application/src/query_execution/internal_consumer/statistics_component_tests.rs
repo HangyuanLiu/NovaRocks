@@ -896,7 +896,7 @@ async fn original_statistics_scoped_cpu_case(panic: bool) {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
-    let (mut typed, (mut control, stage, capacity)) = typed_statistics_custody(&mut owner);
+    let (mut typed, (control, stage, capacity)) = typed_statistics_custody(&mut owner);
     let scope = stage.scope();
     let binding = QueryResultCapacityBinding::from_internal_payload(
         &typed.root.owner.scope(),

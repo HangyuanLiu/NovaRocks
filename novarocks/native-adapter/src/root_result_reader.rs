@@ -36,12 +36,12 @@ use novarocks_worker::root_result_channel::{
     ContextRootRoute, RootChannelError, RootDeliveryOwner, RootMetadataReservation,
 };
 
-/// Closed-route responses are inline facts, not newly admitted context reads.
+/// Closed-route responses carry domain facts without admitting a new context read.
 pub enum NativeRootReadResponse {
     Owned(NativeRootResultReply),
     AwaitTerminalControl { accepted_consumed: u64 },
     Deferred(RootReadDeferred),
-    Refused(RootReadRefusal),
+    Refused(Box<RootReadRefusal>),
 }
 
 /// Full copy credit follows the send owner; logical encoded length cannot
@@ -374,7 +374,9 @@ impl NativeRootResultReader {
 fn refusal(request: &RootResultRead, cause: RootChannelError) -> NativeRootReadResponse {
     let fact = cause.failure_fact();
     let detail = SafeDetail::truncating("root read was refused by its owning channel");
-    NativeRootReadResponse::Refused(RootReadRefusal::for_request(request, fact, detail))
+    NativeRootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
+        request, fact, detail,
+    )))
 }
 fn deferred(request: &RootResultRead, reason: RootReadDeferral) -> NativeRootReadResponse {
     NativeRootReadResponse::Deferred(RootReadDeferred::for_request(request, reason))

@@ -346,10 +346,8 @@ impl OriginalLogicalExit {
             PollCompletion::Ready(_) => true,
             PollCompletion::Panicked(original) => original.value().cleanup().is_none(),
         };
-        if actual_frame_exit {
-            if let Some(source) = &self.background {
-                source.finish_background_after_bank_exit();
-            }
+        if actual_frame_exit && let Some(source) = &self.background {
+            source.finish_background_after_bank_exit();
         }
     }
     pub(super) fn receive_role_silent(&self, packet: &mut Option<RoleResult>) {
@@ -569,9 +567,11 @@ impl LogicalExecutionExitView<'_> {
 }
 /// Borrow-only access to this source's original dormant failure fields.
 /// Holding this view prevents Native-body mutation, never grants actual exit.
+#[cfg(test)]
 pub(crate) struct LogicalDormantFailureView<'a> {
     body: tokio::sync::MutexGuard<'a, OriginalNativePreparation>,
 }
+#[cfg(test)]
 impl LogicalDormantFailureView<'_> {
     pub(crate) fn activation_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.body.dormant.activation_panic()
@@ -599,6 +599,7 @@ impl LogicalExecutionExitObserver {
     ) -> Option<Arc<crate::session_control::StatementActionFailure>> {
         self.source.as_ref()?.background.as_ref()?.failure()
     }
+    #[cfg(test)]
     pub(crate) fn dormant_failure(&self) -> Option<LogicalDormantFailureView<'_>> {
         let body = self.source.as_ref()?.native.try_lock().ok()?;
         if !body.dormant.has_failure() {

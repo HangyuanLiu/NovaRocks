@@ -3453,7 +3453,6 @@ mod tests {
         attempt_runtime_failure, failed_context_allows_successor,
         wait_for_failed_context_isolation,
     };
-    use crate::query_execution::artifact::ManifestBoundNativeAttemptInputs;
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_execution_contract::BackendProcessDescriptor;
     use novarocks_query_application::api::{

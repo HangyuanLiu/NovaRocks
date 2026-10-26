@@ -127,11 +127,8 @@ impl std::fmt::Debug for NativeAsyncActionAuthority {
     }
 }
 impl NativeAsyncActionAuthority {
-    /// Read the installed original Native source support. Encoding coexistence
-    /// is a fact from the actual Native builder, not a delegated capacity.
-    /// The production profile keeps FG/Settlement payload support equal to
-    /// this source's encoding backing plus its next owned increment.
-
+    /// Capture one action on this original Native source. The quote describes
+    /// its actual owned backing and next increment; it does not grant capacity.
     pub fn action_source(
         &self,
         lane: JointLane,

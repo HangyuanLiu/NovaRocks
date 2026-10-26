@@ -62,7 +62,6 @@ impl std::error::Error for SnapshotRawFailure {
 }
 impl novarocks_failure_contract::FailureProjection for SnapshotRawFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         self.kind.failure_fact()
     }
 }

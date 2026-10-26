@@ -99,7 +99,6 @@ fn prepare(
         };
         authenticate_parent(&state, fence, proposal.scope.id)?;
         let facts = Arc::clone(&parent.active_facts);
-        let class = class_index(node.class);
         for _ in 0..count {
             let slot = state
                 .cancellations

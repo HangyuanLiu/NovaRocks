@@ -33,7 +33,6 @@ use crate::query_execution::{
 };
 use novarocks_query_application::session_control::GovernedStatementAction;
 use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_workload_control::WorkError;
 
 struct InsertFamily;
 
@@ -113,12 +112,6 @@ impl WriteStatementFamily for InsertFamily {
     fn finalize(prepared: &Self::Prepared) -> Result<(), String> {
         prepared.finalize()
     }
-
-    fn prepared_source_layouts() -> Result<Vec<std::alloc::Layout>, WorkError> {
-        iceberg_writer::prepared_source_layouts()
-            .map(Vec::from)
-            .map_err(|_| WorkError::ArithmeticOverflow)
-    }
 }
 
 struct PreparationInput {
@@ -166,8 +159,8 @@ pub(crate) fn prepare(
         .map_err(|e| e.to_string())?;
     let profile = stack.session().io_profile().map_err(|e| e.to_string())?;
     drop(stack);
-    // The original fixed per-root Source invoice precedes this allocation.
-    // Only newly formed Provider backing belongs to the later initial grant.
+    // Use the existing Provider profile for this source metadata backing.
+    // Retained payload and Root admission keep their original owners.
     let source_bytes = profile.geometry().metadata_bytes().get();
     let io =
         MetadataIoAdmission::new(root.clone(), profile, source_bytes).map_err(|e| e.to_string())?;
@@ -232,40 +225,4 @@ pub(crate) fn prepare(
         #[cfg(novarocks_dev_controls)]
         observation: input.observation,
     }))
-}
-
-pub(crate) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
-    write_action::fixed_source_bytes::<InsertFamily>(geometry, k)
-}
-
-#[cfg(test)]
-mod fixed_source_tests {
-    use super::*;
-    #[test]
-    fn original_fixed_source_invoice_is_independent_of_later_provider_payment() {
-        use novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry as G;
-        use std::num::{NonZeroU64, NonZeroUsize};
-        let a = G::new(
-            NonZeroUsize::new(8).unwrap(),
-            NonZeroU64::new(1).unwrap(),
-            NonZeroU64::new(1).unwrap(),
-        );
-        let b = G::new(
-            NonZeroUsize::new(8).unwrap(),
-            NonZeroU64::new(1 << 20).unwrap(),
-            NonZeroU64::new(8 << 20).unwrap(),
-        );
-        assert_eq!(
-            fixed_source_bytes(&a, 3).unwrap(),
-            fixed_source_bytes(&b, 3).unwrap()
-        );
-        assert!(
-            fixed_source_bytes(&a, 3).unwrap()
-                > MetadataIoAdmission::fixed_backing_bytes(8, 3).unwrap()
-        );
-        assert!(fixed_source_bytes(&a, 4).unwrap() > fixed_source_bytes(&a, 3).unwrap());
-    }
 }

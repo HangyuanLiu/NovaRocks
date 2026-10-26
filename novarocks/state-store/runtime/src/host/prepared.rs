@@ -222,21 +222,20 @@ impl PreparedStateStoreHost {
                 "prepared state store opening is not ready for handoff",
             ));
         }
-        if self.instance.is_none() {
-            if let Err(failure) = self
+        if self.instance.is_none()
+            && let Err(failure) = self
                 .original
                 .as_mut()
                 .expect("original source remains installed")
                 .take_instance_in(&mut self.instance)
-            {
-                self.first_failure = Some(failure.clone());
-                return Err(StateStoreHostError::from_original_failure(
-                    StateStoreHostErrorKind::Open,
-                    self.provider_id(),
-                    "original instance handoff failed",
-                    failure,
-                ));
-            }
+        {
+            self.first_failure = Some(failure.clone());
+            return Err(StateStoreHostError::from_original_failure(
+                StateStoreHostErrorKind::Open,
+                self.provider_id(),
+                "original instance handoff failed",
+                failure,
+            ));
         }
         if let Err(failure) = validate_original_instance(
             self.descriptor,

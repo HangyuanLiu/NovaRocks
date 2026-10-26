@@ -57,10 +57,6 @@ pub(super) fn resolve_target(
     Ok((target, "main".to_string()))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The action passes its admitted statement, target, generation, execution and receiving authority unchanged."
-)]
 pub(super) async fn prepare_equality_delete_statement_async(
     state: &DmlExecutionKernel,
     stmt: &AddEqualityDelete,

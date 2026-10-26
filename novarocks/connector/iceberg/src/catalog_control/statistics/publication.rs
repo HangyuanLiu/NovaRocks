@@ -29,7 +29,6 @@ use crate::commit::model::{
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::recovery::FrozenPublicationFacts;
 use crate::commit::staging::{PreparedChange, Preparer, StagedView};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub(super) fn preparation_error(error: ConnectorError) -> crate::iceberg::Error {
@@ -459,6 +458,7 @@ mod tests {
         SortOrder, Summary, TableMetadata, TableMetadataBuilder,
     };
     use crate::resources::IcebergCatalogRuntime;
+    use async_trait::async_trait;
     use novarocks_spi::connector::ConnectorMutationFailureKind;
     use novarocks_spi::connector::{
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,

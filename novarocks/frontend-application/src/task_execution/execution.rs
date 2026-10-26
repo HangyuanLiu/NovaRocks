@@ -33,12 +33,12 @@ use crate::task_execution::completion_facts::{AttemptDrainFacts, parent_released
 use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
 use crate::task_execution::operation::OperationDispatchResult;
 use crate::task_execution::status_validation::GoneObservation;
-use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use crate::task_protocol_config::DispatchBudget;
 use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution::task_execution::{
-    AbortCause, AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind,
-    QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
-    TaskStatusCursor, TerminationDetail,
+    AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, QueryContextRef,
+    TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor,
+    TerminationDetail,
 };
 use novarocks_execution::task_execution::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QuiesceQueryContextReceipt,

@@ -136,8 +136,15 @@ pub enum NativeAttemptTopologyRequirement {
 /// IdentityMismatch for this operation and a different process at its frozen
 /// endpoint within the ORIGINAL observation horizon. This value does not claim
 /// that the wire identified a particular IdentityField, grant retry, or prove exit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreReadyProcessReplacementWitness {
+    // Rare, immutable diagnostic facts share one allocation across the original
+    // failure carriers. This holds no permit, source, or resource authority.
+    facts: Arc<PreReadyProcessReplacementFacts>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PreReadyProcessReplacementFacts {
     context: novarocks_execution_contract::QueryContextRef,
     operation_id: novarocks_execution_contract::TaskOperationId,
     replacement: BackendProcessId,
@@ -156,10 +163,12 @@ impl PreReadyProcessReplacementWitness {
             return Err("pre-ready replacement evidence does not match its original refusal");
         }
         Ok(Self {
-            context,
-            operation_id,
-            replacement,
-            refusal_fact: input.fact(),
+            facts: Arc::new(PreReadyProcessReplacementFacts {
+                context,
+                operation_id,
+                replacement,
+                refusal_fact: input.fact(),
+            }),
         })
     }
     pub(crate) fn refusal_operation(
@@ -188,24 +197,24 @@ impl PreReadyProcessReplacementWitness {
             _ => None,
         }
     }
-    pub const fn context(&self) -> novarocks_execution_contract::QueryContextRef {
-        self.context
+    pub fn context(&self) -> novarocks_execution_contract::QueryContextRef {
+        self.facts.context
     }
-    pub const fn operation_id(&self) -> novarocks_execution_contract::TaskOperationId {
-        self.operation_id
+    pub fn operation_id(&self) -> novarocks_execution_contract::TaskOperationId {
+        self.facts.operation_id
     }
-    pub const fn replacement_process(&self) -> BackendProcessId {
-        self.replacement
+    pub fn replacement_process(&self) -> BackendProcessId {
+        self.facts.replacement
     }
     pub(crate) fn matches_input(
         &self,
         input: &crate::execution_error::ExecutionFailureInput,
     ) -> bool {
-        input.fact() == self.refusal_fact
+        input.fact() == self.facts.refusal_fact
             && input.site()
                 == (crate::execution_error::ExecutionFailureSite::Operation {
-                    context: self.context,
-                    operation_id: self.operation_id,
+                    context: self.facts.context,
+                    operation_id: self.facts.operation_id,
                     kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
                 })
     }
@@ -246,11 +255,11 @@ impl NativeAttemptPreparationFailure {
         self.pre_ready_replacement.as_ref()
     }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.pre_ready_replacement.map_or_else(
+        self.pre_ready_replacement.as_ref().map_or_else(
             || self.input().topology_requirement(),
             |witness| {
                 NativeAttemptTopologyRequirement::ExcludeProcess(
-                    witness.context.backend_process_id(),
+                    witness.context().backend_process_id(),
                 )
             },
         )
@@ -1429,6 +1438,11 @@ impl fmt::Debug for NativeDormantCustody {
             .finish()
     }
 }
+pub(crate) type DormantActivationParts<'a> = (
+    &'a mut (dyn DormantNativeAttemptOwner + 'static),
+    &'a mut Option<Box<dyn std::any::Any + Send>>,
+);
+
 impl NativeDormantCustody {
     pub(crate) fn as_mut(&mut self) -> &mut dyn DormantNativeAttemptOwner {
         self.owner
@@ -1437,12 +1451,7 @@ impl NativeDormantCustody {
             .as_mut()
     }
     /// Pure split borrow of this original owner and its empty receiving slot.
-    pub(crate) fn activation_parts(
-        &mut self,
-    ) -> Option<(
-        &mut (dyn DormantNativeAttemptOwner + 'static),
-        &mut Option<Box<dyn std::any::Any + Send>>,
-    )> {
+    pub(crate) fn activation_parts(&mut self) -> Option<DormantActivationParts<'_>> {
         if self.retiring || self.has_failure() || self.convergence_completed {
             return None;
         }
@@ -2642,7 +2651,9 @@ pub(crate) fn pre_ready_identity_refusal_test_fixture(
     )
     .unwrap();
     let mut failure = NativeAttemptPreparationFailure::from_input(input.clone());
-    failure.attach_pre_ready_replacement(witness).unwrap();
+    failure
+        .attach_pre_ready_replacement(witness.clone())
+        .unwrap();
     (input, witness, failure)
 }
 

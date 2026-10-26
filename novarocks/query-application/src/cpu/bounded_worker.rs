@@ -602,10 +602,10 @@ impl<R> BoundedWorkerOwner<R> {
             .unwrap_or_else(|error| error.into_inner());
         let mut panicked_workers = 0;
         for worker in workers.iter_mut() {
-            if let Some(join) = worker.join.take() {
-                if let Err(original) = join.join() {
-                    worker.failure = Some(super::QueryBlockingWorkerFailure::new(original));
-                }
+            if let Some(join) = worker.join.take()
+                && let Err(original) = join.join()
+            {
+                worker.failure = Some(super::QueryBlockingWorkerFailure::new(original));
             }
             panicked_workers += usize::from(worker.failure.is_some());
         }
@@ -664,6 +664,7 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
     /// Attempts bounded queue admission without waiting for a queue position.
     /// A full or closed executor returns the same unexecuted move-only job.
     /// This is only the physical queue seam; it grants no workload capacity.
+    #[cfg(test)]
     pub(crate) fn try_submit(
         &self,
         job: BoundedWorkerJob<R>,
@@ -1055,16 +1056,16 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
                 None,
             );
         }
-        if let Some(exit) = exit {
-            if let Some(original) = exit.publish(1, None) {
-                retire_failed_worker_after_running(
-                    &shared,
-                    None,
-                    Some(&exit),
-                    BoundedWorkerError::panicked(original),
-                    None,
-                );
-            }
+        if let Some(exit) = exit
+            && let Some(original) = exit.publish(1, None)
+        {
+            retire_failed_worker_after_running(
+                &shared,
+                None,
+                Some(&exit),
+                BoundedWorkerError::panicked(original),
+                None,
+            );
         }
     }
 }

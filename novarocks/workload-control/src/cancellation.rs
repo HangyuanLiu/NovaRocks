@@ -307,11 +307,11 @@ impl Cancellation {
             if decision == CancellationRequestOutcome::Requested {
                 node.changed.notify_waiters();
             }
-            if let Some(effective) = effective {
-                if let Some(child) = node.next_child_after(None) {
-                    current = Some((child, effective));
-                    continue;
-                }
+            if let Some(effective) = effective
+                && let Some(child) = node.next_child_after(None)
+            {
+                current = Some((child, effective));
+                continue;
             }
             // A sealed node prunes its entire subtree. Stop only when the
             // original root itself is exhausted, after its remaining siblings

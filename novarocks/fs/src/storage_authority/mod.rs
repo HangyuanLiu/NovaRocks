@@ -1033,10 +1033,9 @@ impl AuthorityShared {
                 .inflight
                 .as_ref()
                 .is_some_and(|inflight| inflight.generation == generation)
+                && !keep_inflight
             {
-                if !keep_inflight {
-                    state.inflight = None;
-                }
+                state.inflight = None;
             }
             return;
         }

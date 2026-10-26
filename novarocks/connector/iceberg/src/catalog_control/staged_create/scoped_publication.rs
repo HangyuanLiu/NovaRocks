@@ -304,31 +304,30 @@ impl PublicationOriginal {
             drop(child);
             // The first positive frontier deliberately did not run safe GC.
             // This is the SAME operation and journal's exact retained set.
-            if observation.applied_receipt().is_some()
+            if (observation.applied_receipt().is_some()
                 || matches!(
                     observation.raw_outcome(),
                     Some(Ok(ConnectorStagedCreatePublishOutcome::NoOp { .. }))
-                )
-            {
-                if matches!(
+                ))
+                && matches!(
                     journal.catalog_entry_outcome(
                         journal.current_entry().expect("final publication entry")
                     ),
                     ExternalMutationOutcome::KnownCommitted { .. }
-                ) {
-                    let result = journal
-                        .settle_committed_cleanup_in(&operation, &current)
-                        .await;
-                    let source = cleanup_receiving
-                        .upgrade()
-                        .expect("same original cleanup receiver");
-                    let mut slot = source
-                        .cleanup_result
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    assert!(slot.is_none(), "one original staged cleanup call result");
-                    *slot = Some(result);
-                }
+                )
+            {
+                let result = journal
+                    .settle_committed_cleanup_in(&operation, &current)
+                    .await;
+                let source = cleanup_receiving
+                    .upgrade()
+                    .expect("same original cleanup receiver");
+                let mut slot = source
+                    .cleanup_result
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                assert!(slot.is_none(), "one original staged cleanup call result");
+                *slot = Some(result);
             }
         })));
         body.started = true;
@@ -457,7 +456,7 @@ impl PublicationOriginal {
         }
         // Keep the original allocation in its slot if its destructor unwinds.
         body.original.as_mut().unwrap().actual_drop();
-        drop(body.original.take());
+        body.original = None;
         self.finish_original(body);
         body.closed = true;
         self.observation.record_provider_exit();
@@ -482,15 +481,15 @@ impl Drop for PublicationOriginal {
         // An unpolled publication has not created a physical Future. Return
         // its original prepared target rather than abandoning that inventory.
         let body = self.body.get_mut().unwrap_or_else(|p| p.into_inner());
-        if let Some(body) = body {
-            if !body.started && !body.closed {
-                if let Some(prepared) = body.prepared.take() {
-                    self.adapter.record_terminal(
-                        self.request.handle.operation_id(),
-                        OperationState::Prepared(prepared),
-                    );
-                }
-            }
+        if let Some(body) = body
+            && !body.started
+            && !body.closed
+            && let Some(prepared) = body.prepared.take()
+        {
+            self.adapter.record_terminal(
+                self.request.handle.operation_id(),
+                OperationState::Prepared(prepared),
+            );
         }
     }
 }

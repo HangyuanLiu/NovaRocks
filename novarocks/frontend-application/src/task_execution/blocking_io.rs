@@ -33,7 +33,7 @@ use tokio::runtime::Handle;
 mod child_admission;
 mod stable_job;
 pub(crate) use child_admission::ConnectorBlockingIoAdmission;
-pub(crate) use stable_job::{ConnectorBlockingIoActionQuote, ConnectorOperationJob};
+pub(crate) use stable_job::ConnectorOperationJob;
 
 /// Why a submitted blocking call produced no Connector outcome.
 #[derive(Clone, Debug)]
@@ -86,8 +86,7 @@ impl ConnectorBlockingIoError {
     /// Alias the existing opaque carrier, without moving or formatting its raw
     /// panic payload and without allocating a second payload wrapper.
     pub(crate) fn health_cause(&self) -> Arc<dyn std::error::Error + Send + Sync> {
-        let cause = Arc::clone(&self.original);
-        cause
+        Arc::clone(&self.original) as Arc<dyn std::error::Error + Send + Sync>
     }
 }
 

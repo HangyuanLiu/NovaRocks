@@ -338,23 +338,6 @@ impl CatalogApplicationService {
         self.source()?.sql_mutation_authority()
     }
 
-    fn block_on<T>(
-        &self,
-        future: impl Future<Output = Result<T, CatalogAttachmentError>>,
-    ) -> Result<T, CatalogApplicationError> {
-        let result = match Handle::try_current() {
-            Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => {
-                return Err(CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Unavailable,
-                    "catalog attachment StateStore access is unavailable on a current-thread Tokio runtime",
-                ));
-            }
-            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
-            Err(_) => self.runtime.block_on(future),
-        };
-        result.map_err(repository_error)
-    }
-
     fn block_on_catalog<T>(
         &self,
         future: impl Future<Output = Result<T, CatalogApplicationError>>,
@@ -1392,11 +1375,12 @@ impl CatalogApplicationService {
         receipt: Option<&crate::CatalogMutationReceipt>,
     ) -> Result<(), CatalogApplicationError> {
         let repository = self.sql_mutation_authority()?;
-        let Some(existing) = (match execution {
+        let Some(existing) = match execution {
             Some(execution) => repository.get_in(&command.instance_id, execution).await,
             None => repository.get(&command.instance_id).await,
         }
-        .map_err(repository_error)?) else {
+        .map_err(repository_error)?
+        else {
             return if command.if_exists {
                 Ok(())
             } else {

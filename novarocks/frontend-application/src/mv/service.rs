@@ -30,7 +30,6 @@ use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenan
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
 };
-use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::{
     activity::{MvActivityAdmissionError, MvActivityLease, MvActivityOwner},
     maintenance::{
@@ -83,7 +82,6 @@ impl FrontendMvProductAdapter {
     )]
     pub(crate) fn with_refresh_dependencies(
         readiness: Arc<MvReadinessPort>,
-        query_execution: QueryExecutionService,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         provider_activation: Arc<
             dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation,
@@ -100,7 +98,6 @@ impl FrontendMvProductAdapter {
     ) -> Self {
         Self {
             refresh: refresh::FrontendMvRefreshDependencies {
-                query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
                 #[cfg(novarocks_dev_controls)]

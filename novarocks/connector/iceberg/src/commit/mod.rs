@@ -66,7 +66,6 @@ mod write_preparation;
 mod write_shared;
 pub mod write_stack;
 
-pub(crate) use equality_delete_writer::write_equality_delete_file;
 pub use mv_provenance::{
     MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MvPublicationProvenanceV2,
     ProvenanceBase, RefreshTechnique,

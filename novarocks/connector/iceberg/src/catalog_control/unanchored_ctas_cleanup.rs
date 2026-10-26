@@ -1084,6 +1084,22 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unsupported, message.into())
 }
 
+pub(crate) fn async_source_backing_bytes() -> Result<usize, ConnectorError> {
+    let layouts = [
+        cleanup_future_layout(discover_unanchored_ctas_entry),
+        cleanup_future_layout(inspect_then_delete_unanchored_ctas_entry),
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            AtomicBool,
+        >())
+        .map_err(|error| invalid(error.to_string()))?,
+    ];
+    layouts.into_iter().try_fold(0usize, |bytes, layout| {
+        bytes
+            .checked_add(layout.size())
+            .ok_or_else(|| invalid("CTAS cleanup source quote overflow"))
+    })
+}
+
 #[cfg(test)]
 mod listing_tests {
     use super::*;
@@ -1304,20 +1320,4 @@ mod listing_tests {
         assert!(!started.load(Ordering::Acquire));
         assert!(operator.exists("root/keep").await.unwrap());
     }
-}
-
-pub(crate) fn async_source_backing_bytes() -> Result<usize, ConnectorError> {
-    let layouts = [
-        cleanup_future_layout(discover_unanchored_ctas_entry),
-        cleanup_future_layout(inspect_then_delete_unanchored_ctas_entry),
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            AtomicBool,
-        >())
-        .map_err(|error| invalid(error.to_string()))?,
-    ];
-    layouts.into_iter().try_fold(0usize, |bytes, layout| {
-        bytes
-            .checked_add(layout.size())
-            .ok_or_else(|| invalid("CTAS cleanup source quote overflow"))
-    })
 }

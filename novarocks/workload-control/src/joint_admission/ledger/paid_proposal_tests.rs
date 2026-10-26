@@ -339,7 +339,6 @@ fn paid_selected_origin_deduplicates_before_owned_output_and_preserves_full_unio
             JointResources::ZERO,
         )
         .unwrap();
-    let next = handle.inner.state.lock().unwrap().next_id;
     let c = url::Url::parse("https://new.example/not-yet-owned").unwrap();
     overflow
         .push_selected_network(SelectedNetworkOrigin::from_selected_url(&c).unwrap())
@@ -586,7 +585,7 @@ fn rejected_push_after_complete_growth_does_not_mint_or_partially_bind_a_new_dom
             .joint
             .as_ref()
             .unwrap()
-            .control_has_domains_for_test(id, &[a.clone()])
+            .control_has_domains_for_test(id, std::slice::from_ref(&a))
     );
     drop(state);
     finish(work);

@@ -19,10 +19,8 @@
 
 use std::sync::{Arc, Mutex, Weak};
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorTableObjectId, ExternalMutationOutcome,
 };
 use novarocks_table_maintenance::job_service::{CapturedOptimizeTarget, OptimizeTargetCapturePort};
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
@@ -39,9 +37,7 @@ use novarocks_table_maintenance::{
     AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceEffectId, MaintenanceTarget, MaintenanceTargetRebind, OptimizeJob,
 };
-use novarocks_workload_control::{
-    QueryConcurrencyPermit, RootAdmissionHandle, WorkClass, WorkError, WorkOwner, WorkRequest,
-};
+use novarocks_workload_control::{RootAdmissionHandle, WorkClass, WorkError, WorkRequest};
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
 

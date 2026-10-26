@@ -25,7 +25,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::application;
 use super::model::StatisticsJobTarget;
@@ -1147,7 +1147,7 @@ mod admission_and_conclusion_tests {
     use std::future::Future;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
+    use std::time::Duration;
 
     use novarocks_statistics_application::{
         StatisticsAttemptError, StatisticsFailure, StatisticsJobConclusion, StatisticsJobState,

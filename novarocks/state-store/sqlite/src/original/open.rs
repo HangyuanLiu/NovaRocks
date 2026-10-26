@@ -70,10 +70,8 @@ impl OpenOriginal {
             });
             // Counts only avoid useless work. The same worker's try_unwrap is
             // the last-owner author, including races with external Weak upgrades.
-            if ready {
-                if let Err(failure) = self.core.queue_if_idle(Phase::Close) {
-                    self.core.fail(failure);
-                }
+            if ready && let Err(failure) = self.core.queue_if_idle(Phase::Close) {
+                self.core.fail(failure);
             }
             return;
         }

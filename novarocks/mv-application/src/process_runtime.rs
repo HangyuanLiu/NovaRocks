@@ -1379,9 +1379,10 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
+        type OriginalEventSlot = Mutex<Option<Box<super::OriginalEvent>>>;
         struct InspectHealth {
             expected: Arc<u64>,
-            event: Mutex<Option<std::sync::Weak<Mutex<Option<Box<super::OriginalEvent>>>>>>,
+            event: Mutex<Option<std::sync::Weak<OriginalEventSlot>>>,
             received: Mutex<Vec<(bool, bool)>>,
             changed: tokio::sync::Notify,
         }

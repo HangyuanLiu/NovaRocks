@@ -783,12 +783,6 @@ where
     pub(crate) fn notify_original_change(&self) {
         self.changed.notify_waiters();
     }
-    pub(crate) fn has_prepared_pending(&self) -> Result<bool, RuntimeError> {
-        Ok(self.lock()?.active.values().any(|job| {
-            job.state == MaintenanceJobState::Pending
-                && matches!(job.custody.admission, JobAdmissionRoute::Prepared(_))
-        }))
-    }
     pub(crate) async fn claim_prepared(
         &self,
         at_ms: i64,

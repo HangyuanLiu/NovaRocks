@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
 use crate::query_execution::mv_native_write::MvRefreshProviderActivation;
-use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::ports::{MvProviderFailure, MvProviderFailureKind};
 use novarocks_mv_application::product::MvProductError;
 use novarocks_mv_application::publication::{
@@ -33,7 +32,6 @@ use novarocks_spi::connector::{
 
 #[derive(Clone)]
 pub(super) struct FrontendMvRefreshDependencies {
-    pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
     #[cfg(novarocks_dev_controls)]

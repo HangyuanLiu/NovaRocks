@@ -169,7 +169,6 @@ impl std::fmt::Display for CloseCause {
 impl std::error::Error for CloseCause {}
 impl novarocks_execution_contract::failure::FailureProjection for CloseCause {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::FailureProjection;
         novarocks_spi::connector::ConnectorError::new(
             novarocks_spi::connector::ConnectorErrorKind::Unavailable,
             "fixture close fact",

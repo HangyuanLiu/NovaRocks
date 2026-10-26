@@ -3891,7 +3891,6 @@ mod tests {
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::mv::domain::test_admission::test_readiness(),
-            crate::query_execution::compiler::test_query_execution_service(),
         )
     }
 
@@ -5702,7 +5701,6 @@ mod tests {
                     ),
                     Arc::new(spi::UnavailableMvStorageObservationPort),
                     crate::mv::domain::test_admission::test_readiness(),
-                    crate::query_execution::compiler::test_query_execution_service(),
                 );
                 let execution = QueryExecutionContext::new(
                     novarocks_types::ClusterRole::Fe,

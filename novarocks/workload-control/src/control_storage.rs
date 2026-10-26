@@ -296,7 +296,6 @@ impl CancellationStorage {
             }
             return self.insert_legacy(cell, class, id, None);
         }
-        let class_index = free_class_index(class);
         let free = self
             .free_head
             .ok_or(WorkError::Capacity("fixed control slots"))?;
@@ -341,7 +340,6 @@ impl CancellationStorage {
             }
             return result;
         }
-        let class_index = free_class_index(class);
         let free = self
             .free_head
             .ok_or(WorkError::Capacity("fixed control slots"))?;
@@ -419,7 +417,6 @@ impl CancellationStorage {
         assert!(slot.parent.is_none());
         assert!(slot.next_free.is_none());
         slot.phase = SlotPhase::Free;
-        let class = free_class_index(slot.class);
         slot.next_free = self.free_head;
         self.free_head = Some(id);
     }
@@ -468,7 +465,6 @@ impl CancellationStorage {
         };
         slot.parent = None;
         slot.phase = SlotPhase::Free;
-        let class = free_class_index(slot.class);
         slot.next_free = self.free_head;
         self.free_head = Some(id);
         self.retired -= 1;
@@ -512,26 +508,9 @@ pub(crate) enum ReapPreparation {
     },
 }
 
-fn free_class_index(class: WorkClass) -> usize {
-    match class {
-        WorkClass::Query => 0,
-        WorkClass::MaterializedView => 1,
-        WorkClass::Statistics => 2,
-        WorkClass::TableMaintenance => 3,
-        WorkClass::Management => 4,
-    }
-}
-
 pub(crate) fn arc_bytes<T>() -> Result<usize, WorkError> {
     Layout::new::<[AtomicUsize; 2]>()
         .extend(Layout::new::<T>())
-        .map(|(layout, _)| layout.pad_to_align().size())
-        .map_err(|_| WorkError::ArithmeticOverflow)
-}
-
-pub(crate) fn arc_slice_bytes<T>(count: usize) -> Result<usize, WorkError> {
-    Layout::new::<[AtomicUsize; 2]>()
-        .extend(Layout::array::<T>(count).map_err(|_| WorkError::ArithmeticOverflow)?)
         .map(|(layout, _)| layout.pad_to_align().size())
         .map_err(|_| WorkError::ArithmeticOverflow)
 }
@@ -540,12 +519,6 @@ pub(crate) fn array_bytes<T>(count: usize) -> Result<usize, WorkError> {
     Layout::array::<T>(count)
         .map(|layout| layout.size())
         .map_err(|_| WorkError::ArithmeticOverflow)
-}
-
-pub(crate) fn sum_bytes(values: impl IntoIterator<Item = usize>) -> Result<usize, WorkError> {
-    values.into_iter().try_fold(0usize, |sum, n| {
-        sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)
-    })
 }
 
 /// Source-pinned Rust 1.98.1 BTree upper layout: eleven key/value slots,

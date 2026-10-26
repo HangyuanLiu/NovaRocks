@@ -153,10 +153,6 @@ impl FrontendQueryCompiler {
         .await
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The direct async author preserves the independently frozen original EXPLAIN inputs."
-    )]
     async fn complete_async_explain(
         &self,
         query: &Query,
@@ -238,10 +234,6 @@ impl FrontendQueryCompiler {
         Ok(PreparedAsyncExplain::Lines(lines))
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The closed Profile creator consumes the same independently frozen compiler inputs."
-    )]
     async fn complete_async_profile(
         &self,
         query: &Query,

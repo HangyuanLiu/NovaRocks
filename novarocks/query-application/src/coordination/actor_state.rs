@@ -623,7 +623,7 @@ impl LogicalExecutionState {
         failed: &AttemptCapability,
         replacement: QueryExecutionId,
         failure: AttemptFailureClass,
-        pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
+        pre_ready_replacement: Option<&crate::api::PreReadyProcessReplacementWitness>,
         deadline_reached: bool,
     ) -> Result<ReplacementToken, ActorStateError> {
         if self.conclusion.is_some() {
@@ -2091,7 +2091,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::ContractViolation,
-                Some(witness),
+                Some(&witness),
                 false
             ),
             Err(ActorStateError::NotCurrent)
@@ -2114,12 +2114,12 @@ mod tests {
             BackendProcessId::new_v7(),
         );
         let (_, witness, _) = crate::api::pre_ready_identity_refusal_test_fixture(current);
-        state
+        let _replacement = state
             .begin_replacement(
                 &initial,
                 execution(2),
                 AttemptFailureClass::ContractViolation,
-                Some(witness),
+                Some(&witness),
                 false,
             )
             .unwrap();

@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
     ConnectorOriginalResultScopeCheck, ConnectorRequestContext, OriginalResultCheckClass as Class,
     OriginalResultCheckError as Failure,
 };
-use novarocks_workload_control::WorkError;
 use std::{sync::Arc, time::Instant};
 
 struct OriginalRewriteCapture {

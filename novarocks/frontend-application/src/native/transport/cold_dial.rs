@@ -36,7 +36,15 @@ pub(in crate::native) enum NativeChannelSource {
 
 pub(in crate::native) struct SelectedNativeDial {
     reservation: NativeDialReservation,
-    connector: NativeEndpointConnector,
+    packet: Box<ColdDialPacket>,
+}
+
+/// One owned cold preparation, allocated once before the first network poll.
+/// Reservation only installs the original physical positions in this packet;
+/// the source, handoff and call move the same allocation without cloning it.
+struct ColdDialPacket {
+    dial: Option<FrontendDialReservation>,
+    connector: Option<NativeEndpointConnector>,
     endpoint: tonic::transport::Endpoint,
 }
 
@@ -55,9 +63,7 @@ pub(in crate::native) enum NativeDialAttempt {
 /// Physical/connector fields precede the original lane/cache custody, so an
 /// unused handoff drops original physical positions before releasing its lane.
 pub(in crate::native) struct ReservedNativeDial {
-    dial: Option<FrontendDialReservation>,
-    connector: Option<NativeEndpointConnector>,
-    endpoint: tonic::transport::Endpoint,
+    packet: Box<ColdDialPacket>,
     _lane: OwnedMutexGuard<()>,
     reservation: Option<NativeDialReservation>,
 }
@@ -104,8 +110,11 @@ impl Client {
         .timeout(Duration::from_secs(600));
         Ok(NativeChannelSource::Cold(SelectedNativeDial {
             reservation,
-            connector,
-            endpoint,
+            packet: Box::new(ColdDialPacket {
+                dial: None,
+                connector: Some(connector),
+                endpoint,
+            }),
         }))
     }
 }
@@ -138,7 +147,7 @@ impl NativeChannelSource {
                     unreachable!("the borrowed source variant cannot change");
                 };
                 *target = Some(NativeDialHandoff::Ready(acquired));
-                return Ok(NativeDialAttempt::Installed);
+                Ok(NativeDialAttempt::Installed)
             }
             Self::Cold(selected) => {
                 if let Some(acquired) = selected
@@ -189,13 +198,12 @@ impl NativeChannelSource {
                     drop(source.take());
                     return Ok(NativeDialAttempt::Installed);
                 }
-                let Some(Self::Cold(selected)) = source.take() else {
+                let Some(Self::Cold(mut selected)) = source.take() else {
                     unreachable!("the borrowed source variant cannot change");
                 };
+                selected.packet.dial = Some(dial);
                 *target = Some(NativeDialHandoff::Reserved(ReservedNativeDial {
-                    dial: Some(dial),
-                    connector: Some(selected.connector),
-                    endpoint: selected.endpoint,
+                    packet: selected.packet,
                     _lane: lane_position,
                     reservation: Some(selected.reservation),
                 }));
@@ -236,14 +244,21 @@ impl ReservedNativeDial {
         let lane = reservation.lane();
         let admission = reservation.data_runtime().transport_admission().clone();
         let connector = self
+            .packet
             .dial
             .take()
             .expect("original dial retained")
-            .into_connector(self.connector.take().expect("original connector retained"));
+            .into_connector(
+                self.packet
+                    .connector
+                    .take()
+                    .expect("original connector retained"),
+            );
         // Endpoint consumes the nonClone service without reacquiring its first
         // physical/handshake positions. H2 setup runs with the original lane
         // guard and the caller's same stage still held.
         let created = self
+            .packet
             .endpoint
             .connect_with_connector(connector)
             .await

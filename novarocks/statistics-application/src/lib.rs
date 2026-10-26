@@ -39,9 +39,9 @@ use std::{
 };
 
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
-use novarocks_workload_control::{
-    QueryConcurrencyPermit, WorkClass, WorkOwner, WorkRequest, WorkScope,
-};
+use novarocks_workload_control::{QueryConcurrencyPermit, WorkOwner, WorkScope};
+#[cfg(test)]
+use novarocks_workload_control::{WorkClass, WorkRequest};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -2150,16 +2150,17 @@ mod tests {
             MAX_RECENT_TERMINAL_STATISTICS_JOBS
         );
         scope.check().unwrap();
-        let state = repository.lock().unwrap();
-        let tail = state
-            .terminal
-            .iter()
-            .find(|entry| entry.job.id == original.id)
-            .unwrap();
-        assert!(tail.owner.is_some() && tail.query_concurrency.is_some());
-        assert!(tail.result_capacity.is_some());
-        assert_eq!(tail.job.convergence, StatisticsConvergence::default());
-        drop(state);
+        {
+            let state = repository.lock().unwrap();
+            let tail = state
+                .terminal
+                .iter()
+                .find(|entry| entry.job.id == original.id)
+                .unwrap();
+            assert!(tail.owner.is_some() && tail.query_concurrency.is_some());
+            assert!(tail.result_capacity.is_some());
+            assert_eq!(tail.job.convergence, StatisticsConvergence::default());
+        }
         close_local_terminal_fixtures(&repository, retained).await;
     }
 
@@ -3052,13 +3053,14 @@ mod tests {
                 "business cannot fabricate original exit"
             );
         }
-        let mut state = repository.lock().unwrap();
-        StatisticsJobRepository::trim_terminal(&mut state);
-        assert_eq!(state.terminal.len(), 2);
-        assert!(state.terminal.iter().all(|entry| entry.transferred
-            && entry.owner.is_none()
-            && !entry.job.convergence.is_complete()));
-        drop(state);
+        {
+            let mut state = repository.lock().unwrap();
+            StatisticsJobRepository::trim_terminal(&mut state);
+            assert_eq!(state.terminal.len(), 2);
+            assert!(state.terminal.iter().all(|entry| entry.transferred
+                && entry.owner.is_none()
+                && !entry.job.convergence.is_complete()));
+        }
         let originals = std::mem::take(&mut *executor.0.lock().unwrap());
         for mut original in originals {
             let owner = original.owner.take().unwrap();
@@ -3103,10 +3105,10 @@ mod tests {
         assert!(!before.convergence.is_complete());
         let cleanup = test_publication_failure("late original GC failure");
         progress
-            .record_publication_cleanup_failure(cleanup.clone())
+            .record_publication_cleanup_failure(cleanup)
             .unwrap();
         progress
-            .record_publication_cleanup_failure(cleanup.clone())
+            .record_publication_cleanup_failure(cleanup)
             .unwrap();
         let after = repository.get(created.id).await.unwrap().unwrap();
         assert_eq!(

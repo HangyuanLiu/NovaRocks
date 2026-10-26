@@ -530,7 +530,7 @@ fn poll_original_preparation<T>(
     poisoned: &mut bool,
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<()> {
-    use std::{future::Future, task::Poll};
+    use std::task::Poll;
     if destination.is_some() {
         return Poll::Ready(());
     }

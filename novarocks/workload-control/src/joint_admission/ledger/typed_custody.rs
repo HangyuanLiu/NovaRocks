@@ -993,10 +993,8 @@ fn typed_binding_view_mode(
     if computation && !row.internal_position && row.computation_window.is_none() {
         return Err(WorkError::Conflict);
     }
-    if computation {
-        if let Some(window) = &row.computation_window {
-            window.validate_claim(key[0])?;
-        }
+    if computation && let Some(window) = &row.computation_window {
+        window.validate_claim(key[0])?;
     }
     let custody = match row.custody {
         ClaimCustody::Computation { epoch, pins } if computation => epoch == key[1] && pins != 0,

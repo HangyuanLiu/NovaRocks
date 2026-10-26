@@ -161,10 +161,8 @@ impl Original for EvidenceOriginal {
             let retry = lock(&self.core.body)
                 .as_ref()
                 .is_some_and(|body| body.work_exited && body.evidence.is_some());
-            if retry {
-                if let Err(failure) = self.core.queue_if_idle(Phase::Close) {
-                    self.core.fail(failure);
-                }
+            if retry && let Err(failure) = self.core.queue_if_idle(Phase::Close) {
+                self.core.fail(failure);
             }
         }
         self.core.notify();
@@ -229,17 +227,17 @@ async fn call(
                     .unwrap_or_else(|| Err(invalid("SQLite evidence result was already received"))),
             );
         }
-        if let Poll::Ready(Err(failure)) = progress {
-            if matches!(
+        if let Poll::Ready(Err(failure)) = progress
+            && matches!(
                 failure.failure_fact().class(),
                 FailureClass::Unexpected | FailureClass::Invariant
-            ) {
-                original.core.fail(failure.clone());
-                return Poll::Ready(Err(failure));
-            }
-            // Ordinary refusal is received by the same Source after its exact
-            // footer. Its output cannot escape before the Close worker exits.
+            )
+        {
+            original.core.fail(failure.clone());
+            return Poll::Ready(Err(failure));
         }
+        // Ordinary refusal is received by the same Source after its exact
+        // footer. Its output cannot escape before the Close worker exits.
         Poll::Pending
     })
     .await;

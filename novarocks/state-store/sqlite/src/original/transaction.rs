@@ -148,22 +148,21 @@ impl TxnOriginal {
             .is_some_and(|b| !b.closed_connection);
         if should_close
             && (self.closing.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire))
+            && let Err(failure) = self.core.queue_if_idle(Phase::Close)
         {
-            if let Err(failure) = self.core.queue_if_idle(Phase::Close) {
-                self.core.fail(failure);
-            }
+            self.core.fail(failure);
         }
     }
     fn record_commit(body: &mut TxnBody) {
-        if !body.commit_metric_recorded {
-            if let (Some(started), Some(outcome)) = (body.commit_started, body.commit.as_ref()) {
-                body.input.metrics.record_operation(
-                    crate::metrics::StateStoreOperation::Commit,
-                    txn::commit_metric_outcome(outcome),
-                    started.elapsed(),
-                );
-                body.commit_metric_recorded = true;
-            }
+        if !body.commit_metric_recorded
+            && let (Some(started), Some(outcome)) = (body.commit_started, body.commit.as_ref())
+        {
+            body.input.metrics.record_operation(
+                crate::metrics::StateStoreOperation::Commit,
+                txn::commit_metric_outcome(outcome),
+                started.elapsed(),
+            );
+            body.commit_metric_recorded = true;
         }
     }
     fn settle(body: &mut TxnBody) -> Result<(), StateStoreError> {
@@ -201,10 +200,9 @@ impl TxnOriginal {
                 | Phase::Put
                 | Phase::Delete
         ) && b.output.is_none()
+            && let Some(failure) = self.core.physical_failure()
         {
-            if let Some(failure) = self.core.physical_failure() {
-                b.output = Some((request, Err(failure)));
-            }
+            b.output = Some((request, Err(failure)));
         }
         if request.phase == Phase::Commit && exit == Exit::NeverPublishedReturned {
             b.withdrawn_commit = true;
@@ -487,11 +485,11 @@ impl TxnOriginal {
         let result = std::future::poll_fn(|cx| {
             let progress = self.core.poll_step(cx);
             let mut body = lock(&self.core.body);
-            if let Some(b) = body.as_mut() {
-                if b.output.as_ref().is_some_and(|(r, _)| *r == request) {
-                    let (_, result) = b.output.take().unwrap();
-                    return Poll::Ready(result);
-                }
+            if let Some(b) = body.as_mut()
+                && b.output.as_ref().is_some_and(|(r, _)| *r == request)
+            {
+                let (_, result) = b.output.take().unwrap();
+                return Poll::Ready(result);
             }
             match progress {
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -565,10 +563,10 @@ impl Original for TxnOriginal {
         }
     }
     fn receive_result(&self, request: Request, result: Result<(), Failure>) {
-        if result.is_err() {
-            if let Some(body) = lock(&self.core.body).as_ref() {
-                body.input.metrics.record_blocking_failure();
-            }
+        if result.is_err()
+            && let Some(body) = lock(&self.core.body).as_ref()
+        {
+            body.input.metrics.record_blocking_failure();
         }
         self.core.result(request, result);
     }
@@ -631,10 +629,10 @@ impl Original for TxnOriginal {
                     Phase::EvidenceRead
                 })
             });
-            if let Some(phase) = retry {
-                if let Err(failure) = self.core.queue_if_idle(phase) {
-                    self.core.fail(failure);
-                }
+            if let Some(phase) = retry
+                && let Err(failure) = self.core.queue_if_idle(phase)
+            {
+                self.core.fail(failure);
             }
             self.core.notify();
         }
@@ -747,13 +745,13 @@ impl OriginalWriteTransaction for Transaction {
         let result = std::future::poll_fn(|cx| {
             let progress = self.original.core.poll_step(cx);
             let body = lock(&self.original.core.body);
-            if let Some(body) = body.as_ref() {
-                if body.commit_ready {
-                    return Poll::Ready(Ok(body
-                        .commit
-                        .clone()
-                        .unwrap_or_else(|| CommitOutcome::DefiniteFailure(txn::worker_error()))));
-                }
+            if let Some(body) = body.as_ref()
+                && body.commit_ready
+            {
+                return Poll::Ready(Ok(body
+                    .commit
+                    .clone()
+                    .unwrap_or_else(|| CommitOutcome::DefiniteFailure(txn::worker_error()))));
             }
             drop(body);
             if let Some(failure) = self.original.core.health() {
@@ -862,15 +860,14 @@ async fn wait_begin(original: &Arc<TxnOriginal>) -> Result<(), Failure> {
     let result = std::future::poll_fn(|cx| {
         let progress = original.core.poll_step(cx);
         let mut b = lock(&original.core.body);
-        if let Some(body) = b.as_mut() {
-            if body
+        if let Some(body) = b.as_mut()
+            && body
                 .output
                 .as_ref()
                 .is_some_and(|(r, _)| matches!(r.phase, Phase::BeginRead | Phase::BeginWrite))
-            {
-                let (_, value) = body.output.take().unwrap();
-                return Poll::Ready(value.map(|_| ()));
-            }
+        {
+            let (_, value) = body.output.take().unwrap();
+            return Poll::Ready(value.map(|_| ()));
         }
         match progress {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),

@@ -262,18 +262,17 @@ impl ConnectorCleanupAsyncSource for Original {
         {
             return Err(invalid("cleanup retains an unresolved original journal"));
         }
-        if let Step::Execute(request) = step.as_ref().unwrap() {
-            if !self
+        if let Step::Execute(request) = step.as_ref().unwrap()
+            && !self
                 .shared
                 .executed
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(request.prepared.batch_ordinal())
-            {
-                return Err(invalid(
-                    "cleanup prepared batch was already dispatched in this original source",
-                ));
-            }
+        {
+            return Err(invalid(
+                "cleanup prepared batch was already dispatched in this original source",
+            ));
         }
         let step = step.take().unwrap();
         body.future = Some(Box::pin(run_step(self.shared.clone(), step)));
@@ -865,7 +864,7 @@ enum CpuInput {
         outcomes: Vec<ReceiptRecord>,
     },
 }
-pub(crate) enum CpuOutput {
+pub(in crate::catalog_control) enum CpuOutput {
     Admitted,
     Request(ConnectorCleanupPlanningRequest, IcebergTablePayload),
     Payload(PlanPayload),
@@ -879,7 +878,7 @@ impl CpuWork {
         assert!(self.result.is_none(), "one actual cleanup CPU phase");
         self.result = Some(self.run_once());
     }
-    pub(crate) fn take_output(&mut self) -> Result<CpuOutput, ConnectorError> {
+    pub(in crate::catalog_control) fn take_output(&mut self) -> Result<CpuOutput, ConnectorError> {
         self.result
             .take()
             .ok_or_else(|| internal("cleanup CPU result is absent"))?

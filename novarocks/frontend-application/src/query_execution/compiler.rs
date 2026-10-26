@@ -111,7 +111,6 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn catalog_application(
         &self,
     ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort>;
-    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService;
     fn capture_dml_fallback_execution(
         &self,
     ) -> Result<novarocks_query_application::admitted_query_context::QueryExecutionContext, String>;
@@ -146,10 +145,6 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         &self,
     ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
-    }
-
-    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService {
-        self.query_execution()
     }
 
     fn capture_dml_fallback_execution(
@@ -192,10 +187,6 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         &self,
     ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
-    }
-
-    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService {
-        self.query_execution()
     }
 
     fn capture_dml_fallback_execution(
@@ -865,12 +856,6 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
             )
         })
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_query_execution_service()
--> crate::query_execution::service::QueryExecutionService {
-    crate::query_execution::service::QueryExecutionService::new()
 }
 
 #[cfg(test)]

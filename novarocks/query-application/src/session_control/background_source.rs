@@ -55,7 +55,7 @@ pub trait GovernedBackgroundAction: Send + 'static {
 pub struct BackgroundActionCustody {
     pub(super) owner: Option<WorkOwner>,
     scope: WorkScope,
-    context: Option<QueryExecutionContext>,
+    context: Option<Box<QueryExecutionContext>>,
     // Same original window, no compute/activity or query-concurrency pin.
     _result_retention: Option<ResultWindowAlias>,
     query_permit: Option<QueryConcurrencyPermit>,
@@ -98,10 +98,13 @@ impl BackgroundActionCustody {
             .as_ref()
             .and_then(|c| c.result_capacity())
             .map(|binding| binding.window_alias());
+        // Receive the same original context once, before any business poll.
+        // The unique backing moves with custody and creates no new authority.
+        let context = context.take().map(Box::new);
         Ok(Self {
             owner: None,
             scope,
-            context: context.take(),
+            context,
             _result_retention: result_retention,
             query_permit: permit.take(),
             _payload: payload.take(),
@@ -226,8 +229,9 @@ impl Drop for BackgroundActionReceipt {
 }
 
 /// Actual layouts from the common owner. `custody` is nested inside `source`;
-/// it is informational, not a second allocation. Receiver/header layouts must
-/// be counted once by their concrete caller's real frame author.
+/// it is informational, not a second allocation. The unique context backing
+/// is separate; these layouts are not a complete retained-heap quote or an
+/// admission policy.
 #[derive(Clone, Copy)]
 pub struct BackgroundActionSourceGeometry {
     pub source: Layout,
@@ -238,17 +242,6 @@ pub struct BackgroundActionSourceGeometry {
     pub receipt: Layout,
     pub custody: Layout,
     pub mutex_backing: Layout,
-}
-impl BackgroundActionSourceGeometry {
-    pub fn fixed_source_bytes(self) -> Result<usize, WorkError> {
-        self.source
-            .size()
-            .checked_add(self.wake.size())
-            .and_then(|n| n.checked_add(self.failure.size().checked_mul(2)?))
-            .and_then(|n| n.checked_add(self.summary.size()))
-            .and_then(|n| n.checked_add(self.mutex_backing.size().checked_mul(3)?))
-            .ok_or(WorkError::ArithmeticOverflow)
-    }
 }
 
 pub(super) const BACKGROUND_FAILURE_DETAIL: &str =

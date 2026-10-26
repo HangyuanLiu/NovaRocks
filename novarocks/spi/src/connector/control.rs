@@ -1234,8 +1234,7 @@ mod async_scan_tests {
         let error = futures::executor::block_on(
             planning.begin_scan_async_in(&table, request, &cpu, &original, &mut owner),
         )
-        .err()
-        .expect("no implicit asynchronous implementation");
+        .expect_err("no implicit asynchronous implementation");
         assert!(owner.is_none(), "unsupported does not install an owner");
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
         assert_eq!(

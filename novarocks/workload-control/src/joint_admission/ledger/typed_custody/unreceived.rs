@@ -80,10 +80,6 @@ pub struct UnreceivedProductionAdmission {
     quote: UnreceivedProductionQuote,
 }
 impl WorkScope {
-    /// Pure configured support fact. It neither binds D nor grants a record.
-    /// The same original configuration protects a complete indivisible cohort
-    /// under its cumulative per-dependency responsibility limit.
-
     /// A closed delegated constructor: only these responsibility coordinates,
     /// the original active Node's complete class/D, and original paid Q.
     pub fn begin_unreceived_productions(

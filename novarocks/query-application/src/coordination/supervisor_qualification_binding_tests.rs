@@ -81,7 +81,7 @@ impl NativeAttemptPreparationPort for BindingGatePreparation {
             binding: Arc::clone(&self.binding),
         });
         Box::pin(async move {
-            let scheduling = no_scan_scheduling(&request);
+            let scheduling = no_scan_scheduling(request);
             request.bind_staged(scheduling).map_err(Into::into)
         })
     }

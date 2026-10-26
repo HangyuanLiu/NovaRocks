@@ -702,7 +702,6 @@ impl std::fmt::Display for OriginalPublicationCause {
 impl std::error::Error for OriginalPublicationCause {}
 impl novarocks_failure_contract::FailureProjection for OriginalPublicationCause {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         ConnectorErrorKind::PermissionDenied.failure_fact()
     }
 }
@@ -791,7 +790,7 @@ fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_clos
     );
     let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
     assert_same_original_cause(&observed, &primary);
-    assert_eq!(required, false);
+    assert!(!required);
     assert!(matches!(
         original.shared.first_failure.lock().unwrap().as_ref(),
         Some(OriginalFailure::Publication(
@@ -817,7 +816,7 @@ fn rejected_original_cause_precedes_receipt_cpu_refusal_and_survives_actual_clos
     assert_same_original_cause(&original.shared.original_failure().unwrap(), &primary);
     let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
     assert_same_original_cause(&observed, &primary);
-    assert_eq!(required, false);
+    assert!(!required);
     assert_eq!(
         original.publication_fact(),
         (Some(LakePublicationDisposition::KnownUncommitted), false)
@@ -870,7 +869,7 @@ fn applied_required_finalize_cause_precedes_receipt_cpu_refusal_and_survives_act
     assert_same_original_cause(&actual, &primary);
     let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
     assert_same_original_cause(&observed, &primary);
-    assert_eq!(required, true);
+    assert!(required);
     assert!(matches!(
         original.shared.first_failure.lock().unwrap().as_ref(),
         Some(OriginalFailure::Publication(
@@ -896,7 +895,7 @@ fn applied_required_finalize_cause_precedes_receipt_cpu_refusal_and_survives_act
     assert_same_original_cause(&original.shared.original_failure().unwrap(), &primary);
     let (observed, required) = ConnectorCleanupAsyncSource::original_failure(&original).unwrap();
     assert_same_original_cause(&observed, &primary);
-    assert_eq!(required, true);
+    assert!(required);
     assert_eq!(
         original.publication_fact(),
         (Some(LakePublicationDisposition::KnownCommitted), true)

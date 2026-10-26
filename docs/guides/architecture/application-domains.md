@@ -34,7 +34,8 @@ ADR-0198 的统一执行契约已接受；源码索引反映旧同步协调路�
 `read_action.rs`、`write_action.rs`、`mutation_action.rs` 和 `ctas_action.rs` 的实际 Action，以及
 `statement_computation.rs`、`statement_publication.rs` 的共享接缝核对。Query Application 的
 `coordination/supervisor.rs` 拥有统一 query-id 来源、逻辑驱动与恢复；Frontend 的
-`QueryExecutionService` 只保原 Provider rewrite 封存，不再拥有另一执行循环或 ID 来源。
+Provider rewrite session 保管在 `query_execution/distributed_rewrite.rs`，空的
+`QueryExecutionService` 及其注入链已退役。
 原 credentials、RF 与 Profile 的共享事实/作者仍由实际消费者保留。
 Statistics 的现有 Action 入口在 `statistics_jobs/{service,attempt_executor}.rs`：前台 capture 实际关闭
 CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原 worker；后台沿共享计算 owner

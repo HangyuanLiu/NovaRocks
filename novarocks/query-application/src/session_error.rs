@@ -17,7 +17,7 @@
 
 //! Query-session errors before a protocol adapter maps them to wire codes.
 
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use crate::api::StatementExternalEffectDisposition;
 use novarocks_spi::connector::{LakePublicationDisposition, LakePublicationTerminal};
@@ -65,19 +65,43 @@ enum QueryServiceErrorBody {
     },
 }
 
+/// Sparse, value-semantic diagnostics shared by clones of the same error.
+/// These facts grant no publication, cancellation or execution authority.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DiagnosticFacts {
+    publication_terminal: Option<LakePublicationTerminal>,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
+    compile_provenance: Option<novarocks_type_contract::CompileControlProvenance>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryServiceError {
     failure_cause: Option<novarocks_failure_contract::SharedFailureCause>,
     body: QueryServiceErrorBody,
-    publication_terminal: Option<LakePublicationTerminal>,
+    diagnostics: Option<Arc<DiagnosticFacts>>,
     external_effect_disposition: Option<StatementExternalEffectDisposition>,
-    compile_control: Option<novarocks_type_contract::CompileControlError>,
-    compile_provenance: Option<novarocks_type_contract::CompileControlProvenance>,
 }
 
 impl QueryServiceError {
     pub const FRONTEND_DRAINING_MESSAGE: &'static str =
         "FRONTEND_DRAINING: frontend is draining; retry on another frontend";
+
+    fn diagnostic_facts_mut(&mut self) -> &mut DiagnosticFacts {
+        Arc::make_mut(
+            self.diagnostics
+                .get_or_insert_with(|| Arc::new(DiagnosticFacts::default())),
+        )
+    }
+
+    fn remove_empty_diagnostics(&mut self) {
+        if self.diagnostics.as_deref().is_some_and(|facts| {
+            facts.publication_terminal.is_none()
+                && facts.compile_control.is_none()
+                && facts.compile_provenance.is_none()
+        }) {
+            self.diagnostics = None;
+        }
+    }
 
     pub fn frontend_draining() -> Self {
         Self::new(
@@ -92,10 +116,8 @@ impl QueryServiceError {
                 kind,
                 message: message.into(),
             },
-            publication_terminal: None,
+            diagnostics: None,
             external_effect_disposition: None,
-            compile_control: None,
-            compile_provenance: None,
             failure_cause: None,
         }
     }
@@ -105,10 +127,8 @@ impl QueryServiceError {
         let message = error.to_string();
         Self {
             body: QueryServiceErrorBody::User { error, message },
-            publication_terminal: None,
+            diagnostics: None,
             external_effect_disposition: None,
-            compile_control: None,
-            compile_provenance: None,
             failure_cause: None,
         }
     }
@@ -124,10 +144,8 @@ impl QueryServiceError {
                 user_error,
                 message,
             },
-            publication_terminal: None,
+            diagnostics: None,
             external_effect_disposition: None,
-            compile_control: None,
-            compile_provenance: None,
             failure_cause: None,
         }
     }
@@ -200,10 +218,11 @@ impl QueryServiceError {
                 kind: QueryServiceErrorKind::Internal,
                 message: message.into(),
             },
-            publication_terminal: Some(terminal),
+            diagnostics: Some(Arc::new(DiagnosticFacts {
+                publication_terminal: Some(terminal),
+                ..DiagnosticFacts::default()
+            })),
             external_effect_disposition: None,
-            compile_control: None,
-            compile_provenance: None,
             failure_cause: None,
         }
     }
@@ -213,7 +232,7 @@ impl QueryServiceError {
     /// retry; KnownUncommitted is not, by itself, permission to retry. Provider
     /// and target diagnostics remain in the terminal sidecar.
     pub fn attach_publication_terminal(mut self, terminal: LakePublicationTerminal) -> Self {
-        self.publication_terminal = Some(terminal);
+        self.diagnostic_facts_mut().publication_terminal = Some(terminal);
         self.render_execution_message();
         self
     }
@@ -228,7 +247,11 @@ impl QueryServiceError {
             // Both independent knowledge fields render from the same frozen
             // descriptor. Neither attachment may erase the other one's guard.
             *message = user_error.to_string();
-            if let Some(terminal) = self.publication_terminal.as_ref() {
+            if let Some(terminal) = self
+                .diagnostics
+                .as_deref()
+                .and_then(|facts| facts.publication_terminal.as_ref())
+            {
                 let disposition = match terminal.disposition() {
                     LakePublicationDisposition::KnownUncommitted => "KnownUncommitted",
                     LakePublicationDisposition::CommitUnknown => "CommitUnknown",
@@ -313,8 +336,17 @@ impl QueryServiceError {
         mut self,
         cause: Option<novarocks_type_contract::CompileControlError>,
     ) -> Self {
-        self.compile_provenance = cause.as_ref().map(|cause| cause.provenance());
-        self.compile_control = cause;
+        if cause.is_none()
+            && self.diagnostics.as_deref().is_none_or(|facts| {
+                facts.compile_control.is_none() && facts.compile_provenance.is_none()
+            })
+        {
+            return self;
+        }
+        let facts = self.diagnostic_facts_mut();
+        facts.compile_provenance = cause.as_ref().map(|cause| cause.provenance());
+        facts.compile_control = cause;
+        self.remove_empty_diagnostics();
         self
     }
     pub fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
@@ -331,57 +363,12 @@ impl QueryServiceError {
             CompileControlError::ResourceExhausted => "pure compilation work budget was exhausted",
             CompileControlError::Source(_) => "pure compilation failed in its source domain",
         };
-        let mut failure = Self::from_execution_failure(ExecutionFailureInput::new(
+        Self::from_execution_failure(ExecutionFailureInput::new(
             error.failure_fact(),
             SafeDetail::truncating(detail),
             ExecutionFailureSite::Coordinator,
-        ));
-        failure.compile_provenance = Some(error.provenance());
-        failure.compile_control = Some(error);
-        failure
-    }
-    /// Storage-only geometry for the existing execution projection followed
-    /// by attach_publication_terminal. The caller pays real target String
-    /// lengths separately. No Provider diagnostics or source graphs enter it.
-    pub fn bounded_publication_projection_backing_bytes(
-        family: novarocks_spi::connector::LakePublicationFamily,
-        detail_bytes: usize,
-    ) -> Result<usize, novarocks_workload_control::WorkError> {
-        use crate::execution_error::{EXECUTION_ERROR_CODE_DESCRIPTORS, ExecutionFailureInput};
-        use novarocks_workload_control::WorkError;
-        let code = EXECUTION_ERROR_CODE_DESCRIPTORS
-            .iter()
-            .map(|d| d.code.as_str().len())
-            .max()
-            .unwrap_or(0);
-        // UUID display is exactly 36 bytes. The original caller supplies
-        // the publication family. KnownCommitted including its retry guard
-        // is the longest complete suffix; the negative verdict has no guard.
-        // Target text is not rendered in this suffix.
-        let suffix = " (lake publication id=".len()
-            + 36
-            + " family=".len()
-            + family.as_str().len()
-            + " disposition=KnownCommitted do_not_retry=true; do not retry statement)".len();
-        // Both existing facts may be present on the same selected error. The
-        // cumulative effect has its own complete public guard, independently
-        // of the current publication terminal.
-        let effect_suffix = " (external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)".len();
-        let rendered = code
-            .checked_add(3)
-            .and_then(|n| n.checked_add(detail_bytes))
-            .and_then(|n| n.checked_add(suffix))
-            .and_then(|n| n.checked_add(effect_suffix))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        // Existing String formatting can double RawVec capacity. Count the
-        // old rendering, reset rendering, and one reallocation peak together;
-        // the two exact detail copies belong to SafeDetail and UserError.
-        rendered
-            .max(8)
-            .checked_mul(6)
-            .and_then(|n| detail_bytes.checked_mul(2).and_then(|d| n.checked_add(d)))
-            .and_then(|n| n.checked_add(std::mem::size_of::<ExecutionFailureInput>()))
-            .ok_or(WorkError::ArithmeticOverflow)
+        ))
+        .with_compile_control(Some(error))
     }
     /// A historical fact carries its real compiler provenance without keeping
     /// the original Provider tree alive or manufacturing a rich Source error.
@@ -389,16 +376,24 @@ impl QueryServiceError {
         mut self,
         provenance: Option<novarocks_type_contract::CompileControlProvenance>,
     ) -> Self {
-        self.compile_provenance = provenance;
+        if self.compile_control_provenance() == provenance {
+            return self;
+        }
+        self.diagnostic_facts_mut().compile_provenance = provenance;
+        self.remove_empty_diagnostics();
         self
     }
     pub fn compile_control_provenance(
         &self,
     ) -> Option<novarocks_type_contract::CompileControlProvenance> {
-        self.compile_provenance
+        self.diagnostics
+            .as_deref()
+            .and_then(|facts| facts.compile_provenance)
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control.clone()
+        self.diagnostics
+            .as_deref()
+            .and_then(|facts| facts.compile_control.clone())
     }
 
     pub fn kind(&self) -> QueryServiceErrorKind {
@@ -441,7 +436,9 @@ impl QueryServiceError {
     }
 
     pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {
-        self.publication_terminal.as_ref()
+        self.diagnostics
+            .as_deref()
+            .and_then(|facts| facts.publication_terminal.as_ref())
     }
 }
 
@@ -457,8 +454,9 @@ impl std::error::Error for QueryServiceError {
             .as_ref()
             .map(|cause| cause as &dyn std::error::Error)
             .or_else(|| {
-                self.compile_control
-                    .as_ref()
+                self.diagnostics
+                    .as_deref()
+                    .and_then(|facts| facts.compile_control.as_ref())
                     .map(|cause| cause as &dyn std::error::Error)
             })
     }
@@ -647,6 +645,90 @@ mod publication_message_tests {
             },
             Some(LakePublicationStatementTag::try_new("private-tag".to_string()).unwrap()),
         )
+    }
+
+    #[test]
+    fn diagnostic_updates_preserve_cloned_facts_and_clear_only_requested_fields() {
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_type_contract::{CompileControlError, CompileControlProvenance};
+
+        let source = SharedFailureCause::from_static_detail(
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "private provider diagnostic",
+            ),
+            "selected source failed",
+        );
+        let terminal = publication(LakePublicationDisposition::KnownCommitted);
+        let original = QueryServiceError::from_failure_cause(source.clone())
+            .with_compile_control(Some(CompileControlError::Cancelled))
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted)
+            .attach_publication_terminal(terminal.clone());
+        let input = original.execution_failure().unwrap().clone();
+        let message = original.message().to_owned();
+
+        let cleared = original.clone().with_compile_control(None);
+        assert_eq!(cleared.compile_control_error(), None);
+        assert_eq!(cleared.compile_control_provenance(), None);
+        assert_eq!(cleared.publication_terminal(), Some(&terminal));
+        assert_eq!(cleared.failure_cause(), Some(&source));
+        assert_eq!(cleared.execution_failure(), Some(&input));
+        assert_eq!(cleared.message(), message);
+
+        let replacement = publication(LakePublicationDisposition::KnownUncommitted);
+        let updated = cleared
+            .with_compile_control_provenance(Some(CompileControlProvenance::DeadlineExceeded))
+            .attach_publication_terminal(replacement.clone())
+            .attach_external_effect_disposition(
+                StatementExternalEffectDisposition::KnownUncommitted,
+            );
+        assert_eq!(updated.publication_terminal(), Some(&replacement));
+        assert_eq!(updated.compile_control_error(), None);
+        assert_eq!(
+            updated.compile_control_provenance(),
+            Some(CompileControlProvenance::DeadlineExceeded)
+        );
+        assert_eq!(updated.failure_cause(), Some(&source));
+        assert_eq!(updated.execution_failure(), Some(&input));
+        assert_eq!(
+            updated.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        assert!(updated.message().contains("disposition=KnownUncommitted)"));
+        assert!(updated.message().contains(
+            "external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)"
+        ));
+        assert!(!updated.message().contains("private provider diagnostic"));
+
+        assert_eq!(original.publication_terminal(), Some(&terminal));
+        assert_eq!(
+            original.compile_control_error(),
+            Some(CompileControlError::Cancelled)
+        );
+        assert_eq!(
+            original.compile_control_provenance(),
+            Some(CompileControlProvenance::Cancelled)
+        );
+        assert_eq!(original.message(), message);
+        assert_eq!(original.failure_cause(), Some(&source));
+
+        let plain = QueryServiceError::new(QueryServiceErrorKind::Internal, "same failure");
+        assert_eq!(plain.clone().with_compile_control(None), plain);
+        assert_eq!(plain.clone().with_compile_control_provenance(None), plain);
+        assert_eq!(
+            plain
+                .clone()
+                .with_compile_control(Some(CompileControlError::Cancelled))
+                .with_compile_control(None),
+            plain
+        );
+        assert_eq!(
+            plain
+                .clone()
+                .with_compile_control_provenance(Some(CompileControlProvenance::DeadlineExceeded))
+                .with_compile_control_provenance(None),
+            plain
+        );
     }
 
     #[test]
@@ -1034,11 +1116,11 @@ mod publication_message_tests {
             .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted)
             .attach_publication_terminal(terminal.clone());
         let control = original.compile_control_error();
-        let provenance = original.compile_provenance;
+        let provenance = original.compile_control_provenance();
         let selected = original.reconcile_local_stop_observation(&cancellation);
         assert_eq!(selected.failure_cause(), Some(&source));
         assert_eq!(selected.compile_control_error(), control);
-        assert_eq!(selected.compile_provenance, provenance);
+        assert_eq!(selected.compile_control_provenance(), provenance);
         assert_eq!(selected.publication_terminal(), Some(&terminal));
         assert_eq!(
             selected.external_effect_disposition(),

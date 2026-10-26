@@ -73,11 +73,11 @@ impl WorkScope {
             if node.parent.is_some() || node.root != self.id {
                 return Err(WorkError::Conflict);
             }
-            if node.root_domains.is_some() {
+            if let Some(domains) = &node.root_domains {
                 return Ok(RootDomainBinding {
                     inner: Arc::downgrade(&self.inner),
                     root: self.id,
-                    binding: node.root_domains.as_ref().unwrap().binding,
+                    binding: domains.binding,
                 });
             }
             if node.children != 0
@@ -194,10 +194,10 @@ impl WorkScope {
             .current
             .as_mut()
             .ok_or(WorkError::Conflict)?;
-        if let GroupOrigin::Inherited(original) = current.origin {
-            if original != root.binding {
-                return Err(WorkError::Conflict);
-            }
+        if let GroupOrigin::Inherited(original) = current.origin
+            && original != root.binding
+        {
+            return Err(WorkError::Conflict);
         }
         current.origin = GroupOrigin::Inherited(root.binding);
         for fact in local_s {
@@ -640,6 +640,7 @@ pub(in crate::joint_admission) struct FactCapture {
     allocated: bool,
 }
 impl FactCapture {
+    #[cfg(test)]
     pub(in crate::joint_admission) fn capture(
         state: &State,
         facts: Arc<ResponsibilityFacts>,

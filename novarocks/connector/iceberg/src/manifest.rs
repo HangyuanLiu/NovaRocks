@@ -656,46 +656,15 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
     snapshot_id: i64,
     scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
 ) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
-    extract_checked_data_files_with_stats(table, snapshot_id, scope, None).await
-}
-
-pub(crate) async fn extract_rewrite_data_files_with_stats_with_original_scope(
-    table: &Table,
-    snapshot_id: i64,
-    scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
-    all_deletes: &mut Vec<std::sync::Arc<crate::delete_semantics::DeleteFact>>,
-) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
-    extract_checked_data_files_with_stats(table, snapshot_id, scope, Some(all_deletes)).await
-}
-
-async fn extract_checked_data_files_with_stats(
-    table: &Table,
-    snapshot_id: i64,
-    scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
-    all_deletes: Option<&mut Vec<std::sync::Arc<crate::delete_semantics::DeleteFact>>>,
-) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
     use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
     let build = async {
         let capture = CaptureScope::new(scope)?;
-        let captured = match all_deletes {
-            Some(receiving) => {
-                crate::read_snapshot::build_rewrite_read_files_with_original_scope(
-                    table,
-                    snapshot_id,
-                    &capture,
-                    receiving,
-                )
-                .await?
-            }
-            None => {
-                crate::read_snapshot::build_cow_read_files_at_with_original_scope(
-                    table,
-                    snapshot_id,
-                    &capture,
-                )
-                .await?
-            }
-        };
+        let captured = crate::read_snapshot::build_cow_read_files_at_with_original_scope(
+            table,
+            snapshot_id,
+            &capture,
+        )
+        .await?;
         finish_checked_cow_data_files_from_original_files(
             table.metadata(),
             snapshot_id,
@@ -732,7 +701,7 @@ pub(crate) fn finish_checked_cow_data_files_from_original_files(
                 snapshot_schema.as_ref(),
                 spec_id,
                 values,
-                Some(&capture),
+                Some(capture),
             )?,
             _ => Vec::new(),
         };

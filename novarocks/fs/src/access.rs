@@ -2603,9 +2603,6 @@ struct AuthoritySigningSource {
 }
 
 impl AuthoritySigningSource {
-    async fn credential_for_request(&self) -> anyhow::Result<reqsign::AwsCredential> {
-        self.credential_for_request_in(None).await
-    }
     async fn credential_for_request_in(
         &self,
         request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
@@ -5339,7 +5336,7 @@ mod tests {
 
         for _ in 0..3 {
             let credential = runtime
-                .block_on(loader.credential_for_request())
+                .block_on(loader.credential_for_request_in(None))
                 .expect("material in hand is served");
             assert_eq!(credential.access_key_id, "access-live");
             assert_eq!(credential.secret_access_key, "secret-live");

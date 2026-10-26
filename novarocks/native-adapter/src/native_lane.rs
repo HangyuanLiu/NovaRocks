@@ -309,7 +309,7 @@ impl NativeLaneStreamBody {
     pub fn new(inner: BoxBody, permit: Option<NativeLaneStreamPermit>) -> Self {
         Self {
             inner: Some(inner),
-            permit: permit.map(StreamCustody::Direct),
+            permit: permit.map(|permit| StreamCustody::Direct { _permit: permit }),
         }
     }
     fn boxed_with_custody(inner: BoxBody, permit: Option<StreamCustody>) -> BoxBody {
@@ -342,7 +342,7 @@ impl HttpBody for NativeLaneStreamBody {
             // Legacy observers retain their original public-body semantics.
             // Paid calls retain the same source through actual inner Drop;
             // outgoing Bytes aliases independently keep their same tail.
-            if matches!(self.permit, Some(StreamCustody::Direct(_))) {
+            if matches!(self.permit, Some(StreamCustody::Direct { .. })) {
                 drop(self.permit.take());
             }
         }
@@ -550,7 +550,7 @@ impl Future for NativeLaneResponseFuture {
                 ))
             }
             Poll::Ready(Err(error)) => {
-                if matches!(self.permit, Some(StreamCustody::Direct(_))) {
+                if matches!(self.permit, Some(StreamCustody::Direct { .. })) {
                     drop(self.permit.take());
                 }
                 Poll::Ready(Err(error.into()))

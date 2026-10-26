@@ -516,7 +516,7 @@ impl ConnectorStagedWritePlanningBinding {
 /// missing fact belongs *inside* the receipt its own session minted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StagedWriteReceiptOwner {
-    Owned(ConnectorWriteReceipt),
+    Owned(Arc<ConnectorWriteReceipt>),
     Needed(Arc<super::write_stack::ConnectorWriteNeededReady>),
 }
 #[derive(Clone, Debug)]
@@ -536,7 +536,7 @@ impl ConnectorStagedWriteProof {
     pub fn try_new(receipt: ConnectorWriteReceipt, row_count: u64) -> Result<Self, ConnectorError> {
         receipt.validate()?;
         Ok(Self {
-            receipt: StagedWriteReceiptOwner::Owned(receipt),
+            receipt: StagedWriteReceiptOwner::Owned(Arc::new(receipt)),
             row_count,
         })
     }
@@ -562,7 +562,7 @@ impl ConnectorStagedWriteProof {
 
     pub fn receipt(&self) -> &ConnectorWriteReceipt {
         match &self.receipt {
-            StagedWriteReceiptOwner::Owned(receipt) => receipt,
+            StagedWriteReceiptOwner::Owned(receipt) => receipt.as_ref(),
             StagedWriteReceiptOwner::Needed(needed) => needed.receipt(),
         }
     }
@@ -1148,21 +1148,19 @@ impl ConnectorStagedCreatePublicationRecorder {
                 .facts
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if let Some(applied) = &facts.applied {
-                if !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,..}) if receipt==applied)
-                {
-                    validation = Err(invalid(
-                        "staged raw outcome contradicts its original Applied receipt",
-                    ));
-                }
+            if let Some(applied) = &facts.applied
+                && !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,..}) if receipt==applied)
+            {
+                validation = Err(invalid(
+                    "staged raw outcome contradicts its original Applied receipt",
+                ));
             }
-            if let Some(needed) = &facts.needed {
-                if !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,finalization}|ConnectorStagedCreatePublishOutcome::NoOp{receipt,finalization}) if receipt==&needed.receipt && finalization==&needed.finalization)
-                {
-                    validation = Err(invalid(
-                        "staged raw outcome contradicts its necessary facts",
-                    ));
-                }
+            if let Some(needed) = &facts.needed
+                && !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,finalization}|ConnectorStagedCreatePublishOutcome::NoOp{receipt,finalization}) if receipt==&needed.receipt && finalization==&needed.finalization)
+            {
+                validation = Err(invalid(
+                    "staged raw outcome contradicts its necessary facts",
+                ));
             }
         }
         if before_dispatch && raw.is_err() {
@@ -1244,11 +1242,11 @@ impl ConnectorStagedCreatePublication {
             .expect("installed original publication");
         let progress = source.poll_progress(cx);
         let observation = self.receiving.observation();
-        if let Some(result) = observation.raw_outcome() {
-            if let Some(validation) = observation.validation() {
-                validation?;
-                return std::task::Poll::Ready(result);
-            }
+        if let Some(result) = observation.raw_outcome()
+            && let Some(validation) = observation.validation()
+        {
+            validation?;
+            return std::task::Poll::Ready(result);
         }
         assert!(
             progress.is_pending(),
@@ -1688,12 +1686,12 @@ impl ConnectorUnanchoredCtasCleanupLease {
                 *slot = Some(outcome);
             }
             drop(original);
-            let outcome = receiving
+
+            receiving
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
-                .expect("same stored CTAS Provider verdict");
-            outcome
+                .expect("same stored CTAS Provider verdict")
         }
     }
 
@@ -1736,12 +1734,12 @@ impl ConnectorUnanchoredCtasCleanupLease {
                 *slot = Some(outcome);
             }
             drop(original);
-            let outcome = receiving
+
+            receiving
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
-                .expect("same stored CTAS Provider verdict");
-            outcome
+                .expect("same stored CTAS Provider verdict")
         }
     }
 
@@ -1975,7 +1973,7 @@ impl ConnectorStagedCreateLease {
             }
             operations.insert(operation_id, LeaseOperationState::Preparing);
         }
-        let outcome = match {
+        let original_outcome = {
             let mut original = self.capability.prepare_async(request);
             let outcome =
                 std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
@@ -1990,13 +1988,14 @@ impl ConnectorStagedCreateLease {
                 *slot = Some(outcome);
             }
             drop(original);
-            let outcome = receiving
+
+            receiving
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
-                .expect("same stored CTAS Provider verdict");
-            outcome
-        } {
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.record_after_dispatch(
@@ -2137,7 +2136,7 @@ impl ConnectorStagedCreateLease {
         let operation_id = request.handle.operation_id();
         let handle_digest = request.handle.digest();
         let dispatch_operation_id = request.operation_id;
-        let outcome = match {
+        let original_outcome = {
             let mut original = self.capability.publish_async(request);
             let outcome =
                 std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
@@ -2152,13 +2151,14 @@ impl ConnectorStagedCreateLease {
                 *slot = Some(outcome);
             }
             drop(original);
-            let outcome = receiving
+
+            receiving
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
-                .expect("same stored CTAS Provider verdict");
-            outcome
-        } {
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.set_unknown_without_evidence(
@@ -2212,7 +2212,7 @@ impl ConnectorStagedCreateLease {
         let operation_id = request.handle.operation_id();
         let handle_digest = request.handle.digest();
         let dispatch_operation_id = request.operation_id;
-        let outcome = match {
+        let original_outcome = {
             let mut original = self.capability.abort_async(request);
             let outcome =
                 std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
@@ -2227,13 +2227,14 @@ impl ConnectorStagedCreateLease {
                 *slot = Some(outcome);
             }
             drop(original);
-            let outcome = receiving
+
+            receiving
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
-                .expect("same stored CTAS Provider verdict");
-            outcome
-        } {
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.set_unknown_without_evidence(operation_id, Some(handle_digest), bound_write);
@@ -2315,7 +2316,7 @@ impl ConnectorStagedCreateLease {
             );
             prior
         };
-        let outcome = match {
+        let original_outcome = {
             let mut original = self.capability.adjudicate_publication_async(request);
             let outcome =
                 std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
@@ -2330,13 +2331,14 @@ impl ConnectorStagedCreateLease {
                 *slot = Some(outcome);
             }
             drop(original);
-            let outcome = receiving
+
+            receiving
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
-                .expect("same stored CTAS Provider verdict");
-            outcome
-        } {
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 // The sole observation attempt was consumed once the provider

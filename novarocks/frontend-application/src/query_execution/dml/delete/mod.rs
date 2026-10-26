@@ -79,19 +79,6 @@ pub(crate) struct PreparedDeleteWrite {
     distribution: novarocks_sql::compiler::RootDistributionRequirement,
 }
 
-/// The original Prepared allocation has one Arc header. Variable AST, SQL and
-/// Provider backing keep their original invoices rather than graph estimates.
-pub(crate) fn prepared_delete_source_layouts() -> Result<
-    [std::alloc::Layout; 1],
-    novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-> {
-    Ok([
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            PreparedDeleteWrite,
-        >())?,
-    ])
-}
-
 impl PreparedDeleteWrite {
     pub(crate) fn target(&self) -> &crate::catalog_application::resolver::TargetBackend {
         &self.target
@@ -147,10 +134,6 @@ impl PreparedDeleteWrite {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The action passes its original statement, target, generation, context, identity and receiving authority independently."
-)]
 pub(crate) async fn prepare_delete_write_async(
     state: &DmlExecutionKernel,
     statement: &OwnedDeleteStatement,

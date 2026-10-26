@@ -19,6 +19,7 @@
 //! This is a separate process worker set from command execution: a command
 //! may wait for domain progress while holding its own worker.
 
+#[cfg(test)]
 use std::num::NonZeroUsize;
 use std::time::Instant;
 

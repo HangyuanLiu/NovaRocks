@@ -560,13 +560,11 @@ impl NativeActiveCustodyRegistry {
             drop(ack);
             (returned, (!retain).then(|| slots.remove(&key)).flatten())
         };
-        if returned {
-            if let Some(source) = slot.original_exit.upgrade() {
-                source.native_return_silent(
-                    key,
-                    super::LocalExecutionDisposition::OriginalPaidOwnerReturn,
-                );
-            }
+        if returned && let Some(source) = slot.original_exit.upgrade() {
+            source.native_return_silent(
+                key,
+                super::LocalExecutionDisposition::OriginalPaidOwnerReturn,
+            );
         }
         drop(removed);
         if returned {
@@ -766,6 +764,7 @@ impl NativeActiveCustodyRegistry {
         }
         changed.await;
     }
+    #[cfg(test)]
     pub(crate) fn contains_registration(&self, initial: QueryExecutionId, generation: u64) -> bool {
         self.slots
             .lock()
@@ -1397,7 +1396,7 @@ pub(crate) struct RootAckTestOwner {
 }
 #[cfg(test)]
 impl RootAckTestOwner {
-    pub(crate) fn start_consumer_in(&self, input: &mut Option<OriginalConsumerStart>) {
+    pub(super) fn start_consumer_in(&self, input: &mut Option<OriginalConsumerStart>) {
         self.registry
             .start_consumer_in(self.key, &self.slot, input)
             .unwrap();

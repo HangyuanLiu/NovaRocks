@@ -664,6 +664,23 @@ impl IcebergWriteAdmission for OperationState {
     }
 }
 
+impl IcebergCommitOperation {
+    pub(crate) fn fixed_backing_bytes() -> Result<usize> {
+        let arc = std::mem::size_of::<[usize; 2]>();
+        std::mem::size_of::<OperationState>()
+            .checked_add(arc)
+            .and_then(|n| n.checked_add(std::mem::size_of::<Semaphore>() + arc))
+            .and_then(|n| {
+                n.checked_add(if cfg!(target_os = "macos") {
+                    4 * 128
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| invalid("original operation backing overflow"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,22 +1213,5 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-}
-
-impl IcebergCommitOperation {
-    pub(crate) fn fixed_backing_bytes() -> Result<usize> {
-        let arc = std::mem::size_of::<[usize; 2]>();
-        std::mem::size_of::<OperationState>()
-            .checked_add(arc)
-            .and_then(|n| n.checked_add(std::mem::size_of::<Semaphore>() + arc))
-            .and_then(|n| {
-                n.checked_add(if cfg!(target_os = "macos") {
-                    4 * 128
-                } else {
-                    0
-                })
-            })
-            .ok_or_else(|| invalid("original operation backing overflow"))
     }
 }

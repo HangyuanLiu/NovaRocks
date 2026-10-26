@@ -1233,7 +1233,7 @@ mod tests {
         FrontendWorkloadCapacityProfile, compose_frontend_statement_ingress,
         compose_frontend_workload_runtime, compose_task_execution_budgets,
     };
-    use crate::provider_manifest::ServerProviderManifest;
+
     use novarocks_execution_contract::{MaxWait, OperationKind};
     use novarocks_frontend_application::task_protocol_config::DispatchBudget;
     use novarocks_native_adapter::FrontendTaskTransportBudget;

@@ -124,7 +124,7 @@ mod client_computation_tests {
                 signals: Arc::clone(&self.signals),
             });
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }

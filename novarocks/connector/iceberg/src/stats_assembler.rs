@@ -189,18 +189,20 @@ pub async fn write_puffin_artifacts(
     .await
     .map_err(|error| error.to_string())
 }
+type PuffinArtifactCpu<'a> = (
+    &'a std::sync::Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    &'a novarocks_spi::connector::ConnectorInstanceDescriptor,
+    novarocks_spi::connector::ProviderBindingEpoch,
+    &'a std::sync::Arc<[StatisticsArtifactDraft]>,
+);
+
 async fn write_puffin_artifacts_original(
     file_io: &FileIO,
     puffin_path: &str,
     snapshot_id: i64,
     sequence_number: i64,
     artifacts: &[StatisticsArtifactDraft],
-    cpu: Option<(
-        &std::sync::Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
-        &novarocks_spi::connector::ConnectorInstanceDescriptor,
-        novarocks_spi::connector::ProviderBindingEpoch,
-        &std::sync::Arc<[StatisticsArtifactDraft]>,
-    )>,
+    cpu: Option<PuffinArtifactCpu<'_>>,
 ) -> Result<Option<StatisticsFile>, PuffinWriteFailure> {
     if artifacts.is_empty() {
         return Ok(None);

@@ -233,13 +233,6 @@ impl InternalCpuFactoryBinding {
     }
 }
 impl WorkloadControl {
-    /// Minimum global/domain limits for complete progress on this original
-    /// registered source. Other sources' shared coordinates retain their
-    /// original causal floor. Reading these facts grants no capacity.
-
-    /// Validate source-aware floors from this original authority's registered
-    /// closed factory. Full charged dependencies and every hard cap remain.
-    /// No caller-selected causal mask or arbitrary finite contribution enters.
     /// Installs the one InternalResultClosedFactory on this original authority.
     /// Only first-party role composition owns both this unique owner and the
     /// physical CPU owner. The reviewed closed implementation, not its TypeId,

@@ -410,7 +410,6 @@ async fn run_io(
                 }
             })
             .await;
-            drop(original);
         }
         RawRead::Bytes { io, path } => {
             let input = match io.new_input(&path) {
@@ -450,7 +449,6 @@ async fn run_io(
                     }
                 })
                 .await;
-                drop(original);
             }
             drop(input);
         }

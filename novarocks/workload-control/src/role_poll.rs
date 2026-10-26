@@ -347,10 +347,12 @@ impl<C, O> PollTurnCompletion<C, O> {
         (context, completion)
     }
 }
+#[cfg(test)]
 pub(crate) struct MountRejected<I, C = ()> {
     pub(crate) owner: WorkOwner,
     pub(crate) input: I,
-    pub(crate) context: C,
+    // Retain the original association on refusal until the receiving caller drops it.
+    pub(crate) _context: C,
     pub(crate) error: WorkError,
 }
 
@@ -375,6 +377,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         Self::install_with_context(control, role, make)
     }
 
+    #[cfg(test)]
     pub(crate) fn mount_owned(
         &mut self,
         owner: WorkOwner,
@@ -522,6 +525,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F, C> RolePollBank<I, F, M, C> {
         self.shared.export()
     }
 
+    #[cfg(test)]
     pub(crate) fn mount_owned_with_context(
         &mut self,
         owner: WorkOwner,
@@ -542,7 +546,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F, C> RolePollBank<I, F, M, C> {
             Err(error) => Err(MountRejected {
                 owner: owner.take().unwrap(),
                 input: input.take().unwrap(),
-                context: context.take().unwrap(),
+                _context: context.take().unwrap(),
                 error,
             }),
         }

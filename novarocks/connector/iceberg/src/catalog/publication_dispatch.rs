@@ -156,7 +156,6 @@ impl EvidenceContext {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::catalog::publication::CatalogEvidencePolicy;
     use novarocks_spi::connector::read_stack::ConnectorSourceOperations;
     use novarocks_spi::connector::{

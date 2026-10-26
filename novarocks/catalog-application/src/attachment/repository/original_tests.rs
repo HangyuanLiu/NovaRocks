@@ -1144,13 +1144,15 @@ async fn original_receiving_preserves_first_cause_across_two_real_attempts() {
 
 // Reuse this module's real pure original read implementation for the service
 // deadline test; it panics if a caller chooses a legacy provider API.
-pub(super) fn read_fixture() -> (
+pub(crate) type OriginalReadFixture = (
     Arc<dyn StateStore>,
     Arc<dyn StateStoreExecutionPort>,
     StateStoreExecutionContext,
     Arc<Mutex<Vec<Instant>>>,
     Arc<Mutex<Vec<Instant>>>,
-) {
+);
+
+pub(super) fn read_fixture() -> OriginalReadFixture {
     let (port, context) = context();
     let store = Arc::new(OriginalMemory::new(context.clone()));
     let read_deadlines = store.read_deadlines.clone();

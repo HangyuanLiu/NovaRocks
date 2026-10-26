@@ -50,6 +50,9 @@ impl NativeDispatchFrozen {
         self.epoch
     }
 }
+type RootGraphCapture = (u64, Option<Arc<Vec<DependencyRef>>>);
+type RootGraphWait = Pin<Box<dyn Future<Output = Result<(), WorkError>> + Send>>;
+
 /// Original pins keep the real paid rows alive while this finite preparer runs.
 /// A row admits one staging token, and a frozen row admits no second capture.
 pub struct NativeDispatchSource {
@@ -57,14 +60,13 @@ pub struct NativeDispatchSource {
     token: u64,
     action: u64,
     root: WorkId,
-    execution: WorkId,
     lane: JointLane,
     members: Vec<Member>,
     root_graph: Option<Arc<Vec<DependencyRef>>>,
     epoch: Option<u64>,
     cursor: usize,
     capture: Option<FactCapture>,
-    wait: Option<Pin<Box<dyn Future<Output = Result<(), WorkError>> + Send>>>,
+    wait: Option<RootGraphWait>,
     complete: bool,
     per_turn: usize,
     _exit: crate::scope::ReclaimWakeOnExit,
@@ -130,10 +132,9 @@ impl Drop for Construction {
                 .joint
                 .as_mut()
                 .and_then(|l| l.claims.get_mut(&self.action))
+                && row.dispatch_staging == Some(token)
             {
-                if row.dispatch_staging == Some(token) {
-                    row.dispatch_staging = None;
-                }
+                row.dispatch_staging = None;
             }
         }
     }
@@ -284,7 +285,6 @@ impl NativeDispatchSource {
             token,
             action: action_id,
             root: origin.root,
-            execution: origin.execution,
             lane: origin.lane,
             members,
             root_graph: None,
@@ -304,8 +304,8 @@ impl NativeDispatchSource {
             member.flat = None;
         }
     }
-    fn charge(&self, work: u64) -> Result<(u64, Option<Arc<Vec<DependencyRef>>>), WorkError> {
-        let mut state = self.inner.state.lock().unwrap();
+    fn capture_active_root(&self) -> Result<RootGraphCapture, WorkError> {
+        let state = self.inner.state.lock().unwrap();
         if state
             .joint
             .as_ref()
@@ -330,15 +330,15 @@ impl NativeDispatchSource {
         };
         let row = state
             .joint
-            .as_mut()
+            .as_ref()
             .unwrap()
             .claims
-            .get_mut(&self.action)
+            .get(&self.action)
             .ok_or(WorkError::Released)?;
         if row.dispatch_staging != Some(self.token) {
             return Err(WorkError::Conflict);
         }
-        let original = row.native_dispatch.as_mut().ok_or(WorkError::Conflict)?;
+        row.native_dispatch.as_ref().ok_or(WorkError::Conflict)?;
         Ok((epoch, graph))
     }
     fn commit(&mut self) -> Result<bool, WorkError> {
@@ -448,7 +448,7 @@ impl Future for NativeDispatchSource {
             };
         }
         for _ in 0..self.per_turn {
-            let (epoch, graph) = match self.charge(1) {
+            let (epoch, graph) = match self.capture_active_root() {
                 Ok(value) => value,
                 Err(error) => {
                     self.complete = true;
@@ -487,11 +487,7 @@ impl Future for NativeDispatchSource {
             }
             // Free the captured-history slot BEFORE dedup/old-S retirement.
             self.root_graph = None;
-            let commit_work = match u64::try_from(self.members.len()) {
-                Ok(n) => n,
-                Err(_) => return Poll::Ready(Err(WorkError::ArithmeticOverflow)),
-            };
-            if let Err(error) = self.charge(commit_work) {
+            if let Err(error) = self.capture_active_root() {
                 self.complete = true;
                 return Poll::Ready(Err(error));
             }
@@ -539,10 +535,10 @@ impl Drop for NativeDispatchSource {
                 if id == self.action {
                     continue;
                 }
-                if let Some(row) = state.joint.as_mut().and_then(|l| l.claims.get_mut(&id)) {
-                    if row.dispatch_staging == Some(self.token) {
-                        row.dispatch_staging = None;
-                    }
+                if let Some(row) = state.joint.as_mut().and_then(|l| l.claims.get_mut(&id))
+                    && row.dispatch_staging == Some(self.token)
+                {
+                    row.dispatch_staging = None;
                 }
             }
         }
@@ -553,10 +549,9 @@ impl Drop for NativeDispatchSource {
                 .joint
                 .as_mut()
                 .and_then(|l| l.claims.get_mut(&self.action))
+                && row.dispatch_staging == Some(self.token)
             {
-                if row.dispatch_staging == Some(self.token) {
-                    row.dispatch_staging = None;
-                }
+                row.dispatch_staging = None;
             }
         }
     }

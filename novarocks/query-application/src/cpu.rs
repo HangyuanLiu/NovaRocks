@@ -132,7 +132,6 @@ impl std::error::Error for QueryBlockingFailure {}
 impl novarocks_failure_contract::FailureProjection for QueryBlockingFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use crate::execution_error::QueryFailureReason;
-        use novarocks_failure_contract::FailureProjection;
         match self {
             Self::Panicked(_) => QueryFailureReason::BlockingWorkerPanicked,
             Self::ExecutorClosed | Self::SubmissionClosed => {
@@ -197,7 +196,11 @@ enum ElasticWorkerState {
     Idle(Sender<WorkerCommand>),
     Assigned,
     Retiring,
-    Failed(Arc<preserving_cpu::CpuWork>),
+    Failed {
+        // The failed row retains the original work even when no reader needs
+        // its contents. Actual thread exit is not failure disposition.
+        _original: Arc<preserving_cpu::CpuWork>,
+    },
 }
 
 struct ElasticPlanningPoolState {
@@ -376,7 +379,7 @@ impl ElasticPlanningPool {
                     && !state
                         .workers
                         .values()
-                        .any(|worker| matches!(worker, ElasticWorkerState::Failed(_)))
+                        .any(|worker| matches!(worker, ElasticWorkerState::Failed { .. }))
             };
             if drained {
                 return Ok(());

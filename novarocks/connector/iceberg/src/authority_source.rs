@@ -187,6 +187,37 @@ impl AuthorityMaterialSource for IcebergAuthorityMaterialSource {
     }
 }
 
+impl IcebergAuthorityMaterialSource {
+    fn project_material(
+        &self,
+        refreshed: novarocks_spi::connector::VendedS3CredentialLeaseRefresh,
+    ) -> Result<AuthorityMaterial, AcquisitionFailure> {
+        // The refresh may legitimately cover several prefixes. This authority
+        // owns exactly one, and taking "some entry" instead of "this scope's
+        // entry" would hand a reader material for a neighbouring prefix that
+        // happens to sort first.
+        let entry = refreshed
+            .into_entries()
+            .into_iter()
+            .find(|entry| entry.prefix() == &self.scope)
+            .ok_or_else(|| {
+                AcquisitionFailure::Denied(format!(
+                    "refresh returned no material covering {}",
+                    self.scope.as_str()
+                ))
+            })?;
+
+        let (_, not_after_unix_ms, access_key_id, secret_access_key, session_token) =
+            entry.into_parts();
+        Ok(AuthorityMaterial::new(
+            access_key_id,
+            secret_access_key,
+            Some(session_token),
+            monotonic_not_after(not_after_unix_ms, Instant::now()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -300,36 +331,5 @@ mod tests {
             IcebergAuthorityMaterialSource::budget_for(Instant::now()),
             MIN_ACQUISITION_BUDGET
         );
-    }
-}
-
-impl IcebergAuthorityMaterialSource {
-    fn project_material(
-        &self,
-        refreshed: novarocks_spi::connector::VendedS3CredentialLeaseRefresh,
-    ) -> Result<AuthorityMaterial, AcquisitionFailure> {
-        // The refresh may legitimately cover several prefixes. This authority
-        // owns exactly one, and taking "some entry" instead of "this scope's
-        // entry" would hand a reader material for a neighbouring prefix that
-        // happens to sort first.
-        let entry = refreshed
-            .into_entries()
-            .into_iter()
-            .find(|entry| entry.prefix() == &self.scope)
-            .ok_or_else(|| {
-                AcquisitionFailure::Denied(format!(
-                    "refresh returned no material covering {}",
-                    self.scope.as_str()
-                ))
-            })?;
-
-        let (_, not_after_unix_ms, access_key_id, secret_access_key, session_token) =
-            entry.into_parts();
-        Ok(AuthorityMaterial::new(
-            access_key_id,
-            secret_access_key,
-            Some(session_token),
-            monotonic_not_after(not_after_unix_ms, Instant::now()),
-        ))
     }
 }

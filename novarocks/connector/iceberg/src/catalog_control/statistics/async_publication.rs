@@ -233,10 +233,10 @@ impl StatisticsPublicationSource {
         if let Some(StatisticsPublicationClose::RetainedUnknown { .. }) = &self.close {
             return Ok(self.close.as_ref().expect("observed close").clone());
         }
-        if self.journal.cleanup_inventory_is_disposed() {
-            if let Some(close) = &self.close {
-                return Ok(close.clone());
-            }
+        if self.journal.cleanup_inventory_is_disposed()
+            && let Some(close) = &self.close
+        {
+            return Ok(close.clone());
         }
         let mut uncommitted_disposed = false;
         let outcome = match &self.ready {

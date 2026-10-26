@@ -256,14 +256,16 @@ fn exact_copy_count_refuses_an_extra_output_without_minting_a_guard() {
         .schema(&metadata)
         .unwrap();
     let (scope, drops) = scope();
-    let mut checked = Plan::inspect(&metadata, &schema, &scope)
-        .unwrap()
-        .for_copies(2, &scope)
-        .unwrap();
-    let first = checked.build_one().unwrap();
-    let second = checked.build_one().unwrap();
-    assert!(matches!(checked.build_one(), Err(Error::ShapeChanged)));
-    drop(checked);
+    let (first, second) = {
+        let mut checked = Plan::inspect(&metadata, &schema, &scope)
+            .unwrap()
+            .for_copies(2, &scope)
+            .unwrap();
+        let first = checked.build_one().unwrap();
+        let second = checked.build_one().unwrap();
+        assert!(matches!(checked.build_one(), Err(Error::ShapeChanged)));
+        (first, second)
+    };
     drop(scope);
     drop(first);
     assert_eq!(drops.load(Ordering::SeqCst), 0);

@@ -33,17 +33,11 @@ use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWriteRequest, PreparedMvFirstRefreshWrite, PreparedMvMetadataOnlyWrite,
 };
-use crate::query_execution::mv_assembly::refresh_handoff::{
-    PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
-};
-use crate::query_execution::mv_native_write::{
-    MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
-};
+use crate::query_execution::mv_native_write::MvRefreshProviderActivation;
 use novarocks_mv_application::product::MvIncrementalWriteMode;
 use novarocks_mv_application::publication::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// Core-side provider adapter installed into the frontend composition.
 ///
@@ -98,57 +92,6 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
             owners,
             capacity,
             requests,
-        )
-    }
-
-    fn activate_write(
-        &self,
-        prepared: PreparedMvRefreshWrite,
-        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        execution: &QueryExecutionContext,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-        match prepared.into_assembly_artifact() {
-            PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
-                super::first_refresh_staging::bind_prepared_mv_first_refresh_staging(
-                    &self.query_kernel,
-                    &self.ports,
-                    prepared,
-                    planning_lease,
-                    exact_lease,
-                    execution,
-                    connector_context,
-                )
-            }
-            PreparedMvRefreshWriteArtifact::Incremental(prepared) => {
-                super::incremental_staging::bind_prepared_mv_incremental_staging(
-                    &self.query_kernel,
-                    &self.ports,
-                    prepared,
-                    planning_lease,
-                    exact_lease,
-                    execution,
-                    connector_context,
-                )
-            }
-        }
-    }
-
-    fn activate_metadata_only_publication(
-        &self,
-        prepared: &PreparedMvMetadataOnlyWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String>
-    {
-        begin_metadata_only_connector_write_session(
-            prepared,
-            connector_context,
-            exact_lease,
-            planning_lease,
-            self.query_kernel.typed_connector_control(),
         )
     }
 
@@ -217,24 +160,6 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
 /// The publication id travels inside the managed intent and nowhere else. It
 /// reaches the snapshot the commit writes -- that is what the publication fence
 /// reads back -- but no writer recipe, commit fragment, or backend sees it.
-pub(crate) fn begin_first_refresh_connector_write_session(
-    prepared: &PreparedMvFirstRefreshWrite,
-    connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
-    let request =
-        prepare_first_refresh_document_write_request(prepared, connector_context, exact_lease)
-            .map_err(|error| error.to_string())?;
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
-        crate::connector::write_target::derive_write_stack_lease(typed_connector_control, planning_lease)?,
-        exact_lease,
-        request,
-    )
-}
-
-/// Borrow the original receiving Source for the asynchronous Provider begin.
 pub(crate) async fn begin_first_refresh_connector_write_session_async_in(
     prepared: &PreparedMvFirstRefreshWrite,
     connector_context: ConnectorRequestContext,
@@ -350,24 +275,6 @@ fn prepare_first_refresh_document_write_request(
 /// rows to replace, and the empty-input disposition is `CommitEmptyWrite`,
 /// because the empty write *is* the publication -- an output version whose one
 /// new fact is the watermark P records.
-pub(crate) fn begin_metadata_only_connector_write_session(
-    prepared: &PreparedMvMetadataOnlyWrite,
-    connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
-    let request =
-        prepare_metadata_only_document_write_request(prepared, connector_context, exact_lease)
-            .map_err(|error| error.to_string())?;
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
-        crate::connector::write_target::derive_write_stack_lease(typed_connector_control, planning_lease)?,
-        exact_lease,
-        request,
-    )
-}
-
-/// Borrow the original receiving Source for the asynchronous Provider begin.
 pub(crate) async fn begin_metadata_only_connector_write_session_async_in(
     prepared: &PreparedMvMetadataOnlyWrite,
     connector_context: ConnectorRequestContext,
@@ -565,35 +472,6 @@ fn incremental_publication_write_input(
 /// The publication id travels inside the managed intent and nowhere else. It
 /// reaches the snapshot the commit writes -- that is what the publication fence
 /// reads back -- but no writer recipe, commit fragment, or backend sees it.
-pub(crate) fn begin_incremental_connector_write_session(
-    request: &MvIncrementalWriteRequest,
-    target_table: &novarocks_spi::connector::ConnectorTableHandle,
-    publication_intent: &MvRefreshPublicationIntent,
-    mode: MvIncrementalWriteMode,
-    target_write_fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
-    connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
-    let request = prepare_incremental_document_write_request(
-        request,
-        target_table,
-        publication_intent,
-        mode,
-        target_write_fields,
-        connector_context,
-        exact_lease,
-    )
-    .map_err(|error| error.to_string())?;
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
-        crate::connector::write_target::derive_write_stack_lease(typed_connector_control, planning_lease)?,
-        exact_lease,
-        request,
-    )
-}
-
-/// Borrow the original receiving Source for the asynchronous Provider begin.
 pub(crate) async fn begin_incremental_connector_write_session_async_in(
     request: &MvIncrementalWriteRequest,
     target_table: &novarocks_spi::connector::ConnectorTableHandle,
@@ -676,27 +554,6 @@ fn prepare_incremental_document_write_request(
             connector_context,
         )
         .map_err(invalid_activation)
-}
-
-/// Release a session that will never reach its commit.
-///
-/// Nothing external has happened -- a begin performs reads only, and a session
-/// commits only through a completion this attempt never produced -- but the
-/// provider is holding a session for a write that will not run, and this
-/// refresh's one terminal decision is the only thing that releases it. So a
-/// failed refresh leaves nothing behind. The original failure is what the
-/// caller reports, so a failure to release is logged rather than substituted
-/// for it.
-pub(crate) fn release_mv_write_session_without_commit(
-    write_session: &crate::query_execution::write_session::ConnectorWriteSession,
-    connector_context: &ConnectorRequestContext,
-) {
-    if let Err(error) = write_session.abort(connector_context.clone()) {
-        tracing::warn!(
-            %error,
-            "releasing an uncommitted MV first-refresh write session failed",
-        );
-    }
 }
 
 /// Freeze the declaration one MV publication commits under.

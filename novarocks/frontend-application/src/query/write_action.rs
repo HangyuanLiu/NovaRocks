@@ -39,8 +39,7 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMetadataCleanupResponsibility,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteReceipt,
-    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationFinalization,
     LakePublicationDisposition,
 };
 use novarocks_workload_control::{WorkError, WorkScope};
@@ -67,8 +66,6 @@ pub(crate) trait WriteStatementFamily: Send + Sync + 'static {
     + Send;
 
     fn finalize(prepared: &Self::Prepared) -> Result<(), String>;
-
-    fn prepared_source_layouts() -> Result<Vec<std::alloc::Layout>, WorkError>;
 }
 
 pub(crate) struct WriteStatementStart<P: WriteStatementFamily> {
@@ -174,82 +171,6 @@ pub(crate) fn prepare<P: WriteStatementFamily>(
         selected: None,
         close_failure: None,
     })
-}
-
-/// Fixed original source backing; externally created graphs retain their
-/// creator's charges. This does not quote SDK/Tokio private allocations.
-fn future_size<I, F: Future>(_: fn(I) -> F) -> usize {
-    std::mem::size_of::<F>()
-}
-fn future_size3<I, J, K, F: Future>(_: fn(I, J, K) -> F) -> usize {
-    std::mem::size_of::<F>()
-}
-pub(crate) fn fixed_source_bytes<P: WriteStatementFamily>(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use std::alloc::Layout;
-    let mut bytes = 0usize;
-    for layout in [
-        Layout::new::<WriteStatementAction<P>>(),
-        Layout::new::<WriteCleanupResidual>(),
-        arc_layout(Layout::new::<P::Input>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<Mutex<Option<Arc<ConnectorWriteSession>>>>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-    ] {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    bytes = bytes
-        .checked_add(future_size(P::prepare))
-        .and_then(|n| n.checked_add(future_size(close_original)))
-        .and_then(|n| n.checked_add(future_size3(P::compile)))
-        .and_then(|n| n.checked_add(super::statement_computation::heap_source_bytes().ok()?))
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    for layout in P::prepared_source_layouts()? {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for layout in ConnectorWriteSession::fixed_receiving_layouts()
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-    {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for layout in
-        FrontendCompletionCustody::known_layouts().map_err(|_| WorkError::ArithmeticOverflow)?
-    {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    // PublicationCall is inline in the original action; its additional
-    // original inputs/F pointees coexist with that action, not a second call.
-    for layout in WritePublicationCall::known_layouts()
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .into_iter()
-        .skip(1)
-    {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for layout in WriteBeginReceiving::known_layouts().map_err(|_| WorkError::ArithmeticOverflow)? {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    u64::try_from(bytes)
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .checked_add(MetadataIoAdmission::fixed_backing_bytes(
-            geometry.max_concurrent_io().get(),
-            k,
-        )?)
-        .ok_or(WorkError::ArithmeticOverflow)
 }
 
 struct WriteStatementAction<P: WriteStatementFamily> {
@@ -800,7 +721,9 @@ impl GovernedStatementResidual for WriteCleanupResidual {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+    use novarocks_spi::connector::{
+        ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationOutcome,
+    };
 
     #[test]
     fn exact_commit_cleanup_and_business_finalization_are_independent() {

@@ -57,7 +57,6 @@ impl std::error::Error for ReadQuotaFailure {
 }
 impl novarocks_failure_contract::FailureProjection for ReadQuotaFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         self.original.failure_fact()
     }
 }

@@ -91,7 +91,6 @@ pub(crate) struct ProposalSlotWaitTarget {
     owner: WorkId,
     slot: SlotId,
     generation: u64,
-    marker: crate::WorkloadProgressRevision,
 }
 pub(crate) enum ProposalReservation {
     Reserved(Option<ProposalConstruction>),
@@ -275,7 +274,6 @@ impl JointAdmissionHandle {
                             owner: scope.id,
                             slot,
                             generation: state.cancellations.slots[slot.0].generation,
-                            marker: self.inner.capture_progress(&state),
                         }));
                     }
                     domains

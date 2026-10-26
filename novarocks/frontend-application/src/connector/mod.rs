@@ -18,7 +18,6 @@
 pub mod backend;
 pub mod cleanup_maintenance;
 pub mod data_mutation;
-pub mod distributed_rewrite_application;
 pub mod metadata_maintenance;
 pub mod mutation;
 pub mod scan_admission;

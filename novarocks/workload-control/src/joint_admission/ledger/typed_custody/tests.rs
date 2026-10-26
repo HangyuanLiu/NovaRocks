@@ -24,51 +24,11 @@ use std::{
 };
 
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    fixture_with_cpu_jobs(0)
-}
-fn fixture_with_cpu_jobs(
-    cpu_jobs: u64,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    fixture_with_cpu_lane(cpu_jobs, JointLane::Foreground)
-}
-fn fixture_with_cpu_lane(
-    cpu_jobs: u64,
-    lane: JointLane,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    fixture_with_cpu_lane_and_productions(cpu_jobs, lane, 1, 0)
-}
-fn fixture_with_cpu_lane_and_productions(
-    cpu_jobs: u64,
-    lane: JointLane,
-    production_records: u64,
-    publications: u64,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    fixture_with_production_changes(cpu_jobs, lane, production_records, publications, 2)
-}
-fn fixture_with_production_changes(
-    cpu_jobs: u64,
-    lane: JointLane,
-    production_records: u64,
-    publications: u64,
-    changes: usize,
-) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
-    let (control, handle, driver, binding) = fixture_with_optional_closed_factory(
-        cpu_jobs,
-        lane,
-        production_records,
-        publications,
-        changes,
-        None,
-    );
+    let (control, handle, driver, binding) = fixture_with_optional_closed_factory(None);
     assert!(binding.is_none());
     (control, handle, driver)
 }
 fn fixture_with_optional_closed_factory(
-    cpu_jobs: u64,
-    lane: JointLane,
-    production_records: u64,
-    publications: u64,
-    changes: usize,
     descriptor: Option<InternalResultClosedFactoryDescriptor>,
 ) -> (
     WorkloadControl,
@@ -677,7 +637,7 @@ fn cpu_stage(
 #[test]
 fn cpu_action_inherits_every_stage_domain_and_retires_after_original_physical_drop() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let (control, handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     let facts = [fact("cpu-a"), fact("cpu-b")];
@@ -729,7 +689,7 @@ fn cpu_action_inherits_every_stage_domain_and_retires_after_original_physical_dr
     impl Drop for Physical<'_> {
         fn drop(&mut self) {
             // The real local holder must exit while its original charge lives.
-            assert_eq!(held(&self.control, JointResource::InternalCpuJobs), 1);
+            assert_eq!(held(self.control, JointResource::InternalCpuJobs), 1);
             self.dropped.store(true, Ordering::Release);
         }
     }
@@ -762,7 +722,7 @@ fn cpu_action_inherits_every_stage_domain_and_retires_after_original_physical_dr
 #[test]
 fn cpu_action_refuses_foreign_scope_and_source_exit_at_both_physical_cuts() {
     for exit_after_offer in [false, true] {
-        let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+        let (control, handle, mut driver) = fixture();
         let work = root(&control);
         let scope = work.owner.scope();
         let computation = cpu_stage(&handle, &work.owner, &[fact("exact")], &mut driver);
@@ -815,7 +775,7 @@ fn cpu_action_refuses_foreign_scope_and_source_exit_at_both_physical_cuts() {
 #[test]
 fn original_settlement_cpu_action_survives_new_business_cancel_at_each_local_cut() {
     for phase in 0..4 {
-        let (control, handle, mut driver) = fixture_with_cpu_lane(1, JointLane::Settlement);
+        let (control, handle, mut driver) = fixture();
         let work = root(&control);
         let scope = work.owner.scope();
         let facts = [fact("settlement")];
@@ -877,7 +837,7 @@ fn original_settlement_cpu_action_survives_new_business_cancel_at_each_local_cut
 
 #[test]
 fn foreground_cpu_source_keeps_the_original_cancellation_refusal() {
-    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let (control, handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     let computation = cpu_stage(&handle, &work.owner, &[fact("foreground")], &mut driver);
@@ -900,8 +860,7 @@ fn foreground_cpu_source_keeps_the_original_cancellation_refusal() {
 
 #[test]
 fn unknown_production_survives_last_handle_and_received_keeps_publication_until_disposition() {
-    let (control, _handle, mut driver) =
-        fixture_with_cpu_lane_and_productions(0, JointLane::Foreground, 4, 4);
+    let (control, _handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     bind(&scope, &[fact("writer")], &mut driver);
@@ -967,8 +926,7 @@ fn unknown_production_survives_last_handle_and_received_keeps_publication_until_
 
 #[test]
 fn production_registration_rechecks_cancel_after_real_grant_before_metadata_move() {
-    let (control, _handle, mut driver) =
-        fixture_with_cpu_lane_and_productions(0, JointLane::Foreground, 4, 4);
+    let (control, _handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     bind(&scope, &[fact("writer")], &mut driver);
@@ -1053,8 +1011,7 @@ fn production_rows(
 }
 #[test]
 fn control_growth_installs_unknown_and_received_productions_in_one_original_receipt() {
-    let (control, _, mut driver) =
-        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 3);
+    let (control, _, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     bind(&scope, &[fact("original")], &mut driver);
@@ -1103,8 +1060,7 @@ fn control_growth_installs_unknown_and_received_productions_in_one_original_rece
 }
 #[test]
 fn pending_received_production_refuses_settlement_and_drop_rolls_back_all_domain_delta() {
-    let (control, _, mut driver) =
-        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 2);
+    let (control, _, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     bind(&scope, &[fact("original")], &mut driver);
@@ -1134,8 +1090,7 @@ fn pending_received_production_refuses_settlement_and_drop_rolls_back_all_domain
 
 #[test]
 fn an_already_granted_new_record_cannot_register_across_pending_control_growth() {
-    let (control, _, mut driver) =
-        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 2);
+    let (control, _, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     bind(&scope, &[fact("original")], &mut driver);
@@ -1267,7 +1222,7 @@ fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody
         std::num::NonZeroU64::new(23).unwrap(),
     );
     let (control, _handle, mut driver, binding) =
-        fixture_with_optional_closed_factory(1, JointLane::Foreground, 1, 0, 2, Some(descriptor));
+        fixture_with_optional_closed_factory(Some(descriptor));
     let binding = binding.unwrap();
     let work = root(&control);
     let scope = work.owner.scope();
@@ -1359,7 +1314,7 @@ fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody
 
 #[test]
 fn ordinary_positive_grant_does_not_certify_a_closed_cpu_factory() {
-    let (control, handle, mut driver) = fixture_with_cpu_jobs(2);
+    let (control, handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     let facts = [fact("shape-a"), fact("shape-b")];
@@ -1430,7 +1385,7 @@ fn ordinary_positive_grant_does_not_certify_a_closed_cpu_factory() {
 
 #[test]
 fn cancelled_cpu_action_keeps_original_refusal_after_the_producer_source_exits() {
-    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let (control, handle, mut driver) = fixture();
     let work = root(&control);
     let scope = work.owner.scope();
     let computation = cpu_stage(
@@ -1596,14 +1551,8 @@ fn positive_payload_metadata_cpu_continuation_keeps_original_root_facts_after_ca
             std::any::TypeId::of::<fn()>(),
             std::num::NonZeroU64::new(23).unwrap(),
         );
-        let (control, handle, mut driver, factory) = fixture_with_optional_closed_factory(
-            1,
-            JointLane::Foreground,
-            1,
-            0,
-            2,
-            Some(descriptor),
-        );
+        let (control, handle, mut driver, factory) =
+            fixture_with_optional_closed_factory(Some(descriptor));
         let factory = factory.unwrap();
         let work = root(&control);
         let scope = work.owner.scope();
@@ -1710,7 +1659,7 @@ fn metadata_cpu_continuation_rejects_foreign_root_released_payload_and_closed_dr
         std::num::NonZeroU64::new(23).unwrap(),
     );
     let (control, handle, mut driver, factory) =
-        fixture_with_optional_closed_factory(1, JointLane::Foreground, 1, 0, 2, Some(descriptor));
+        fixture_with_optional_closed_factory(Some(descriptor));
     let factory = factory.unwrap();
     let work = root(&control);
     let other = root(&control);

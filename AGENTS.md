@@ -1024,8 +1024,9 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
   Current governed statement custody starts at `novarocks/frontend-application/src/query/statement_action.rs`;
   inspect the read/write/mutation/CTAS/MV Actions, shared `statement_computation.rs` and
-  `statement_publication.rs` in that directory. `QueryExecutionService` only seals the
-  original Provider rewrite; it owns no execution loop or query-id allocator.
+  `statement_publication.rs` in that directory. Provider rewrite session custody is in
+  `query_execution/distributed_rewrite.rs`; the former empty `QueryExecutionService` injection
+  chain is retired.
   Common logical execution policy and identity are in `novarocks/query-application/src/coordination/**`.
   Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
   and MySQL success/error projection; consult ADR-0198 before changing these boundaries.

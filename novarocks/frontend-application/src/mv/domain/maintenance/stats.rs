@@ -229,7 +229,7 @@ impl MaintenanceFactsState {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<TableMaintenanceStats, String>> {
-        use std::{future::Future, task::Poll};
+        use std::task::Poll;
         assert!(
             !self.poll_unproven,
             "unproven maintenance facts cannot be repolled"
@@ -246,7 +246,7 @@ impl MaintenanceFactsState {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<TableMaintenanceStats, String>> {
-        use std::{future::Future, task::Poll};
+        use std::task::Poll;
         if self.compactable.is_none() {
             match self.observation.poll_result(cx) {
                 Poll::Pending => return Poll::Pending,

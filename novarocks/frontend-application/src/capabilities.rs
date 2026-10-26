@@ -40,7 +40,6 @@ use crate::query_execution::maintenance::{
     TableMaintenanceEngine, TableMaintenanceService,
 };
 use crate::query_execution::package_freeze::CompiledPackageCarrier;
-use crate::query_execution::service::QueryExecutionService;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
@@ -69,7 +68,6 @@ pub(crate) struct QueryCompilerPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
-    query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
     exchange_port: u16,
     view_service: Arc<dyn ViewService>,
@@ -92,7 +90,6 @@ impl QueryCompilerPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
-        query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         exchange_port: u16,
         view_service: Arc<dyn ViewService>,
@@ -113,7 +110,6 @@ impl QueryCompilerPorts {
             connector_control,
             typed_connector_control,
             unified_statistics,
-            query_execution,
             backend_topology,
             exchange_port,
             view_service,
@@ -135,7 +131,6 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         Arc::clone(&ports.connector_control),
         Arc::clone(&ports.typed_connector_control),
         Arc::clone(&ports.unified_statistics),
-        ports.query_execution.clone(),
         ports.backend_topology.clone(),
         ports.exchange_port,
         ports.constant_policy,
@@ -185,7 +180,6 @@ pub struct DmlEnginePorts {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    query_execution: QueryExecutionService,
     connector_runtime: tokio::runtime::Handle,
     lake_publication_runtime_policy:
         novarocks_query_application::publication::LakePublicationRuntimePolicy,
@@ -209,7 +203,6 @@ impl DmlEnginePorts {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-        query_execution: QueryExecutionService,
         connector_runtime: tokio::runtime::Handle,
         lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         constant_policy: novarocks_functions::ConstantPolicy,
@@ -226,7 +219,6 @@ impl DmlEnginePorts {
             unified_statistics,
             mv_storage_observation,
             mv_readiness,
-            query_execution,
             connector_runtime,
             write_runtime: None,
             lake_publication_runtime_policy,
@@ -256,7 +248,6 @@ impl DmlEnginePorts {
             Arc::clone(&self.unified_statistics),
             Arc::clone(&self.mv_storage_observation),
             Arc::clone(&self.mv_readiness),
-            self.query_execution.clone(),
         )
         .with_lake_publication_runtime_policy(self.lake_publication_runtime_policy)
         .with_connector_runtime(self.connector_runtime.clone());
@@ -404,7 +395,6 @@ pub struct MaintenanceCommandPorts {
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
     runtime: Handle,
 }
@@ -422,7 +412,6 @@ impl MaintenanceCommandPorts {
         typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-        query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         runtime: Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
@@ -440,7 +429,6 @@ impl MaintenanceCommandPorts {
             typed_connector_control,
             mv_storage_observation,
             mv_readiness,
-            query_execution,
             service,
             runtime,
         }
@@ -471,7 +459,6 @@ impl MaintenanceCommandPorts {
             Arc::clone(&self.typed_connector_control),
             Arc::clone(&self.mv_storage_observation),
             Arc::clone(&self.mv_readiness),
-            self.query_execution.clone(),
             Arc::clone(&self.service),
             self.constant_policy,
             self.static_plan_carrier,
@@ -693,7 +680,6 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
-    query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
     exchange_port: u16,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
@@ -713,7 +699,6 @@ impl MvRefreshProviderActivationPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
-        query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         exchange_port: u16,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
@@ -731,7 +716,6 @@ impl MvRefreshProviderActivationPorts {
             connector_control,
             typed_connector_control,
             unified_statistics,
-            query_execution,
             backend_topology,
             exchange_port,
             mv_readiness,
@@ -742,8 +726,8 @@ impl MvRefreshProviderActivationPorts {
 }
 
 /// Build the provider activation adapter used by the Frontend-owned MV
-/// refresh controller.  The returned trait object contains no state facade
-/// and retains the admitted query execution service for native writes.
+/// refresh controller. The returned trait object retains the exact compiler
+/// authorities used by its provider activation.
 pub(crate) fn mv_refresh_provider_activation(
     ports: MvRefreshProviderActivationPorts,
 ) -> Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation> {
@@ -754,7 +738,6 @@ pub(crate) fn mv_refresh_provider_activation(
         Arc::clone(&ports.connector_control),
         Arc::clone(&ports.typed_connector_control),
         ports.unified_statistics,
-        ports.query_execution,
         ports.backend_topology,
         ports.exchange_port,
         ports.constant_policy,

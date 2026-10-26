@@ -491,22 +491,21 @@ impl StatisticsCollection for IcebergMetadata {
     }
 }
 
+type CollectionSessionParts = (
+    novarocks_spi::connector::ConnectorTableHandle,
+    StatisticsDataVersion,
+    Option<i64>,
+    Vec<StatisticsRequiredAggregation>,
+    IcebergStatisticsCollectionSession,
+);
+
 impl IcebergMetadata {
     fn collection_session(
         &self,
         request: StatisticsCollectionStartRequest,
         table_payload: IcebergTablePayload,
         physical_table: crate::iceberg::table::Table,
-    ) -> Result<
-        (
-            novarocks_spi::connector::ConnectorTableHandle,
-            StatisticsDataVersion,
-            Option<i64>,
-            Vec<StatisticsRequiredAggregation>,
-            IcebergStatisticsCollectionSession,
-        ),
-        ConnectorError,
-    > {
+    ) -> Result<CollectionSessionParts, ConnectorError> {
         self.collection_session_borrowed(&request, &table_payload, &physical_table, None)
     }
     fn collection_session_borrowed(
@@ -515,17 +514,8 @@ impl IcebergMetadata {
         table_payload: &IcebergTablePayload,
         physical_table: &crate::iceberg::table::Table,
         cpu: Option<std::sync::Weak<dyn novarocks_spi::connector::StatisticsCpuPort>>,
-    ) -> Result<
-        (
-            novarocks_spi::connector::ConnectorTableHandle,
-            StatisticsDataVersion,
-            Option<i64>,
-            Vec<StatisticsRequiredAggregation>,
-            IcebergStatisticsCollectionSession,
-        ),
-        ConnectorError,
-    > {
-        let info = base_table_info(&table_payload, "statistics collection")?;
+    ) -> Result<CollectionSessionParts, ConnectorError> {
+        let info = base_table_info(table_payload, "statistics collection")?;
         let expected_uuid = info
             .table_uuid
             .as_deref()
@@ -1319,6 +1309,10 @@ fn internal(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Internal, message.into())
 }
 
+fn future3_bytes<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2004,8 +1998,4 @@ mod tests {
             "the coverage predicate must not consult delete files"
         );
     }
-}
-
-fn future3_bytes<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
-    std::mem::size_of::<F>()
 }

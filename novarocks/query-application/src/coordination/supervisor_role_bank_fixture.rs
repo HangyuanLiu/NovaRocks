@@ -24,13 +24,13 @@ use novarocks_workload_control::joint_admission::{
 use novarocks_workload_control::{ControlStorageConfig, PollRoleGeometry};
 
 type TestRoleFactory<F> = fn(WorkOwner, LogicalRoleInput) -> F;
+type TestRoleBank<F> =
+    RolePollBank<LogicalRoleInput, F, TestRoleFactory<F>, Arc<OriginalLogicalExit>>;
 struct TestGovernance<F: Future> {
     control: Option<WorkloadControl>,
     statement_source_slots: NonZeroUsize,
     // A metadata-only Option move transfers this SAME bank into the root.
-    bank: std::sync::Mutex<
-        Option<RolePollBank<LogicalRoleInput, F, TestRoleFactory<F>, Arc<OriginalLogicalExit>>>,
-    >,
+    bank: std::sync::Mutex<Option<TestRoleBank<F>>>,
     admission: JointAdmissionHandle,
     progress: Option<TestProgressOwner>,
     finished: bool,
@@ -366,7 +366,7 @@ fn unpolled_test_driver<F>(
     control: &TestGovernance<F>,
     native: Arc<dyn LogicalExecutionNativePort>,
 ) -> (
-    RolePollBank<LogicalRoleInput, F, TestRoleFactory<F>, Arc<OriginalLogicalExit>>,
+    TestRoleBank<F>,
     watch::Sender<bool>,
     LogicalExecutionRuntimeRegistry,
     QueryExecutionClient,

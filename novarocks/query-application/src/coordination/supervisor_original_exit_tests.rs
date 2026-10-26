@@ -755,7 +755,7 @@ impl NativeAttemptPreparationPort for CompletedActivationDropPreparation {
             completed: false,
         });
         Box::pin(async move {
-            let scheduling = no_scan_scheduling(&request);
+            let scheduling = no_scan_scheduling(request);
             request.bind_staged(scheduling).map_err(Into::into)
         })
     }
@@ -1002,7 +1002,7 @@ async fn actual_root_cancel_closes_bank_ingress_after_statement_wake_panics() {
     }
     let control = governance_empty();
     let mut control = {
-        let (mut bank, shutdown, mut registry, client) =
+        let (bank, shutdown, mut registry, client) =
             unpolled_test_driver(&control, Arc::new(PanickingOpenNativePort));
         let statements = crate::session_control::StatementProgressSlot::empty();
         statements
@@ -1231,7 +1231,7 @@ impl NativeAttemptPreparationPort for RootReadDropPreparation {
             signals: Arc::clone(&self.signals),
         });
         Box::pin(async move {
-            let scheduling = no_scan_scheduling(&request);
+            let scheduling = no_scan_scheduling(request);
             request.bind_staged(scheduling).map_err(Into::into)
         })
     }

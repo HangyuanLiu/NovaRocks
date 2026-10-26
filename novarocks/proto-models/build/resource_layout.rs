@@ -206,13 +206,21 @@ impl Generator {
                             .collect::<Vec<_>>();
                         implementations.push(self.implementation(&id, &message.ident, fields));
                         let ident = &message.ident;
+                        let visitor = syn::Ident::new(
+                            if message.fields.iter().next().is_none() {
+                                "_visitor"
+                            } else {
+                                "visitor"
+                            },
+                            ident.span(),
+                        );
                         let visits = message.fields.iter().map(|field| {
                             let field = field.ident.as_ref().expect("named generated field");
-                            quote! { crate::resource_layout::GeneratedCloneBacking::visit_clone_backing(&self.#field, visitor)?; }
+                            quote! { crate::resource_layout::GeneratedCloneBacking::visit_clone_backing(&self.#field, #visitor)?; }
                         });
                         implementations.push(syn::parse2(quote! {
                             impl crate::resource_layout::GeneratedCloneBacking for #ident {
-                                fn visit_clone_backing<V: crate::resource_layout::CloneBackingVisitor>(&self, visitor: &mut V) -> ::core::result::Result<(), V::Error> {
+                                fn visit_clone_backing<V: crate::resource_layout::CloneBackingVisitor>(&self, #visitor: &mut V) -> ::core::result::Result<(), V::Error> {
                                     #(#visits)* ::core::result::Result::Ok(())
                                 }
                             }

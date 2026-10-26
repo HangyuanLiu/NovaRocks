@@ -65,7 +65,6 @@ mod publication_call;
 pub(crate) use computation::{
     AcceptedWriteSegment, SessionDecodedWriteSegment, WriteComputationDecode, WriteReceivingPort,
 };
-pub(crate) use production::WriteProductionQuote;
 pub(crate) use publication_call::WritePublicationCall;
 
 #[cfg(test)]
@@ -187,26 +186,6 @@ struct AccumulatedWriteSet {
     statistics_body_bytes: usize,
     statistics_property_bytes: usize,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
-}
-
-pub(crate) fn require_uncommitted_release(
-    outcome: novarocks_spi::connector::ConnectorWriteAbortOutcome,
-) -> Result<(), String> {
-    use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
-    match outcome {
-        ConnectorWriteAbortOutcome::KnownUncommitted { cleanup } => match cleanup {
-            ExternalMutationFinalization::Complete => Ok(()),
-            ExternalMutationFinalization::Failed(error) => {
-                Err(format!("write release cleanup failed: {error}"))
-            }
-        },
-        ConnectorWriteAbortOutcome::KnownCommitted { .. } => {
-            Err("write release observed a known committed publication".into())
-        }
-        ConnectorWriteAbortOutcome::CommitUnknown { failure, .. } => Err(format!(
-            "write release publication outcome is unknown: {failure}"
-        )),
-    }
 }
 
 impl ConnectorWriteSession {
@@ -428,13 +407,6 @@ impl ConnectorWriteSession {
         receiving.adopt_session();
         receiving.finish_drop();
         receiving.completed_result()
-    }
-
-    pub(crate) fn io_profile(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
-    {
-        self.lease.session().io_profile()
     }
 
     pub(crate) fn cleanup_responsibility(
@@ -1788,21 +1760,6 @@ pub(crate) fn finish_empty_staged_create_write_for_following_terminal_action(
         outcome,
         affected_rows,
         context,
-    })
-}
-
-/// Commit a metadata-only publication: an empty write on the target's own
-/// `main`, carrying the publication document that states the watermark.
-pub(crate) fn finish_empty_metadata_only_publication(
-    session: &ConnectorWriteSession,
-    context: ConnectorRequestContext,
-) -> Result<CommittedWriteSession, ConnectorError> {
-    let outcome = session.finish_empty_metadata_only_publication(context)?;
-    let affected_rows =
-        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(0);
-    Ok(CommittedWriteSession {
-        outcome,
-        affected_rows,
     })
 }
 

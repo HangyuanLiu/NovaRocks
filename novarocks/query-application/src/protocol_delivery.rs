@@ -325,7 +325,7 @@ pub enum QuerySessionOutput {
     /// until the application wraps it with the original governed owner.
     Query(QueryResult),
     GovernedQuery(GovernedImmediateStatementResult),
-    StreamingQuery(StreamingStatementResult),
+    StreamingQuery(Box<StreamingStatementResult>),
     GovernedCompletion(GovernedCompletionStatementResult),
     GovernedError(GovernedErrorStatementResult),
     Ok,

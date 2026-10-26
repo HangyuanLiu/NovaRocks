@@ -145,7 +145,10 @@ struct LockCheckingWake {
     dropped: Arc<AtomicBool>,
 }
 impl std::task::Wake for LockCheckingWake {
-    fn wake(self: Arc<Self>) {}
+    fn wake(self: Arc<Self>) {
+        // Consume this original alias; its last Drop checks lock-free retirement.
+        drop(self);
+    }
 }
 impl Drop for LockCheckingWake {
     fn drop(&mut self) {

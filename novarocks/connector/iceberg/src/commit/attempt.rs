@@ -329,7 +329,7 @@ pub(crate) async fn run_to_committed_frontier(
     )
     .await
 }
-pub(crate) async fn run_in_phase(
+async fn run_in_phase(
     operation: &IcebergCommitOperation,
     intent: &OperationIntent,
     prefix: &PreparedChange,

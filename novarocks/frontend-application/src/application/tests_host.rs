@@ -657,7 +657,6 @@ impl novarocks_state_store_api::StateStoreProviderFactory for HeldPureFactory {
         context: &novarocks_state_store_api::StateStoreExecutionContext,
         target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>>,
     ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
-        use novarocks_state_store_api::StateStoreProviderFactory;
         assert!(target.is_none());
         let mut inner = None;
         Box::new(

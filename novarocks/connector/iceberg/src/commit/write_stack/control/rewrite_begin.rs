@@ -46,7 +46,6 @@ impl std::error::Error for RewriteRetentionFailure {
 }
 impl novarocks_failure_contract::FailureProjection for RewriteRetentionFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         match self.0 {
             novarocks_resource_contract::RetentionPinError::Overflow => {
                 ConnectorErrorKind::ResourceExhausted.failure_fact()

@@ -17,7 +17,6 @@
 
 //! Actual canonical Root/Stage receipts and the closed Production author.
 use super::*;
-use crate::joint_admission::*;
 use crate::{ControlStorageConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig};
 use std::task::Waker;
 
@@ -41,7 +40,7 @@ fn reply(admission: &mut JointAdmission) -> JointGrantedBatch {
         _ => panic!("original paid reply"),
     }
 }
-fn fixture(publications: u64) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let storage = ControlStorageConfig::new(8, &[]);
     let config = ResponsibilityConfig {
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
@@ -249,7 +248,7 @@ fn finish(producer: Producer) {
 
 #[test]
 fn canonical_unknown_and_received_follow_grow_and_hold_root_until_exact_settlement() {
-    let (control, _handle, mut driver) = fixture(9);
+    let (control, _handle, mut driver) = fixture();
     let a = producer(&control, &mut driver, "provider-a");
     let root = a.work.owner.scope();
     let stage = a.stage.scope();
@@ -334,7 +333,7 @@ fn canonical_unknown_and_received_follow_grow_and_hold_root_until_exact_settleme
 
 #[test]
 fn registration_refuses_frozen_local_s_against_canonical_control_without_taking_metadata() {
-    let (control, handle, mut driver) = fixture(9);
+    let (control, handle, mut driver) = fixture();
     let a = producer(&control, &mut driver, "provider-a");
     let scope = a.stage.scope();
     let origin: Arc<dyn Send + Sync> = Arc::new(());
@@ -373,7 +372,7 @@ fn registration_refuses_frozen_local_s_against_canonical_control_without_taking_
 
 #[test]
 fn canonical_productions_preserve_each_complete_catalog_native_and_shared_host_origin() {
-    let (control, _handle, mut driver) = fixture(5);
+    let (control, _handle, mut driver) = fixture();
     let a = producer(&control, &mut driver, "provider-a");
     let b = producer(&control, &mut driver, "provider-b");
     let origin_a: Arc<dyn Send + Sync> = Arc::new(());

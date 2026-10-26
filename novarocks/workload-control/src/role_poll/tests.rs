@@ -920,8 +920,7 @@ async fn closed_bank_mount_returns_the_original_owner_and_input_without_queueing
     control.close_admission();
     let rejected = bank
         .mount_owned(root.owner, input)
-        .err()
-        .expect("closed mount refusal");
+        .expect_err("closed mount refusal");
     assert_eq!(rejected.error, WorkError::Closed);
     assert_eq!(rejected.owner.scope().id(), work);
     assert!(Arc::ptr_eq(&rejected.input.ready, &original));

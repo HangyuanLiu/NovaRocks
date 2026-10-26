@@ -390,7 +390,7 @@ impl TaskOperationSink for RecordingSink {
     fn try_reserve_queue(
         &self,
         request: TaskOperationQueueRequest,
-        preparation: &mut super::intent::TaskOperationQueuePreparation,
+        _preparation: &mut super::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
         let key = (request.lane(), request.backend_process_id());
         self.reservations
@@ -7958,20 +7958,22 @@ pub(crate) async fn settle_original_actor_establish_facts(
     );
 }
 
+pub(crate) type ManifestFixture<Tail, Protocol> = (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Tail,
+    Arc<ManualClock>,
+    Protocol,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+);
+
 /// The original lifecycle fixture with its caller execution and facts installed
 /// before the root source is transferred. No production constructor is added.
 #[cfg(novarocks_dev_controls)]
 pub(crate) fn manifest_normal_release_ack_with_protocol_fixture(
     execution: QueryExecutionId,
     plan: novarocks_query_application::api::PlanSeal,
-) -> (
-    TaskRoundForTest,
-    crate::native::task_transport::TaskAckIntakeHandle,
-    OperationIntent,
-    Arc<ManualClock>,
-    super::protocol_facts::AttemptProtocolFactsReceiver,
-    Vec<(OperationIntent, OperationAcknowledgement)>,
-) {
+) -> ManifestFixture<OperationIntent, super::protocol_facts::AttemptProtocolFactsReceiver> {
     let harness = manifest_protocol_harness(execution);
     let (round, acks, release, clock, protocol, facts) =
         manifest_normal_release_ack_fixture(harness, Some(plan));
@@ -8012,14 +8014,7 @@ fn manifest_protocol_harness(execution: QueryExecutionId) -> Harness {
 pub(crate) fn manifest_pending_release_with_protocol_fixture(
     execution: QueryExecutionId,
     plan: novarocks_query_application::api::PlanSeal,
-) -> (
-    TaskRoundForTest,
-    crate::native::task_transport::TaskAckIntakeHandle,
-    ManifestReleaseTail,
-    Arc<ManualClock>,
-    super::protocol_facts::AttemptProtocolFactsReceiver,
-    Vec<(OperationIntent, OperationAcknowledgement)>,
-) {
+) -> ManifestFixture<ManifestReleaseTail, super::protocol_facts::AttemptProtocolFactsReceiver> {
     let (round, acks, tail, clock, protocol, facts) =
         manifest_pending_release_fixture(manifest_protocol_harness(execution), Some(plan));
     (round, acks, tail, clock, protocol.unwrap(), facts)
@@ -8028,14 +8023,7 @@ pub(crate) fn manifest_pending_release_with_protocol_fixture(
 fn manifest_normal_release_ack_fixture(
     harness: Harness,
     plan: Option<novarocks_query_application::api::PlanSeal>,
-) -> (
-    TaskRoundForTest,
-    crate::native::task_transport::TaskAckIntakeHandle,
-    OperationIntent,
-    Arc<ManualClock>,
-    Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
-    Vec<(OperationIntent, OperationAcknowledgement)>,
-) {
+) -> ManifestFixture<OperationIntent, Option<super::protocol_facts::AttemptProtocolFactsReceiver>> {
     let (mut round, acks, tail, clock, protocol, facts) =
         manifest_pending_release_fixture(harness, plan);
     tail.observe_original_consumed_end(&mut round, 0);
@@ -8297,14 +8285,7 @@ impl ManifestReleaseTail {
 pub(crate) fn manifest_pending_write_with_protocol_fixture(
     execution: QueryExecutionId,
     plan: novarocks_query_application::api::PlanSeal,
-) -> (
-    TaskRoundForTest,
-    crate::native::task_transport::TaskAckIntakeHandle,
-    ManifestReleaseTail,
-    Arc<ManualClock>,
-    super::protocol_facts::AttemptProtocolFactsReceiver,
-    Vec<(OperationIntent, OperationAcknowledgement)>,
-) {
+) -> ManifestFixture<ManifestReleaseTail, super::protocol_facts::AttemptProtocolFactsReceiver> {
     let (round, acks, tail, clock, protocol, facts) = manifest_pending_release_fixture_with_writers(
         manifest_protocol_harness(execution),
         Some(plan),
@@ -8316,14 +8297,8 @@ pub(crate) fn manifest_pending_write_with_protocol_fixture(
 fn manifest_pending_release_fixture(
     harness: Harness,
     plan: Option<novarocks_query_application::api::PlanSeal>,
-) -> (
-    TaskRoundForTest,
-    crate::native::task_transport::TaskAckIntakeHandle,
-    ManifestReleaseTail,
-    Arc<ManualClock>,
-    Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
-    Vec<(OperationIntent, OperationAcknowledgement)>,
-) {
+) -> ManifestFixture<ManifestReleaseTail, Option<super::protocol_facts::AttemptProtocolFactsReceiver>>
+{
     manifest_pending_release_fixture_with_writers(harness, plan, false)
 }
 
@@ -8331,14 +8306,8 @@ fn manifest_pending_release_fixture_with_writers(
     harness: Harness,
     plan: Option<novarocks_query_application::api::PlanSeal>,
     declare_upstream_writers: bool,
-) -> (
-    TaskRoundForTest,
-    crate::native::task_transport::TaskAckIntakeHandle,
-    ManifestReleaseTail,
-    Arc<ManualClock>,
-    Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
-    Vec<(OperationIntent, OperationAcknowledgement)>,
-) {
+) -> ManifestFixture<ManifestReleaseTail, Option<super::protocol_facts::AttemptProtocolFactsReceiver>>
+{
     let sink = Arc::clone(&harness.sink);
     let clock = Arc::clone(&harness.clock);
     let mut facts = Vec::new();
@@ -8795,12 +8764,13 @@ impl Drop for PumpCloseCapture {
     }
 }
 
+type PumpCloseJob =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TaskExecutionError>> + Send>>;
+
 struct GatedPumpClose {
     name: &'static str,
     closing: bool,
-    job: Option<
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TaskExecutionError>> + Send>>,
-    >,
+    job: Option<PumpCloseJob>,
     close_turns: Arc<AtomicUsize>,
 }
 
@@ -10706,7 +10676,7 @@ pub(crate) fn synchronous_root_control_round() -> (
     (round, status, clock)
 }
 
-fn original_establish_observation_round_with_requests() -> (
+type EstablishObservationFixture = (
     TaskRoundForTest,
     Arc<ManualClock>,
     crate::native::task_transport::TaskAckIntakeHandle,
@@ -10715,7 +10685,9 @@ fn original_establish_observation_round_with_requests() -> (
     Arc<RecordingSubscriptions>,
     novarocks_execution::task_execution::AcquireQueryContextAdmissionTicket,
     QueryContextAdmissionTicketReceipt,
-) {
+);
+
+fn original_establish_observation_round_with_requests() -> EstablishObservationFixture {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;
     let harness = Harness::new(&[0], &[0], 64);

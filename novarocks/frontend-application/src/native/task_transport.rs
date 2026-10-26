@@ -125,7 +125,6 @@ fn covered_reconnect_backoff(failures: u32, jitter_sample: u64) -> Duration {
 
 mod joint_action;
 use joint_action::NativeCallSource;
-pub(crate) use joint_action::NativeMethodRunProgress;
 pub(crate) use joint_action::{NativeBatchAdmission, NativePhysicalOffer};
 mod queue_input;
 pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
@@ -3108,16 +3107,15 @@ async fn open_covered_subscription(
 
 /// Actual same-factory F layout; does not construct a client, request or F.
 pub(super) fn covered_subscription_future_layout() -> std::alloc::Layout {
-    fn layout<F: Future<Output = ()>>(
-        _: fn(
-            Client,
-            tokio::sync::watch::Receiver<DecodedCoveredSubscription>,
-            Arc<Mutex<DecodedCoveredSubscription>>,
-            Arc<ObservationPublisher>,
-            u32,
-            Arc<Mutex<SubscriptionState>>,
-        ) -> F,
-    ) -> std::alloc::Layout {
+    type CoveredSubscriptionFactory<F> = fn(
+        Client,
+        tokio::sync::watch::Receiver<DecodedCoveredSubscription>,
+        Arc<Mutex<DecodedCoveredSubscription>>,
+        Arc<ObservationPublisher>,
+        u32,
+        Arc<Mutex<SubscriptionState>>,
+    ) -> F;
+    fn layout<F: Future<Output = ()>>(_: CoveredSubscriptionFactory<F>) -> std::alloc::Layout {
         std::alloc::Layout::new::<F>()
     }
     layout(run_covered_subscription)

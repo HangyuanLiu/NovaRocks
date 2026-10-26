@@ -187,7 +187,6 @@ struct FrontendRoleProducts {
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     query_control: novarocks_query_application::session_control::QueryControlService,
-    query_execution: crate::query_execution::service::QueryExecutionService,
     logical_execution_launcher:
         Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
     mv_execution_services: crate::query::mv_action::MvExecutionServices,
@@ -376,7 +375,6 @@ async fn build_frontend_role_products(
             }))
             .map_err(FrontendApplicationError::server)?;
     }
-    let query_execution = host.build_query_execution_service()?;
     let logical_execution_launcher = host.build_logical_execution_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
@@ -463,7 +461,6 @@ async fn build_frontend_role_products(
             Arc::clone(&connector_control),
             Arc::clone(&typed_connector_control),
             Arc::clone(&unified_statistics),
-            query_execution.clone(),
             topology.clone(),
             exchange_port,
             Arc::clone(&mv_readiness),
@@ -478,7 +475,6 @@ async fn build_frontend_role_products(
     let mv_service = Arc::new(
         crate::mv::FrontendMvProductAdapter::with_refresh_dependencies(
             Arc::clone(&mv_readiness),
-            query_execution.clone(),
             Arc::clone(&connector_control),
             mv_activation,
             role,
@@ -527,7 +523,6 @@ async fn build_frontend_role_products(
         Arc::clone(&typed_connector_control),
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_readiness),
-        query_execution.clone(),
         Arc::clone(&maintenance_service),
         Handle::current(),
         host.constant_policy(),
@@ -647,7 +642,6 @@ async fn build_frontend_role_products(
         connector_control,
         typed_connector_control,
         query_control,
-        query_execution,
         logical_execution_launcher,
         topology,
         role,
@@ -682,7 +676,6 @@ fn build_frontend_query_session_factory_from_role_products(
     let function_catalog = Arc::clone(&products.function_catalog);
     let connector_control = Arc::clone(&products.connector_control);
     let typed_connector_control = Arc::clone(&products.typed_connector_control);
-    let query_execution = products.query_execution.clone();
     let topology = products.topology.clone();
     let role = products.role;
     let view_service = Arc::clone(&products.view_service);
@@ -703,7 +696,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&connector_control),
             Arc::clone(&typed_connector_control),
             Arc::clone(&unified_statistics),
-            query_execution.clone(),
             topology.clone(),
             exchange_port,
             view_service.clone(),
@@ -798,7 +790,6 @@ fn build_frontend_query_session_factory_from_role_products(
             unified_statistics,
             mv_storage_observation,
             Arc::clone(&mv_readiness),
-            query_execution.clone(),
             Handle::current(),
             host.lake_publication_runtime_policy(),
             host.constant_policy(),
@@ -819,7 +810,6 @@ fn build_frontend_query_session_factory_from_role_products(
         mv_command_executor,
         products.query_control.clone(),
         client_connection_control,
-        query_execution,
         Arc::clone(&products.logical_execution_launcher),
         host.workload_root_admission(),
         role,

@@ -1557,6 +1557,15 @@ pub type ConnectorTablePreparationFuture<'a> = std::pin::Pin<
     >,
 >;
 
+pub type ConnectorTableObjectSnapshotFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 pub trait ConnectorMetadata: Send + Sync {
     /// Pure selected first-party metadata CPU author, authenticated with the
     /// original planning lease before any closed phase is accepted.
@@ -1574,14 +1583,7 @@ pub trait ConnectorMetadata: Send + Sync {
         &self,
         _request: ConnectorTableObjectCaptureRequest,
         _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
-                > + Send
-                + '_,
-        >,
-    > {
+    ) -> ConnectorTableObjectSnapshotFuture<'_> {
         Box::pin(async {
             Err(ConnectorError::new(
                 super::ConnectorErrorKind::Unsupported,
@@ -1599,14 +1601,7 @@ pub trait ConnectorMetadata: Send + Sync {
         _request: ConnectorTableObjectCaptureRequest,
         _cpu: &'a Arc<dyn super::ProviderMetadataCpuPort>,
         _owner: &'a mut Option<super::ConnectorProcessLocalPayload>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> ConnectorTableObjectSnapshotFuture<'a> {
         Box::pin(async {
             Err(ConnectorError::new(
                 super::ConnectorErrorKind::Unsupported,

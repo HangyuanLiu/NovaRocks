@@ -116,10 +116,10 @@ enum TelemetryBacking {
 }
 impl Drop for TelemetryBacking {
     fn drop(&mut self) {
-        if let Self::Retained { owner, .. } = self {
-            if let Some(owner) = owner.take() {
-                owner.release_alias();
-            }
+        if let Self::Retained { owner, .. } = self
+            && let Some(owner) = owner.take()
+        {
+            owner.release_alias();
         }
     }
 }

@@ -80,8 +80,9 @@ struct TailDropFailure {
     _lease: Option<ExistingOwnerRetentionLease>,
 }
 pub(super) enum StreamCustody {
-    Direct(NativeLaneStreamPermit),
-    Paid(TailHandle),
+    // These original holders remain owned until this stream custody exits.
+    Direct { _permit: NativeLaneStreamPermit },
+    Paid { _tail: TailHandle },
 }
 impl StreamCustody {
     pub(super) fn install(
@@ -89,7 +90,7 @@ impl StreamCustody {
         request: &mut hyper::http::Request<BoxBody>,
     ) -> Self {
         match request.extensions_mut().remove::<NativeRequestCustody>() {
-            None => Self::Direct(permit),
+            None => Self::Direct { _permit: permit },
             Some(custody) => {
                 let tail = TailHandle {
                     data: Some(Arc::new(TailData { _permit: permit })),
@@ -107,7 +108,7 @@ impl StreamCustody {
                         tail: Some(tail.clone()),
                     }),
                 );
-                Self::Paid(tail)
+                Self::Paid { _tail: tail }
             }
         }
     }

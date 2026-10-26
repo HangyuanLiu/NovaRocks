@@ -37,8 +37,8 @@ use novarocks_query_application::{
     session_error::QueryServiceError,
 };
 use novarocks_spi::connector::{
-    ConnectorRequestContext, ExternalMutationFinalization, LakePublicationDisposition,
-    LakePublicationFamily, LakePublicationTarget,
+    ConnectorRequestContext, LakePublicationDisposition, LakePublicationFamily,
+    LakePublicationTarget,
 };
 use novarocks_state_store_api::StateStoreExecutionRequests;
 use source::{PhaseFuture, StepPreparedKind, StepSource};

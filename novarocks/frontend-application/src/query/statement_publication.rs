@@ -32,7 +32,7 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorRequestContext, ConnectorWriteAbortOutcome,
-    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationDisposition,
+    ExternalMutationFinalization, LakePublicationDisposition,
 };
 use std::task::{Context, Poll};
 
@@ -463,6 +463,7 @@ mod tests {
     use crate::query_execution::write_session::tests::{
         commit_fragment_bytes, fixture_with_outcome, known_committed, request_context,
     };
+    use novarocks_spi::connector::ExternalMutationOutcome;
     use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
     use novarocks_spi::connector::{
         LakePublicationFamily, LakePublicationId, LakePublicationTarget,

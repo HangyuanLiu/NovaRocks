@@ -303,9 +303,12 @@ impl CpuWork {
         {
             let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
             state.accepting = false;
-            state
-                .workers
-                .insert(id, ElasticWorkerState::Failed(Arc::clone(self)));
+            state.workers.insert(
+                id,
+                ElasticWorkerState::Failed {
+                    _original: Arc::clone(self),
+                },
+            );
         }
         self.notification.lock().unwrap_or_else(|e| e.into_inner())[0] = Some(cause.clone());
         if let Some(original) = self.exit.publish(2, Some(&cause)) {

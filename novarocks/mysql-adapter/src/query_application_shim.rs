@@ -143,6 +143,7 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
             crate::local_result_writer::write_local_result_one(result, results, more_results).await
         }
         StatementResult::StreamingQuery(result) => {
+            let result = *result;
             crate::governed_result_writer::write_streaming_query_result_with_more(
                 result,
                 results,
@@ -1260,6 +1261,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 crate::write_governed_query_result(result, results).await
             }
             StatementResult::StreamingQuery(result) => {
+                let result = *result;
                 async {
                     #[cfg(feature = "mem-1-m07-closing-pressure")]
                     if let Some(owner) = &self.pressure_owner {

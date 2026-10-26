@@ -50,14 +50,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
-    ActiveNativeAttemptOwner, DormantNativeAttemptOwner, ExecutionHandle,
-    LogicalExecutionNativePort, LogicalNativeOpenError, LogicalNativeOpenRequest,
-    LogicalNativeSession, NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
-    NativeAttemptConvergence, NativeAttemptPreparationError, NativeAttemptPreparationFailure,
-    NativeAttemptTerminal, NativeContextConvergenceKind, NativeRowsAttemptRuntime,
-    QueryExecutionClient, QueryExecutionDriver, QueryExecutionError, QueryExecutionErrorKind,
-    QueryExecutionFuture, QueryExecutionRequest, ReservedExecutionIdentity, ResultSchema,
-    StatementNativeHealthFailure,
+    ActiveNativeAttemptOwner, ExecutionHandle, LogicalExecutionNativePort, LogicalNativeOpenError,
+    LogicalNativeOpenRequest, LogicalNativeSession, NativeActiveConvergenceClosure,
+    NativeActiveConvergenceRequest, NativeAttemptConvergence, NativeAttemptPreparationError,
+    NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeContextConvergenceKind,
+    NativeRowsAttemptRuntime, QueryExecutionClient, QueryExecutionDriver, QueryExecutionError,
+    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest,
+    ReservedExecutionIdentity, ResultSchema, StatementNativeHealthFailure,
 };
 use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::preparation::OutputContract;
@@ -329,6 +328,8 @@ impl LogicalExecutionRootFailureView<'_> {
     }
 }
 
+type LogicalRootRoleBank<F, M> = RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>;
+
 /// The unique original bank, outside the caught borrowed service. Drop closes
 /// the same ingress even before the root's first poll, then retains the whole
 /// bank in the original Supervisor packet. It never ordinarily drops sources.
@@ -337,9 +338,7 @@ where
     F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
     M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
 {
-    bank: std::mem::ManuallyDrop<
-        Option<RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>>,
-    >,
+    bank: std::mem::ManuallyDrop<Option<LogicalRootRoleBank<F, M>>>,
     retirement: OriginalRootPanic,
     statements: Arc<crate::session_control::StatementProgressSlot>,
 }
@@ -348,10 +347,10 @@ where
     F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
     M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
 {
-    fn bank_mut(&mut self) -> &mut RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>> {
+    fn bank_mut(&mut self) -> &mut LogicalRootRoleBank<F, M> {
         self.bank.as_mut().expect("original root bank")
     }
-    fn take(&mut self) -> RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>> {
+    fn take(&mut self) -> LogicalRootRoleBank<F, M> {
         self.bank
             .take()
             .expect("original root bank transferred once")
@@ -1726,7 +1725,7 @@ async fn run_logical_role(
         pending_activated,
         ..
     } = body;
-    let mut session = session.as_mut().unwrap();
+    let session = session.as_mut().unwrap();
     if let Err(error) = session.begin_preparation(
         initial_execution,
         crate::api::NativeAttemptTopologyRequirement::LiveSnapshot,
@@ -1896,7 +1895,7 @@ async fn run_logical_role(
             (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
                 let replacement = session
                     .replacement_effect_port()
-                    .ok_or_else(|| super::LogicalExecutionActorError::InvariantViolation);
+                    .ok_or(super::LogicalExecutionActorError::InvariantViolation);
                 match replacement {
                     Ok(replacement) => {
                         LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
@@ -2130,7 +2129,7 @@ async fn run_logical_role(
                 };
                 let actor_result = supervise_rows(
                     &actor,
-                    &mut session,
+                    session,
                     dormant,
                     pending_activated,
                     Arc::clone(&description),
@@ -2594,13 +2593,17 @@ async fn converge_residual_rows_attempts(
     result
 }
 
+struct RootRelayWork {
+    scope: novarocks_workload_control::WorkScope,
+    cancellation: novarocks_workload_control::CancellationView,
+}
+
 async fn drive_rows_attempt_until_pump_decision(
     active: &mut SupervisedActiveNativeOwner,
     drive: &NativeAttemptDrive,
-    cancellation: novarocks_workload_control::CancellationView,
+    work: RootRelayWork,
     running: super::RunningAttemptPermit,
     root: novarocks_execution_contract::TaskIdentity,
-    scope: novarocks_workload_control::WorkScope,
     runtime: NativeRowsAttemptRuntime,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
@@ -2610,6 +2613,10 @@ async fn drive_rows_attempt_until_pump_decision(
     Result<super::LogicalConclusion, ResultPumpFailure>,
     Option<super::result_pump::ClientRowsComputedCut>,
 ) {
+    let RootRelayWork {
+        scope,
+        cancellation,
+    } = work;
     let root_ack = match active.reserve_root_ack_tail(running.identity(), root) {
         Ok(reservation) => reservation,
         Err(error) => {
@@ -2820,26 +2827,26 @@ async fn supervise_rows(
     // The original process service joins each consumer in its SAME attempt slot.
     // This borrowed wait owns no join and survives cancellation without detaching it.
     registry.wait_registration_consumers(registration).await;
-    if let Some(original) = internal.as_ref() {
-        if let Some(failure) = original.consumer.local_health_failure() {
-            if registry
-                .retain_internal_consumer_health(registration, &original.consumer, &failure)
-                .is_err()
-            {
-                // An impossible stale/occupied receiver cannot discard either
-                // original input. Keep this same finite supervisor/consumer,
-                // rather than claiming a successful retirement or reminting.
-                let _original_custody = (Arc::clone(&original.consumer), failure);
-                std::future::pending::<()>().await;
-                unreachable!("original Internal health receiver remains unresolved");
-            }
-            return first_supervision_error(
-                result,
-                Err(internal_consumer_panicked(
-                    "Original Internal CPU failure remains in custody",
-                )),
-            );
+    if let Some(original) = internal.as_ref()
+        && let Some(failure) = original.consumer.local_health_failure()
+    {
+        if registry
+            .retain_internal_consumer_health(registration, &original.consumer, &failure)
+            .is_err()
+        {
+            // An impossible stale/occupied receiver cannot discard either
+            // original input. Keep this same finite supervisor/consumer,
+            // rather than claiming a successful retirement or reminting.
+            let _original_custody = (Arc::clone(&original.consumer), failure);
+            std::future::pending::<()>().await;
+            unreachable!("original Internal health receiver remains unresolved");
         }
+        return first_supervision_error(
+            result,
+            Err(internal_consumer_panicked(
+                "Original Internal CPU failure remains in custody",
+            )),
+        );
     }
     result
 }
@@ -2884,10 +2891,12 @@ async fn supervise_rows_inner(
         let (pump_result, client_cut) = drive_rows_attempt_until_pump_decision(
             &mut attempt.active,
             &drive,
-            scope.cancellation().map_err(work_error)?,
+            RootRelayWork {
+                cancellation: scope.cancellation().map_err(work_error)?,
+                scope: scope.clone(),
+            },
             attempt.running,
             attempt.schedule.root(),
-            scope.clone(),
             attempt.runtime,
             shutdown,
             requester,
@@ -3004,16 +3013,14 @@ async fn supervise_rows_inner(
                     mode: description.recovery(),
                     effect: description.effect(),
                     failure: decision.class(),
-                    pre_ready_replacement: decision.pre_ready_replacement().copied().filter(
-                        |witness| {
-                            witness.context().query_execution_id() == attempt.schedule.execution()
-                                && decision
-                                    .error()
-                                    .execution_failure()
-                                    .is_some_and(|input| witness.matches_input(input))
-                                && cancellation.reason().is_none()
-                        },
-                    ),
+                    pre_ready_replacement: decision.pre_ready_replacement().filter(|witness| {
+                        witness.context().query_execution_id() == attempt.schedule.execution()
+                            && decision
+                                .error()
+                                .execution_failure()
+                                .is_some_and(|input| witness.matches_input(input))
+                            && cancellation.reason().is_none()
+                    }),
                     output_visible: false,
                     attempts_started,
                     max_attempts: config.rows.max_attempts.get(),
@@ -4389,11 +4396,10 @@ mod tests {
 
     use crate::api::{
         ActivatedNativeAttempt, ActiveNativeAttemptOwner, DormantNativeAttemptOwner,
-        LogicalNativeOpenFailure, NativeActiveAttemptConvergenceFuture,
-        NativeAttemptActivationFailure, NativeAttemptActivationFuture, NativeAttemptConvergence,
-        NativeAttemptConvergenceFuture, NativeAttemptPreparationFailure,
-        NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
-        NativeAttemptPreparationRequest, NativeAttemptRunFuture,
+        NativeActiveAttemptConvergenceFuture, NativeAttemptActivationFailure,
+        NativeAttemptActivationFuture, NativeAttemptConvergence, NativeAttemptConvergenceFuture,
+        NativeAttemptPreparationFailure, NativeAttemptPreparationFuture,
+        NativeAttemptPreparationPort, NativeAttemptRunFuture,
     };
     use crate::coordination::{
         AdmissionIssueSettlement, EstablishIssueIdentity, EstablishIssueSubmit,
@@ -5193,7 +5199,7 @@ mod tests {
             };
             request.stage_fixture_owner(dormant);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -5495,7 +5501,7 @@ mod tests {
             };
             request.stage_fixture_owner(owner);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -5666,10 +5672,9 @@ mod tests {
             request.stage_fixture_owner(dormant);
             drop(state);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
-                let prepared = request.bind_staged(scheduling).map_err(Into::into);
+                let scheduling = no_scan_scheduling(request);
 
-                prepared
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -6055,10 +6060,9 @@ mod tests {
             request.stage_fixture_owner(dormant);
             drop(state);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
-                let result = request.bind_staged(scheduling).map_err(Into::into);
+                let scheduling = no_scan_scheduling(request);
 
-                result
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -6717,23 +6721,22 @@ mod tests {
                 convergence_exit.is_ok(),
                 "original convergence did not exit: {phase:?}"
             );
-            let joined_with_expected_outcome = match (&shutdown, phase) {
+            let joined_with_expected_outcome = matches!(
+                (&shutdown, phase),
                 (
                     Ok(()),
                     InitialTerminalPhase::ActivateFailure
-                    | InitialTerminalPhase::CompletionSuccess
-                    | InitialTerminalPhase::CompletionFailure,
-                ) => true,
-                (
+                        | InitialTerminalPhase::CompletionSuccess
+                        | InitialTerminalPhase::CompletionFailure,
+                ) | (
                     Err(LogicalExecutionSupervisorShutdownError::Registry(
                         LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved,
                     )),
                     InitialTerminalPhase::ActivatePanic
-                    | InitialTerminalPhase::CompletionPanic
-                    | InitialTerminalPhase::CompletionFailureDropPanic,
-                ) => true,
-                _ => false,
-            };
+                        | InitialTerminalPhase::CompletionPanic
+                        | InitialTerminalPhase::CompletionFailureDropPanic,
+                )
+            );
             assert!(
                 joined_with_expected_outcome,
                 "original supervisor owner did not join with its expected outcome: {phase:?} {shutdown:?}"
@@ -7141,7 +7144,7 @@ mod tests {
             };
             request.stage_fixture_owner(owner);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -8168,7 +8171,7 @@ mod tests {
             };
             request.stage_fixture_owner(owner);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -8385,7 +8388,7 @@ mod tests {
             };
             request.stage_fixture_owner(owner);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -8881,7 +8884,7 @@ mod tests {
             };
             request.stage_fixture_owner(dormant);
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -9039,7 +9042,7 @@ mod tests {
                     .await
                     .unwrap();
                 acknowledge_all_control(&control);
-                acknowledge_all_control(&sibling_control);
+                acknowledge_all_control(sibling_control);
                 drop(sibling_handle);
                 scope.wait_released().await;
                 sibling_scope.wait_released().await;
@@ -9069,7 +9072,7 @@ mod tests {
                 expected_frontend,
             });
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -9266,7 +9269,7 @@ mod tests {
             let backend = self.backend;
             request.stage_fixture_owner(PrematureCompletionDormant { backend });
             Box::pin(async move {
-                let scheduling = no_scan_scheduling(&request);
+                let scheduling = no_scan_scheduling(request);
                 request.bind_staged(scheduling).map_err(Into::into)
             })
         }
@@ -9596,7 +9599,7 @@ mod tests {
             );
             supervisor.abandon_for_process_exit();
             acknowledge_all_control(&first_control);
-            acknowledge_all_control(&second_control);
+            acknowledge_all_control(second_control);
             drop(second_handle);
             first_scope.wait_released().await;
             second_scope.wait_released().await;

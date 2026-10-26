@@ -29,7 +29,7 @@ use crate::query_execution::{
 };
 use novarocks_query_application::{
     admitted_query_context::{QueryExecutionContext, QueryResultCapacityBinding},
-    api::{QueryExecutionClient, StatementNativeHealthFailure},
+    api::StatementNativeHealthFailure,
     session_control::{GovernedActionContext, GovernedBackgroundAction, GovernedStatementResidual},
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
@@ -148,7 +148,7 @@ fn select_product_terminal(
     stop_reason: &mut Option<TerminalError>,
     effect: Option<novarocks_coordination_contract::ExecutionEffect>,
 ) -> Result<OriginalProductOutcome, TerminalError> {
-    use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+    use novarocks_execution_contract::failure::FailureEvidence;
     use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
     let Err(mut product) = result else {
@@ -691,11 +691,11 @@ fn form_original_domain(
     let runtime = engine
         .kernel
         .rewrite_runtime()
-        .map_err(|e| TerminalError::from_original_cause(e))?
+        .map_err(TerminalError::from_original_cause)?
         .clone();
     let capacity = io
         .root_capacity()
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     if !capacity.window_alias().is_for_scope(&root) {
         return Err(TerminalError::pre_dispatch_failed(
             "Rewrite MIO belongs to another original Root",
@@ -709,7 +709,7 @@ fn form_original_domain(
             .clone()
             .with_result_capacity(capacity.clone())
     }
-    .map_err(|e| TerminalError::from_original_cause(e))?;
+    .map_err(TerminalError::from_original_cause)?;
     let context = engine
         .connector_context
         .clone()
@@ -724,12 +724,12 @@ fn form_original_domain(
         .execution
         .0
         .provider_creator_cpu()
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let write_stack = engine
         .kernel
         .typed_connector_control()
         .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let (cpu, binding_cpu) = cpu
         .rewrite_cpu_ports(
             &root,
@@ -740,7 +740,7 @@ fn form_original_domain(
             runtime.execution.0.runtime().clone(),
             wake.clone(),
         )
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let original_write = Arc::new(std::sync::Mutex::new(None));
     let begin =
         crate::query_execution::write_session::WriteBeginReceiving::new(original_write.clone());
@@ -753,7 +753,7 @@ fn form_original_domain(
             Some(target.table.clone()),
             None,
         )
-        .map_err(|e| TerminalError::from_original_cause(e))?,
+        .map_err(TerminalError::from_original_cause)?,
         None,
     ));
     let domain = Arc::new(tokio::sync::Mutex::new(RewriteDomain {
@@ -807,7 +807,7 @@ pub(crate) async fn mount_original(
     let runtime = engine
         .kernel
         .rewrite_runtime()
-        .map_err(|e| TerminalError::from_original_cause(e))?
+        .map_err(TerminalError::from_original_cause)?
         .clone();
     let identity = RequestScopedMaintenanceEngine::target_identity(&job.target)
         .map_err(TerminalError::pre_dispatch_failed)?;
@@ -815,24 +815,24 @@ pub(crate) async fn mount_original(
         .kernel
         .connector_control()
         .acquire_current_distributed_rewrite(&identity.instance_id)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let mut dependencies = lease
         .planning_initial_dependencies()
-        .map_err(|error| TerminalError::from_original_cause(error))?;
+        .map_err(TerminalError::from_original_cause)?;
     let write = engine
         .kernel
         .typed_connector_control()
         .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
-        .map_err(|error| TerminalError::from_original_cause(error))?;
+        .map_err(TerminalError::from_original_cause)?;
     dependencies.extend(
         write
             .session()
             .rewrite_begin_initial_dependencies()
-            .map_err(|error| TerminalError::from_original_cause(error))?,
+            .map_err(TerminalError::from_original_cause)?,
     );
     let io =
         MetadataIoAdmission::for_original_source(originals.owner.as_ref().unwrap(), dependencies)
-            .map_err(|error| TerminalError::from_original_cause(error))?;
+            .map_err(TerminalError::from_original_cause)?;
     std::future::poll_fn(
         |cx| match io.poll_progress(originals.owner.as_ref().unwrap(), cx) {
             Ok(true) => Poll::Ready(Ok(())),
@@ -1016,10 +1016,7 @@ async fn begin_original(
     intent: novarocks_table_maintenance::product::RewriteIntent,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 ) -> Result<GovernedRewriteSession, TerminalError> {
-    use crate::query_execution::{
-        distributed_rewrite::ConnectorDistributedRewriteSession,
-        write_session::ConnectorWriteSession,
-    };
+    use crate::query_execution::write_session::ConnectorWriteSession;
     use novarocks_spi::connector::RewriteCpuInput;
     let source = upgrade_original(view)?;
     let mut original = source.lock().await;
@@ -1052,9 +1049,9 @@ async fn begin_original(
     // The entire request/source is in the original Action before its first poll.
     lease
         .prepare_plan_source_in(&mut request, &mut original.plan_source)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let capture = super::rewrite_capture::borrow_positive_capture(&original.io, &original.context)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let cpu = original.cpu.clone();
     let metadata_cpu = original.binding_cpu.clone();
     original
@@ -1063,7 +1060,7 @@ async fn begin_original(
         .unwrap()
         .prepare(cpu.as_ref(), &metadata_cpu, &capture)
         .await
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let RewriteDomain {
         plan_source,
         prepared,
@@ -1073,7 +1070,7 @@ async fn begin_original(
         .as_mut()
         .unwrap()
         .take_preparation_in(prepared)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let prepared = original.prepared.as_ref().unwrap();
     let plan = prepared.plan.clone();
     let count = plan.cohorts().len();
@@ -1100,10 +1097,10 @@ async fn begin_original(
             request_source.clone(),
         ));
         cpu.submit_in(&mut input)
-            .map_err(|e| TerminalError::from_original_cause(e))?;
+            .map_err(TerminalError::from_original_cause)?;
         std::future::poll_fn(|cx| cpu.poll_finished(cx))
             .await
-            .map_err(|e| TerminalError::from_original_cause(e))?;
+            .map_err(TerminalError::from_original_cause)?;
         let mut formed = None;
         request_source
             .take_begin_request_in(&mut formed)
@@ -1131,7 +1128,7 @@ async fn begin_original(
             capture,
         )
         .await
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     }
     let write = original
         .original_write
@@ -1143,10 +1140,10 @@ async fn begin_original(
     );
     let mut input = Some(RewriteCpuInput(original.seal.as_ref().unwrap().clone()));
     cpu.submit_in(&mut input)
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     std::future::poll_fn(|cx| cpu.poll_finished(cx))
         .await
-        .map_err(|e| TerminalError::from_original_cause(e))?;
+        .map_err(TerminalError::from_original_cause)?;
     let RewriteDomain { seal, session, .. } = &mut *original;
     seal.as_ref()
         .unwrap()
@@ -1565,19 +1562,19 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
     }
 }
 
-async fn product_session_execute_cohort<'a>(
-    this: &'a mut GovernedRewriteSession,
+async fn product_session_execute_cohort(
+    this: &mut GovernedRewriteSession,
     ordinal: usize,
 ) -> Result<(), TerminalError> {
     execute_original_cohort(&this.original, ordinal).await
 }
-async fn product_session_commit<'a>(
-    this: &'a mut GovernedRewriteSession,
+async fn product_session_commit(
+    this: &mut GovernedRewriteSession,
 ) -> Result<novarocks_table_maintenance::product::RewriteCommit, RewriteFailure> {
     settle_original(&this.original, false).await
 }
-async fn product_session_abort<'a>(
-    this: &'a mut GovernedRewriteSession,
+async fn product_session_abort(
+    this: &mut GovernedRewriteSession,
     _reason: String,
 ) -> Result<novarocks_table_maintenance::product::RewriteAbort, RewriteFailure> {
     use novarocks_table_maintenance::product::{RewriteAbort, RewriteCommit};
@@ -1587,8 +1584,8 @@ async fn product_session_abort<'a>(
         RewriteCommit::CommitUnknown { failure } => RewriteAbort::CommitUnknown { failure },
     })
 }
-async fn product_session_finalize_committed<'a>(
-    this: &'a mut GovernedRewriteSession,
+async fn product_session_finalize_committed(
+    this: &mut GovernedRewriteSession,
 ) -> Result<novarocks_table_maintenance::product::RewriteReceiptFacts, RewriteFailure> {
     use novarocks_spi::connector::RewriteCpuInput;
     let mut original = this.original.lock().await;
@@ -1655,8 +1652,8 @@ async fn product_port_reject_user_action_on_mv<'a>(
         "mounted Optimize uses its already admitted maintenance activity",
     ))
 }
-async fn product_port_execute_metadata<'a>(
-    _this: &'a GovernedRewriteEffectPort,
+async fn product_port_execute_metadata(
+    _this: &GovernedRewriteEffectPort,
     _request: MaintenanceActionRequest,
 ) -> Result<MaintenanceActionOutcome, String> {
     Err("Rewrite Source does not dispatch metadata maintenance".into())

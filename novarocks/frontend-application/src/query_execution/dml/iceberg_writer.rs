@@ -215,10 +215,6 @@ fn bind_iceberg_session_write_input(
     Ok((sql_write_input, table_bindings))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The pure final assembly retains separate frozen semantic and transaction facts without introducing a second contract."
-)]
 fn finish_iceberg_prepared_write(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -316,20 +312,6 @@ pub(crate) fn sole_session_write_target(
 
 pub(crate) struct PreparedIcebergWrite {
     semantic_binding: Arc<FrozenIcebergWriteSemanticBinding>,
-}
-
-/// Fixed headers of the original prepared value and its actual semantic
-/// binding allocation. Variable plan/Provider backing retains its own invoice.
-pub(crate) fn prepared_source_layouts() -> Result<
-    [std::alloc::Layout; 2],
-    novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use std::alloc::Layout;
-    Ok([
-        arc_layout(Layout::new::<PreparedIcebergWrite>())?,
-        arc_layout(Layout::new::<FrozenIcebergWriteSemanticBinding>())?,
-    ])
 }
 
 impl PreparedIcebergWrite {

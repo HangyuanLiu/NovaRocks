@@ -28,7 +28,6 @@ use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::package_freeze::CompiledPackageCarrier;
-use crate::query_execution::service::QueryExecutionService;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_catalog_application::ConnectorControlHost;
@@ -55,7 +54,6 @@ pub struct QueryPreparationKernel {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
-    query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
 }
 
@@ -111,7 +109,6 @@ impl QueryPreparationKernel {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
-        query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         _exchange_port: u16,
         constant_policy: novarocks_functions::ConstantPolicy,
@@ -126,7 +123,6 @@ impl QueryPreparationKernel {
             connector_control,
             typed_connector_control,
             unified_statistics,
-            query_execution,
             backend_topology,
         }
     }
@@ -166,10 +162,6 @@ impl QueryPreparationKernel {
         &self.unified_statistics
     }
 
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
-    }
-
     #[allow(
         dead_code,
         reason = "Retained for query-preparation callers that require the admitted topology service."
@@ -195,7 +187,6 @@ pub struct DmlExecutionKernel {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    query_execution: QueryExecutionService,
     connector_runtime: Option<tokio::runtime::Handle>,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
@@ -239,7 +230,6 @@ impl DmlExecutionKernel {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-        query_execution: QueryExecutionService,
     ) -> Self {
         let DmlPlanningServices {
             functions,
@@ -258,7 +248,6 @@ impl DmlExecutionKernel {
             unified_statistics,
             mv_storage_observation,
             mv_readiness,
-            query_execution,
             connector_runtime: None,
             write_runtime: None,
             lake_publication_runtime_policy: None,
@@ -378,10 +367,6 @@ impl DmlExecutionKernel {
         &self.mv_readiness
     }
 
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
-    }
-
     pub(crate) fn lake_publication_runtime_policy(
         &self,
     ) -> Option<novarocks_query_application::publication::LakePublicationRuntimePolicy> {
@@ -457,7 +442,6 @@ pub struct MaintenanceExecutionKernel {
     typed_connector_control: Arc<ConnectorControlHost>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
 }
 
@@ -488,7 +472,6 @@ impl MaintenanceExecutionKernel {
         typed_connector_control: Arc<ConnectorControlHost>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-        query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
@@ -505,7 +488,6 @@ impl MaintenanceExecutionKernel {
             typed_connector_control,
             mv_storage_observation,
             mv_readiness,
-            query_execution,
             service,
         }
     }
@@ -572,10 +554,6 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
         &self.mv_readiness
-    }
-
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
     }
 
     pub(crate) fn service(&self) -> &Arc<dyn TableMaintenanceService> {
