@@ -4408,7 +4408,7 @@ fn production_close_reducer_explores_normal_drain_and_backpressure() {
             Some(&failure),
             "close_first={close_first}: normal close disguised failure before seal"
         );
-        assert!(!harness.execution.client_visible_completion());
+        // The actual result owner refuses this latched failure at its seal.
     }
     eprintln!("production failure exploration: close_failure_orders=2 preserved_failures=2");
 }
@@ -4612,170 +4612,82 @@ fn a_shared_producer_is_cancelled_only_after_every_consumer_stops_consuming() {
 }
 
 #[test]
-fn the_client_visible_read_completes_without_waiting_for_upstream_cancellation() {
-    let mut harness = Harness::new(&[0], &[0], 512);
-    harness.settle_until_quiet(Duration::from_secs(10));
-
-    let root = harness.execution.graph().root_task();
+fn accepted_root_seal_does_not_wait_for_upstream_cancellation() {
+    let harness = Harness::new(&[0], &[0], 512);
     let leaf = harness.stage_tasks(1)[0];
-    harness.publish(root, TaskState::Running, None, false);
-    harness.publish(leaf, TaskState::Running, None, false);
-    harness.publish(root, TaskState::Finished, None, true);
-
-    // A backend's claim that its output responsibility is complete is not this
-    // frontend's evidence that it received the end of the stream. Completing
-    // here would tell a client the answer is whole before the last packet was
-    // read.
-    assert!(
-        !harness.execution.client_visible_completion(),
-        "a root FINISHED without an observed end of stream is not a completion"
-    );
-
-    harness
-        .execution
-        .consume_root_result_packet(harness.identity(root), 0, true)
-        .expect("the root's own end of stream is accepted");
-
-    assert!(
-        harness.execution.client_visible_completion(),
-        "the read completes once the root finished and its stream ended"
-    );
-    assert!(
-        !harness.execution.attempt_drained(),
-        "internal draining is still outstanding"
-    );
-
-    harness.publish(
-        leaf,
-        TaskState::Canceling,
-        Some(TerminationDetail::Canceled(
-            CancelReason::UpstreamNoLongerNeeded,
-        )),
-        false,
-    );
-    assert!(
-        harness.execution.client_visible_completion(),
-        "an upstream still standing down never retracts a linearized completion"
-    );
-    assert!(harness.execution.failure_cause().is_none());
-}
-
-#[test]
-fn required_root_evidence_deadline_starts_at_eos_and_survives_stream_generations() {
-    let mut harness = Harness::new(&[0], &[1], 512);
-    harness.settle_until_quiet(Duration::from_secs(10));
-    let root = harness.execution.graph().root_task();
-    let identity = harness.identity(root);
-    let context = harness.execution.graph().task(root).unwrap().context();
-    harness.clock.advance(Duration::from_secs(600));
-    assert!(
-        !harness.execution.required_root_evidence_expired(),
-        "a long-running result has no missing-terminal deadline before EOS"
-    );
-    harness
-        .execution
-        .consume_root_result_packet(identity, 0, false)
-        .unwrap();
-    assert!(!harness.execution.required_root_evidence_expired());
-    harness
-        .execution
-        .consume_root_result_packet(identity, 1, true)
-        .unwrap();
-    harness.clock.advance(Duration::from_secs(29));
-    assert!(!harness.execution.required_root_evidence_expired());
-    for generation in [1, 2] {
-        harness
-            .execution
-            .apply_covered_entries(vec![
-                covered_frame(
-                    context,
-                    generation,
-                    CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
-                        generation,
-                        initial_cut: 0,
-                    }),
-                ),
-                covered_frame(
-                    context,
-                    generation,
-                    CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
-                        generation,
-                        sequence: 1,
-                        covered_prefix: 0,
-                        source_cut: 0,
-                    }),
-                ),
-            ])
-            .unwrap();
-        assert!(!harness.execution.required_root_evidence_expired());
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let source = round.take_root_status_source().unwrap();
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
     }
-    harness.clock.advance(Duration::from_secs(1));
+    round.turn().unwrap();
+    let root = round.root_task();
+    let leaf = round.execution().task(leaf).unwrap().identity();
+    for identity in [root, leaf] {
+        status.publish(StatusEvent::Published(Box::new(
+            TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::new(false),
+            )
+            .unwrap(),
+        )));
+    }
+    round.turn().unwrap();
+    // QA owns local End consumption; this test exercises its real control port.
+    let mut reply = source.begin_success_seal_request().unwrap();
+    round.turn().unwrap();
     assert!(
-        harness.execution.required_root_evidence_expired(),
-        "new coverage markers and generations cannot extend the exact EOS deadline"
+        reply.try_recv().is_err(),
+        "a running Root cannot seal success"
     );
-    harness.publish(root, TaskState::Running, None, false);
-    harness.publish(root, TaskState::Flushing, None, false);
-    harness.publish(root, TaskState::Finished, None, true);
+    assert!(!round.accepted_root_success_sealed());
+    for (version, state, output) in [
+        (3, TaskState::Flushing, false),
+        (4, TaskState::Finished, true),
+    ] {
+        status.publish(StatusEvent::Published(Box::new(
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(version).unwrap(),
+                state,
+                None,
+                TaskOutputFacts::new(output),
+            )
+            .unwrap(),
+        )));
+        round.turn().unwrap();
+        assert_eq!(
+            round.execution().task(root.task_id()).unwrap().task_state(),
+            state,
+        );
+    }
+    assert_eq!(reply.try_recv().unwrap(), Ok(()));
+    assert!(round.accepted_root_success_sealed());
     assert!(
-        !harness.execution.required_root_evidence_expired(),
-        "the exact root terminal discharges required observation evidence"
+        !round.attempt_drained(),
+        "the original upstream/Release tail remains"
     );
-}
-
-#[test]
-fn required_terminal_evidence_waits_only_for_declared_tasks_without_renewing_the_budget() {
-    let mut harness = Harness::new(&[0], &[1], 512);
-    harness.settle_until_quiet(Duration::from_secs(10));
-    let root = harness.execution.graph().root_task();
-    let required = harness
-        .execution
-        .graph()
-        .tasks()
-        .find(|task| task.identity().task_id() != root)
-        .unwrap()
-        .identity();
-    harness.publish(root, TaskState::Running, None, false);
-    harness.publish(root, TaskState::Flushing, None, false);
-    harness.publish(root, TaskState::Finished, None, true);
-    harness
-        .execution
-        .require_terminal_evidence([required])
-        .unwrap();
-    harness.clock.advance(Duration::from_secs(29));
-    harness
-        .execution
-        .require_terminal_evidence([required])
-        .unwrap();
-    assert_eq!(harness.execution.required_terminal_evidence_expired(), None);
-    harness.clock.advance(Duration::from_secs(1));
-    assert_eq!(
-        harness.execution.required_terminal_evidence_expired(),
-        Some(required),
-        "a positive root cannot replace a declared writer's terminal, and repeated requests cannot extend its budget"
+    status.publish(StatusEvent::Published(Box::new(
+        TaskStatus::try_new(
+            leaf,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Canceling,
+            Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            TaskOutputFacts::new(false),
+        )
+        .unwrap(),
+    )));
+    round.turn().unwrap();
+    assert!(
+        round.accepted_root_success_sealed(),
+        "upstream stand-down cannot retract the accepted cut"
     );
-    harness.publish(required.task_id(), TaskState::Running, None, false);
-    harness.publish(
-        required.task_id(),
-        TaskState::Canceling,
-        Some(TerminationDetail::Canceled(
-            CancelReason::UpstreamNoLongerNeeded,
-        )),
-        false,
-    );
-    harness.publish(
-        required.task_id(),
-        TaskState::Canceled,
-        Some(TerminationDetail::Canceled(
-            CancelReason::UpstreamNoLongerNeeded,
-        )),
-        false,
-    );
-    assert_eq!(
-        harness.execution.required_terminal_evidence_expired(),
-        None,
-        "unregistered unrelated tasks do not become evidence gates"
-    );
+    assert!(round.failure_cause().is_none());
 }
 
 #[test]
@@ -4800,7 +4712,7 @@ fn a_task_failure_latches_once_and_withholds_client_completion() {
 
     assert_eq!(harness.execution.failure_cause(), Some(&failure));
     assert_eq!(harness.stage_state(1), StageState::Failed);
-    assert!(!harness.execution.client_visible_completion());
+    // The actual result owner refuses this latched failure at its seal.
 }
 
 // ---------------------------------------------------------------------------
@@ -6384,18 +6296,13 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
         ensured + contexts
     );
 
-    // An attempt that has only sent its establishes reports nothing finished.
-    // These are the verdicts the caller reads instead of inferring completion
-    // from the loop having run, which is how a query reports success it cannot
-    // substantiate.
-    assert!(!round.client_visible_completion());
+    // Sending establishes is neither an accepted Root seal nor a protocol tail.
+    assert!(!round.accepted_root_success_sealed());
     assert!(!round.attempt_drained());
     assert!(round.failure_cause().is_none());
     assert_eq!(round.root_task(), round.execution().graph().root_identity());
 
-    // The root's stream has not started, so a packet claiming to be its second
-    // is a gap rather than something to absorb.
-    assert!(round.consume_root_result_packet(1, false).is_err());
+    // Packet gaps are checked through the actual QA root relay tests.
     let _ = round.execution_mut();
 }
 
@@ -8047,7 +7954,7 @@ fn manifest_protocol_harness(execution: QueryExecutionId) -> Harness {
 }
 
 /// Same original fixture paused before its upstream terminal facts. The root
-/// is Finished; the caller records EOS only after its real decoded receipt.
+/// is Finished; the caller starts convergence only after its real decoded receipt.
 /// Remaining tasks are Running, and no actor success state is assigned.
 #[cfg(novarocks_dev_controls)]
 pub(crate) fn manifest_pending_release_with_protocol_fixture(
@@ -8065,7 +7972,10 @@ fn manifest_normal_release_ack_fixture(
 ) -> ManifestFixture<OperationIntent, Option<super::protocol_facts::AttemptProtocolFactsReceiver>> {
     let (mut round, acks, tail, clock, protocol, facts) =
         manifest_pending_release_fixture(harness, plan);
-    tail.observe_original_consumed_end(&mut round, 0);
+    tail.begin_original_convergence(
+        &mut round,
+        Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
+    );
     let release = tail
         .complete(&mut round, &acks)
         .expect("normal completion releases its original context");
@@ -8100,31 +8010,6 @@ impl ManifestReleaseTail {
         round
             .turn()
             .expect("the original status owner accepts writer success");
-    }
-
-    pub(crate) fn observe_original_consumed_end(
-        &self,
-        round: &mut TaskRoundForTest,
-        data_packets: u64,
-    ) {
-        self.observe_original_consumed_packets(round, data_packets);
-        self.begin_original_convergence(
-            round,
-            Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
-        );
-    }
-
-    /// Record only receipts that the real consumer has already completed.
-    pub(crate) fn observe_original_consumed_packets(
-        &self,
-        round: &mut TaskRoundForTest,
-        data_packets: u64,
-    ) {
-        for sequence in 0..=data_packets {
-            round
-                .consume_root_result_packet(sequence, sequence == data_packets)
-                .expect("only actual consumed original packets precede this EOS");
-        }
     }
 
     /// Invoke the original convergence author after the actual cut or failure.
@@ -8298,8 +8183,7 @@ impl ManifestReleaseTail {
         );
         assert!(
             owner.locally_drained(),
-            "all local tasks and outputs must drain: {:?}",
-            round.execution().attempt_drain_facts()
+            "all local tasks and outputs must drain: {owner:?}"
         );
         if owner.is_released() {
             assert!(
@@ -9318,7 +9202,6 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
         )));
     }
     round.turn().unwrap();
-    round.consume_root_result_packet(0, true).unwrap();
     round.add_pump(Box::new(RefusedPump));
     let mut reply = source.begin_success_seal_request().unwrap();
     round
@@ -9376,8 +9259,7 @@ fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_task
             None
         );
     }
-    assert!(!round.execution().root_end_of_stream_observed());
-    assert!(!round.execution().required_root_evidence_expired());
+    assert!(!round.accepted_root_success_sealed());
     assert_eq!(
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted),
@@ -9480,82 +9362,64 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
 }
 
 #[test]
-fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
+fn covered_exhaustion_respects_exact_root_evidence_before_seal() {
     use crate::native::task_transport::SubscriptionState;
-
-    for eos_first in [false, true] {
-        let harness = Harness::new(&[1], &[0], 64);
-        let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
-        for create in &creates {
-            acks.publish(accepted_create_ack(create));
-        }
-        round.turn().unwrap();
-        let root = round.root_task();
-        let context = round.execution().task(root.task_id()).unwrap().context();
-        for (version, state, output) in [
-            (2, TaskState::Running, false),
-            (3, TaskState::Flushing, false),
-        ] {
-            status.publish(StatusEvent::Published(Box::new(
-                TaskStatus::try_new(
-                    root,
-                    TaskStatusVersion::new(version).unwrap(),
-                    state,
-                    None,
-                    TaskOutputFacts::new(output),
-                )
-                .unwrap(),
-            )));
-        }
-        round.turn().unwrap();
-        if eos_first {
-            round.consume_root_result_packet(0, true).unwrap();
-        }
-        assert_eq!(
-            round.classify_covered_subscription_state(context, SubscriptionState::BudgetExhausted),
-            Some(SubscriptionState::BudgetExhausted),
-            "EOS alone cannot replace missing root terminal evidence"
-        );
-        assert_eq!(
-            round.classify_covered_subscription_state(
-                context,
-                SubscriptionState::ConnectionLossExhausted
-            ),
-            Some(SubscriptionState::ConnectionLossExhausted),
-            "EOS alone cannot replace missing root terminal evidence"
-        );
+    let harness = Harness::new(&[1], &[0], 64);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    let context = round.execution().task(root.task_id()).unwrap().context();
+    for (version, state) in [(2, TaskState::Running), (3, TaskState::Flushing)] {
         status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 root,
-                TaskStatusVersion::new(4).unwrap(),
-                TaskState::Finished,
+                TaskStatusVersion::new(version).unwrap(),
+                state,
                 None,
-                TaskOutputFacts::new(true),
+                TaskOutputFacts::new(false),
             )
             .unwrap(),
         )));
-        round.turn().unwrap();
-        if !eos_first {
-            assert!(!round.execution().client_visible_completion());
-        }
-        assert_eq!(
-            round.classify_covered_subscription_state(context, SubscriptionState::BudgetExhausted),
-            None,
-            "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
-        );
-        assert_eq!(
-            round.classify_covered_subscription_state(
-                context,
-                SubscriptionState::ConnectionLossExhausted
-            ),
-            None,
-            "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
-        );
-        if !eos_first {
-            round.consume_root_result_packet(0, true).unwrap();
-        }
-        assert!(round.execution().client_visible_completion());
     }
+    round.turn().unwrap();
+    for state in [
+        SubscriptionState::BudgetExhausted,
+        SubscriptionState::ConnectionLossExhausted,
+    ] {
+        assert_eq!(
+            round.classify_covered_subscription_state(context, state),
+            Some(state),
+            "the exact Root terminal evidence is still missing"
+        );
+    }
+    status.publish(StatusEvent::Published(Box::new(
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(4).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap(),
+    )));
+    round.turn().unwrap();
+    for state in [
+        SubscriptionState::BudgetExhausted,
+        SubscriptionState::ConnectionLossExhausted,
+    ] {
+        assert_eq!(
+            round.classify_covered_subscription_state(context, state),
+            None,
+            "accepted complete Root evidence survives disconnect; data delivery has its own QA owner"
+        );
+    }
+    assert!(
+        !round.accepted_root_success_sealed(),
+        "Root status alone does not accept a success seal"
+    );
 }
 
 #[test]
@@ -9577,14 +9441,13 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         round.turn().unwrap();
         let root = round.root_task();
         let root_context = round.execution().task(root.task_id()).unwrap().context();
-        round.consume_root_result_packet(0, true).unwrap();
         assert_eq!(
             round.classify_covered_subscription_state(
                 root_context,
                 SubscriptionState::BudgetExhausted
             ),
             Some(SubscriptionState::BudgetExhausted),
-            "EOS does not substitute for the root's terminal output fact"
+            "an attached consumer cannot substitute for the root's terminal output fact"
         );
         assert_eq!(
             round.classify_covered_subscription_state(
@@ -9592,7 +9455,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
                 SubscriptionState::ConnectionLossExhausted
             ),
             Some(SubscriptionState::ConnectionLossExhausted),
-            "EOS does not substitute for the root's terminal output fact"
+            "an attached consumer cannot substitute for the root's terminal output fact"
         );
         for (version, state, output) in [
             (2, TaskState::Running, false),
@@ -9611,7 +9474,10 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
             )));
         }
         round.turn().unwrap();
-        assert!(round.execution().client_visible_completion());
+        assert_eq!(
+            round.execution().task(root.task_id()).unwrap().task_state(),
+            TaskState::Finished,
+        );
         assert!(!round.root_success_sealed());
         let leaf_task = round.execution().task(leaf).unwrap();
         assert!(!leaf_task.is_terminal());
@@ -9619,13 +9485,6 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
             !leaf_task.normally_stood_down(),
             "one-layer stage release has not withdrawn this deep leaf"
         );
-        if !result_consumer {
-            let identity = leaf_task.identity();
-            round
-                .execution_mut()
-                .require_terminal_evidence([identity])
-                .unwrap();
-        }
         assert_eq!(
             round.classify_covered_subscription_state(
                 leaf_context,
@@ -9682,7 +9541,6 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     }
     round.turn().unwrap();
     let root = round.root_task();
-    round.consume_root_result_packet(0, true).unwrap();
     status.publish(StatusEvent::Published(Box::new(
         TaskStatus::try_new(
             root,
@@ -9805,7 +9663,6 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
                 ),
             ])
             .unwrap();
-        round.consume_root_result_packet(0, true).unwrap();
         assert_eq!(
             round.classify_covered_subscription_state(
                 context,
@@ -9951,12 +9808,11 @@ pub(crate) fn manifest_terminal_regression_fixture() -> (
         )));
     }
     round.turn().unwrap();
-    round.consume_root_result_packet(0, true).unwrap();
     (round, acks)
 }
 
 #[test]
-fn required_terminal_consumes_existing_coverage_debt_without_granting_a_new_window() {
+fn covered_terminal_gap_inherits_existing_debt_and_positive_evidence_discharges_it() {
     let mut harness = Harness::new(&[0], &[1], 512);
     harness.settle_until_quiet(Duration::from_secs(10));
     let root = harness.execution.graph().root_task();
@@ -9986,19 +9842,14 @@ fn required_terminal_consumes_existing_coverage_debt_without_granting_a_new_wind
         ])
         .unwrap();
     harness.clock.advance(Duration::from_secs(29));
-    assert_eq!(
-        harness.execution.required_terminal_evidence_expired(),
-        None,
-        "unrequired source debt alone cannot decide a read attempt"
+    assert!(
+        !harness.execution.covered_recovery_expired(),
+        "debt without an actual gap is not a refusal"
     );
     harness
         .execution
-        .consume_root_result_packet(identity, 0, true)
-        .unwrap();
-    assert_eq!(harness.execution.required_terminal_evidence_expired(), None);
-    harness
-        .execution
         .apply_covered_entries(vec![
+            covered_frame(context, 2, CoveredStatusStreamFact::Gone(identity)),
             covered_frame(
                 context,
                 2,
@@ -10019,24 +9870,45 @@ fn required_terminal_consumes_existing_coverage_debt_without_granting_a_new_wind
             ),
         ])
         .unwrap();
+    assert!(!harness.execution.covered_recovery_expired());
     harness.clock.advance(Duration::from_secs(1));
-    assert_eq!(
-        harness.execution.required_terminal_evidence_expired(),
-        Some(identity),
-        "EOS and a larger cut in a new generation cannot renew old necessary debt"
+    assert!(
+        harness.execution.covered_recovery_expired(),
+        "a new generation cannot renew the original required gap debt"
     );
     harness.publish(root, TaskState::Running, None, false);
     harness.publish(root, TaskState::Flushing, None, false);
     harness.publish(root, TaskState::Finished, None, true);
-    assert_eq!(
-        harness.execution.required_terminal_evidence_expired(),
-        None,
-        "positive exact terminal evidence discharges the requirement despite unrelated backlog"
+    let terminal = harness
+        .execution
+        .task(root)
+        .unwrap()
+        .status()
+        .unwrap()
+        .clone();
+    harness
+        .execution
+        .apply_covered_entries(vec![
+            covered_frame(context, 3, CoveredStatusStreamFact::Status(terminal)),
+            covered_frame(
+                context,
+                3,
+                CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                    generation: 3,
+                    initial_cut: 20,
+                }),
+            ),
+        ])
+        .unwrap();
+    assert!(
+        harness.execution.covered_observation_ready(),
+        "exact positive terminal and complete newer catch-up close the gap"
     );
+    assert!(!harness.execution.covered_recovery_expired());
 }
 
 #[test]
-fn registered_gap_inherits_old_debt_but_settled_debt_does_not_age_new_requirements() {
+fn actual_gap_inherits_old_debt_but_settled_debt_does_not_age_a_new_gap() {
     for settle_debt in [false, true] {
         let mut harness = Harness::new(&[0], &[1], 512);
         harness.settle_until_quiet(Duration::from_secs(10));
@@ -10081,36 +9953,27 @@ fn registered_gap_inherits_old_debt_but_settled_debt_does_not_age_new_requiremen
                     }),
                 )])
                 .unwrap();
-            harness
-                .execution
-                .require_terminal_evidence([identity])
-                .unwrap();
-        } else {
-            harness
-                .execution
-                .apply_covered_entries(vec![covered_frame(
-                    context,
-                    2,
-                    CoveredStatusStreamFact::Gone(identity),
-                )])
-                .unwrap();
         }
+        harness
+            .execution
+            .apply_covered_entries(vec![covered_frame(
+                context,
+                2,
+                CoveredStatusStreamFact::Gone(identity),
+            )])
+            .unwrap();
         harness.clock.advance(Duration::from_secs(1));
         if settle_debt {
-            assert_eq!(
-                harness.execution.required_terminal_evidence_expired(),
-                None,
-                "settled debt is not history attached to a later necessary consumer"
+            assert!(
+                !harness.execution.covered_recovery_expired(),
+                "settled debt is not history attached to a later real gap"
             );
             harness.clock.advance(Duration::from_secs(29));
-            assert_eq!(
-                harness.execution.required_terminal_evidence_expired(),
-                Some(identity)
-            );
+            assert!(harness.execution.covered_recovery_expired());
         } else {
             assert!(
                 harness.execution.covered_recovery_expired(),
-                "a newly discovered true gap cannot grant older outstanding debt another window"
+                "a true gap cannot grant old outstanding debt another window"
             );
         }
     }
@@ -10541,7 +10404,6 @@ pub(crate) fn covered_loopback_recovery_round() -> (
     // The transport starts at the next generation. Consume this already-known
     // gap's one reconciliation effect rather than create a second subscription.
     round.execution_mut().take_covered_reconciliations();
-    round.consume_root_result_packet(0, true).unwrap();
     round.execution_mut().begin_normal_drain();
     round.turn().unwrap(); // Issue the exact Context Quiesce before its receipt.
     (round, clock, context, missing)
@@ -10711,7 +10573,7 @@ pub(crate) fn synchronous_root_control_round() -> (
     )));
     round.turn().unwrap();
     assert!(round.result_pump_ready());
-    assert!(!round.execution().root_end_of_stream_observed());
+    assert!(!round.accepted_root_success_sealed());
     (round, status, clock)
 }
 

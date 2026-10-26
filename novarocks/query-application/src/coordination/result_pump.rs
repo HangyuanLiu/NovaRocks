@@ -2311,10 +2311,21 @@ mod tests {
             statuses,
             terminal,
         ));
-        next_segment(&mut stream).await.complete();
+        let delivery = next_segment(&mut stream).await;
+        assert!(
+            !relay.is_finished(),
+            "Finished and Native Completed do not consume local output"
+        );
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        delivery.complete();
         let seal_request = tokio::time::timeout(Duration::from_secs(1), control.next())
             .await
             .unwrap();
+        assert!(
+            !relay.is_finished(),
+            "local End still needs the original success seal"
+        );
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
         drop(sender);
         drop(seal_request);
         let error = tokio::time::timeout(Duration::from_secs(1), relay)
@@ -2338,6 +2349,127 @@ mod tests {
         }
         assert!(stream.next().await.is_err());
         drop((stream, actor, owner, window));
+    }
+
+    #[test]
+    fn a_cancelled_root_and_a_latched_failure_both_refuse_a_read_success_seal() {
+        let root = root_task(execution(100_101));
+        let failure = TaskFailure::new(
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
+            SafeDetail::new("original read failure").unwrap(),
+        );
+        for state in [
+            TaskState::Running,
+            TaskState::Flushing,
+            TaskState::Canceling,
+            TaskState::Canceled,
+            TaskState::Aborted,
+            TaskState::Failed,
+        ] {
+            let termination = match state {
+                TaskState::Canceling | TaskState::Canceled => Some(TerminationDetail::Canceled(
+                    novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+                )),
+                TaskState::Aborted => Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+                TaskState::Failed => Some(TerminationDetail::Failed(failure.clone())),
+                _ => None,
+            };
+            let status = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(1).unwrap(),
+                state,
+                termination,
+                TaskOutputFacts::new(false),
+            )
+            .unwrap();
+            let (sender, mut source) = accepted_root_status_projection(root);
+            sender
+                .publish_attempt_observation(status, AcceptedAttemptFailure::None)
+                .unwrap();
+            let error = sender.seal_success().unwrap_err();
+            assert_eq!(
+                error.kind(),
+                QueryExecutionErrorKind::InvalidRequest,
+                "{state}"
+            );
+            assert_eq!(
+                error.message(),
+                "success seal requires a Finished root and no attempt failure"
+            );
+            assert!(
+                matches!(
+                    source.try_next(),
+                    Some(AcceptedRootProjection::Observation(_))
+                ),
+                "a refused terminal never publishes a success seal"
+            );
+            assert!(
+                source.try_next().is_none(),
+                "no later success seal may follow the refusal"
+            );
+        }
+        let writer = TaskIdentity::new(
+            root.query_execution_id(),
+            StageId::new(2).unwrap(),
+            TaskId::new(2).unwrap(),
+            root.backend_process_id(),
+        );
+        for attempt_failure in [
+            AcceptedAttemptFailure::DerivedPending,
+            AcceptedAttemptFailure::Authoritative(
+                novarocks_coordination_contract::SelectedTaskTermination::new(
+                    writer,
+                    TerminationDetail::Failed(failure.clone()),
+                ),
+            ),
+        ] {
+            let (sender, mut source) = accepted_root_status_projection(root);
+            sender
+                .publish_attempt_observation(finished(root), attempt_failure)
+                .unwrap();
+            let error = sender.seal_success().unwrap_err();
+            assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "success seal requires a Finished root and no attempt failure"
+            );
+            assert!(matches!(
+                source.try_next(),
+                Some(AcceptedRootProjection::Observation(_))
+            ));
+            assert!(
+                source.try_next().is_none(),
+                "no later success seal may follow the latched failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_root_projection_cannot_supply_this_reads_success_seal() {
+        let root = root_task(execution(100_102));
+        let foreign = TaskIdentity::new(
+            root.query_execution_id(),
+            root.stage_id(),
+            root.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let (sender, mut source) = accepted_root_status_projection(root);
+        let error = sender
+            .publish_attempt_observation(finished(foreign), AcceptedAttemptFailure::None)
+            .unwrap_err();
+        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(error.message(), "accepted root status names another Task");
+        assert!(
+            source.try_next().is_none(),
+            "the foreign process must not advance the accepted Root"
+        );
+        assert!(sender.seal_success().is_err());
     }
 
     #[tokio::test]
@@ -2937,7 +3069,7 @@ mod tests {
             root,
             Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
         );
-        status_sender.publish(finished(root)).unwrap();
+        status_sender.publish(running(root)).unwrap();
         // A two-segment row, then a one-row segment carrying End.
         let port = ScriptedRootPort::new(vec![
             rows_data(1, &[5, 0, 0, 0, b'a', b'b'], None),
@@ -2978,8 +3110,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(spans, vec![(b"cde".to_vec(), true), (b"f".to_vec(), true)]);
         second.complete();
-        // Success needs the seal verdict, not a Backend final ACK.
-        seal_port.next().await.accept(status_sender).unwrap();
+        // Real local End alone cannot complete a still-running Root.
+        let seal_request = seal_port.next().await;
+        assert!(!relay.is_finished());
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        status_sender.publish(finished(root)).unwrap();
+        // Success needs the original seal, not the pending Backend final ACK.
+        seal_request.accept(status_sender).unwrap();
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("local End consumption and root Finished produce EOF");
         };
@@ -3320,6 +3457,11 @@ mod tests {
                 vec![rows_data(2, &[1, 0, 0, 0, b'a'], None)],
                 RootRelayError::Sequence,
                 "sequence gap",
+            ),
+            (
+                vec![rows_data(2, &[1, 0, 0, 0, b'a'], Some((3, 1)))],
+                RootRelayError::Sequence,
+                "sequence gap carrying End",
             ),
         ] {
             let (

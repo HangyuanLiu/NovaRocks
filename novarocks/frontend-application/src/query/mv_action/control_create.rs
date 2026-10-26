@@ -200,11 +200,6 @@ impl MvCreateStepOriginal {
                 .as_ref()
                 .is_some_and(|source| source.physical_exit_observed())
     }
-    pub(super) fn close_refusal(&self) -> Option<novarocks_spi::connector::ConnectorError> {
-        self.source
-            .as_ref()
-            .and_then(|source| source.close_refusal())
-    }
     pub(super) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         if self.in_foreign {
             return Some(self.exit_unproven.clone());
@@ -352,8 +347,9 @@ impl MvCreateStepOriginal {
                         self.primary = Some(original_error(error).into());
                     }
                     Err(MvTurnFailure::Cpu(error)) => {
-                        self.primary =
-                            Some(QueryServiceError::from_execution_failure(error).into());
+                        self.primary = Some(
+                            QueryServiceError::from_execution_failure((*error).clone()).into(),
+                        );
                     }
                     Err(MvTurnFailure::Health(error)) => {
                         self.health = Some(error);

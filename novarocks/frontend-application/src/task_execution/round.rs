@@ -815,13 +815,6 @@ impl TaskRound {
                 "success seal refused because Task status observation was incomplete before its linearization point",
             ));
         }
-        if self.execution.covered_observation_active()
-            && let Some(identity) = self.execution.required_terminal_evidence_expired()
-        {
-            return Err(TaskExecutionError::Schedule(format!(
-                "required Task terminal observation {identity:?} did not arrive within its recovery budget"
-            )));
-        }
         if self.pending_success_seal.is_none()
             && self.execution.covered_observation_active()
             && self.execution.covered_recovery_expired()
@@ -1013,6 +1006,7 @@ impl TaskRound {
     /// Freeze only FE producers after the exact accepted Root completion.
     /// The original status, normal destination-close and Cancel path still
     /// runs. Profile may finish terminal info before Quiesce/Release starts.
+    #[cfg(test)]
     pub(crate) fn begin_input_close(&mut self) {
         for pump in &mut self.pumps {
             pump.begin_close();
@@ -1571,6 +1565,7 @@ impl TaskRound {
     /// hosts a task has acknowledged this attempt's shared facts. A caller
     /// uses it to close a pre-ready retry window, so it must be an observation
     /// of acknowledgements rather than of having sent them.
+    #[cfg(test)]
     pub(crate) fn contexts_established(&self) -> bool {
         self.execution.graph().contexts().all(|&context| {
             self.execution
@@ -1585,6 +1580,7 @@ impl TaskRound {
     /// holds or historically held the exact task the schedule placed on it.
     /// Installed or terminal status can prove ownership before a lost Create
     /// receipt is replayed.
+    #[cfg(test)]
     pub(crate) fn tasks_created(&self) -> bool {
         self.execution.graph().tasks().all(|task| {
             self.execution
@@ -1595,6 +1591,7 @@ impl TaskRound {
 
     /// A result fetch needs its own root receiver installed. Other stage
     /// creates may still be preparing or may later be stood down.
+    #[cfg(test)]
     pub(crate) fn result_pump_ready(&self) -> bool {
         let root = self.execution.graph().root_identity();
         self.execution
@@ -1610,22 +1607,6 @@ impl TaskRound {
     /// The root task the client's result comes from.
     pub(crate) fn root_task(&self) -> TaskIdentity {
         self.execution.graph().root_identity()
-    }
-
-    /// Records one packet this frontend received from the root's result plane.
-    pub(crate) fn consume_root_result_packet(
-        &mut self,
-        packet_sequence: u64,
-        end_of_stream: bool,
-    ) -> Result<(), TaskExecutionError> {
-        let root = self.root_task();
-        self.execution
-            .consume_root_result_packet(root, packet_sequence, end_of_stream)
-    }
-
-    /// Whether the client may be told the read is complete.
-    pub(crate) fn client_visible_completion(&self) -> bool {
-        self.execution.client_visible_completion()
     }
 
     /// Whether the result owner and this Task owner fixed the accepted root's
@@ -1683,6 +1664,7 @@ impl TaskRound {
 
     /// Only a process-health wait predicate: every healthy pump has joined,
     /// while a named unresolved pump remains retained. NEVER exit evidence.
+    #[cfg(test)]
     pub(crate) fn pump_close_progress_settled(&self) -> bool {
         self.pumps
             .iter()

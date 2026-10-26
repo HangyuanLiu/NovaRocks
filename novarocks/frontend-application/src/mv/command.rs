@@ -127,7 +127,7 @@ impl MvCommandExecutor {
                 context.execution().clone(),
             );
         }
-        use crate::query::mv_action::{MvCommandRequest, prepare};
+        use crate::query::mv_action::{CreateRequest, MvCommandRequest, prepare};
         let catalog = context.session().current_catalog();
         let database = context.session().current_database();
         let request = match statement {
@@ -160,7 +160,7 @@ impl MvCommandExecutor {
             MaterializedViewStatement::Create(create) => {
                 let statement = lower_typed_create(create)?;
                 let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
-                MvCommandRequest::Create { target, statement }
+                MvCommandRequest::Create(Box::new(CreateRequest { target, statement }))
             }
             MaterializedViewStatement::Drop(drop) => {
                 let statement = MvDropStatement {

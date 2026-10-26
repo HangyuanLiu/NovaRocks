@@ -29,7 +29,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::task_execution::completion_facts::{AttemptDrainFacts, parent_released_children};
+use crate::task_execution::completion_facts::parent_released_children;
 use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
 use crate::task_execution::operation::OperationDispatchResult;
 use crate::task_execution::status_validation::GoneObservation;
@@ -53,7 +53,6 @@ use novarocks_task_codec::operation::{
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
 
-use super::completion::{ReadCompletionTracker, ReadVerdict};
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::AcceptedRootControlRequest;
@@ -61,7 +60,7 @@ use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
 use super::dispatch::{DispatchOperationState, LocalQueueCapacity, OperationDispatcher};
-use super::error::{CapacityBound, TaskExecutionError};
+use super::error::TaskExecutionError;
 use super::graph::TaskGraph;
 use super::intent::{
     DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationQueueAdmission,
@@ -364,8 +363,6 @@ pub struct QueryTaskExecution {
     accepted_terminal_seen: BTreeSet<TaskIdentity>,
     accepted_protocol_dirty_tasks: BTreeSet<TaskId>,
     accepted_protocol_writer_evidence: BTreeMap<TaskId, Arc<TaskStatus>>,
-    read: ReadCompletionTracker,
-    required_evidence_deadlines: BTreeMap<TaskIdentity, MonotonicInstant>,
     required_result_terminal_control_deadline: Option<MonotonicInstant>,
     drained_tasks: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
@@ -593,7 +590,6 @@ impl QueryTaskExecution {
             stages.insert(stage_id, StageExecution::new(node.stage(), root, tasks)?);
         }
 
-        let read = ReadCompletionTracker::new(graph.root_identity());
         let covered_observation = graph
             .contexts()
             .copied()
@@ -630,8 +626,6 @@ impl QueryTaskExecution {
             accepted_terminal_seen: BTreeSet::new(),
             accepted_protocol_dirty_tasks: BTreeSet::new(),
             accepted_protocol_writer_evidence: BTreeMap::new(),
-            read,
-            required_evidence_deadlines: BTreeMap::new(),
             required_result_terminal_control_deadline: None,
             drained_tasks: BTreeSet::new(),
             released_outputs: BTreeSet::new(),
@@ -2378,46 +2372,6 @@ impl QueryTaskExecution {
         Ok(())
     }
 
-    /// Records one packet the root result data plane delivered.
-    ///
-    /// This is the frontend's own evidence about its result stream, and it is
-    /// the only thing that can satisfy the end-of-stream half of a read
-    /// completion. A backend's claim that its output responsibility is
-    /// complete is a different fact, published on a different channel, and it
-    /// cannot substitute for what this process received.
-    pub fn consume_root_result_packet(
-        &mut self,
-        root: TaskIdentity,
-        packet_sequence: u64,
-        end_of_stream: bool,
-    ) -> Result<(), TaskExecutionError> {
-        self.read
-            .consume_packet(root, packet_sequence, end_of_stream)?;
-        if end_of_stream {
-            self.require_terminal_evidence(std::iter::once(root))?;
-        }
-        Ok(())
-    }
-
-    /// Registers exact terminal evidence required after the consumer's result
-    /// proof arrives. Repeated declarations cannot renew an earlier budget;
-    /// unrelated Context coverage does not register any requirement.
-    pub(crate) fn require_terminal_evidence(
-        &mut self,
-        identities: impl IntoIterator<Item = TaskIdentity>,
-    ) -> Result<(), TaskExecutionError> {
-        let deadline = self.clock.now().saturating_add(Duration::from_secs(30));
-        for identity in identities {
-            if self.task_by_identity_ref(identity).is_none() {
-                return Err(TaskExecutionError::UnknownOperation);
-            }
-            self.required_evidence_deadlines
-                .entry(identity)
-                .or_insert(deadline);
-        }
-        Ok(())
-    }
-
     pub(crate) fn require_result_terminal_control(
         &mut self,
         root: TaskIdentity,
@@ -2443,70 +2397,15 @@ impl QueryTaskExecution {
             })
     }
 
-    pub(crate) fn required_terminal_evidence_expired(&self) -> Option<TaskIdentity> {
-        let now = self.clock.now();
-        self.required_evidence_deadlines
-            .iter()
-            .find_map(|(&identity, &deadline)| {
-                let task = self.task_by_identity_ref(identity)?;
-                if task.is_terminal() {
-                    return None;
-                }
-                // A newly required consumer cannot grant an existing source
-                // debt a fresh recovery window. Only this exact Task's Context
-                // is relevant; unrelated coverage never gates read success.
-                let debt_expired = self
-                    .covered_observation
-                    .get(&task.context())
-                    .and_then(|state| state.coverage_debt)
-                    .is_some_and(|(_, since)| {
-                        now.has_reached(since.saturating_add(Duration::from_secs(30)))
-                    });
-                (now.has_reached(deadline) || debt_expired).then_some(identity)
-            })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn required_root_evidence_expired(&self) -> bool {
-        self.required_evidence_deadlines
-            .get(&self.read.root())
-            .is_some_and(|&deadline| {
-                self.clock.now().has_reached(deadline)
-                    && !self
-                        .task_by_identity_ref(self.read.root())
-                        .is_some_and(RemoteTask::is_terminal)
-            })
-    }
-
-    /// Whether the client may be told the read is complete, and why not when
-    /// it may not.
-    ///
-    /// This deliberately does not wait for upstream tasks to finish standing
-    /// down, and it does not wait for any context to be released. Draining is
-    /// internal resource closure and never gates a completion that has
-    /// already been linearized.
-    pub fn read_completion(&self) -> ReadVerdict {
-        let root_state = self
-            .task_by_identity_ref(self.read.root())
-            .map_or(TaskState::Planned, RemoteTask::task_state);
-        self.read.verdict(root_state, self.failure.is_latched())
-    }
-
-    /// Whether the client may be told the read is complete.
-    pub fn client_visible_completion(&self) -> bool {
-        self.read_completion().is_complete()
-    }
-
-    /// Whether this frontend consumed the end of the root result stream.
-    #[cfg(test)]
-    pub fn root_end_of_stream_observed(&self) -> bool {
-        self.read.end_of_stream_observed()
-    }
-
-    /// Whether the whole attempt has drained.
+    /// Test observation of accepted Task/output/Release facts, never actual exit.
     #[cfg(test)]
     pub fn attempt_drained(&self) -> bool {
-        self.attempt_drain_facts().drained()
+        self.stages.values().all(StageExecution::all_terminal)
+            && self
+                .stages
+                .values()
+                .all(StageExecution::all_output_released)
+            && self.owners.values().all(QueryContextOwner::is_released)
     }
 
     /// The exact immutable Worker proof applied by the original covered owner.
@@ -2533,24 +2432,6 @@ impl QueryTaskExecution {
         self.owners
             .get(&context)
             .is_some_and(QueryContextOwner::never_attempted_establish)
-    }
-
-    /// The three facts a drain waits on, separately.
-    ///
-    /// A conjunction that fails has to be able to say which conjunct failed.
-    /// Reporting only "not drained" cost a full cluster run to narrow the one
-    /// time it mattered, and the three have entirely different causes: tasks
-    /// not terminal is the backends still working, output not released is this
-    /// frontend not having consumed what they produced, and contexts not
-    /// released is the release operation itself outstanding.
-    pub fn attempt_drain_facts(&self) -> AttemptDrainFacts {
-        AttemptDrainFacts::new(
-            self.stages.values().all(StageExecution::all_terminal),
-            self.stages
-                .values()
-                .all(StageExecution::all_output_released),
-            self.owners.values().all(QueryContextOwner::is_released),
-        )
     }
 
     /// Where every task of one context has been observed to.
@@ -2959,14 +2840,6 @@ impl QueryTaskExecution {
                 Err(TaskExecutionError::Workload(error))
             }
         }
-    }
-
-    fn process_queue_backpressure(request: TaskOperationQueueRequest) -> TaskExecutionError {
-        CapacityBound::ProcessTransportQueue {
-            lane: request.lane(),
-            bytes: request.queued_bytes(),
-        }
-        .into()
     }
 
     fn locate(&self, identity: TaskIdentity) -> Option<(StageId, TaskId)> {

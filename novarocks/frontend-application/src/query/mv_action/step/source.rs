@@ -1259,7 +1259,9 @@ fn connector_error(error: ConnectorError) -> MvPhaseFailure {
 fn turn_error(source: &StepSource, error: MvTurnFailure) -> MvPhaseFailure {
     match error {
         MvTurnFailure::Admission(error) => original_error(error).into(),
-        MvTurnFailure::Cpu(error) => QueryServiceError::from_execution_failure(error).into(),
+        MvTurnFailure::Cpu(error) => {
+            QueryServiceError::from_execution_failure((*error).clone()).into()
+        }
         MvTurnFailure::Health(health) => health_error(source, health).into(),
     }
 }

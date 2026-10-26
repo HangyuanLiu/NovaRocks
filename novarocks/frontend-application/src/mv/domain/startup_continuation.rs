@@ -44,15 +44,6 @@ use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
 use crate::mv::startup_isolation_file::StartupIsolationSource;
 
-/// Everything one pass needs, owned by the caller.
-pub(crate) struct StartupContinuationPass<'a> {
-    pub(crate) entrance: &'a ManagementEntrance,
-    pub(crate) continuation: &'a ManagementContinuationService,
-    pub(crate) readiness: &'a crate::mv::domain::readiness::MvReadinessPort,
-    pub(crate) connector_control: &'a dyn ConnectorControlResolver,
-    pub(crate) source: &'a StartupIsolationSource,
-}
-
 /// What one pass did, as an operator needs to see it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StartupContinuationReport {
@@ -73,109 +64,6 @@ impl StartupContinuationReport {
             && self.not_covered == 0
             && self.failed == 0
     }
-}
-
-/// Run one pass. An absent statement is the default and does nothing.
-pub(crate) fn run_startup_continuation_pass(
-    pass: &StartupContinuationPass<'_>,
-) -> StartupContinuationReport {
-    let clock = SystemManagementClock;
-    let Some(evidence) = accept_current_statement(pass, &clock) else {
-        return StartupContinuationReport::default();
-    };
-    let projections = match pass
-        .readiness
-        .candidate_reader()
-        .list_candidate_definitions()
-    {
-        Ok(projections) => projections,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "skipping MV startup continuation because the Accelerator is unavailable"
-            );
-            return StartupContinuationReport::default();
-        }
-    };
-    let mut report = StartupContinuationReport::default();
-    for projection in projections {
-        let source = projection.facts.source_revision();
-        match pass.continuation.resume_target_on_startup_isolation(
-            &source.target,
-            &evidence,
-            &clock,
-        ) {
-            StartupContinuation::Nothing => {}
-            StartupContinuation::NotCovered => report.not_covered += 1,
-            StartupContinuation::OperatorOnly => report.operator_only += 1,
-            StartupContinuation::Waiting { deadline } => {
-                report.waiting += 1;
-                tracing::debug!(
-                    mv_target = %format!(
-                        "{}.{}.{}",
-                        source.target.instance_id.as_str(),
-                        source.target.namespace,
-                        source.target.table
-                    ),
-                    deadline = deadline.as_unix_millis(),
-                    "MV startup continuation is waiting for the guaranteed remote window"
-                );
-            }
-            StartupContinuation::Ready {
-                previous_incarnation,
-                permits,
-            } => match readmit(pass, &source.target, previous_incarnation, permits) {
-                Ok(()) => report.readmitted += 1,
-                Err(error) => {
-                    report.failed += 1;
-                    tracing::warn!(
-                        mv_target = %format!(
-                            "{}.{}.{}",
-                            source.target.instance_id.as_str(),
-                            source.target.namespace,
-                            source.target.table
-                        ),
-                        %error,
-                        "MV startup continuation could not readmit a target its statement covers"
-                    );
-                }
-            },
-            StartupContinuation::Refused(error) => {
-                report.failed += 1;
-                tracing::warn!(
-                    mv_target = %format!(
-                        "{}.{}.{}",
-                        source.target.instance_id.as_str(),
-                        source.target.namespace,
-                        source.target.table
-                    ),
-                    %error,
-                    "MV startup continuation refused a target its statement named"
-                );
-            }
-        }
-    }
-    report
-}
-
-/// Read and check the statement as it stands right now.
-///
-/// It is re-read every pass on purpose: the file may appear, be corrected, or
-/// be replaced for a later launch, and a statement cached from the first pass
-/// would outlive all three.
-fn accept_current_statement(
-    pass: &StartupContinuationPass<'_>,
-    clock: &dyn ManagementClock,
-) -> Option<StartupIsolationEvidence> {
-    let declaration = match pass.source.read() {
-        Ok(Some(declaration)) => declaration,
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::warn!(%error, "MV startup isolation evidence could not be read");
-            return None;
-        }
-    };
-    accept_declaration(pass.continuation, pass.source, declaration, clock)
 }
 
 fn accept_declaration(
@@ -208,48 +96,6 @@ fn accept_declaration(
             None
         }
     }
-}
-
-fn readmit(
-    pass: &StartupContinuationPass<'_>,
-    table: &novarocks_spi::connector::ConnectorTableIdentity,
-    previous_incarnation: novarocks_mv_application::management::ProcessIncarnation,
-    permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
-) -> Result<(), String> {
-    let instance_id = ConnectorInstanceId::parse(table.instance_id.as_str())
-        .map_err(|error| format!("parse the continued MV catalog identity: {error}"))?;
-    let lease = pass
-        .connector_control
-        .acquire_current(&instance_id)
-        .map_err(|error| format!("acquire the continued MV catalog generation: {error}"))?;
-    let catalog = lease
-        .binding()
-        .catalog_handle()
-        .map_err(|error| format!("bind the continued MV catalog generation: {error}"))?
-        .clone();
-    crate::mv::domain::staged_create::readmit_declared_target(
-        pass.entrance,
-        pass.readiness,
-        pass.connector_control,
-        catalog,
-        novarocks_mv_application::product::MvTarget::from_parts(
-            Some(table.instance_id.as_str()),
-            &table.namespace,
-            &table.table,
-        ),
-        uuid::Uuid::now_v7(),
-        previous_incarnation,
-        permits,
-        // The old writer's effects are settled by the deployment's statement,
-        // not by this process; observe under a scope that cannot be mistaken
-        // for part of one of them.
-        crate::connector::connector_request_context(
-            None,
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-        )?
-        .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
-        .after_external_effect(),
-    )
 }
 
 /// Named storage in the original maintenance event. The deployment file job,
@@ -336,9 +182,8 @@ impl StartupContinuationReceiving {
     }
 }
 
-/// Same deployment evidence, continuation policy and exact readmission as
-/// the synchronous compatibility route, with actual I/O borrowed from the
-/// cadence's already-installed original Root.
+/// Preserve the actual connector cause while the original maintenance Root
+/// retains deployment evidence, continuation policy and exact readmission.
 fn startup_connector_failure(
     error: novarocks_spi::connector::ConnectorError,
 ) -> novarocks_mv_application::readiness::MvProjectionError {

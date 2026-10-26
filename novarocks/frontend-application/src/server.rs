@@ -237,7 +237,6 @@ impl FrontendRoleProducts {
                         .expect("serving MV product owns document-management authority"),
                     self.constant_policy,
                 ),
-                Arc::clone(&self.maintenance_engine),
                 self.mv_execution_services.clone(),
             ))
             .map_err(|error| {
@@ -475,13 +474,11 @@ async fn build_frontend_role_products(
     let mv_service = Arc::new(
         crate::mv::FrontendMvProductAdapter::with_refresh_dependencies(
             Arc::clone(&mv_readiness),
-            Arc::clone(&connector_control),
             mv_activation,
             role,
             topology.clone(),
             Arc::clone(&mv_product_service),
             host.mv_maintenance_config(),
-            Arc::clone(&maintenance_service),
             host.optimizer_query_mem_limit_bytes(),
             host.lake_publication_runtime_policy()
                 .max_attempt_duration(),

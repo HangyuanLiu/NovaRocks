@@ -70,8 +70,8 @@ pub(crate) enum MvRefreshPreparationOutput {
     Explain(Vec<String>),
     DependencySteps(Vec<crate::mv::domain::dependency::refresh::MvRefreshDependencyStep>),
     Catalog(MvCatalogCaptureOutput),
-    Refresh(super::pure_reader::MvRefreshPrepared),
-    WriteAnalysis(super::super::activation_preparation::MvWriteAnalysisPrepared),
+    Refresh(Box<super::pure_reader::MvRefreshPrepared>),
+    WriteAnalysis(Box<super::super::activation_preparation::MvWriteAnalysisPrepared>),
 }
 
 type Reader = Pin<
@@ -166,6 +166,7 @@ impl MvRefreshPreparationOriginal {
                 reader: Some(Box::pin(async move {
                     super::pure_reader::prepare_refresh(input, &reader_io)
                         .await
+                        .map(Box::new)
                         .map(MvRefreshPreparationOutput::Refresh)
                 })),
                 result: None,
@@ -223,6 +224,7 @@ impl MvRefreshPreparationOriginal {
                 reader: Some(Box::pin(async move {
                     super::super::activation_preparation::prepare_analysis(input, &reader_io)
                         .await
+                        .map(Box::new)
                         .map(MvRefreshPreparationOutput::WriteAnalysis)
                 })),
                 result: None,

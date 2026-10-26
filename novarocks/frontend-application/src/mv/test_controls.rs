@@ -474,28 +474,6 @@ impl MvTestControls {
         Err("MV document expiry has no active unclaimed authorization for this FE launch, target and token".into())
     }
 
-    pub(crate) fn recovery(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        mv: &str,
-        phase: &str,
-    ) -> Result<(), String> {
-        for action in &self.actions {
-            if let Some(barrier) =
-                self.claim_recovery_barrier(action, catalog, namespace, mv, phase)?
-            {
-                wait_release(
-                    &barrier.claim,
-                    &barrier.trigger,
-                    Duration::from_secs(30),
-                    || false,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) async fn recovery_async(
         &self,
         catalog: &str,
@@ -555,28 +533,6 @@ impl MvTestControls {
         claim.record_hit().map_err(|error| error.to_string())?;
         eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
         Ok(Some(AuthorizedBarrier { claim, trigger }))
-    }
-
-    pub(crate) fn known_committed(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        mv: &str,
-        publication_id: &novarocks_spi::connector::LakePublicationId,
-    ) -> Result<(), String> {
-        for action in &self.actions {
-            if let Some(barrier) =
-                self.claim_known_committed_barrier(action, catalog, namespace, mv, publication_id)?
-            {
-                wait_release(
-                    &barrier.claim,
-                    &barrier.trigger,
-                    Duration::from_secs(30),
-                    || false,
-                )?;
-            }
-        }
-        Ok(())
     }
 
     pub(crate) async fn known_committed_async(
@@ -643,21 +599,6 @@ impl MvTestControls {
         Ok(Some(AuthorizedBarrier { claim, trigger }))
     }
 
-    pub(crate) fn scheduler(
-        &self,
-        target: &novarocks_sql::planning::mv::SqlMvTarget,
-        cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
-    ) -> Result<bool, String> {
-        if let Some(barrier) = self.claim_scheduler_barrier(target)? {
-            wait_release(
-                &barrier.claim,
-                &barrier.trigger,
-                Duration::from_secs(120),
-                || cancellation.is_cancelled(),
-            )?;
-        }
-        Ok(cancellation.is_cancelled())
-    }
     pub(crate) async fn scheduler_async(
         &self,
         target: &novarocks_sql::planning::mv::SqlMvTarget,
@@ -1799,8 +1740,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn session_close_releases_scheduler_barrier_and_actual_waiter_is_joined() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_close_releases_scheduler_barrier_and_actual_waiter_is_joined() {
         let directory = std::env::temp_dir().join(format!("nrscheduler-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("mvx4-scheduler-hold.trigger"), "hold").unwrap();
@@ -1812,15 +1753,19 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let waiter = std::thread::spawn(move || {
-            controls.scheduler(
-                &novarocks_sql::planning::mv::SqlMvTarget {
-                    catalog: Some("ice".into()),
-                    database: "sales".into(),
-                    name: "orders".into(),
-                },
-                &novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
-            )
+        let waiter = tokio::spawn(async move {
+            let cancellation =
+                novarocks_query_application::cancellation::QueryCancellationSource::new();
+            controls
+                .scheduler_async(
+                    &novarocks_sql::planning::mv::SqlMvTarget {
+                        catalog: Some("ice".into()),
+                        database: "sales".into(),
+                        name: "orders".into(),
+                    },
+                    &cancellation.view(),
+                )
+                .await
         });
         let until = Instant::now() + Duration::from_secs(1);
         while !directory
@@ -1828,12 +1773,12 @@ pub(crate) mod tests {
             .exists()
         {
             assert!(Instant::now() < until);
-            std::thread::yield_now();
+            tokio::task::yield_now().await;
         }
         session.close();
         assert!(
             waiter
-                .join()
+                .await
                 .unwrap()
                 .unwrap_err()
                 .contains("session closed")
@@ -2270,8 +2215,8 @@ pub(crate) mod tests {
         assert!(session.role.scope().observations().is_empty());
     }
 
-    #[test]
-    fn recovery_wrong_target_phase_or_arm_token_cannot_claim() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_wrong_target_phase_or_arm_token_cannot_claim() {
         let root = std::env::temp_dir().join(format!("nrmvrecovery-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&root).unwrap();
         let controlled = TestSession::new(
@@ -2290,12 +2235,16 @@ pub(crate) mod tests {
             ("ice", "sales", "other", "data-prepared"),
             ("ice", "sales", "orders", "publication-committed"),
         ] {
-            controls.recovery(catalog, namespace, mv, phase).unwrap();
+            controls
+                .recovery_async(catalog, namespace, mv, phase)
+                .await
+                .unwrap();
         }
         assert!(controlled.role.scope().observations().is_empty());
         assert!(
             controls
-                .recovery("ice", "sales", "orders", "data-prepared")
+                .recovery_async("ice", "sales", "orders", "data-prepared")
+                .await
                 .unwrap_err()
                 .contains("finite grant")
         );

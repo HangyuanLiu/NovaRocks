@@ -24,9 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::background::MvBackgroundBindings;
 use crate::mv::domain::application::MvApplicationError;
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use novarocks_mv_application::{
-    activity::{MvActivityAdmissionError, MvActivityLease, MvActivityOwner},
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
@@ -35,14 +33,10 @@ use novarocks_mv_application::{
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::BackendTopologyService;
-use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
+use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
-use super::{
-    activity::canonical_mv_target,
-    refresh,
-    scheduler::{self, ScheduledRefreshDisposition, ScheduledRefreshRequest},
-};
+use super::scheduler::{self, ScheduledRefreshDisposition, ScheduledRefreshRequest};
 
 #[path = "service/background_original.rs"]
 mod background_original;
@@ -53,10 +47,10 @@ mod background_original;
 /// deliberately return `None` so their existing core routes remain active.
 pub struct FrontendMvProductAdapter {
     readiness: Arc<MvReadinessPort>,
-    refresh: refresh::FrontendMvRefreshDependencies,
+    provider_activation:
+        Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation>,
     product_service: Arc<MvKeyedProductService>,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_service: Arc<dyn TableMaintenanceService>,
     execution_role: novarocks_types::ClusterRole,
     topology: BackendTopologyService,
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
@@ -71,13 +65,8 @@ pub struct FrontendMvProductAdapter {
 }
 
 impl FrontendMvProductAdapter {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Frontend MV composition keeps independently owned ports explicit at the application boundary."
-    )]
     pub(crate) fn with_refresh_dependencies(
         readiness: Arc<MvReadinessPort>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
         provider_activation: Arc<
             dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation,
         >,
@@ -85,23 +74,16 @@ impl FrontendMvProductAdapter {
         topology: BackendTopologyService,
         product_service: Arc<MvKeyedProductService>,
         maintenance_config: MaintenanceCoordinatorConfig,
-        table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
         attempt_timeout: Duration,
         root_admission: RootAdmissionHandle,
         startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     ) -> Self {
         Self {
-            refresh: refresh::FrontendMvRefreshDependencies {
-                connector_control: Arc::clone(&connector_control),
-                provider_activation: Arc::clone(&provider_activation),
-                #[cfg(novarocks_dev_controls)]
-                test_controls: readiness.test_controls_owner(),
-            },
+            provider_activation,
             readiness: Arc::clone(&readiness),
             product_service,
             maintenance_config,
-            table_maintenance_service,
             execution_role,
             topology,
             optimizer_query_mem_limit_bytes,
@@ -123,7 +105,7 @@ impl FrontendMvProductAdapter {
     ) {
         (
             self.product_service.clone(),
-            self.refresh.provider_activation.clone(),
+            self.provider_activation.clone(),
         )
     }
 
@@ -153,19 +135,15 @@ impl FrontendMvProductAdapter {
             .product_service
             .begin_background_start()
             .map_err(lifecycle_error)?;
-        let dependencies = self.refresh.clone();
         let topology = self.topology.clone();
-        let table_maintenance_service = Arc::clone(&self.table_maintenance_service);
         let runtime = start_background_workers(RefreshWorkerDependencies {
             readiness: Arc::clone(&self.readiness),
-            refresh: dependencies,
+            provider_activation: Arc::clone(&self.provider_activation),
             ports: bindings.ports,
             execution: bindings.execution,
             topology,
             role: self.execution_role,
             maintenance_config: self.maintenance_config.clone(),
-            table_maintenance_engine: bindings.table_maintenance_engine,
-            table_maintenance_service,
             product_service: Arc::clone(&self.product_service),
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
@@ -177,57 +155,16 @@ impl FrontendMvProductAdapter {
     }
 }
 
-impl FrontendMvProductAdapter {
-    /// Run one foreground DDL path under the same per-target FIFO gate as
-    /// refresh and background maintenance. The SQL session cancellation scope
-    /// remains the authority while the statement waits for its turn.
-    pub(crate) fn execute_serialized<T, E: From<String>>(
-        &self,
-        target: &novarocks_sql::planning::mv::SqlMvTarget,
-        owner: MvActivityOwner,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        action: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        let _gate_lease = self
-            .acquire_activity_lease(target, owner, execution)
-            .map_err(|error| E::from(error.to_string()))?;
-        action()
-    }
-
-    fn acquire_activity_lease(
-        &self,
-        target: &novarocks_sql::planning::mv::SqlMvTarget,
-        owner: MvActivityOwner,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<MvActivityLease, MvApplicationError> {
-        self.product_service
-            .acquire_foreground(canonical_mv_target(target), owner, || {
-                execution.cancellation().is_cancelled()
-            })
-            .map_err(|error| match error {
-                MvActivityAdmissionError::Cancelled => MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "MV statement was cancelled while waiting for activity gate",
-                ),
-                MvActivityAdmissionError::Stopping => MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "frontend MV activity admission is closed",
-                ),
-            })
-    }
-}
-
 #[derive(Clone)]
 struct RefreshWorkerDependencies {
     readiness: Arc<MvReadinessPort>,
-    refresh: refresh::FrontendMvRefreshDependencies,
+    provider_activation:
+        Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation>,
     ports: crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
     execution: crate::query::mv_action::MvExecutionServices,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
-    table_maintenance_service: Arc<dyn TableMaintenanceService>,
     product_service: Arc<MvKeyedProductService>,
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
@@ -280,41 +217,6 @@ fn start_background_workers(
     .map_err(|error| {
         MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
     })
-}
-
-/// One startup-continuation pass, if this process still owns the management
-/// authority the pass needs. A product without it has nothing to reopen.
-fn run_startup_continuation(
-    source: &crate::mv::startup_isolation_file::StartupIsolationSource,
-    readiness: &MvReadinessPort,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    product_service: &MvKeyedProductService,
-) {
-    let (Some(entrance), Some(continuation)) = (
-        product_service.management_entrance(),
-        product_service.management_continuation(),
-    ) else {
-        return;
-    };
-    let report = crate::mv::domain::startup_continuation::run_startup_continuation_pass(
-        &crate::mv::domain::startup_continuation::StartupContinuationPass {
-            entrance: entrance.as_ref(),
-            continuation: continuation.as_ref(),
-            readiness,
-            connector_control,
-            source,
-        },
-    );
-    if !report.is_silent() {
-        tracing::info!(
-            readmitted = report.readmitted,
-            waiting = report.waiting,
-            operator_only = report.operator_only,
-            not_covered = report.not_covered,
-            failed = report.failed,
-            "MV startup continuation pass"
-        );
-    }
 }
 
 fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {

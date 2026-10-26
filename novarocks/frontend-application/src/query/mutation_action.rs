@@ -64,15 +64,19 @@ use std::{
 // This closed sum delegates actual assembly/consumer construction. No query is
 // reconstructed and no selection is cloned to cross a phase boundary.
 enum MutationAssembly {
-    Selection(PreparedCowMatchAssembly, QueryOptions),
-    Write(PreparedDmlWriteAssembly),
+    Selection(Box<MutationSelectionAssembly>),
+    Write(Box<PreparedDmlWriteAssembly>),
+}
+struct MutationSelectionAssembly {
+    assembly: PreparedCowMatchAssembly,
+    options: QueryOptions,
 }
 enum MutationOutput {
     Selection(CowComputationOutput),
     Write(WriteComputationOutput),
 }
 enum MutationReady {
-    Selection(ReadyCowComputation),
+    Selection(Box<ReadyCowComputation>),
     Write(ReadyWriteComputation),
 }
 impl StatementComputationAssembly for MutationAssembly {
@@ -90,10 +94,13 @@ impl StatementComputationAssembly for MutationAssembly {
         QueryExecutionError,
     > {
         match self {
-            Self::Selection(assembly, options) => assembly
-                .prepare_computation(initial, runtime, Some(options))
-                .map(|(c, r, o)| (c, r, MutationOutput::Selection(o))),
-            Self::Write(assembly) => assembly
+            Self::Selection(selection) => {
+                let MutationSelectionAssembly { assembly, options } = *selection;
+                assembly
+                    .prepare_computation(initial, runtime, Some(options))
+                    .map(|(c, r, o)| (c, r, MutationOutput::Selection(o)))
+            }
+            Self::Write(assembly) => (*assembly)
                 .prepare_computation(initial, runtime)
                 .map(|(c, r, o)| (c, r, MutationOutput::Write(o))),
         }
@@ -112,7 +119,10 @@ impl StatementComputationOutput for MutationOutput {
         token: ComputationReadyToken,
     ) -> Result<MutationReady, QueryExecutionError> {
         match self {
-            Self::Selection(o) => o.take_ready(token).map(MutationReady::Selection),
+            Self::Selection(o) => o
+                .take_ready(token)
+                .map(Box::new)
+                .map(MutationReady::Selection),
             Self::Write(o) => o.take_ready(token).map(MutationReady::Write),
         }
     }
@@ -200,12 +210,18 @@ async fn prepare_phase(
         PhaseRequest::CompileMor(prepared, custody) => prepared
             .compile_async(&custody, Some(input.options.clone()))
             .await
+            .map(Box::new)
             .map(MutationAssembly::Write)
             .map(PhaseValue::Assembly),
         PhaseRequest::CompileSelection(prepared, custody) => prepared
             .compile_async(&custody, Some(input.options.clone()))
             .await
-            .map(|a| MutationAssembly::Selection(a, input.options.clone()))
+            .map(|assembly| {
+                MutationAssembly::Selection(Box::new(MutationSelectionAssembly {
+                    assembly,
+                    options: input.options.clone(),
+                }))
+            })
             .map(PhaseValue::Assembly),
         PhaseRequest::CompileTarget(prepared, index, execution, context, custody) => prepared
             .compile_target_async(
@@ -216,6 +232,7 @@ async fn prepare_phase(
                 Some(input.options.clone()),
             )
             .await
+            .map(Box::new)
             .map(MutationAssembly::Write)
             .map(PhaseValue::Assembly),
     }
@@ -629,6 +646,7 @@ impl MutationAction {
                             let MutationReady::Selection(ready) = self.ready.take().unwrap() else {
                                 unreachable!()
                             };
+                            let ready = *ready;
                             self.start(PhaseRequest::BeginCow(
                                 Arc::clone(self.facts.as_ref().unwrap()),
                                 ready.selection,

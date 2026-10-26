@@ -1000,7 +1000,7 @@ impl CtasSource {
                             }
                         }
                         StandardCtasWriteOutcome::KnownUncommitted { failure } => {
-                            self.failure(failure)
+                            self.failure(*failure)
                         }
                     }
                 }

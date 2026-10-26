@@ -202,7 +202,7 @@ impl MvWritePreparationCustody {
             .take()
             .expect("same original MV reader result")
         {
-            Ok(MvRefreshPreparationOutput::WriteAnalysis(prepared)) => prepared,
+            Ok(MvRefreshPreparationOutput::WriteAnalysis(prepared)) => *prepared,
             Err(error) => return Err(F::Domain(error)),
             _ => {
                 return Err(F::Domain(contract_error(

@@ -60,7 +60,7 @@ impl From<&RefreshWorkerDependencies> for OriginalWorkerDependencies {
     fn from(original: &RefreshWorkerDependencies) -> Self {
         Self {
             readiness: original.readiness.clone(),
-            activation: original.refresh.provider_activation.clone(),
+            activation: original.provider_activation.clone(),
             ports: original.ports.clone(),
             execution: original.execution.clone(),
             topology: original.topology.clone(),

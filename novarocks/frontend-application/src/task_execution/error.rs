@@ -26,8 +26,7 @@ use std::time::Duration;
 
 use crate::task_execution::operation::OperationDispatchResult;
 use crate::task_execution::status_validation::FinalInfoDisagreement;
-use crate::task_protocol_config::DispatchLane;
-use novarocks_coordination_contract::{ResultPacketVerdict, StatusObservation};
+use novarocks_coordination_contract::StatusObservation;
 use novarocks_execution::task_execution::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
     OperationOutcome, QueryContextRef, RequestError, TaskOperationId, TaskState,
@@ -145,9 +144,6 @@ pub enum TaskExecutionError {
         kind: OperationKind,
         result: OperationDispatchResult,
     },
-    /// The root result stream lost, repeated, or overran a packet, so the
-    /// result this frontend holds is not provably the whole result.
-    ResultStream(ResultPacketVerdict),
     /// A fetched final task info contradicts the terminal status this attempt
     /// already observed.
     FinalInfo(FinalInfoDisagreement),
@@ -190,8 +186,6 @@ pub enum CapacityBound {
     DescriptorBytes { limit: usize, actual: usize },
     /// One operation's queue-side carrier.
     OperationBytes { limit: usize, actual: usize },
-    /// The process-wide Native transport could not retain this queued carrier.
-    ProcessTransportQueue { lane: DispatchLane, bytes: usize },
     /// Edge-open versions one producer task can mint.
     ///
     /// A task mints one per edge-open decision and never reuses one, so this
@@ -273,14 +267,6 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
                 u64::try_from(actual).ok(),
                 u64::try_from(limit).ok(),
             ),
-            Self::ProcessTransportQueue { bytes, .. } => (
-                48,
-                Some(S::Request),
-                Some(S::Process),
-                D::Bytes,
-                u64::try_from(bytes).ok(),
-                None,
-            ),
             Self::EdgeOpenVersions { limit } => (
                 49,
                 Some(S::Task),
@@ -336,10 +322,6 @@ impl fmt::Display for CapacityBound {
             Self::OperationBytes { limit, actual } => write!(
                 formatter,
                 "operation queue carrier is {actual} bytes, limit is {limit}"
-            ),
-            Self::ProcessTransportQueue { lane, bytes } => write!(
-                formatter,
-                "process Native transport cannot retain a {bytes}-byte {lane:?} operation"
             ),
             Self::EdgeOpenVersions { limit } => {
                 write!(formatter, "edge-open versions for one task reached {limit}")
@@ -446,9 +428,6 @@ impl fmt::Display for TaskExecutionError {
                     formatter,
                     "{kind} failed before a Worker receipt: {result:?}"
                 )
-            }
-            Self::ResultStream(verdict) => {
-                write!(formatter, "root result stream is not intact: {verdict}")
             }
             Self::FinalInfo(disagreement) => write!(formatter, "{disagreement}"),
             Self::ParticipantUnobservable { backend, state } => write!(
@@ -779,10 +758,6 @@ impl TaskExecutionError {
                     ExecutionFailureSite::Coordinator,
                 );
             }
-            Self::ResultStream(_) => (
-                QueryFailureReason::ResultProtocol,
-                ExecutionFailureSite::Coordinator,
-            ),
             _ => (
                 QueryFailureReason::PreparationProtocol,
                 ExecutionFailureSite::Coordinator,
@@ -1203,22 +1178,7 @@ mod capacity_projection_tests {
         assert_eq!(queue.requested, None);
         assert_eq!(queue.limit, Some(7));
     }
-    #[test]
-    fn process_queue_preserves_carrier_bytes_without_fabricating_a_limit() {
-        let input = TaskExecutionError::Capacity(CapacityBound::ProcessTransportQueue {
-            lane: DispatchLane::Create,
-            bytes: 19,
-        })
-        .preparation_input();
-        let facts = input.fact().resource().unwrap();
-        assert_eq!(input.fact().reason().code(), 48);
-        assert_eq!(facts.requested, Some(19));
-        assert_eq!(facts.limit, None);
-        assert_eq!(facts.constraint_scope, Some(ResourceScope::Process));
-        assert_eq!(facts.required_growth, None);
-        assert_eq!(facts.live, None);
-        assert_eq!(facts.committed, None);
-    }
+
     #[test]
     fn descriptor_and_request_boundaries_delegate_the_original_owner_fact() {
         use novarocks_execution_contract::failure::FailureProjection;

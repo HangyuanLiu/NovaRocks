@@ -118,11 +118,13 @@ impl From<QueryServiceError> for MvPhaseFailure {
     }
 }
 
+pub(crate) struct CreateRequest {
+    pub(crate) target: SqlMvTarget,
+    pub(crate) statement: crate::mv::domain::application::MvCreateStatement,
+}
+
 pub(crate) enum MvCommandRequest {
-    Create {
-        target: SqlMvTarget,
-        statement: crate::mv::domain::application::MvCreateStatement,
-    },
+    Create(Box<CreateRequest>),
     Control(MvControlRequest),
     Refresh {
         statement: MvRefreshRequest,
@@ -141,7 +143,7 @@ pub(crate) enum MvCommandRequest {
 impl MvCommandRequest {
     fn target(&self) -> &SqlMvTarget {
         match self {
-            Self::Create { target, .. } => target,
+            Self::Create(request) => &request.target,
             Self::Control(request) => request.target(),
             Self::Refresh { requested, .. } | Self::ScheduledRefresh { requested, .. } => requested,
             Self::Repartition { target, .. } => target,
@@ -149,7 +151,7 @@ impl MvCommandRequest {
     }
     fn owner(&self) -> MvActivityOwner {
         match self {
-            Self::Create { .. } => MvActivityOwner::Create,
+            Self::Create(_) => MvActivityOwner::Create,
             Self::Control(request) => request.owner(),
             Self::Refresh { .. } => MvActivityOwner::ManualRefresh,
             Self::ScheduledRefresh { .. } => MvActivityOwner::ScheduledRefresh,
@@ -158,10 +160,7 @@ impl MvCommandRequest {
     }
 }
 pub(super) enum StepRequest {
-    Create {
-        target: SqlMvTarget,
-        statement: crate::mv::domain::application::MvCreateStatement,
-    },
+    Create(Box<CreateRequest>),
     Control(MvControlRequest),
     Iceberg {
         target: SqlMvTarget,

@@ -269,7 +269,6 @@ async fn run_case(fail_writer: bool) {
         })
         .await;
         let tail = attempt.pending_upstream.as_ref().unwrap();
-        tail.observe_original_consumed_packets(&mut attempt.round, 1);
         let expected = if fail_writer {
             let selected = tail.publish_original_failure(&mut attempt.round, original_failure());
             Some(ExecutionFailureInput::from_selected_task(&selected).unwrap())

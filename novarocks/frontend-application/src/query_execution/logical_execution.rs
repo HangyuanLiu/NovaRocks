@@ -112,26 +112,6 @@ pub(crate) struct InitialComputationReservation {
 }
 
 impl InitialComputationReservation {
-    /// Same original first-attempt fixed allocations; reading is not admission.
-    pub(crate) fn fixed_backing_bytes() -> Result<usize, novarocks_workload_control::WorkError> {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        use novarocks_workload_control::WorkError;
-        let credentials = arc_layout(std::alloc::Layout::new::<InitialComputationCredentials>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
-        super::lifecycle_plan::initial_credential_layouts()
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .into_iter()
-            .chain(std::iter::once(
-                novarocks_spi::connector::ConnectorRequestScope::fixed_backing_layout()
-                    .map_err(|_| WorkError::ArithmeticOverflow)?,
-            ))
-            .try_fold(credentials.size(), |bytes, layout| {
-                bytes
-                    .checked_add(layout.size())
-                    .ok_or(WorkError::ArithmeticOverflow)
-            })
-    }
-
     pub(crate) fn new(reserved: ReservedExecutionIdentity) -> Result<Self, DistributedQueryError> {
         let reservation = QueryAttemptReservation::from_reserved(&reserved)?;
         let terminal = reservation.terminal_storage_resolver();

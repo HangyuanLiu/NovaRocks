@@ -104,20 +104,6 @@ pub(super) fn prepare(
     }))
 }
 
-/// Full fixed frontend package for one original metadata statement root.
-pub(crate) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, novarocks_workload_control::WorkError> {
-    use novarocks_workload_control::WorkError;
-    // Call is already inline in the action. Replace its sub-layout, rather
-    // than summing the same inline bytes twice.
-    MaintenanceCommandExecutor::frontend_fixed_source_bytes(geometry, k)?
-        .checked_sub(std::mem::size_of::<MaintenanceCommandCall>() as u64)
-        .and_then(|n| n.checked_add(std::mem::size_of::<MetadataMaintenanceAction>() as u64))
-        .ok_or(WorkError::ArithmeticOverflow)
-}
-
 struct MetadataMaintenanceAction {
     call: MaintenanceCommandCall,
     origin: novarocks_workload_control::ResultWindowAlias,

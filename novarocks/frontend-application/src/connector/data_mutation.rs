@@ -91,6 +91,10 @@ pub struct CompletedDataMutation {
     pub receipt: ConnectorDataMutationReceipt,
     pub finalization: ExternalMutationFinalization,
     /// Diagnostic cleanup, independent of necessary business finalization.
+    #[expect(
+        dead_code,
+        reason = "Retains the independent cleanup diagnostic in the committed outcome"
+    )]
     pub cleanup: ExternalMutationFinalization,
 }
 

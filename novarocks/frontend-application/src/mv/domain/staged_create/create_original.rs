@@ -481,28 +481,6 @@ impl CreateOriginal {
         *target = slot.take();
         Ok(())
     }
-    /// The normal same-lease outcome retains exact evidence for its existing
-    /// late-adjudication author. Reading it grants no new dispatch or deletion.
-    pub(crate) fn stage_outcome(
-        &self,
-    ) -> Option<Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>> {
-        self.state
-            .body
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .and_then(|body| body.stage_result.clone())
-    }
-    pub(crate) fn abort_outcome(
-        &self,
-    ) -> Option<Result<ConnectorStagedCreateAbortOutcome, ConnectorError>> {
-        self.state
-            .body
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .and_then(|body| body.abort_result.clone())
-    }
     pub(crate) fn staged_target(&self) -> Result<MvStagedTarget, MvApplicationError> {
         let body = self
             .state
@@ -628,14 +606,6 @@ impl CreateOriginal {
     }
     pub(crate) fn physical_exit_observed(&self) -> bool {
         self.physical_exit.load(Ordering::Acquire)
-    }
-    /// Ordinary same-Map observation failure, distinct from actual-exit health.
-    pub(crate) fn close_refusal(&self) -> Option<ConnectorError> {
-        self.close_refusal
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .cloned()
     }
     pub(crate) fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut foreign = CloseGuard {
@@ -1240,7 +1210,7 @@ fn turn_failure(error: MvTurnFailure) -> CreatePhaseFailure {
             }
         }
         MvTurnFailure::Cpu(error) => CreatePhaseFailure {
-            service: QueryServiceError::from_execution_failure(error),
+            service: QueryServiceError::from_execution_failure((*error).clone()),
             domain: None,
         },
         MvTurnFailure::Health(_) => CreatePhaseFailure {

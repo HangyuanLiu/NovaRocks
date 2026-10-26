@@ -535,7 +535,10 @@ async fn run_case(case: Case) {
             .pending_upstream
             .as_ref()
             .unwrap()
-            .observe_original_consumed_end(&mut attempt.round, u64::from(with_body));
+            .begin_original_convergence(
+                &mut attempt.round,
+                Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
+            );
         let expected_failure = if matches!(
             case,
             Case::ProtocolFailureFirst | Case::OriginalFailureStreamAfterEnd

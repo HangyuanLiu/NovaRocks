@@ -51,21 +51,6 @@ pub fn query_catalog_service_snapshot(
     catalog_service_snapshot(query_kernel)
 }
 
-/// Freeze optional MV rewrite candidates through the request's exact Core
-/// ports.  Frontend chooses whether an unavailable repository means no
-/// candidates; it never gains connector-control access directly.
-pub(crate) fn freeze_query_mv_rewrite_definition_index(
-    query_kernel: &domain::QueryPreparationKernel,
-    candidate_reader: &crate::mv::domain::readiness::MvCandidateReader,
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
-    crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-        candidate_reader,
-        query_kernel.connector_control().as_ref(),
-        storage_observation,
-    )
-}
-
 /// Leaf ports used by admitted asynchronous DML compilation and final encoding.
 pub(crate) trait DmlQueryExecutionKernel:
     CatalogServiceSource

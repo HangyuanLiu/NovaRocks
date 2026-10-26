@@ -566,7 +566,7 @@ pub enum StandardCtasWriteOutcome {
         execution_identity: [u8; 32],
     },
     KnownUncommitted {
-        failure: CtasFailure,
+        failure: Box<CtasFailure>,
     },
 }
 
@@ -1059,7 +1059,9 @@ fn staged_write_failed_with_failure(
             "; standard CTAS target rejected write-unknown transition: {error}"
         ));
     }
-    StandardCtasWriteOutcome::KnownUncommitted { failure }
+    StandardCtasWriteOutcome::KnownUncommitted {
+        failure: Box::new(failure),
+    }
 }
 
 fn standard_ctas_unsupported() -> CtasFailure {
@@ -2067,9 +2069,6 @@ impl PreparedGovernedCtasWrite {
             execution_identity: self.execution_identity(),
         }
     }
-    pub(crate) fn write_failed(&self, failure: CtasFailure) -> StandardCtasWriteOutcome {
-        staged_write_failed_with_failure(self.target.as_ref(), failure)
-    }
 }
 
 #[cfg(test)]
@@ -2098,6 +2097,7 @@ mod tests {
             let StandardCtasWriteOutcome::KnownUncommitted { failure } = outcome else {
                 panic!("publication remains uncommitted")
             };
+            let failure = *failure;
             assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
             assert!(target.bound().is_empty());
             assert_eq!(failure.execution_failure().unwrap().fact(), expected);
@@ -2182,6 +2182,7 @@ mod tests {
         let StandardCtasWriteOutcome::KnownUncommitted { failure } = outcome else {
             panic!("a failed runtime write cannot publish a table");
         };
+        let failure = *failure;
         assert_eq!(failure.execution_failure(), Some(input.clone()));
         let error = failure.into_governed_dml_error("CREATE TABLE dst AS SELECT 1");
         assert_eq!(error.execution_failure(), Some(&input));

@@ -39,7 +39,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub(crate) enum MvTurnFailure {
     Admission(WorkError),
-    Cpu(ExecutionFailureInput),
+    Cpu(Arc<ExecutionFailureInput>),
     Health(StatementNativeHealthFailure),
 }
 
@@ -247,7 +247,7 @@ impl MvRefreshTurnCustody {
                         });
                     return self.fail(MvTurnFailure::Health(health));
                 }
-                return self.fail(MvTurnFailure::Cpu(failure.clone()));
+                return self.fail(MvTurnFailure::Cpu(Arc::new(failure.clone())));
             }
             assert!(matches!(self.marker, Some(Ok(()))), "same MV CPU marker");
             self.job.take();

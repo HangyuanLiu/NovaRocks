@@ -1037,6 +1037,94 @@ mod original_request_tests {
             error.original_failure().is_some(),
             "keep the whole repository cause"
         );
+        // Mint the need through the public SQL completion author, never by
+        // constructing its private occurrence identity or an execution Root.
+        use novarocks_sql::compiler::{
+            DEFAULT_COMPLETION_LIMITS, MaterializedViewOutcome, SessionOptimizerSettings,
+            SqlCompileControl, SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFactBatch,
+            SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput, builtin_sql_function_catalog,
+        };
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            novarocks_physical_plan::PlanVersionId::try_new([17; 16]).unwrap(),
+            SqlStatementInput::sql("select order_key from orders"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: Some("ice".into()),
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    enable_materialized_view_rewrite: Some(true),
+                    ..SessionOptimizerSettings::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            crate::application::test_constant_policy(),
+            control.clone(),
+            novarocks_physical_plan::PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            novarocks_physical_plan::ScanReadBudget {
+                max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let SqlCompileProgress::Incomplete(compilation) =
+            SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap()
+        else {
+            panic!("MV-enabled external query must ask its original optional need");
+        };
+        let need = match compilation.needs() {
+            SqlNeedBatch::MaterializedViews(needs) if needs.len() == 1 => needs[0].clone(),
+            other => panic!("expected the original MV need, got {other:?}"),
+        };
+        let connector_control =
+            crate::query_execution::compiler::TestConnectorControlRegistry::default();
+        let storage = novarocks_spi::connector::UnavailableMvStorageObservationPort;
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let connector_request =
+            crate::connector::connector_request_context(None, stop.view()).unwrap();
+        let fact = crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports_async(
+            &need,
+            &original,
+            &connector_control,
+            &storage,
+            &connector_request,
+        )
+        .await;
+        assert_eq!(fact.id(), need.id());
+        match fact.outcome() {
+            MaterializedViewOutcome::Missing { reason } => assert_eq!(
+                reason.as_ref(),
+                "materialized-view rewrite inventory is unavailable",
+            ),
+            other => panic!("actual inventory refusal must become Missing, got {other:?}"),
+        }
+        let SqlCompileProgress::Incomplete(base) = SqlCompiler::finish(
+            compilation,
+            SqlFactBatch::MaterializedViews(vec![fact].into_boxed_slice()),
+            &control,
+        )
+        .unwrap() else {
+            panic!("missing optional inventory must continue the base query");
+        };
+        match base.needs() {
+            SqlNeedBatch::CatalogRelations(needs) if needs.len() == 1 => {
+                assert_eq!(needs[0].relation().fqn(), "ice.db.orders");
+            }
+            other => panic!("expected the original base relation need, got {other:?}"),
+        }
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "optional facts must not invent an execution owner"
+        );
         assert!(
             original.list_candidate_definitions().is_err(),
             "sync original must refuse before block_in_place"

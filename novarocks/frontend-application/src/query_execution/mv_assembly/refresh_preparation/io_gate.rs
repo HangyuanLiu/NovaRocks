@@ -51,6 +51,10 @@ use novarocks_spi::connector::document_storage::{
     ConnectorDocumentStorageLease, KeyedDocumentObservationRequest,
 };
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The complete request stays in the original Arc-owned gate slot and its single loan, then moves into the existing boxed operation; inline variants avoid another request allocation."
+)]
 enum Request {
     RefreshGraph {
         readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
@@ -117,6 +121,10 @@ enum Response {
     ChangeWindow(Result<(), ConnectorError>),
 }
 type Operation = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The original Arc-owned gate has one complete state slot and loan; Running already owns its boxed operation, so inline request and response variants avoid per-phase containers."
+)]
 enum State {
     Idle,
     Requested(Request),

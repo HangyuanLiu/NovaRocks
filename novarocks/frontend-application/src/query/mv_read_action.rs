@@ -572,7 +572,9 @@ impl State {
                 }
             }
             Err(MvTurnFailure::Admission(error)) => Err(work(error)),
-            Err(MvTurnFailure::Cpu(error)) => Err(QueryServiceError::from_execution_failure(error)),
+            Err(MvTurnFailure::Cpu(error)) => {
+                Err(QueryServiceError::from_execution_failure((*error).clone()))
+            }
             Err(MvTurnFailure::Health(error)) => {
                 self.raw_health = Some(error);
                 return Poll::Pending;

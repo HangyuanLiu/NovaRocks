@@ -18,7 +18,7 @@
 //! The original statement owns dependency observation and its pure graph turn.
 //! A borrowed waiter never owns the StateStore request or CPU exit receipt.
 
-use super::{CommandInput, MvCommandRequest, MvPhaseFailure, MvWake, StepRequest};
+use super::{CommandInput, CreateRequest, MvCommandRequest, MvPhaseFailure, MvWake, StepRequest};
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind, MvRefreshRequest},
     dependency::refresh::MvRefreshDependencyStep,
@@ -81,11 +81,11 @@ impl DependencyPreparation {
             handed_off: false,
         };
         match &result.input.request {
-            MvCommandRequest::Create { target, statement } => {
-                result.steps = Some(vec![StepRequest::Create {
-                    target: target.clone(),
-                    statement: statement.clone(),
-                }]);
+            MvCommandRequest::Create(request) => {
+                result.steps = Some(vec![StepRequest::Create(Box::new(CreateRequest {
+                    target: request.target.clone(),
+                    statement: request.statement.clone(),
+                }))]);
             }
             MvCommandRequest::Control(request) => {
                 // One metadata command, not a refresh dependency traversal.
@@ -230,7 +230,7 @@ impl DependencyPreparation {
                     return Poll::Ready(Err(error.into()));
                 }
                 Poll::Ready(Err(MvTurnFailure::Cpu(error))) => {
-                    let error = QueryServiceError::from_execution_failure(error);
+                    let error = QueryServiceError::from_execution_failure((*error).clone());
                     self.failure = Some(error.clone().into());
                     return Poll::Ready(Err(error.into()));
                 }

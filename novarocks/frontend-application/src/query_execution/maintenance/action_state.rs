@@ -57,12 +57,6 @@ impl Drop for ActionLoan<'_> {
     }
 }
 impl MaintenanceActionState {
-    pub(super) fn owned_row_bytes() -> Result<usize, novarocks_workload_control::WorkError> {
-        std::mem::size_of::<Mutex<Option<ActionBody>>>()
-            .checked_add(std::mem::size_of::<[usize; 2]>())
-            .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 128 } else { 0 }))
-            .ok_or(novarocks_workload_control::WorkError::ArithmeticOverflow)
-    }
     pub(crate) fn publication_disposition(
         &self,
     ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {

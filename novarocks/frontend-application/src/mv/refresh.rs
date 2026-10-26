@@ -16,20 +16,8 @@
 
 //! Frontend execution of a lake-authoritative MV publication.
 
-use std::sync::Arc;
-
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
-use crate::query_execution::mv_native_write::MvRefreshProviderActivation;
 use novarocks_mv_application::publication::MvRefreshPublicationIntent;
-use novarocks_spi::connector::ConnectorControlRegistry;
-
-#[derive(Clone)]
-pub(super) struct FrontendMvRefreshDependencies {
-    pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
-    pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
-    #[cfg(novarocks_dev_controls)]
-    pub(super) test_controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
-}
 
 /// Bind the exact publication document this write promised when it opened.
 ///

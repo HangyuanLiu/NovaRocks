@@ -105,6 +105,13 @@ pub struct CompletedMetadataMaintenance {
     pub receipt: ConnectorMetadataMaintenanceReceipt,
     pub finalization: ExternalMutationFinalization,
     /// Diagnostic cleanup, independent of necessary business finalization.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the independent cleanup diagnostic in the committed outcome"
+        )
+    )]
     pub cleanup: ExternalMutationFinalization,
 }
 
@@ -164,6 +171,10 @@ pub struct MetadataMaintenanceCall {
     table: ConnectorTableIdentity,
     operation_id: ConnectorMutationOperationId,
     intent: MetadataMaintenanceIntent,
+    #[expect(
+        dead_code,
+        reason = "Retains the original request scope and authority until this stable call is dropped"
+    )]
     context: ConnectorRequestContext,
     preparation: Option<MaintenancePreparation>,
     preparation_poll_unproven: bool,

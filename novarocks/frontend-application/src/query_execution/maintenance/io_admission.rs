@@ -554,14 +554,19 @@ impl MetadataIoAdmission {
         // This records the original configured budget and real inline Source
         // header only. Neither quantity reserves backing or adds a quota;
         // actual result allocations still require their original byte receipt.
-        let header_bytes = u64::try_from(std::mem::size_of::<Body>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let header_bytes = Self::source_header_bytes()?;
         Self::from_original_facts(
             owner.scope(),
             initial_dependencies,
             header_bytes,
             configured_bytes,
         )
+    }
+
+    // Shared by this actual Source constructor and finite admission fixtures.
+    // This is the inline header declaration, not a quote of requests or domains.
+    fn source_header_bytes() -> Result<u64, WorkError> {
+        u64::try_from(std::mem::size_of::<Body>()).map_err(|_| WorkError::ArithmeticOverflow)
     }
 
     fn from_original_facts(
@@ -645,48 +650,6 @@ impl MetadataIoAdmission {
         body.adopted_initial = true;
         body.changed = true;
         Ok(())
-    }
-    /// Legacy responsibility-only declaration used by callers not yet migrated.
-    /// This is not a fixed request inventory or a capacity qualification.
-    pub(crate) fn fixed_backing_bytes(n: usize, k: usize) -> Result<u64, WorkError> {
-        let arc = std::mem::size_of::<[usize; 2]>();
-        let mutex_external = if cfg!(target_os = "macos") {
-            128usize
-        } else {
-            0
-        };
-        // Inline wait/source fields are already in the actual CellBody. Only
-        // the one possible original wait factory F pointee is additional.
-        let (_, wait_future) = JointProposalSlotWait::metadata_layouts();
-        let per = std::mem::size_of::<RequestCell>()
-            .checked_add(wait_future.size())
-            .and_then(|v| v.checked_add(arc))
-            .and_then(|v| v.checked_add(4 * mutex_external))
-            .and_then(|v| v.checked_add(std::mem::size_of::<Arc<RequestCell>>()))
-            .and_then(|v| v.checked_add(std::mem::size_of::<Loan<'_, CellBody>>()))
-            .and_then(|v| v.checked_add(2 * std::mem::size_of::<usize>()))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        let facts = k
-            .checked_mul(3)
-            .and_then(|v| v.checked_mul(std::mem::size_of::<SharedDependency>() + 2 * 1024 + arc))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        let bytes = per
-            .checked_mul(n)
-            // Initial and growth are mutually exclusive original Root phases;
-            // they share one fixed wait slot and at most one actual wait F.
-            .and_then(|v| v.checked_add(wait_future.size()))
-            .and_then(|v| {
-                v.checked_add(
-                    std::mem::size_of::<Self>()
-                        + std::mem::size_of::<Body>()
-                        + std::mem::size_of::<MetadataWake>()
-                        + 2 * arc
-                        + 2 * mutex_external,
-                )
-            })
-            .and_then(|v| v.checked_add(facts))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)
     }
     fn receive_cleanup_completion(&self, cell: &RequestCell) -> bool {
         if self
@@ -1360,6 +1323,7 @@ impl MetadataIoAdmission {
         ExistingMetadataObligation::capture(self, root, context)
     }
 
+    #[cfg(test)]
     pub(crate) fn settlement_result_scope(
         self: &Arc<Self>,
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -2187,7 +2151,7 @@ mod original_governor_tests {
     #[test]
     fn original_root_responsibility_growth_does_not_change_the_actual_result_budget() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2285,7 +2249,7 @@ mod original_governor_tests {
     #[test]
     fn retired_formation_preserves_admitted_provider_peak_and_actual_request_exit() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2417,7 +2381,7 @@ mod original_governor_tests {
     fn queued_root_payload_is_adopted_and_provider_domains_are_proved_before_ready() {
         let (control, mut driver, root) = original_governor();
         let scope = root.owner.scope();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let route = SharedDependency::Network(
             novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
                 &url::Url::parse("https://statistics-rebind.invalid").unwrap(),
@@ -2519,7 +2483,7 @@ mod original_governor_tests {
     #[test]
     fn reused_bootstrap_grant_cannot_dispatch_a_new_route_before_full_domain_install() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2597,7 +2561,7 @@ mod original_governor_tests {
     #[test]
     fn covered_owned_peak_retains_positive_domains_and_proves_each_new_route() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2712,7 +2676,7 @@ mod original_governor_tests {
         }
 
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2853,7 +2817,7 @@ mod original_governor_tests {
         use novarocks_workload_control::CancellationReason;
 
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -3023,7 +2987,7 @@ mod original_governor_tests {
     #[test]
     fn eight_original_requests_exceed_a_one_request_profile_and_all_exit() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(8, 1).unwrap();
+        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),

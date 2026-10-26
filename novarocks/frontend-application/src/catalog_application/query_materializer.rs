@@ -326,10 +326,6 @@ impl<'a> CatalogServiceMaterializer<'a> {
         }
     }
 
-    pub fn query_table_bindings(&self) -> Arc<QueryTableBindingStore> {
-        Arc::clone(&self.bindings)
-    }
-
     pub fn with_catalog_application(
         mut self,
         catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,

@@ -824,9 +824,9 @@ impl QueryContextOwner {
 
     /// Whether every local task and output responsibility has drained.
     ///
-    /// This is per-context on purpose. The attempt-level drain, which also
-    /// waits for every context to be released, is derived separately from the
-    /// neutral `AttemptDrainFacts`.
+    /// This is per-context on purpose. The original Release author uses these
+    /// Task/output observations; physical convergence still needs the Worker's
+    /// actual-exit receipt or exact process replacement.
     pub const fn locally_drained(&self) -> bool {
         self.drained_tasks >= self.expected_tasks && self.released_outputs >= self.expected_tasks
     }

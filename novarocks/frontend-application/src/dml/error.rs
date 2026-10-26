@@ -285,46 +285,12 @@ impl DmlError {
         }
     }
 
-    /// Publication observations cannot replace an already selected Task input.
-    pub(crate) fn prefer_selected_execution(self, later: Self) -> Self {
-        if matches!(
-            &self.body,
-            DmlErrorBody::Execution(_) | DmlErrorBody::Application(_)
-        ) {
-            tracing::warn!(publication_error = %later, "publication observation accompanies the selected execution failure");
-            self
-        } else {
-            later
-        }
-    }
-
     pub(crate) fn execution_failure(&self) -> Option<&ExecutionFailureInput> {
         match &self.body {
             DmlErrorBody::Execution(input) => Some(input.as_ref()),
             DmlErrorBody::Application(error) => error.execution_failure(),
             DmlErrorBody::Legacy(_) => None,
         }
-    }
-
-    /// Cleanup may enrich local legacy diagnostics, never the selected input.
-    pub(crate) fn with_uncommitted_cleanup(
-        mut self,
-        cleanup: &novarocks_spi::connector::ExternalMutationFinalization,
-    ) -> Self {
-        match &mut self.body {
-            DmlErrorBody::Legacy(message) => {
-                *message =
-                    crate::connector::mutation::known_uncommitted_message(&*message, cleanup);
-            }
-            DmlErrorBody::Execution(_) | DmlErrorBody::Application(_) => {
-                if let novarocks_spi::connector::ExternalMutationFinalization::Failed(error) =
-                    cleanup
-                {
-                    tracing::warn!(%error, "artifact cleanup failed after the selected execution failure");
-                }
-            }
-        }
-        self
     }
 
     fn cow(error: crate::query_execution::dml::mutation_flow::CowFailure) -> Self {
@@ -480,11 +446,6 @@ impl DmlError {
             finalization,
         }));
         self
-    }
-
-    #[cfg(test)]
-    pub fn staged_create_preparation(&self) -> Option<&DmlStagedCreateFailure> {
-        self.staged_create_preparation.as_deref()
     }
 
     pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {

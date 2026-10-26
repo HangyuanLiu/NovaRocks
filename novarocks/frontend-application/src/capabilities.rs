@@ -935,7 +935,6 @@ impl MvBackgroundPorts {
 /// runtime after restore and maintenance recovery have completed.
 pub(crate) fn mv_background_bindings(
     ports: MvBackgroundPorts,
-    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     execution: crate::query::mv_action::MvExecutionServices,
 ) -> crate::mv::background::MvBackgroundBindings {
     let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
@@ -951,6 +950,5 @@ pub(crate) fn mv_background_bindings(
     crate::mv::background::MvBackgroundBindings {
         ports: iceberg_ports,
         execution,
-        table_maintenance_engine,
     }
 }

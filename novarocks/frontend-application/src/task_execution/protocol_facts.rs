@@ -764,7 +764,7 @@ mod tests {
             )
             .unwrap();
         let mut tracker = WriteProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
-        assert!(tracker.execution_verdict().is_complete());
+        assert!(tracker.execution_verdict() == WriteVerdict::Complete);
         publisher.publish_updates(1, vec![], None, true).unwrap();
         let sealed = take(&mut receiver);
         assert!(sealed.tasks.is_empty());

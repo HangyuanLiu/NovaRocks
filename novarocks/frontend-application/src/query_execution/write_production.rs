@@ -34,22 +34,6 @@ pub(crate) struct WriteProductionQuote {
     quote: UnreceivedProductionQuote,
 }
 impl WriteProductionQuote {
-    /// The original cohort author derives its exact bounded metadata. No
-    /// remote object bytes, credentials or unknown payload are inferred here.
-    pub(crate) fn for_composition(count: NonZeroUsize) -> Result<Self, WorkError> {
-        let records = u64::try_from(count.get())
-            .ok()
-            .and_then(NonZeroU64::new)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        let bytes = count
-            .get()
-            .checked_mul(COHORT_BYTES)
-            .and_then(NonZeroUsize::new)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(Self {
-            quote: UnreceivedProductionQuote::new(records, bytes)?,
-        })
-    }
     /// Derived from the actual immutable manifest, never scope/cache capacity.
     pub(crate) fn from_manifest(
         manifest: &TaskManifestBinding,
@@ -71,24 +55,12 @@ impl WriteProductionQuote {
             quote: UnreceivedProductionQuote::new(records, bytes).map_err(production_work_error)?,
         }))
     }
-    pub(crate) fn required_progress(
-        self,
-    ) -> novarocks_workload_control::joint_admission::JointResources {
-        self.quote.required_progress()
-    }
     pub(crate) fn metadata_bytes(self) -> usize {
         self.quote.facts_bytes()
     }
+    #[cfg(all(test, novarocks_dev_controls))]
     pub(crate) fn occurrences(self) -> u64 {
         self.quote.records()
-    }
-    /// Original fields only; fixed Session and ClaimRecord fees must consume
-    /// their actual full layouts once. This does not quote opaque pointees.
-    pub(crate) fn receiving_inline_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<WriteProductionReceiving>()
-    }
-    pub(crate) fn canonical_record_layout() -> std::alloc::Layout {
-        UnreceivedProductionQuote::record_inline_layout()
     }
 }
 pub(super) struct Registration {

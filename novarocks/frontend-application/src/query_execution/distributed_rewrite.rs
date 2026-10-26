@@ -235,12 +235,6 @@ impl ConnectorDistributedRewriteSession {
             }),
         })
     }
-    pub(crate) fn original_source_layout() -> std::alloc::Layout {
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            ConnectorDistributedRewriteSessionInner,
-        >())
-        .expect("fixed Rewrite session layout")
-    }
     /// Borrowed invoice for the exact original request constructor below.
     /// Typed value bindings clone their two immutable handles; Arrow root
     /// Field names/maps and the actual request Vecs are owned here.

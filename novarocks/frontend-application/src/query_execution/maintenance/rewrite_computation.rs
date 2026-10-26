@@ -39,7 +39,6 @@ use novarocks_query_application::{
 };
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
-    alloc::Layout,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -74,9 +73,6 @@ impl ReadyRewriteCohort {
     }
     pub(crate) fn is_empty(&self) -> bool {
         self._original.accepted.is_empty()
-    }
-    pub(crate) fn layout() -> Layout {
-        Layout::new::<Self>()
     }
 }
 
@@ -307,15 +303,5 @@ impl RewriteCohortComputation {
                     .as_ref()
                     .and_then(StatementNativeTail::local_health_failure)
             })
-    }
-    /// Header is inline; do not count twice in an Action size_of.
-    pub(crate) fn layout() -> Layout {
-        Layout::new::<Self>()
-    }
-    pub(crate) fn heap_source_bytes() -> Result<usize, WorkError> {
-        crate::query::statement_computation::heap_source_bytes()
-    }
-    pub(crate) fn retained_tail_layout() -> Layout {
-        Layout::new::<StatementNativeTail>()
     }
 }

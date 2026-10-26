@@ -17,9 +17,6 @@
 
 //! Frontend-owned contracts and bindings for MV background workers.
 
-use std::sync::Arc;
-
-use crate::query_execution::maintenance::TableMaintenanceEngine;
 /// Bound only after Core has restored catalogs, performed MV recovery, bound
 /// providers and started table-maintenance recovery. The frontend starts and
 /// owns worker threads after it receives this value.
@@ -27,5 +24,4 @@ use crate::query_execution::maintenance::TableMaintenanceEngine;
 pub(crate) struct MvBackgroundBindings {
     pub(crate) ports: crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
     pub(crate) execution: crate::query::mv_action::MvExecutionServices,
-    pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 }

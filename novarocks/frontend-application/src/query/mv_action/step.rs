@@ -19,7 +19,10 @@
 
 mod source;
 
-use super::{CommandInput, MvPhaseFailure, MvWake, StepRequest, native::MvNativePhase, service};
+use super::{
+    CommandInput, CreateRequest, MvPhaseFailure, MvWake, StepRequest, native::MvNativePhase,
+    service,
+};
 use crate::query::statement_publication::StatementPublication;
 use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
 use crate::state_store::execution::StateStoreOriginalOwner;
@@ -49,9 +52,9 @@ use std::{
 
 /// Both step kinds borrow the same command Root and stable retired slots.
 pub(super) enum MvStepOriginal {
-    Refresh(MvRefreshStepOriginal),
-    Control(super::control::MvControlStepOriginal),
-    Create(super::control_create::MvCreateStepOriginal),
+    Refresh(Box<MvRefreshStepOriginal>),
+    Control(Box<super::control::MvControlStepOriginal>),
+    Create(Box<super::control_create::MvCreateStepOriginal>),
 }
 impl MvStepOriginal {
     pub(super) fn new(
@@ -63,17 +66,21 @@ impl MvStepOriginal {
         wake: Arc<MvWake>,
     ) -> Result<Self, QueryServiceError> {
         match request {
-            StepRequest::Create { target, statement } => {
+            StepRequest::Create(request) => {
+                let CreateRequest { target, statement } = *request;
                 super::control_create::MvCreateStepOriginal::new(
                     input, io, store, target, statement, context, wake,
                 )
+                .map(Box::new)
                 .map(Self::Create)
             }
             StepRequest::Control(request) => {
                 super::control::MvControlStepOriginal::new(input, io, store, request, context, wake)
+                    .map(Box::new)
                     .map(Self::Control)
             }
             refresh => MvRefreshStepOriginal::new(input, io, store, refresh, context, wake)
+                .map(Box::new)
                 .map(Self::Refresh),
         }
     }

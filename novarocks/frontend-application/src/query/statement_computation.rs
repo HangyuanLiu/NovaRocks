@@ -919,28 +919,6 @@ fn health() -> StatementNativeHealthFailure {
     )
 }
 
-/// The header is inline in the original Action; only these actual pointees are additional Source backing.
-pub(crate) fn stage_heap_source_bytes() -> Result<usize, WorkError> {
-    let health =
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            SourceExitUnproven,
-        >())
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .size();
-    novarocks_workload_control::joint_admission::JointProposalSlotWait::metadata_layouts()
-        .1
-        .size()
-        .checked_add(health)
-        .ok_or(WorkError::ArithmeticOverflow)
-}
-pub(crate) fn heap_source_bytes() -> Result<usize, WorkError> {
-    InitialComputationReservation::fixed_backing_bytes()?
-        .checked_add(QueryResultCapacityBinding::fixed_backing_layout()?.size())
-        .ok_or(WorkError::ArithmeticOverflow)?
-        .checked_add(stage_heap_source_bytes()?)
-        .ok_or(WorkError::ArithmeticOverflow)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
