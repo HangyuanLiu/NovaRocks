@@ -223,7 +223,7 @@ impl PreparedLogicalRead {
         }
     }
 
-    pub(crate) fn validate_client_start(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate_read_start(&self) -> Result<(), &'static str> {
         use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
         use novarocks_query_application::preparation::ExecutionFinishBoundary;
         if self.description.finish_boundary() != ExecutionFinishBoundary::ClientEof
@@ -237,7 +237,7 @@ impl PreparedLogicalRead {
         }
         Ok(())
     }
-    pub(crate) fn client_row_carrier(
+    pub(crate) fn row_carrier(
         &self,
     ) -> Result<novarocks_query_application::api::ResultRowCarrier, String> {
         self.description.row_carrier()

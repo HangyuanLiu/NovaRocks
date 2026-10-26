@@ -574,7 +574,7 @@ impl GovernedStatementResidual for SetNativeTail {
 }
 
 struct SetStatementAction {
-    source: String,
+    source: Arc<str>,
     set: ast::SetStatement,
     cursor: usize,
     live: Arc<Mutex<SessionSqlState>>,
@@ -716,7 +716,7 @@ impl SetStatementAction {
                             role: self.role,
                             optimizer_limit: self.optimizer_limit,
                             // The AST spans belong to the whole admitted SET source.
-                            sql: self.source.clone(),
+                            sql: Arc::clone(&self.source),
                             parsed,
                             state: staged.clone(),
                             deadline: self.deadline,
@@ -898,7 +898,7 @@ pub(super) fn apply_session_assignment_in(
 impl FrontendQuerySession {
     pub(super) async fn execute_observed_set(
         &self,
-        source: String,
+        source: Arc<str>,
         set: ast::SetStatement,
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,

@@ -1628,6 +1628,7 @@ impl FrontendQuerySession {
         source: String,
         set: ast::SetStatement,
     ) -> Result<StatementResult, QueryServiceError> {
+        let source: Arc<str> = source.into();
         for assignment in &set.assignments {
             self.admit_session_set_assignment(&source, assignment)?;
         }
@@ -1653,7 +1654,7 @@ impl FrontendQuerySession {
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
-                Some(Arc::from(source.as_str())),
+                Some(Arc::clone(&source)),
                 window_class,
             )
             .await
@@ -1673,6 +1674,7 @@ impl FrontendQuerySession {
         sql: String,
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
+        let sql: Arc<str> = sql.into();
         let ParsedStatement::Query(query) = &parsed_statement else {
             return Err(internal_error("read admission requires a query statement"));
         };
@@ -1690,7 +1692,7 @@ impl FrontendQuerySession {
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
-                Some(Arc::from(sql.as_str())),
+                Some(Arc::clone(&sql)),
                 purpose.window_class(),
             )
             .await

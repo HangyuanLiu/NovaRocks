@@ -1030,8 +1030,8 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             let prepared = read
                 .as_ref()
                 .ok_or_else(|| refused("prepared Read is absent"))?;
-            prepared.validate_client_start().map_err(refused)?;
-            let carrier = prepared.client_row_carrier().map_err(|e| {
+            prepared.validate_read_start().map_err(refused)?;
+            let carrier = prepared.row_carrier().map_err(|e| {
                 attempt_runtime_failure(QueryFailureReason::PreparationProtocol, e)
                     .error()
                     .clone()

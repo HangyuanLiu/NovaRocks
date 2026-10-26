@@ -46,7 +46,7 @@ pub(super) struct ReadPreparationInput {
     pub(super) topology: BackendTopologyService,
     pub(super) role: ClusterRole,
     pub(super) optimizer_limit: u64,
-    pub(super) sql: String,
+    pub(super) sql: Arc<str>,
     pub(super) parsed: ParsedStatement,
     pub(super) state: SessionSqlState,
     pub(super) deadline: Option<Instant>,
@@ -814,7 +814,7 @@ impl GovernedStatementAction for ReadStatementAction {
 impl FrontendQuerySession {
     pub(super) async fn execute_observed_read(
         &self,
-        sql: String,
+        sql: Arc<str>,
         parsed: ParsedStatement,
         state: SessionSqlState,
         deadline: Option<Instant>,
