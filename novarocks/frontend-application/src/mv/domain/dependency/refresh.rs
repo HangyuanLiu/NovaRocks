@@ -41,6 +41,7 @@ impl MvRefreshDependencyStep {
         self.object.display_name()
     }
 
+    #[cfg(test)]
     pub fn target(&self) -> &MvTarget {
         &self.target
     }

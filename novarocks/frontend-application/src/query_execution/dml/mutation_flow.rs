@@ -398,7 +398,7 @@ fn finish_change_stream_write(
     query_options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::query_execution::compiler::PreparedDmlWriteAssembly,
     crate::dml::error::DmlExecutionError,
 > {
     let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new(
@@ -434,7 +434,7 @@ fn finish_change_stream_write(
         ),
         completion_control,
     )?;
-    let (plan, writer_routes) = finalized.into_parts();
+    let (plan, _) = finalized.into_parts();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
@@ -464,15 +464,12 @@ fn finish_change_stream_write(
         completion_control,
     )?;
     Ok(
-        crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-            assembly: crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
-                encoded,
-                version,
-                query_options,
-                Arc::clone(write_session),
-            )?,
-            writer_routes,
-        },
+        crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
+            encoded,
+            version,
+            query_options,
+            Arc::clone(write_session),
+        )?,
     )
 }
 
@@ -553,30 +550,13 @@ pub(crate) struct PreparedUpdateMutation {
     /// same authority.
     pub(crate) write_lease: novarocks_spi::connector::ConnectorWriteLease,
     pub(crate) cow_preparations: Option<DmlChangeStreamPreparations>,
-    pub(crate) mor_write_target: Option<PreparedMorUpdateWriteTarget>,
+    pub(crate) mor_preparations: Option<DmlChangeStreamPreparations>,
     /// The physical route the provider signed for this statement. Kept as the
     /// neutral strategy rather than re-encoded into the provider's own write-mode
     /// enum, so nothing downstream re-decides it.
     pub(crate) mode: novarocks_spi::connector::ConnectorRowMutationStrategy,
-    /// The base version the provider signed for this target ref. The frontend
-    /// persists it in its durable DML journal; nothing here re-derives it from a
-    /// table handle.
-    pub(crate) admitted_base_snapshot_id: Option<i64>,
     pub(crate) execution: QueryExecutionContext,
     pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
-}
-
-/// MOR-only writer facts frozen during UPDATE admission.
-///
-/// COW UPDATE retains its existing per-file application lifecycle.  In
-/// contrast, MOR builds one SQL change-stream producer after the frontend has
-/// persisted the mutation intent, so its writer target must be frozen here.
-pub(crate) struct PreparedMorUpdateWriteTarget {
-    /// Provider-signed writer facts frozen with `planning_lease`. They are
-    /// admitted into the same query-local store as the producer compile, never
-    /// rebuilt during stage/preparation.
-    pub(crate) preparations: DmlChangeStreamPreparations,
-    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
 pub(crate) struct PreparedMergeMutation {
@@ -598,19 +578,10 @@ pub(crate) struct PreparedMergeMutation {
     /// same authority.
     pub(crate) write_lease: novarocks_spi::connector::ConnectorWriteLease,
     pub(crate) cow_preparations: Option<DmlChangeStreamPreparations>,
-    pub(crate) mor_write_target: Option<PreparedMorMergeWriteTarget>,
+    pub(crate) mor_preparations: Option<DmlChangeStreamPreparations>,
     pub(crate) insert_columns_resolved: Option<MergeInsertColumns>,
-    /// See [`PreparedUpdateMutation::admitted_base_snapshot_id`].
-    pub(crate) admitted_base_snapshot_id: Option<i64>,
     pub(crate) execution: QueryExecutionContext,
     pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
-}
-
-/// Frozen MOR writer facts for MERGE.  The producer query and its terminal
-/// sink must use the same admission lease and physical target envelope.
-pub(crate) struct PreparedMorMergeWriteTarget {
-    pub(crate) preparations: DmlChangeStreamPreparations,
-    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
 #[derive(Clone, Copy)]
@@ -910,7 +881,6 @@ fn finish_update_mutation_preparation(
             ));
         }
     };
-    let admitted_base_snapshot_id = strategy_preparation.base_version_ordinal();
     let target_columns =
         if mode == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite {
             cow_target_columns(&strategy_preparation, connector_context)?
@@ -942,17 +912,14 @@ fn finish_update_mutation_preparation(
     let cow_preparations = (mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite)
         .then(|| signed_preparations.clone());
-    let mor_write_target =
+    let mor_preparations =
         if mode == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead {
             // The writer target is the preparation that already named the strategy.
             // Signing a second one here would give a single UPDATE two base versions
             // and two digests. Stage runs after frontend lifecycle persistence and
             // must never reopen the connector generation or observe a later
             // snapshot.
-            Some(PreparedMorUpdateWriteTarget {
-                preparations: signed_preparations,
-                planning_lease: planning_lease.clone(),
-            })
+            Some(signed_preparations)
         } else {
             None
         };
@@ -968,9 +935,8 @@ fn finish_update_mutation_preparation(
         planning_lease,
         write_lease,
         cow_preparations,
-        mor_write_target,
+        mor_preparations,
         mode,
-        admitted_base_snapshot_id,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
     })
@@ -1063,7 +1029,6 @@ fn finish_merge_mutation_preparation(
             ));
         }
     };
-    let admitted_base_snapshot_id = preparations.preparation.base_version_ordinal();
     let target_columns = if table_write_mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
     {
@@ -1099,13 +1064,10 @@ fn finish_merge_mutation_preparation(
     let cow_preparations = (table_write_mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite)
         .then(|| preparations.clone());
-    let mor_write_target = if table_write_mode
+    let mor_preparations = if table_write_mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead
     {
-        Some(PreparedMorMergeWriteTarget {
-            preparations,
-            planning_lease: planning_lease.clone(),
-        })
+        Some(preparations)
     } else {
         None
     };
@@ -1122,9 +1084,8 @@ fn finish_merge_mutation_preparation(
         planning_lease,
         write_lease,
         cow_preparations,
-        mor_write_target,
+        mor_preparations,
         insert_columns_resolved,
-        admitted_base_snapshot_id,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
     })
@@ -6606,7 +6567,6 @@ mod tests {
 
     struct RowMutationSessionFixture {
         session: Arc<ConnectorWriteSession>,
-        calls: Arc<Mutex<RowMutationSessionCalls>>,
     }
 
     fn row_mutation_session_fixture(
@@ -6657,7 +6617,7 @@ mod tests {
             },
         )
         .expect("begin row-mutation write session");
-        RowMutationSessionFixture { session, calls }
+        RowMutationSessionFixture { session }
     }
 
     fn known_uncommitted_outcome() -> novarocks_spi::connector::ExternalMutationOutcome<

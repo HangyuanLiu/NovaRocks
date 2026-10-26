@@ -994,9 +994,6 @@ fn original_provider_completion_fixture(
     };
     control.close_admission();
     let shutdown = control.shutdown();
-    if let Some(error) = blocking.take_original_failure() {
-        blocking.retire_original_failure(error);
-    }
     drop(adapter);
     drop(host);
     drop(blocking);

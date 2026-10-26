@@ -138,11 +138,6 @@ impl SupervisedSplitSource {
             SourceOwner::Fixture => None,
         }
     }
-    pub(crate) fn request_close(&self) {
-        // The original serial owner performs the actual callback; no callback,
-        // spawn or ticket wait occurs in a view Drop.
-        self.cell().requested.store(true, Ordering::Release);
-    }
     /// Call close once, install its typed Err in the SAME stable header, then
     /// retire the actual original Box and Adapter/provider backing lock-free.
     /// The caller is the source's already retained CPU/retirement author, not

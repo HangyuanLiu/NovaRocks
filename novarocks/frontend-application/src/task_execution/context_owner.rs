@@ -35,11 +35,11 @@ use crate::task_execution::lease::{RenewSchedule, RequestedLeaseDurations};
 use crate::task_execution::operation::{FrontendAction, OperationDispatchResult, frontend_action};
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{
-    AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionEpochCapability,
-    CodecOwnedContent, CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor,
-    OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef,
-    QueryContextState, QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome,
-    ReleaseQueryContext, RenewQueryExecutionLease, TaskOperationId, UpdateQueryContext,
+    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, CodecOwnedContent,
+    CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor, OperationKind,
+    OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef, QueryContextState,
+    QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    RenewQueryExecutionLease, TaskOperationId, UpdateQueryContext,
 };
 
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
@@ -179,8 +179,6 @@ pub struct QueryContextOwner {
     renewal_queue_preparation: super::intent::TaskOperationQueuePreparation,
     quiesce_queue_preparation: super::intent::TaskOperationQueuePreparation,
     release_queue_preparation: super::intent::TaskOperationQueuePreparation,
-    abort_queue_preparation: super::intent::TaskOperationQueuePreparation,
-    abort_released: bool,
     context: QueryContextRef,
     native_compatibility_id: NativeCompatibilityId,
     admission_epoch_capability: AdmissionEpochCapability,
@@ -219,7 +217,6 @@ pub struct QueryContextOwner {
     release_retry_at: Option<MonotonicInstant>,
     release_retry_delay: Duration,
     released: bool,
-    abort: Option<AbortQueryContext>,
     progress: u64,
     /// The sealed runtime-filter observation this backend reported on the
     /// release that took its shared facts down.
@@ -244,7 +241,6 @@ impl QueryContextOwner {
             OperationIntent::UpdateQueryContext(_) => &mut self.renewal_queue_preparation,
             OperationIntent::QuiesceQueryContext(_) => &mut self.quiesce_queue_preparation,
             OperationIntent::ReleaseQueryContext(_) => &mut self.release_queue_preparation,
-            OperationIntent::AbortQueryContext(_) => &mut self.abort_queue_preparation,
             _ => panic!("Task input cannot borrow a Context preparation"),
         }
     }
@@ -263,8 +259,6 @@ impl QueryContextOwner {
             renewal_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
             quiesce_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
             release_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
-            abort_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
-            abort_released: false,
             context,
             native_compatibility_id,
             admission_epoch_capability,
@@ -297,7 +291,6 @@ impl QueryContextOwner {
             release_retry_at: None,
             release_retry_delay: RELEASE_RETRY_INITIAL,
             released: false,
-            abort: None,
             progress: 0,
             runtime_filter_contribution: None,
         }
@@ -746,19 +739,6 @@ impl QueryContextOwner {
         Some(OperationIntent::ReleaseQueryContext(request))
     }
 
-    /// The forced stand-down of this context, once.
-    pub fn abort_intent(&mut self, cause: AbortCause) -> Option<OperationIntent> {
-        if self.released || self.abort_released {
-            return None;
-        }
-        self.begin_terminal_cleanup();
-        let request = *self.abort.get_or_insert_with(|| {
-            AbortQueryContext::new(TaskOperationId::new_v7(), self.context, cause)
-        });
-        self.abort_released = true;
-        Some(OperationIntent::AbortQueryContext(request))
-    }
-
     /// Closes future normal lifecycle issuance while retaining any immutable
     /// request that already crossed transport. A late Worker settlement may
     /// still apply that request once, but the FE never uses the settlement to
@@ -773,9 +753,7 @@ impl QueryContextOwner {
     /// admission.
     ///
     /// Replayable requests keep their immutable payload and first-send time;
-    /// only the in-flight marker is released. An unsent abort is cleared
-    /// because no remote effect can exist and a later cleanup turn may mint it
-    /// again.
+    /// only the in-flight marker is released.
     pub(crate) fn rollback_unsent(&mut self, operation_id: TaskOperationId) {
         if let Some(released) = &mut self.admission
             && released.request.envelope().operation_id() == operation_id
@@ -807,13 +785,6 @@ impl QueryContextOwner {
             .is_some_and(|request| request.envelope().operation_id() == operation_id)
         {
             self.release_in_flight = false;
-            return;
-        }
-        if self
-            .abort
-            .is_some_and(|request| request.envelope().operation_id() == operation_id)
-        {
-            self.abort_released = false;
         }
     }
 
@@ -1191,37 +1162,6 @@ impl QueryContextOwner {
                 Ok(ReleaseSettlement::FailedClosed(outcome))
             }
         }
-    }
-
-    /// Settles one abort acknowledgement.
-    pub fn on_abort_ack(
-        &mut self,
-        ack: &OperationAcknowledgement,
-    ) -> Result<(), TaskExecutionError> {
-        if self
-            .abort
-            .is_none_or(|request| request.envelope().operation_id() != ack.operation_id())
-        {
-            return Err(TaskExecutionError::UnknownOperation);
-        }
-        if ack.worker_outcome().is_none()
-            && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
-        {
-            return Err(crate::task_execution::error::dispatch_rejection(
-                ack,
-                OperationKind::AbortQueryContext,
-            ));
-        }
-        if ack.is_applied()
-            || matches!(
-                ack.worker_outcome(),
-                Some(OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone)
-            )
-        {
-            self.state = QueryContextState::TerminalRetained;
-            self.released = true;
-        }
-        Ok(())
     }
 
     /// Records the definitive closure receipt for an actor-owned Abort.

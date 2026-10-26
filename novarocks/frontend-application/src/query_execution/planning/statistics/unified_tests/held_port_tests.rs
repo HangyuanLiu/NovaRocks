@@ -373,7 +373,6 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
     let shutdown =
         runtime.block_on(fixture.shutdown_until(Instant::now() + Duration::from_secs(2)));
     let after = observation.snapshot();
-    let blocking_failure = blocking.take_original_failure();
     let expected = if class == ResultWindowClass::Local {
         [0, 1, 0, 0]
     } else {
@@ -404,8 +403,7 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
         && !delivered.load(Ordering::Acquire)
         && after.result_windows.held_positions == [0; 4]
         && after.scopes.is_empty()
-        && shutdown.is_ok()
-        && blocking_failure.is_none();
+        && shutdown.is_ok();
     struct Failure {
         _waiter: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed>,
         _waiter_handle: tokio::task::JoinHandle<()>,
@@ -414,7 +412,6 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
             (),
             novarocks_query_application::coordination::LogicalExecutionSupervisorShutdownError,
         >,
-        _blocking_failure: Option<crate::task_execution::blocking_io::ConnectorBlockingIoError>,
         _blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
         _fixture: crate::query_execution::logical_execution_test_profile::IdentityTestOwner,
         _runtime: tokio::runtime::Runtime,
@@ -429,7 +426,6 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
             _waiter_handle: waiter,
             _watchdog: watchdog_join,
             _shutdown: shutdown,
-            _blocking_failure: blocking_failure,
             _blocking: blocking,
             _fixture: fixture,
             _runtime: runtime,

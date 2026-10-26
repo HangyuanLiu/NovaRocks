@@ -25,18 +25,12 @@ use novarocks_execution_contract::QueryContextState;
 pub enum QueryContextEvent {
     Establish,
     EstablishCompleted,
-    Release,
-    ReleaseCompleted,
-    Abort,
-    AbortCompleted,
-    Reap,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContextTransition {
     Apply(QueryContextState),
     Idempotent,
-    LostToRelease,
     AlreadyTerminal,
     Illegal,
 }
@@ -50,25 +44,11 @@ pub fn classify_context_transition(
 
     match (state, event) {
         (State::Absent, Event::Establish) => ContextTransition::Apply(State::Establishing),
-        (State::Absent, Event::Abort) => ContextTransition::Apply(State::TerminalRetained),
         (State::Establishing, Event::EstablishCompleted) => ContextTransition::Apply(State::Active),
-        (State::Establishing, Event::Abort) => ContextTransition::Apply(State::Aborting),
         (State::Establishing, Event::Establish) => ContextTransition::Idempotent,
-        (State::Active, Event::Release) => ContextTransition::Apply(State::Releasing),
-        (State::Active, Event::Abort) => ContextTransition::Apply(State::Aborting),
         (State::Active, Event::Establish | Event::EstablishCompleted) => {
             ContextTransition::Idempotent
         }
-        (State::Releasing, Event::ReleaseCompleted) => {
-            ContextTransition::Apply(State::TerminalRetained)
-        }
-        (State::Releasing, Event::Release) => ContextTransition::Idempotent,
-        (State::Releasing, Event::Abort) => ContextTransition::LostToRelease,
-        (State::Aborting, Event::AbortCompleted) => {
-            ContextTransition::Apply(State::TerminalRetained)
-        }
-        (State::Aborting, Event::Abort) => ContextTransition::Idempotent,
-        (State::TerminalRetained, Event::Reap) => ContextTransition::Apply(State::Gone),
         (State::TerminalRetained | State::Gone, _) => ContextTransition::AlreadyTerminal,
         _ => ContextTransition::Illegal,
     }
@@ -89,11 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normal_coordinator_context_path_is_closed_explicitly() {
-        assert_eq!(
-            classify_context_transition(QueryContextState::Active, QueryContextEvent::Release),
-            ContextTransition::Apply(QueryContextState::Releasing)
-        );
+    fn releasing_context_is_closed() {
         assert!(context_state_is_closed(QueryContextState::Releasing));
     }
 }

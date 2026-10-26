@@ -341,7 +341,6 @@ fn parse_runtime_filter_total_at_least(
 fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructuredAssertion {
     meta.query_lifecycle_structured_assertion
         .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
-            error_source: None,
             runtime_filter_availability: None,
             runtime_filter_details: Vec::new(),
             runtime_filter_totals_at_least: Vec::new(),
@@ -600,14 +599,6 @@ fn parse_meta_with_sql_error_descriptors(
                     meta.query_lifecycle_fault = Some(fault);
                 }
                 meta.query_lifecycle_faults.push(fault);
-            }
-            "expect_lifecycle_error_source" => {
-                let source = QueryLifecycleErrorSource::parse(&raw_value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid expect_lifecycle_error_source: {raw_value}; expected backend-attestation, frontend-liveness, or no-outcome"
-                    )
-                })?;
-                structured_assertion_mut(&mut meta).error_source = Some(source);
             }
             "expect_runtime_filter_available" => {
                 let availability = RuntimeFilterAvailabilityExpectation::parse(&raw_value)
@@ -875,10 +866,6 @@ fn merge_lifecycle_structured_assertion(
     let base = base?;
     let override_meta = override_meta.unwrap_or(base);
     Some(QueryLifecycleStructuredAssertion {
-        error_source: override_meta
-            .error_source
-            .clone()
-            .or_else(|| base.error_source.clone()),
         runtime_filter_availability: override_meta
             .runtime_filter_availability
             .or(base.runtime_filter_availability),
@@ -2334,7 +2321,7 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,2".to_string(),
-            "-- @expect_lifecycle_error_source=backend-attestation".to_string(),
+            "-- @expect_runtime_filter_available=available".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse RFO-8R2 directives");
@@ -2356,8 +2343,8 @@ mod opt5_directive_tests {
             .query_lifecycle_structured_assertion
             .expect("structured assertion");
         assert_eq!(
-            assertion.error_source,
-            Some(QueryLifecycleErrorSource::BackendAttestation)
+            assertion.runtime_filter_availability,
+            Some(RuntimeFilterAvailabilityExpectation::Available)
         );
     }
 

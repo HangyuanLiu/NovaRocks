@@ -254,40 +254,6 @@ impl InternalResultCpu {
             }),
         }))
     }
-    pub(crate) fn rewrite_cpu_port(
-        &self,
-        scope: &WorkScope,
-        window: ResultWindowAlias,
-        lease: &ConnectorDistributedRewriteLease,
-        cancellation: QueryCancellationView,
-        runtime: tokio::runtime::Handle,
-        wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<Arc<dyn RewriteCpuPort>, WorkError> {
-        if !window.is_for_scope(scope) {
-            return Err(WorkError::Conflict);
-        }
-        scope.check()?;
-        let _ = self.provider_creator_source(scope)?;
-        let source_type = lease
-            .scoped_cpu_source_type_id()
-            .map_err(|_| WorkError::InvalidConfig("original Rewrite CPU factory is unsupported"))?;
-        Ok(Arc::new(ScopedProviderCreatorCpu {
-            cpu: self.clone(),
-            scope: scope.clone(),
-            window,
-            descriptor: lease.descriptor().clone(),
-            incarnation: lease.incarnation(),
-            source_type,
-            mode: CreatorCpuMode::RewriteProvider,
-            control: cancellation.into(),
-            runtime,
-            wake,
-            state: std::sync::Mutex::new(CreatorPortState {
-                job: None,
-                busy: false,
-            }),
-        }))
-    }
 }
 impl RewriteCpuPort for ScopedProviderCreatorCpu {
     fn submit_in(&self, input: &mut Option<RewriteCpuInput>) -> Result<(), ConnectorError> {
@@ -302,7 +268,6 @@ impl RewriteCpuPort for ScopedProviderCreatorCpu {
             crate::query_execution::maintenance::rewrite_preparation::RewriteCohortCpuOriginal,
         >();
         let selected = match &self.mode {
-            CreatorCpuMode::RewriteProvider => actual == self.source_type,
             CreatorCpuMode::RewriteBound {
                 provider,
                 write_begin,

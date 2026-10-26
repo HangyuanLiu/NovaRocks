@@ -40,22 +40,6 @@ use novarocks_mv_application::persistence::aggregate_bindings::{
 /// already used. Repeated SQL references to one relation produce distinct
 /// occurrence records, even though they deliberately reuse one request-local
 /// source metadata binding.
-pub(crate) fn observe_mv_create_source_bindings(
-    observer: &dyn MvStorageObservationPort,
-    sql_facts: &SqlMvCreatePersistenceFacts,
-    bindings: &QueryTableBindingStore,
-    context: ConnectorRequestContext,
-) -> Result<
-    (
-        Vec<MvCreateRelationObservation>,
-        novarocks_mv_application::persistence::codec::keyed::BindingDocument,
-    ),
-    String,
-> {
-    observe_mv_create_source_bindings_original(observer, sql_facts, bindings, context)
-        .map_err(|error| error.to_string())
-}
-
 pub(crate) fn observe_mv_create_source_bindings_original(
     observer: &dyn MvStorageObservationPort,
     sql_facts: &SqlMvCreatePersistenceFacts,

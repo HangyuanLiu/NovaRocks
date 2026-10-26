@@ -1164,9 +1164,11 @@ impl InternalResultCpu {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn configured_capacity(&self) -> QueryBlockingExecutorConfig {
         self.executor.configured_capacity()
     }
+    #[cfg(test)]
     pub(crate) fn operation_action_quote(&self) -> Result<InternalCpuActionQuote, WorkError> {
         metadata_geometry::operation_action_quote(&self.executor)
     }
@@ -2027,7 +2029,7 @@ pub(crate) fn admitted_internal_fixture() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_execution::status_intake::CondvarWake;
+    use crate::task_execution::status_intake::TestIntakeWake;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
@@ -2283,7 +2285,7 @@ mod tests {
             cpu.factory.clone(),
             Some(source),
             control,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             Arc::clone(&packet),
             completed,
         ));
@@ -2887,7 +2889,7 @@ mod tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             move |input, _| {
                 entered.send(()).unwrap();
                 blocked.recv().unwrap();
@@ -3019,7 +3021,7 @@ mod tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             move |input, _| {
                 entered.send(()).unwrap();
                 blocked.recv().unwrap();
@@ -3135,7 +3137,7 @@ mod actual_close_tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(crate::task_execution::status_intake::CondvarWake::default()),
+            Arc::new(crate::task_execution::status_intake::TestIntakeWake::default()),
             move |input, _| {
                 entered.send(()).unwrap();
                 let _ = blocked.recv();

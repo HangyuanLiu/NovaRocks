@@ -1382,13 +1382,6 @@ const fn dml_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
     }
 }
 
-pub(crate) struct PlannedIcebergChangeStreamWrite {
-    pub(crate) assembly: PreparedDmlWriteAssembly,
-    /// SQL owns the mutable change-stream topology.  Core retains only the
-    /// sealed writer-route projection required for operation registration.
-    pub(crate) writer_routes: Vec<novarocks_sql::planning::dml::DmlFinalChangeStreamWriterRoute>,
-}
-
 #[cfg(test)]
 #[allow(
     dead_code,

@@ -295,6 +295,7 @@ impl QueryLocalTableOverlay {
 }
 
 impl<'a> CatalogServiceMaterializer<'a> {
+    #[cfg(test)]
     pub fn new(
         current_catalog: Option<&'a str>,
         service: &'a crate::catalog_application::query_catalog::QueryCatalogService,

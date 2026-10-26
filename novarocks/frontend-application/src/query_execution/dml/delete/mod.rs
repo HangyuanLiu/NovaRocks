@@ -33,7 +33,7 @@ use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 #[derive(Clone, Copy, Debug)]
 pub enum DeleteStatement<'a> {
     Predicate(&'a novarocks_parser::ast::Delete),
-    Equality(&'a novarocks_parser::ast::AddEqualityDelete),
+    Equality,
 }
 
 /// The exact parser-owned statement retained by the supervised write action.
@@ -68,8 +68,6 @@ pub(crate) fn resolve_target(
 pub(crate) struct PreparedDeleteWrite {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
-    target_ref: String,
-    base_snapshot_id: Option<i64>,
     delete_query: novarocks_parser::ast::Query,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
@@ -80,24 +78,6 @@ pub(crate) struct PreparedDeleteWrite {
 }
 
 impl PreparedDeleteWrite {
-    pub(crate) fn target(&self) -> &crate::catalog_application::resolver::TargetBackend {
-        &self.target
-    }
-
-    pub(crate) fn target_ref(&self) -> &str {
-        &self.target_ref
-    }
-
-    pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
-        self.base_snapshot_id
-    }
-
-    pub(crate) fn write_session(
-        &self,
-    ) -> Arc<crate::query_execution::write_session::ConnectorWriteSession> {
-        Arc::clone(&self.write_session)
-    }
-
     /// Called only after the action installed this exact Prepared in its stable
     /// source. This future borrows the already retained session and custody.
     pub(crate) async fn prepare_native_assembly_for_execution_async(
@@ -238,7 +218,7 @@ impl DeleteStatement<'_> {
     pub const fn kind(self) -> DeleteStatementKind {
         match self {
             Self::Predicate(_) => DeleteStatementKind::Predicate,
-            Self::Equality(_) => DeleteStatementKind::Equality,
+            Self::Equality => DeleteStatementKind::Equality,
         }
     }
 }

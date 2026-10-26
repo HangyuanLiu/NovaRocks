@@ -165,9 +165,9 @@ impl WriteCompletionTracker {
 
     /// The task-terminal half of the commit gate.
     ///
-    /// The write commit barrier keeps "the prepared write set is complete" and
-    /// "execution succeeded" as two independent facts on purpose, so this
-    /// reports only the second one.
+    /// The registered write consumer checks the complete Root payload and
+    /// this verdict independently before accepting the original Session union.
+    /// This tracker reports only the Task-terminal fact.
     pub fn execution_verdict(&self, attempt_failed: bool) -> WriteVerdict {
         if attempt_failed {
             return WriteVerdict::AttemptFailed;
@@ -292,13 +292,9 @@ mod tests {
         tracker.observe_status(&status(root, 4, TaskState::Finished));
         assert!(tracker.execution_verdict(false) == WriteVerdict::Complete);
 
-        // What this verdict does NOT say is deliberately not askable here.
-        // "A complete prepared write set arrived" belongs to the write commit
-        // barrier and "the external commit succeeded" to finish_write_session;
-        // both directions of the first are asserted over there, in
-        // write_barrier's a_successful_execution_does_not_stand_in_for_a_
-        // complete_set and its converse. A second answer here is what this
-        // type was trimmed to make unrepresentable.
+        // Complete Root payload belongs to the registered write consumer;
+        // external publication belongs to the original Session/Call. This
+        // tracker provides neither of those independent facts.
     }
 
     #[test]
@@ -398,6 +394,31 @@ mod tests {
         // would call it complete.
         assert!(tracker.execution_verdict(false) == WriteVerdict::Complete);
         assert_eq!(tracker.execution_verdict(true), WriteVerdict::AttemptFailed);
+    }
+
+    #[test]
+    fn original_writer_status_distinguishes_complete_pending_and_refused() {
+        let backend = BackendProcessId::new_v7();
+        let writer = identity(2, 1, backend);
+        let root = identity(1, 1, backend);
+        for state in [TaskState::Finished, TaskState::Running, TaskState::Aborted] {
+            let mut tracker = WriteCompletionTracker::try_new(root, [writer]).unwrap();
+            tracker.observe_status(&status(root, 2, TaskState::Finished));
+            tracker.observe_status(&status(writer, 2, state));
+            let verdict = tracker.execution_verdict(false);
+            if state == TaskState::Finished {
+                assert_eq!(verdict, WriteVerdict::Complete);
+            } else {
+                assert_eq!(
+                    verdict,
+                    WriteVerdict::TaskNotFinished {
+                        task: writer,
+                        state
+                    }
+                );
+                assert_eq!(verdict.is_pending(), state == TaskState::Running);
+            }
+        }
     }
 
     #[test]

@@ -387,23 +387,51 @@ fn nested_declared_domains_preserve_actual_cast_spelling() {
 }
 #[test]
 fn type_construction_preserves_first_original_caller_without_tail() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorStopOwner, OriginalResultCheckClass,
+    };
+    use std::error::Error;
+
+    let (control, root, binding, _capacity) =
+        crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+    let cancellation = ConnectorStopOwner::new();
+    let context = crate::connector::connector_request_context(None, cancellation.view()).unwrap();
+    let scope = crate::query_execution::original_cow_result_scope::from_original_binding(
+        &binding, &context,
+    )
+    .unwrap();
+    scope.check_active().expect("the original caller is active");
+    cancellation.request_stop();
     let complete = declared(&SqlType::Json, &DataType::Utf8);
     let calls = std::cell::Cell::new(0);
     let failure = type_name(&complete, &|| {
         calls.set(calls.get() + 1);
-        Err(BuildError::Control(
-            novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Cancelled,
-                "original COW caller stopped",
-            ),
-        ))
+        scope.check_active().map_err(BuildError::Original)
     })
     .unwrap_err();
-    let BuildError::Control(original) = failure else {
+    let BuildError::Original(original) = failure else {
         panic!("original caller");
     };
-    assert_eq!(original.message(), "original COW caller stopped");
+    assert_eq!(original.class(), OriginalResultCheckClass::Control);
+    assert_eq!(
+        original.failure_fact(),
+        ConnectorErrorKind::Cancelled.failure_fact()
+    );
+    let source = original
+        .source()
+        .unwrap()
+        .downcast_ref::<ConnectorError>()
+        .unwrap();
+    assert_eq!(source.kind(), ConnectorErrorKind::Cancelled);
+    assert_eq!(source.message(), "connector operation was cancelled");
     assert_eq!(calls.get(), 1);
+    drop(original);
+    drop(scope);
+    drop(binding);
+    root.owner.complete();
+    root.business.release();
+    control.close_admission();
 }
 
 #[test]

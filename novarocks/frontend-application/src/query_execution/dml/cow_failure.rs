@@ -152,7 +152,6 @@ impl CowFailure {
                 use crate::query_execution::dml::cow_closed_ast::BuildError;
                 match error {
                     BuildError::Original(error) => out.original(error),
-                    BuildError::Control(error) => out.connector(error),
                     _ => {
                         let _ = write!(&mut out, "{error}");
                     }

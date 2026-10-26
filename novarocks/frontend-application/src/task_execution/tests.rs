@@ -7173,7 +7173,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
 
-    use super::status_intake::CondvarWake;
+    use super::status_intake::TestIntakeWake;
     use novarocks_workload_control::{
         ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
@@ -7191,7 +7191,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .map(|context| (context.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(SwitchableQueueSink::default());
-    let wake = Arc::new(CondvarWake::default());
+    let wake = Arc::new(TestIntakeWake::default());
     let status = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
     let execution = QueryTaskExecution::new(
         graph,
@@ -8072,6 +8072,45 @@ impl ManifestReleaseTail {
         round: &mut TaskRoundForTest,
         acks: &crate::native::task_transport::TaskAckIntakeHandle,
     ) -> Option<OperationIntent> {
+        self.complete_in(round, acks, None)
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn complete_for_original_control(
+        self,
+        round: &mut TaskRoundForTest,
+        acks: &crate::native::task_transport::TaskAckIntakeHandle,
+        scope: &novarocks_workload_control::WorkScope,
+        reason: novarocks_workload_control::CancellationReason,
+    ) -> Option<OperationIntent> {
+        self.complete_in(round, acks, Some((scope, reason)))
+    }
+
+    fn complete_in(
+        self,
+        round: &mut TaskRoundForTest,
+        acks: &crate::native::task_transport::TaskAckIntakeHandle,
+        original_control: Option<(
+            &novarocks_workload_control::WorkScope,
+            novarocks_workload_control::CancellationReason,
+        )>,
+    ) -> Option<OperationIntent> {
+        if let Some((scope, reason)) = &original_control {
+            assert!(matches!(
+                reason,
+                novarocks_workload_control::CancellationReason::Requested
+                    | novarocks_workload_control::CancellationReason::DeadlineExceeded
+            ));
+            assert_eq!(scope.cancellation().unwrap().reason(), Some(reason.clone()));
+            assert!(round.execution().selected_task_failure().is_none());
+        }
+        let context = *round
+            .execution()
+            .graph()
+            .contexts()
+            .next()
+            .expect("one backend context");
+        let mut controlled_actor_abort = None;
         for identity in self.upstream {
             if round
                 .execution()
@@ -8127,9 +8166,28 @@ impl ManifestReleaseTail {
                 if intent.kind() == OperationKind::ReleaseQueryContext {
                     releases.push(intent);
                 } else if let OperationIntent::AbortQueryContext(request) = &intent {
-                    // A real selected Task failure adds this exact operation
-                    // to the normal tail. Its receipt settles the request; it
-                    // does not prove Worker exit or replace the later Release.
+                    assert_eq!(request.context(), context);
+                    if original_control.is_some() {
+                        assert_eq!(
+                            round
+                                .execution()
+                                .actor_abort_dispatch_state(intent.operation_id())
+                                .expect("the original Root actor owns this exact Abort"),
+                            super::execution::ActorAbortDispatchState::InFlight
+                        );
+                        assert!(
+                            controlled_actor_abort
+                                .replace(intent.operation_id())
+                                .is_none()
+                        );
+                    } else {
+                        assert!(
+                            round.execution().selected_task_failure().is_some(),
+                            "normal successful computation must release without Abort"
+                        );
+                    }
+                    // Settle this exact dispatched operation through the real
+                    // acknowledgement intake. This is not Worker-exit proof.
                     acks.publish(OperationAcknowledgement::worker_receipt(
                         intent.operation_id(),
                         OperationKind::AbortQueryContext,
@@ -8170,12 +8228,6 @@ impl ManifestReleaseTail {
                 break;
             }
         }
-        let context = *round
-            .execution()
-            .graph()
-            .contexts()
-            .next()
-            .expect("one backend context");
         let owner = round.execution().owner(context).expect("the context owner");
         assert!(
             owner.creates_closed(),
@@ -8185,10 +8237,22 @@ impl ManifestReleaseTail {
             owner.locally_drained(),
             "all local tasks and outputs must drain: {owner:?}"
         );
+        if let Some((scope, reason)) = original_control {
+            assert_eq!(scope.cancellation().unwrap().reason(), Some(reason));
+            assert!(
+                controlled_actor_abort.is_some(),
+                "the original Root must dispatch its Abort"
+            );
+            assert!(
+                owner.is_released(),
+                "the exact actor Abort receipt must settle the context"
+            );
+        }
         if owner.is_released() {
             assert!(
-                round.execution().selected_task_failure().is_some(),
-                "only the original failed Task path settles Abort instead of Release"
+                round.execution().selected_task_failure().is_some()
+                    || controlled_actor_abort.is_some(),
+                "only original Task failure or proven Root actor control settles Abort instead of Release"
             );
             assert!(releases.is_empty());
             assert!(round.attempt_drained());

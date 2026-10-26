@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_types::naming::TableIdentity;
 
@@ -47,40 +45,4 @@ pub(crate) fn observe_loaded_refresh_base(
         ));
     }
     Ok(observation)
-}
-
-pub(crate) fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
-    static MV_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    lock_mv_refresh_mutex(MV_REFRESH_LOCK.get_or_init(|| Mutex::new(())))
-}
-
-fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
-    lock.lock()
-        .map_err(|_| "materialized view refresh lock poisoned".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Mutex, OnceLock};
-
-    #[test]
-    fn lock_mv_refresh_mutex_reports_poisoned_lock() {
-        let lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
-        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _hook_guard = PANIC_HOOK_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("panic hook lock");
-        let old_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let poison_result = std::panic::catch_unwind(|| {
-            let _guard = lock.lock().expect("lock");
-            panic!("poison test lock");
-        });
-        std::panic::set_hook(old_hook);
-        assert!(poison_result.is_err());
-
-        let err = super::lock_mv_refresh_mutex(lock).expect_err("poisoned lock should fail");
-        assert!(err.contains("poisoned"), "err={err}");
-    }
 }

@@ -52,7 +52,6 @@ use crate::task_execution::blocking_io::{
 };
 use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::StatementNativeHealthFailure;
-use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
@@ -69,7 +68,6 @@ fn failed_connector(error: ConnectorError) -> DistributedQueryError {
 /// Credential material stays under its planning collector until every split
 /// source of this exact attempt is open.
 pub(crate) enum RoundCredentialLeaseSource {
-    Frozen(Option<QueryCredentialLeases>),
     Fresh {
         collector: Arc<AttemptCredentialLeaseCollector>,
         request_scope: ConnectorRequestScope,
@@ -90,19 +88,6 @@ impl RoundCredentialLeaseSource {
         source.drain_credential_leases()
     }
 
-    #[cfg(novarocks_dev_controls)]
-    pub(crate) fn test_statement_nomination(
-        &self,
-    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
-        match self {
-            Self::Reservation {
-                reservation: Some(reservation),
-                ..
-            } => reservation.test_statement_nomination(),
-            _ => None,
-        }
-    }
-
     pub(crate) fn fresh(execution: QueryExecutionId) -> Self {
         Self::Fresh {
             collector: AttemptCredentialLeaseCollector::new(execution),
@@ -115,7 +100,6 @@ impl RoundCredentialLeaseSource {
         context: ConnectorRequestContext,
     ) -> Result<ConnectorRequestContext, String> {
         match self {
-            Self::Frozen(_) => Ok(context),
             Self::Fresh {
                 collector,
                 request_scope,
@@ -151,9 +135,6 @@ impl RoundCredentialLeaseSource {
     fn drain_credential_leases(&mut self) -> Result<QueryCredentialLeases, DistributedQueryError> {
         self.publish_observed();
         match self {
-            Self::Frozen(leases) => leases
-                .take()
-                .ok_or_else(|| failed("frozen credential source already drained")),
             Self::Fresh { collector, .. } => collector.drain_credential_leases(),
             Self::Reservation { reservation, .. } => reservation
                 .as_ref()
@@ -229,55 +210,22 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
 #[derive(Clone)]
 struct AttemptInitializationLifecycle {
     deadline: Instant,
-    cancellation: AttemptInitializationCancellation,
-}
-
-#[derive(Clone)]
-enum AttemptInitializationCancellation {
-    Legacy(QueryCancellationView),
-    Governed(novarocks_workload_control::CancellationView),
-}
-
-impl AttemptInitializationCancellation {
-    fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Legacy(cancellation) => cancellation.is_cancelled(),
-            Self::Governed(cancellation) => cancellation.reason().is_some(),
-        }
-    }
-
-    async fn cancelled(&self) {
-        match self {
-            Self::Legacy(cancellation) => {
-                cancellation.cancelled().await;
-            }
-            Self::Governed(cancellation) => {
-                cancellation.cancelled().await;
-            }
-        }
-    }
+    cancellation: novarocks_workload_control::CancellationView,
 }
 
 impl AttemptInitializationLifecycle {
-    fn new(deadline: Instant, cancellation: QueryCancellationView) -> Self {
-        Self {
-            deadline,
-            cancellation: AttemptInitializationCancellation::Legacy(cancellation),
-        }
-    }
-
     fn governed(
         deadline: Instant,
         cancellation: novarocks_workload_control::CancellationView,
     ) -> Self {
         Self {
             deadline,
-            cancellation: AttemptInitializationCancellation::Governed(cancellation),
+            cancellation,
         }
     }
 
     fn check(&self) -> Result<(), DistributedQueryError> {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.reason().is_some() {
             return Err(failed("query cancelled while initializing its attempt"));
         }
         if Instant::now() >= self.deadline {
@@ -470,15 +418,11 @@ pub(super) fn check_source_close(
     }
 }
 
-enum SourceChildAdmission {
-    LegacyIndividual,
-    Cohort(crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort),
-}
-
 struct ProductionInitializationState {
     work_scope: WorkScope,
     result_window: ResultWindowAlias,
-    source_children: SourceChildAdmission,
+    source_cohort:
+        crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
     execution_id: QueryExecutionId,
     artifacts: Option<PreparedDistributedQuery>,
     schedule: Option<ValidatedFragmentSchedule>,
@@ -699,21 +643,11 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         Ok(Some(AttemptSourceRecipe {
             identity,
             recipe: ProductionSourceRecipe {
-                admission: match &self.source_children {
-                    SourceChildAdmission::Cohort(cohort) => {
-                        ConnectorBlockingIoResponsibility::request_from_cohort(
-                            &self.work_scope,
-                            &self.result_window,
-                            cohort.clone(),
-                        )
-                    }
-                    SourceChildAdmission::LegacyIndividual => {
-                        ConnectorBlockingIoResponsibility::request(
-                            &self.work_scope,
-                            &self.result_window,
-                        )
-                    }
-                }
+                admission: ConnectorBlockingIoResponsibility::request_from_cohort(
+                    &self.work_scope,
+                    &self.result_window,
+                    self.source_cohort.clone(),
+                )
                 .map_err(|error| failed(error.to_string()))?,
                 source,
                 session: self.session.as_ref().unwrap().clone(),
@@ -821,44 +755,6 @@ impl AttemptInitializing {
         clippy::too_many_arguments,
         reason = "Each input is an independently frozen fact needed before an attempt may become ready."
     )]
-    pub(crate) fn new(
-        execution_id: QueryExecutionId,
-        work_scope: WorkScope,
-        result_window: ResultWindowAlias,
-        artifacts: PreparedDistributedQuery,
-        schedule: ValidatedFragmentSchedule,
-        retry_policy: TaskUpdateRetryPolicy,
-        feedback: Arc<RuntimeFilterFeedbackState>,
-        initial_dynamic_filter_wait_cap: Duration,
-        connector_context: ConnectorRequestContext,
-        cancellation: QueryCancellationView,
-        runtime: FrontendDataRuntime,
-        credential_lease_source: RoundCredentialLeaseSource,
-    ) -> Result<Self, DistributedQueryError> {
-        let lifecycle =
-            AttemptInitializationLifecycle::new(connector_context.deadline(), cancellation);
-        let mut credential_lease_source = Some(credential_lease_source);
-        Self::from_lifecycle(
-            execution_id,
-            work_scope,
-            result_window,
-            artifacts,
-            schedule,
-            retry_policy,
-            feedback,
-            initial_dynamic_filter_wait_cap,
-            connector_context,
-            runtime,
-            &mut credential_lease_source,
-            lifecycle,
-            SourceChildAdmission::LegacyIndividual,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Each input is an independently frozen fact needed before an attempt may become ready."
-    )]
     fn from_lifecycle(
         execution_id: QueryExecutionId,
         work_scope: WorkScope,
@@ -872,7 +768,7 @@ impl AttemptInitializing {
         runtime: FrontendDataRuntime,
         credential_lease_source: &mut Option<RoundCredentialLeaseSource>,
         lifecycle: AttemptInitializationLifecycle,
-        source_children: SourceChildAdmission,
+        source_cohort: crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
     ) -> Result<Self, DistributedQueryError> {
         if schedule.execution_id() != execution_id {
             return Err(DistributedQueryError::new(
@@ -889,7 +785,7 @@ impl AttemptInitializing {
                 ProductionInitializationState {
                     work_scope,
                     result_window,
-                    source_children,
+                    source_cohort,
                     execution_id,
                     artifacts: Some(artifacts),
                     schedule: Some(schedule),
@@ -956,7 +852,7 @@ impl AttemptInitializing {
             runtime,
             credential_lease_source,
             lifecycle,
-            SourceChildAdmission::Cohort(source_cohort),
+            source_cohort,
         )?);
         Ok(())
     }
@@ -1035,29 +931,6 @@ impl AttemptReady {
         }
         Ok(())
     }
-
-    /// Legacy synchronous coordinator transfer; it already owns this entire
-    /// ready value on its original statement stack.
-    pub(crate) fn into_parts(
-        mut self,
-    ) -> (
-        QueryExecutionId,
-        PreparedDistributedQuery,
-        ValidatedFragmentSchedule,
-        Arc<RuntimeFilterFeedbackState>,
-        Option<RoundSplitAssignmentPlan>,
-        QueryCredentialLeases,
-    ) {
-        let (execution, artifacts, schedule, feedback, leases) = self.take_preparation_parts();
-        (
-            execution,
-            artifacts,
-            schedule,
-            feedback,
-            self.take_split_plan(),
-            leases,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -1076,8 +949,8 @@ mod tests {
     use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
-    use novarocks_query_application::cancellation::{
-        QueryCancellationReason, QueryCancellationSource,
+    use novarocks_workload_control::{
+        CancellationReason, RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
 
     #[test]
@@ -1204,23 +1077,8 @@ mod tests {
     }
 
     struct ProtectedCleanup {
-        armed: bool,
         supervisor: ConnectorBlockingIoSupervisor,
         closed: Option<mpsc::Sender<()>>,
-    }
-
-    impl Drop for ProtectedCleanup {
-        fn drop(&mut self) {
-            if !self.armed {
-                return;
-            }
-            let Some(closed) = self.closed.take() else {
-                return;
-            };
-            let _ = self.supervisor.spawn_protected(move || {
-                closed.send(()).expect("publish protected cleanup");
-            });
-        }
     }
 
     struct FixtureInitializationState {
@@ -1255,7 +1113,6 @@ mod tests {
                 release.recv().expect("release source-open call");
             }
             drop(recipe.connector_context.take());
-            recipe.cleanup.armed = true;
             let identity = recipe.reported_identity.take().unwrap_or(identity);
             Some(Ok(OpenedAttemptSource {
                 identity,
@@ -1268,7 +1125,6 @@ mod tests {
             _: &crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>,
         ) -> Option<()> {
             for mut cleanup in accepted.drain(..) {
-                cleanup.armed = false;
                 if let Some(closed) = cleanup.closed.take() {
                     closed
                         .send(())
@@ -1342,9 +1198,6 @@ mod tests {
             &mut self,
             ready: &mut Option<Self::Ready>,
         ) -> Result<(), DistributedQueryError> {
-            for cleanup in &mut self.accepted {
-                cleanup.armed = false;
-            }
             *ready = Some(self.next);
             Ok(())
         }
@@ -1379,7 +1232,6 @@ mod tests {
                     release: None,
                     connector_context: None,
                     cleanup: ProtectedCleanup {
-                        armed: false,
                         supervisor: supervisor.clone(),
                         closed: Some(closed.clone()),
                     },
@@ -1395,8 +1247,60 @@ mod tests {
         }
     }
 
-    fn lifecycle(source: &QueryCancellationSource) -> AttemptInitializationLifecycle {
-        AttemptInitializationLifecycle::new(Instant::now() + Duration::from_secs(5), source.view())
+    struct InitializationCancellationFixture {
+        control: WorkloadControl,
+        root: RootWork,
+    }
+    impl InitializationCancellationFixture {
+        fn new() -> Self {
+            let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+                .unwrap()
+                .owner;
+            control.mark_ready().unwrap();
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            Self { control, root }
+        }
+        fn view(&self) -> novarocks_workload_control::CancellationView {
+            self.root.owner.scope().cancellation().unwrap()
+        }
+        fn request(&self, reason: CancellationReason) {
+            self.root
+                .owner
+                .cancellation_requester()
+                .request(reason.clone())
+                .unwrap();
+            assert_eq!(self.view().reason(), Some(reason));
+        }
+        fn complete(self) {
+            if self.view().reason().is_some() {
+                let notice = self
+                    .control
+                    .next_control()
+                    .expect("the original Cancel notification");
+                assert_eq!(notice.scope().id(), self.root.owner.scope().id());
+                assert!(
+                    notice
+                        .intents()
+                        .contains(novarocks_workload_control::ControlIntent::Cancel)
+                );
+                notice.acknowledge();
+            }
+            assert!(self.control.next_control().is_none());
+            self.root.owner.complete();
+            self.root.business.release();
+            self.control.close_admission();
+            self.control.shutdown().unwrap_or_else(|failure| {
+                panic!("initializer governance did not drain: {}", failure.error())
+            });
+        }
+    }
+    fn lifecycle(source: &InitializationCancellationFixture) -> AttemptInitializationLifecycle {
+        AttemptInitializationLifecycle::governed(
+            Instant::now() + Duration::from_secs(5),
+            source.view(),
+        )
     }
 
     struct ScopeDropCanary {
@@ -1546,7 +1450,7 @@ mod tests {
     async fn no_scan_becomes_ready_without_submitting_connector_work() {
         let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = InitializationCancellationFixture::new();
         let (closed, _observe_close) = mpsc::channel();
         let state = fixture(execution_id, Vec::new(), supervisor.clone(), closed);
 
@@ -1559,13 +1463,14 @@ mod tests {
         assert_eq!(initializing.ready, Some(0));
         assert!(initializing.opening.is_none());
         executors.shutdown().await;
+        cancellation.complete();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_before_submission_keeps_recipe_unopened() {
         let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = InitializationCancellationFixture::new();
         let (started, observe_started) = mpsc::channel();
         let (closed, _observe_close) = mpsc::channel();
         let mut state = fixture(
@@ -1578,7 +1483,7 @@ mod tests {
             .as_mut()
             .expect("first fixture recipe")
             .started = Some(started);
-        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        cancellation.request(CancellationReason::ClientDisconnected);
         let mut initializing =
             InitializationProgress::new(supervisor, lifecycle(&cancellation), state);
         let error = initializing
@@ -1591,13 +1496,14 @@ mod tests {
             "a cancelled recipe must remain unopened"
         );
         executors.shutdown().await;
+        cancellation.complete();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_during_source_open_reaps_late_success() {
         let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = InitializationCancellationFixture::new();
         let (started, observe_started) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let (closed, observe_close) = mpsc::channel();
@@ -1619,7 +1525,7 @@ mod tests {
         observe_started
             .recv_timeout(Duration::from_secs(2))
             .expect("source-open call starts");
-        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        cancellation.request(CancellationReason::ClientDisconnected);
 
         let (mut initializing, result) = tokio::time::timeout(Duration::from_secs(1), actor)
             .await
@@ -1657,13 +1563,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("late state is reaped after actual source-open exit");
         executors.shutdown().await;
+        cancellation.complete();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_closes_accepted_source_without_dropping_the_shared_attempt_scope() {
         let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = InitializationCancellationFixture::new();
         let (source_two_started, observe_source_two_started) = mpsc::channel();
         let (release_source_two, source_two_released) = mpsc::channel();
         let (source_one_closed, observe_source_one_closed) = mpsc::channel();
@@ -1699,7 +1606,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("second source starts after the first was accepted");
 
-        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        cancellation.request(CancellationReason::ClientDisconnected);
         let (mut initializing, result) = tokio::time::timeout(Duration::from_secs(1), actor)
             .await
             .expect("running second source observes cancellation")
@@ -1738,13 +1645,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("the shared attempt scope releases after the late provider return");
         executors.shutdown().await;
+        cancellation.complete();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn source_result_from_another_generation_is_rejected_before_ready() {
         let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = InitializationCancellationFixture::new();
         let expected = identity(execution_id, 7);
         let (closed, observe_close) = mpsc::channel();
         let mut state = fixture(
@@ -1781,5 +1689,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("rejected source state is reaped");
         executors.shutdown().await;
+        cancellation.complete();
     }
 }

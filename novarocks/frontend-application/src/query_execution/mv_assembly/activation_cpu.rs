@@ -552,31 +552,6 @@ impl MvWriteActivationOriginal {
     pub(crate) fn foreign_exit_unproven(&self) -> bool {
         self.in_foreign.load(Ordering::Acquire)
     }
-    /// Return unconsumed capability custody after a failed pure finalization.
-    /// The caller retains this SAME source until this handoff and the original
-    /// CPU job's physical exit/forwarder close have both been observed.
-    pub(crate) fn take_returned_access_in(
-        &self,
-        target: &mut Option<FinalPlanRuntimeAccess<FrozenProviderRead>>,
-    ) -> Result<(), &'static str> {
-        if target.is_some() {
-            return Err("MV returned read-access receiver is occupied");
-        }
-        if self.foreign_exit_unproven() {
-            return Err("original MV activation turn is unproven");
-        }
-        let mut state = self.body.lock().unwrap_or_else(|p| p.into_inner());
-        let body = state
-            .as_mut()
-            .ok_or("original MV activation body is borrowed")?;
-        if !body.started {
-            return Err("original MV activation CPU turn has not started");
-        }
-        if let MvWriteActivationRequest::Finish(input) = &mut body.request {
-            *target = input.access.take();
-        }
-        Ok(())
-    }
     /// Called after the original CPU receipt and forwarder have really closed.
     /// Every fallible encode/mapping/description check completed while access
     /// was borrowed; this receiving step performs only the original move.

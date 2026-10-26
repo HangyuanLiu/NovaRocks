@@ -144,6 +144,7 @@ struct SlotStore {
     slots: Box<[Slot]>,
     dirty: BTreeSet<usize>,
     failure: Option<SelectedTaskTermination>,
+    #[cfg(test)]
     root_success_sealed: bool,
 }
 #[derive(Debug)]
@@ -182,20 +183,15 @@ pub(crate) struct AcceptedAttemptProtocolChanges {
     initial: bool,
     tasks: Box<[AcceptedTaskProtocolChange]>,
     failure: Option<SelectedTaskTermination>,
+    #[cfg(test)]
     root_success_sealed: bool,
 }
 impl AcceptedAttemptProtocolChanges {
-    pub(crate) const fn binding(&self) -> AttemptProtocolBinding {
-        self.binding
-    }
     pub(crate) const fn revision(&self) -> u64 {
         self.revision
     }
     pub(crate) const fn is_initial(&self) -> bool {
         self.initial
-    }
-    pub(crate) fn frozen_tasks(&self) -> &[TaskIdentity] {
-        &self.frozen.tasks
     }
     pub(crate) fn tasks(&self) -> &[AcceptedTaskProtocolChange] {
         &self.tasks
@@ -203,6 +199,7 @@ impl AcceptedAttemptProtocolChanges {
     pub(crate) fn selected_failure(&self) -> Option<&SelectedTaskTermination> {
         self.failure.as_ref()
     }
+    #[cfg(test)]
     pub(crate) const fn root_success_sealed(&self) -> bool {
         self.root_success_sealed
     }
@@ -287,6 +284,7 @@ impl AttemptProtocolFactsPublisher {
                 slots,
                 dirty: BTreeSet::new(),
                 failure: None,
+                #[cfg(test)]
                 root_success_sealed: false,
             }),
         });
@@ -456,7 +454,10 @@ impl AttemptProtocolFactsPublisher {
                 plan: self.shared.frozen.plan,
             });
             store.failure = failure.cloned();
-            store.root_success_sealed = sealed;
+            #[cfg(test)]
+            {
+                store.root_success_sealed = sealed;
+            }
             store.revision = revision;
             revision
         };
@@ -511,6 +512,7 @@ impl AttemptProtocolFactsReceiver {
             initial,
             tasks,
             failure: store.failure.clone(),
+            #[cfg(test)]
             root_success_sealed: store.root_success_sealed,
         };
         store.dirty.clear();

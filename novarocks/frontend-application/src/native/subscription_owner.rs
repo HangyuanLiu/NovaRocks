@@ -363,6 +363,7 @@ fn close_records(core: &Core, reject: bool) {
 impl NativeSubscriptionOwner {
     /// Same original finite container plus actual source allocations and F
     /// pointees. Existing variable request/cause backing is not cloned here.
+    #[cfg(test)]
     pub(crate) fn resident_storage_bytes(
         max_records: usize,
     ) -> Result<usize, novarocks_workload_control::WorkError> {

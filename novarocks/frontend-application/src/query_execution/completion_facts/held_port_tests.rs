@@ -497,9 +497,6 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
     let shutdown =
         runtime.block_on(fixture.shutdown_until(Instant::now() + Duration::from_secs(2)));
     let after = observation.snapshot();
-    if let Some(error) = blocking.take_original_failure() {
-        blocking.retire_original_failure(error);
-    }
     drop(bindings);
     drop(blocking);
     // Keep real primary/cleanup results and original owners through all

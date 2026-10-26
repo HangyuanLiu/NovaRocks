@@ -69,7 +69,6 @@ pub(crate) enum MvRefreshPreparationOutput {
     Create(Arc<crate::mv::domain::iceberg_refresh::IcebergMvCreatePlan>),
     Explain(Vec<String>),
     DependencySteps(Vec<crate::mv::domain::dependency::refresh::MvRefreshDependencyStep>),
-    Catalog(MvCatalogCaptureOutput),
     Refresh(Box<super::pure_reader::MvRefreshPrepared>),
     WriteAnalysis(Box<super::super::activation_preparation::MvWriteAnalysisPrepared>),
 }
@@ -136,25 +135,6 @@ impl MvRefreshPreparationOriginal {
     }
     pub(crate) fn is_for_io(&self, io: &Arc<MvRefreshPreparationIo>) -> bool {
         Arc::ptr_eq(&self.io, io)
-    }
-    pub(crate) fn for_catalog(
-        input: MvCatalogCaptureInput,
-        io: Arc<MvRefreshPreparationIo>,
-    ) -> Arc<Self> {
-        let reader_io = Arc::clone(&io);
-        Arc::new(Self {
-            body: Mutex::new(Some(Body {
-                reader: Some(Box::pin(async move {
-                    capture_catalog(input, &reader_io)
-                        .await
-                        .map(MvRefreshPreparationOutput::Catalog)
-                })),
-                result: None,
-                received: false,
-            })),
-            poisoned: AtomicBool::new(false),
-            io,
-        })
     }
     pub(crate) fn for_refresh(
         input: Arc<super::pure_reader::MvRefreshPreparationInput>,

@@ -288,15 +288,6 @@ impl FrontendProviderReadFacts {
             .ok_or("fixture has no original creator job")?
             .take_joined_for_fixture_disposition(observed)
     }
-    pub(crate) async fn local_health_failure(
-        &self,
-    ) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
-        let source = self.source.lock().await;
-        source
-            .job
-            .as_ref()
-            .and_then(ProviderReadCpuJob::health_failure)
-    }
 }
 
 impl FrontendProviderReadFacts {

@@ -30,7 +30,6 @@ use novarocks_native_adapter::root_record_assembly::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(test)]
 use arrow::array::{Array, BinaryArray, Int32Array, ListArray, MapArray, StringArray};
@@ -143,33 +142,12 @@ fn artifact_properties_type() -> DataType {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StatisticsExecutionPolicy {
-    attempt_timeout: Duration,
-}
-
-impl StatisticsExecutionPolicy {
-    pub fn try_new(attempt_timeout: Duration) -> Result<Self, DistributedQueryError> {
-        if attempt_timeout.is_zero() {
-            return Err(contract_violation(
-                "statistics attempt timeout must be greater than zero",
-            ));
-        }
-        Ok(Self { attempt_timeout })
-    }
-
-    pub const fn attempt_timeout(self) -> Duration {
-        self.attempt_timeout
-    }
-}
-
 /// Move-only execution contract retained by the FE coordinator until Root EOF
 /// and every required execution terminal have both been observed.
 pub struct StatisticsCollectionProgram {
     table: novarocks_spi::connector::ConnectorTableHandle,
     read_version_ordinal: i64,
     required: Vec<StatisticsRequiredAggregation>,
-    policy: StatisticsExecutionPolicy,
 }
 
 impl StatisticsCollectionProgram {
@@ -177,7 +155,6 @@ impl StatisticsCollectionProgram {
         table: novarocks_spi::connector::ConnectorTableHandle,
         read_version_ordinal: Option<i64>,
         required: Vec<StatisticsRequiredAggregation>,
-        policy: StatisticsExecutionPolicy,
     ) -> Result<Self, DistributedQueryError> {
         if required.is_empty() {
             return Err(contract_violation(
@@ -213,12 +190,7 @@ impl StatisticsCollectionProgram {
             table,
             read_version_ordinal,
             required,
-            policy,
         })
-    }
-
-    pub const fn policy(&self) -> StatisticsExecutionPolicy {
-        self.policy
     }
 
     pub fn table(&self) -> &novarocks_spi::connector::ConnectorTableHandle {
@@ -744,8 +716,6 @@ mod tests {
             .expect("checked table handle"),
             Some(7),
             required,
-            super::StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30))
-                .expect("bounded attempt policy"),
         )
     }
 

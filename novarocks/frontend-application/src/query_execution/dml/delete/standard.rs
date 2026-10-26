@@ -165,8 +165,6 @@ pub(super) async fn prepare_delete_statement_async(
     Ok(super::PreparedDeleteWrite {
         state: state.clone(),
         target: target.clone(),
-        target_ref: target_ref.to_string(),
-        base_snapshot_id: mutation.base_version_ordinal(),
         delete_query,
         sql_write_input,
         table_bindings,

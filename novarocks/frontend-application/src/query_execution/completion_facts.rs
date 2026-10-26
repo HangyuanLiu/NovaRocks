@@ -276,28 +276,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
 /// query, while a catalog that could not say is a fact about this process. The
 /// second must not be flattened into the first, or a query over a healthy table
 /// would report that the table does not exist whenever the catalog is down.
-pub(crate) fn catalog_fact(
-    materializer: &CatalogServiceMaterializer<'_>,
-    need: &CatalogRelationNeed,
-) -> Result<CatalogRelationFact, String> {
-    let relation = need.relation();
-    let resolved = match need.target() {
-        CatalogLookupTarget::Table { .. } => materializer.resolve_table_for_analysis_typed(
-            Some(&relation.catalog),
-            &relation.namespace,
-            &relation.table,
-        ),
-        CatalogLookupTarget::IcebergMetadata { kind } => materializer.resolve_metadata_table_typed(
-            Some(&relation.catalog),
-            &relation.namespace,
-            &relation.table,
-            kind,
-        ),
-    };
-    catalog_fact_from(need, resolved)
-}
-
-fn catalog_fact_from(
+pub(super) fn catalog_fact_from(
     need: &CatalogRelationNeed,
     resolved: CatalogResolutionResult<novarocks_sql::planning::catalog::ResolvedAnalyzerTable>,
 ) -> Result<CatalogRelationFact, String> {

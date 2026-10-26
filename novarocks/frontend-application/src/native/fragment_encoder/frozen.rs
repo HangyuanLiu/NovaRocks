@@ -114,6 +114,7 @@ pub(crate) struct FragmentFacts {
     fragment_id: FragmentId,
     dop_domain: PipelineDopDomain,
     sink_targets: Box<[StaticSinkTarget]>,
+    #[cfg(test)]
     root_plan_node_id: i32,
     table_writers: Box<[StaticTableWriter]>,
     carries_runtime_filter_bindings: bool,
@@ -138,6 +139,7 @@ impl FragmentFacts {
     /// It is the identity EXPLAIN ANALYZE keys a fragment by: the renderer
     /// looks each `PLAN FRAGMENT` up by its sealed root node id, and the
     /// encoder copied that id onto the frozen plan unchanged.
+    #[cfg(test)]
     pub(crate) const fn root_plan_node_id(&self) -> i32 {
         self.root_plan_node_id
     }
@@ -148,6 +150,7 @@ impl FragmentFacts {
     /// distributed write's writer set is what decides whether the write
     /// completed, and an exchange or scan fragment of a write plan is not a
     /// writer.
+    #[cfg(test)]
     pub(crate) fn declares_table_writer(&self) -> bool {
         !self.table_writers.is_empty()
     }
@@ -195,7 +198,9 @@ impl FragmentArtifact {
     ) -> Result<Arc<Self>, PackageFreezeError> {
         let fragment = package.fragment();
         let fragment_id = fragment.id().get();
-        let root_plan_node_id = i32::try_from(fragment.root().get()).map_err(|_| {
+        // Validate the signed native representation in every build. Only tests
+        // retain an additional copy of this already encoded package fact.
+        let _validated_root_plan_node_id = i32::try_from(fragment.root().get()).map_err(|_| {
             PackageFreezeError::Facts(format!(
                 "fragment {fragment_id} root node {} exceeds the wire node identity",
                 fragment.root().get()
@@ -205,7 +210,8 @@ impl FragmentArtifact {
             fragment_id,
             dop_domain: fragment.dop_domain(),
             sink_targets: package_sink_targets(fragment, edges)?,
-            root_plan_node_id,
+            #[cfg(test)]
+            root_plan_node_id: _validated_root_plan_node_id,
             table_writers: fragment
                 .nodes()
                 .values()

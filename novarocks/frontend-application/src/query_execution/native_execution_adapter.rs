@@ -1311,44 +1311,6 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             observation,
         )
     }
-    fn start_computation(
-        &self,
-        computation: PreparedLogicalComputation,
-        owner: WorkOwner,
-        result_capacity: QueryResultCapacityBinding,
-        reservation: Option<novarocks_query_application::api::ReservedExecutionIdentity>,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> QueryExecutionFuture {
-        let PreparedLogicalComputation {
-            description,
-            template,
-            options,
-            consumer,
-            handoffs,
-            diagnostics,
-            initial_credentials,
-        } = computation;
-        self.start_native(
-            FrontendLogicalLaunch {
-                description,
-                template,
-                options,
-                internal: Some(InternalNativeRegistration {
-                    consumer,
-                    handoffs,
-                    diagnostics,
-                    initial_credentials,
-                }),
-            },
-            owner,
-            Some(result_capacity),
-            reservation,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        )
-    }
 }
 
 impl FrontendNativeLogicalExecutionLauncher {
@@ -2671,7 +2633,6 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                 self.lifecycle_diagnostics.publish(
                 crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
                     execution_id,
-                    error_source: None,
                     primary_error: None,
                 failure: observed_failure,
                 worker_contexts_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),

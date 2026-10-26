@@ -46,13 +46,6 @@ pub struct QueryAttemptReservation {
 }
 
 impl QueryAttemptReservation {
-    #[cfg(novarocks_dev_controls)]
-    pub(crate) fn test_statement_nomination(
-        &self,
-    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
-        self.test_nomination.get().cloned()
-    }
-
     #[cfg(test)]
     pub(crate) fn retry(
         query_id: QueryId,

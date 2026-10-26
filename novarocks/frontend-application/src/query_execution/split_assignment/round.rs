@@ -120,15 +120,6 @@ pub(crate) struct RoundSplitEnumerationResult {
     pub(crate) source: RoundSplitSource,
 }
 
-impl RoundSplitEnumerationResult {
-    pub(crate) fn discard_batch(self) -> RoundSplitSource {
-        let Self { batch, source, .. } = self;
-        // Keep the source's original backing until the unadopted batch retires.
-        drop(batch);
-        source
-    }
-}
-
 impl RoundSplitAssignment {
     pub(crate) fn join_pins(
         &self,
@@ -267,6 +258,7 @@ impl RoundSplitAssignment {
     }
 
     /// Performs the only Connector call in one ordinary blocking job.
+    #[cfg(test)]
     pub(crate) fn enumerate_source(
         request: RoundSplitEnumerationRequest,
     ) -> RoundSplitEnumerationResult {

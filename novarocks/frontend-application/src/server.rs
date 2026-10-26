@@ -590,8 +590,7 @@ async fn build_frontend_role_products(
                         host.write_data_runtime(),
                     ),
                     Arc::clone(&function_catalog),
-                    host.lake_publication_runtime_policy()
-                        .max_attempt_duration(),
+                    host.lake_publication_runtime_policy(),
                     Handle::current(),
                     host.constant_policy(),
                     host.static_plan_carrier(),
@@ -706,7 +705,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            host.connector_blocking_io_supervisor(),
         ));
     let catalog_command_executor =
         core_capabilities::catalog_command_executor(core_capabilities::CatalogCommandPorts::new(

@@ -1397,19 +1397,14 @@ impl Drop for LifecycleStatementObservationGuard {
 }
 
 fn await_lifecycle_statement_observation(
-    meta: &QueryMeta,
     guard: &LifecycleStatementObservationGuard,
     deadline: Instant,
 ) -> Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot> {
-    let require_success = meta
-        .query_lifecycle_structured_assertion
-        .as_ref()
-        .is_none_or(|assertion| assertion.error_source.is_none());
     guard
         .server_handle
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
-        .await_query_lifecycle_statement_observation(&guard.observation, require_success, deadline)
+        .await_query_lifecycle_statement_observation(&guard.observation, true, deadline)
 }
 
 fn runtime_filter_details(
@@ -1565,27 +1560,6 @@ fn verify_lifecycle_structured_assertion(
     let Some(assertion) = meta.query_lifecycle_structured_assertion.as_ref() else {
         return Ok(());
     };
-    if let Some(expected) = assertion.error_source.as_ref() {
-        let expected = match expected {
-            QueryLifecycleErrorSource::BackendAttestation => {
-                novarocks_cluster_harness::QueryLifecycleErrorSource::BackendAttestation
-            }
-            QueryLifecycleErrorSource::FrontendLiveness => {
-                novarocks_cluster_harness::QueryLifecycleErrorSource::FrontendLiveness
-            }
-            QueryLifecycleErrorSource::NoOutcome => {
-                novarocks_cluster_harness::QueryLifecycleErrorSource::NoOutcome
-            }
-        };
-        if after.error_source != Some(expected) {
-            bail!(
-                "structured lifecycle error source mismatch: expected {}, actual {:?}, execution_id={:?}",
-                assertion.error_source.as_ref().expect("checked").as_str(),
-                after.error_source,
-                after.execution_id
-            );
-        }
-    }
     verify_runtime_filter_structured_assertion(assertion, after)?;
     Ok(())
 }
@@ -4437,9 +4411,7 @@ fn run_case_observed(
             let assertion_result = structured_lifecycle_observation
                 .as_ref()
                 .context("exact statement lifecycle observation disappeared after the step")
-                .and_then(|guard| {
-                    await_lifecycle_statement_observation(&step.meta, guard, assertion_deadline)
-                })
+                .and_then(|guard| await_lifecycle_statement_observation(guard, assertion_deadline))
                 .and_then(|after| {
                     verify_lifecycle_structured_assertion(&step.meta, &after)?;
                     Ok(after.execution_id)
@@ -5217,7 +5189,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "kill_be_after_be_log_contains",
         "terminal_snapshot_conflict_be_index",
         "query_lifecycle_fault",
-        "expect_lifecycle_error_source",
         // Structured runtime-filter assertions read the same debug projection
         // as the lifecycle fault assertions, even when the query itself has no
         // injected fault.
@@ -7335,7 +7306,6 @@ mod tests {
             process_namespace: 1,
             local_sequence: 2,
             attempt_id: 3,
-            error_source: None,
             failure_fact: None,
             failure_detail: None,
             failure_site: None,
@@ -7374,7 +7344,6 @@ mod tests {
             },
         };
         let delivered = QueryLifecycleStructuredAssertion {
-            error_source: None,
             runtime_filter_availability: None,
             runtime_filter_details: vec![RuntimeFilterDetailExpectation::DeliveredConsumer],
             runtime_filter_totals_at_least: Vec::new(),

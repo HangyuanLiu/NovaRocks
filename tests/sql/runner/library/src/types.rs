@@ -50,38 +50,8 @@ pub struct KillBeAfterBeLogDirective {
     pub pattern: String,
 }
 
-/// Structured fault assertions deliberately name a result category rather
-/// than matching a human-readable diagnostic. T7/T9 provide the actual
-/// snapshot producer; T4 owns this stable runner contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryLifecycleErrorSource {
-    BackendAttestation,
-    FrontendLiveness,
-    NoOutcome,
-}
-
-impl QueryLifecycleErrorSource {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "backend-attestation" => Some(Self::BackendAttestation),
-            "frontend-liveness" => Some(Self::FrontendLiveness),
-            "no-outcome" => Some(Self::NoOutcome),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::BackendAttestation => "backend-attestation",
-            Self::FrontendLiveness => "frontend-liveness",
-            Self::NoOutcome => "no-outcome",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredAssertion {
-    pub error_source: Option<QueryLifecycleErrorSource>,
     /// Runtime Filter facts are asserted from the typed query-terminal
     /// projection supplied by the cluster harness, never from profile text.
     pub runtime_filter_availability: Option<RuntimeFilterAvailabilityExpectation>,

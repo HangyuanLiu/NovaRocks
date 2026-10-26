@@ -752,7 +752,6 @@ mod statement_observation_tests {
     fn snapshot(execution_id: QueryExecutionId) -> QueryLifecycleConvergenceSnapshot {
         QueryLifecycleConvergenceSnapshot {
             execution_id,
-            error_source: None,
             primary_error: None,
             failure: None,
             worker_contexts_converged: false,
@@ -1214,7 +1213,6 @@ mod session_owner_tests {
             };
             QueryLifecycleConvergenceSnapshot {
                 execution_id,
-                error_source: None,
                 primary_error: None,
                 failure: None,
                 worker_contexts_converged: false,

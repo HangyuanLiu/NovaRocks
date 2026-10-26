@@ -552,9 +552,6 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
         self.assembly = Some(assembly);
         Ok(())
     }
-    pub(crate) fn ready(&self) -> Option<&<A::Output as StatementComputationOutput>::Ready> {
-        self.ready.as_ref()
-    }
     pub(crate) fn take_ready(
         &mut self,
     ) -> Option<<A::Output as StatementComputationOutput>::Ready> {
@@ -726,35 +723,6 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
                 }
                 Poll::Ready(Ok(())) => {}
             }
-        }
-        Poll::Ready(Ok(()))
-    }
-    pub(crate) fn poll_native_exit(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        if self.busy || self.close_failure.is_some() {
-            return Poll::Pending;
-        }
-        self.busy = true;
-        let polled = self.poll_native_exit_inner(cx);
-        self.busy = false;
-        polled
-    }
-    fn poll_native_exit_inner(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        if let Some(exit) = self.original.exit.as_mut() {
-            match exit.poll_exit(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(value) => self.exit_receipt = Some(value),
-            }
-            drop(self.original.exit.take());
-        }
-        if self.exit_receipt.as_ref().is_some_and(Result::is_err) {
-            self.close_failure = Some(self.admission.health.clone());
-            return Poll::Pending;
         }
         Poll::Ready(Ok(()))
     }
@@ -966,18 +934,6 @@ mod tests {
             QueryExecutionError,
         > {
             panic!("Local EXPLAIN cannot start Native work")
-        }
-        fn start_computation(
-            &self,
-            _: crate::query_execution::logical_execution::PreparedLogicalComputation,
-            _: WorkOwner,
-            _: QueryResultCapacityBinding,
-            _: Option<ReservedExecutionIdentity>,
-            #[cfg(novarocks_dev_controls)] _: Option<
-                crate::preparation_diagnostics::StatementObservationHandle,
-            >,
-        ) -> QueryExecutionFuture {
-            panic!("the retired convenience start is not called")
         }
         fn start(
             &self,

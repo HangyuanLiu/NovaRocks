@@ -92,6 +92,7 @@ impl ProviderReadError {
         }
         self
     }
+    #[cfg(test)]
     pub(crate) fn fact(&self) -> Option<FailureFact> {
         match self {
             Self::Connector { error, .. } => Some(error.failure_fact()),

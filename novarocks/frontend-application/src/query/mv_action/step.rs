@@ -406,7 +406,6 @@ impl MvRefreshStepOriginal {
             input: &self.input,
             io: &self.io,
             store,
-            context: &self.context,
             owner,
         };
         if self
@@ -651,7 +650,6 @@ struct StepPort<'a, 'owner> {
     input: &'a Arc<CommandInput>,
     io: &'a Arc<MetadataIoAdmission>,
     store: &'a StateStoreOriginalOwner,
-    context: &'a ConnectorRequestContext,
     owner: &'a mut GovernedActionContext<'owner>,
 }
 impl MvRefreshProgressPort for StepPort<'_, '_> {

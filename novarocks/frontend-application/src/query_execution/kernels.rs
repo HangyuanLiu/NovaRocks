@@ -28,7 +28,6 @@ use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::package_freeze::CompiledPackageCarrier;
-use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::api::BackendTopologyService;
@@ -583,7 +582,6 @@ pub struct SessionCatalogResolver {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    connector_blocking_io: ConnectorBlockingIoSupervisor,
 }
 
 impl SessionCatalogResolver {
@@ -591,13 +589,11 @@ impl SessionCatalogResolver {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        connector_blocking_io: ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
-            connector_blocking_io,
         }
     }
 }
@@ -667,7 +663,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
 
 #[cfg(test)]
 mod session_catalog_tests {
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
     use novarocks_query_application::session_error::QueryServiceErrorKind;
     use novarocks_query_application::sql::catalog::SessionCatalogPort;
@@ -680,9 +676,6 @@ mod session_catalog_tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
-            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
-                tokio::runtime::Handle::current(),
-            ),
         )
     }
 
@@ -709,19 +702,10 @@ mod session_catalog_tests {
 
     #[tokio::test]
     async fn cancelled_external_namespace_lookup_stops_before_provider_call() {
-        let supervisor = crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
-            tokio::runtime::Handle::current(),
-        );
-        let (release, released) = mpsc::channel();
-        let held = supervisor.spawn_ordinary(move || {
-            released.recv().expect("release held call");
-        });
-
         let resolver = SessionCatalogResolver::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
-            supervisor,
         );
         let cancellation = novarocks_spi::connector::ConnectorStopOwner::new();
         let request = crate::connector::connector_request_context(None, cancellation.view())
@@ -737,8 +721,6 @@ mod session_catalog_tests {
             .external_namespace_exists(request, &capacity, "warehouse", "analytics")
             .await
             .expect_err("cancelled request must not reach the provider");
-        release.send(()).expect("release held call");
-        held.finish().await.expect("held call completes");
         drop(capacity);
         root.owner.complete();
         root.business.release();

@@ -604,21 +604,6 @@ impl OperationDispatcher {
         self.take_backend_lane_batch(backend, lane_index(DispatchLane::Control))
     }
 
-    /// Takes from one exact lane without letting unrelated ordinary work hide
-    /// an urgent lifecycle operation queued for the same backend.
-    pub(super) fn take_priority_lane_batch(
-        &mut self,
-        backend: BackendProcessId,
-        lane: DispatchLane,
-    ) -> Option<DispatchBatch> {
-        let lane_index = lane_index(lane);
-        let queues = self.backends.get_mut(&backend)?;
-        if queues.credits[lane_index] == 0 {
-            queues.credits[lane_index] = self.budget.permits_for(lane);
-        }
-        self.take_backend_lane_batch(backend, lane_index)
-    }
-
     /// Takes only one already-queued exact head operation. Pending process
     /// observation uses this for actor-owned Abort, so ordinary lifecycle
     /// work cannot hitch a ride even though it shares the same lane.

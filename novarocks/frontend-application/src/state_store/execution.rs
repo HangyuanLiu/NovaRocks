@@ -1266,6 +1266,10 @@ enum PhysicalFailure {
     Reserve(QueryBlockingReserveRefusal),
     Publish(QueryBlockingPublishRefusal),
     Exit {
+        #[expect(
+            dead_code,
+            reason = "Preserve the exact actual-exit verdict alongside its original opaque cause in the diagnostic failure."
+        )]
         kind: QueryBlockingActualExitFailure,
         cause: Option<QueryBlockingFailure>,
     },

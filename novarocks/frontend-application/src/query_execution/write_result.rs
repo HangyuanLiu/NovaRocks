@@ -178,6 +178,7 @@ impl RootWriteDecodeFailure {
     ) {
         (self.message, self.source)
     }
+    #[cfg(test)]
     pub(crate) fn into_connector_error(self) -> novarocks_spi::connector::ConnectorError {
         let (message, source) = self.into_parts();
         match source {
@@ -922,19 +923,7 @@ pub(crate) mod tests {
     use arrow::datatypes::{DataType, Field};
     use novarocks_execution::exec::node::table_write_relation::RootWriteResultRelationSchema;
 
-    use crate::query_execution::write_barrier::WriteCommitBarrier;
-
     use super::*;
-
-    #[derive(Clone, Copy, Debug)]
-    enum CompletionFact {
-        RootRows,
-        RootEof,
-        ExecutionAllSuccess,
-        TaskFailure,
-        Cancelled,
-        DeadlineExpired,
-    }
 
     struct Row {
         kind: i8,
@@ -1521,89 +1510,6 @@ pub(crate) mod tests {
         assert!(decoder.apply_record(&record[..record.len() - 1]).is_err());
     }
 
-    fn permutations(facts: &[CompletionFact]) -> Vec<Vec<CompletionFact>> {
-        if facts.is_empty() {
-            return vec![Vec::new()];
-        }
-        let mut result = Vec::new();
-        for index in 0..facts.len() {
-            let mut remaining = facts.to_vec();
-            let fact = remaining.remove(index);
-            for mut suffix in permutations(&remaining) {
-                let mut permutation = Vec::with_capacity(facts.len());
-                permutation.push(fact);
-                permutation.append(&mut suffix);
-                result.push(permutation);
-            }
-        }
-        result
-    }
-
-    fn causal_permutations(facts: &[CompletionFact]) -> Vec<Vec<CompletionFact>> {
-        permutations(facts)
-            .into_iter()
-            .filter(|order| {
-                let rows = order
-                    .iter()
-                    .position(|fact| matches!(fact, CompletionFact::RootRows))
-                    .expect("test case has Root rows");
-                let eof = order
-                    .iter()
-                    .position(|fact| matches!(fact, CompletionFact::RootEof))
-                    .expect("test case has Root EOF");
-                rows < eof
-            })
-            .collect()
-    }
-
-    fn observe_completion_fact(
-        decoder: &mut RootWriteResultDecoder,
-        barrier: &mut WriteCommitBarrier,
-        fact: CompletionFact,
-    ) -> Result<(), String> {
-        match fact {
-            CompletionFact::RootRows => decoder
-                .apply_chunk(&chunk(vec![
-                    summary(7),
-                    fragment(0, 3),
-                    artifact(0, 11, "theta-v1", b"sketch"),
-                ]))
-                .map_err(|error| error.to_string()),
-            CompletionFact::RootEof => decoder
-                .observe_root_eof()
-                .map_err(|error| error.to_string()),
-            CompletionFact::ExecutionAllSuccess => {
-                barrier.observe_execution_terminals(true);
-                Ok(())
-            }
-            CompletionFact::TaskFailure => {
-                barrier.observe_execution_terminals(false);
-                Ok(())
-            }
-            CompletionFact::Cancelled => {
-                barrier.observe_cancelled();
-                Ok(())
-            }
-            CompletionFact::DeadlineExpired => {
-                barrier.observe_deadline_expired();
-                Ok(())
-            }
-        }
-    }
-
-    fn run_completion_order(order: &[CompletionFact]) -> Result<DecodedPreparedWriteSet, String> {
-        let mut decoder = exact_decoder();
-        let mut barrier = WriteCommitBarrier::new();
-        for fact in order {
-            observe_completion_fact(&mut decoder, &mut barrier, *fact)?;
-        }
-        let prepared = decoder.finish().map_err(|error| error.to_string())?;
-        barrier.observe_prepared_write_set(prepared);
-        barrier
-            .into_committable()
-            .map_err(|blocked| blocked.as_str().to_string())
-    }
-
     #[test]
     fn a_complete_set_spans_several_batches_and_keeps_its_fragments() {
         let mut decoder = new_decoder(2);
@@ -1819,113 +1725,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exact_root_rows_eof_and_all_success_accept_every_causal_arrival_order() {
-        // Root rows necessarily precede Root EOF, but execution convergence is
-        // independent and may be observed before, between, or after them.
-        let facts = [
-            CompletionFact::RootRows,
-            CompletionFact::RootEof,
-            CompletionFact::ExecutionAllSuccess,
-        ];
-        let orders = causal_permutations(&facts);
-        assert_eq!(orders.len(), 3);
-
-        for order in orders {
-            let prepared = run_completion_order(&order).expect("completion facts open the gate");
-            assert_eq!(prepared.row_count(), 7, "{order:?}");
-            assert_eq!(prepared.fragments().len(), 1, "{order:?}");
-            assert_eq!(prepared.fragments()[0].1, vec![7_u8; 3], "{order:?}");
-            assert_eq!(prepared.statistics.len(), 1, "{order:?}");
-            assert_eq!(prepared.statistics[0].target().get(), 0, "{order:?}");
-            assert_eq!(
-                prepared.statistics[0].draft().identity().input_fields(),
-                &[11],
-                "{order:?}"
-            );
-            assert_eq!(
-                prepared.statistics[0].draft().body().as_ref(),
-                b"sketch",
-                "{order:?}"
-            );
-        }
+    fn exact_root_rows_and_eof_preserve_the_original_complete_payload() {
+        let mut decoder = exact_decoder();
+        decoder
+            .apply_chunk(&chunk(vec![
+                summary(7),
+                fragment(0, 3),
+                artifact(0, 11, "theta-v1", b"sketch"),
+            ]))
+            .unwrap();
+        decoder.observe_root_eof().unwrap();
+        let prepared = decoder.finish().expect("complete Root relation");
+        assert_eq!(prepared.row_count(), 7);
+        assert_eq!(prepared.fragments().len(), 1);
+        assert_eq!(prepared.fragments()[0].1, vec![7_u8; 3]);
+        assert_eq!(prepared.statistics.len(), 1);
+        assert_eq!(prepared.statistics[0].target().get(), 0);
+        assert_eq!(
+            prepared.statistics[0].draft().identity().input_fields(),
+            &[11]
+        );
+        assert_eq!(prepared.statistics[0].draft().body().as_ref(), b"sketch");
     }
 
     #[test]
-    fn root_eof_before_rows_rejects_every_noncausal_arrival_order() {
-        let facts = [
-            CompletionFact::RootRows,
-            CompletionFact::RootEof,
-            CompletionFact::ExecutionAllSuccess,
-        ];
-        let orders = permutations(&facts)
-            .into_iter()
-            .filter(|order| {
-                let rows = order
-                    .iter()
-                    .position(|fact| matches!(fact, CompletionFact::RootRows))
-                    .expect("Root rows");
-                let eof = order
-                    .iter()
-                    .position(|fact| matches!(fact, CompletionFact::RootEof))
-                    .expect("Root EOF");
-                eof < rows
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(orders.len(), 3);
-
-        for order in orders {
-            let error = run_completion_order(&order).expect_err("EOF closes the Root stream");
-            assert!(
-                error.contains("trailing batch after EOF"),
-                "{order:?}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn task_failure_cancel_and_deadline_veto_every_causal_arrival_order() {
-        let cases: &[(&str, &[CompletionFact], usize, &str)] = &[
-            (
-                "task failure",
-                &[
-                    CompletionFact::RootRows,
-                    CompletionFact::RootEof,
-                    CompletionFact::TaskFailure,
-                ],
-                3,
-                "did not reach a success-compatible terminal",
-            ),
-            (
-                "cancellation",
-                &[
-                    CompletionFact::RootRows,
-                    CompletionFact::RootEof,
-                    CompletionFact::ExecutionAllSuccess,
-                    CompletionFact::Cancelled,
-                ],
-                12,
-                "cancelled",
-            ),
-            (
-                "deadline",
-                &[
-                    CompletionFact::RootRows,
-                    CompletionFact::RootEof,
-                    CompletionFact::ExecutionAllSuccess,
-                    CompletionFact::DeadlineExpired,
-                ],
-                12,
-                "deadline expired",
-            ),
-        ];
-
-        for (name, facts, expected_orders, expected_error) in cases {
-            let orders = causal_permutations(facts);
-            assert_eq!(orders.len(), *expected_orders, "{name}");
-            for order in orders {
-                let error = run_completion_order(&order).expect_err("must not commit");
-                assert!(error.contains(expected_error), "{name} {order:?}: {error}");
-            }
-        }
+    fn root_eof_before_rows_rejects_the_original_trailing_batch() {
+        let mut decoder = exact_decoder();
+        decoder.observe_root_eof().unwrap();
+        let error = decoder
+            .apply_chunk(&chunk(vec![
+                summary(7),
+                fragment(0, 3),
+                artifact(0, 11, "theta-v1", b"sketch"),
+            ]))
+            .expect_err("EOF closes the Root stream");
+        assert!(error.to_string().contains("trailing batch after EOF"));
     }
 }

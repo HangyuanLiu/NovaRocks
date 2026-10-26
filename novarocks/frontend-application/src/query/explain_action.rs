@@ -449,18 +449,6 @@ mod tests {
         > {
             panic!("Local EXPLAIN cannot start Native work")
         }
-        fn start_computation(
-            &self,
-            _: crate::query_execution::logical_execution::PreparedLogicalComputation,
-            _: WorkOwner,
-            _: QueryResultCapacityBinding,
-            _: Option<ReservedExecutionIdentity>,
-            #[cfg(novarocks_dev_controls)] _: Option<
-                crate::preparation_diagnostics::StatementObservationHandle,
-            >,
-        ) -> QueryExecutionFuture {
-            panic!("the retired convenience start is not called")
-        }
         fn start(
             &self,
             _: crate::query_execution::completion::PreparedLogicalRead,

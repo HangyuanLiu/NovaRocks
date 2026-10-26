@@ -160,6 +160,7 @@ impl MvReadinessPort {
         self.controls.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn in_execution<'a>(
         &'a self,
         execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
@@ -366,6 +367,7 @@ impl MvReadinessExecution<'_> {
             )
             .await
     }
+    #[cfg(test)]
     pub(crate) async fn query_admission(
         &self,
         target: &MvTarget,
@@ -444,6 +446,7 @@ impl MvReadinessExecution<'_> {
 
 impl MvCandidateReader {
     /// A request clone retains only the exact weak Context, never a new owner.
+    #[cfg(test)]
     pub(crate) fn in_execution(
         &self,
         execution: &novarocks_state_store_api::StateStoreExecutionContext,

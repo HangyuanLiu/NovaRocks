@@ -25,7 +25,7 @@ use crate::query_execution::{
         test_fixture::internal_statistics_description,
     },
     internal_result_cpu::InternalResultCpuOwner,
-    statistics::{StatisticsCollectionProgram, StatisticsExecutionPolicy},
+    statistics::StatisticsCollectionProgram,
 };
 use arrow::{
     array::{ArrayRef, BinaryArray, Int32Builder, ListBuilder, MapBuilder, StringArray},
@@ -77,7 +77,6 @@ fn original_program() -> StatisticsCollectionProgram {
         .unwrap(),
         Some(7),
         vec![required],
-        StatisticsExecutionPolicy::try_new(Duration::from_secs(30)).unwrap(),
     )
     .unwrap();
     assert_eq!(program.required_aggregations().len(), 1);

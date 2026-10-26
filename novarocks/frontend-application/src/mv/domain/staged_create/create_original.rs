@@ -83,8 +83,6 @@ pub(crate) struct CreateOriginalInput {
     pub(crate) cancellation: QueryCancellationView,
     pub(crate) io: Arc<MetadataIoAdmission>,
     pub(crate) cpu: MvRefreshTurnCustody,
-    // The Action retains the strong same-Root StateStore owner independently.
-    pub(crate) requests: Arc<dyn StateStoreExecutionRequests>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct CreatePhaseFailure {
@@ -1830,7 +1828,6 @@ mod original_stage_tests {
                 cancellation,
                 io: io.clone(),
                 cpu: turn,
-                requests,
             })
             .unwrap();
             source.prepare().await;

@@ -3479,7 +3479,6 @@ pub(crate) mod tests {
 
     #[test]
     fn the_frontend_write_path_composes_from_begin_to_commit() {
-        use crate::query_execution::write_barrier::WriteCommitBarrier;
         use novarocks_plan_codec::SealedWriteTargets;
 
         let fixture = fixture_with_outcome(
@@ -3514,37 +3513,31 @@ pub(crate) mod tests {
             )],
         );
 
-        // 3. Both facts, then and only then the commit.
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(prepared);
-        barrier.observe_execution_terminals(true);
-        let committable = barrier.into_committable().expect("both facts hold");
-        assert_eq!(committable.row_count(), 7);
-
-        let outcome = fixture
+        // 3. The same session interprets and accepts this exact generation;
+        //    Task readiness belongs to the registered consumer component tests.
+        let decoded = fixture
             .session
-            .publish_prepared_for_test(committable, request_context())
-            .expect("finish reaches the connector");
+            .computation_decode(&[WriteTargetOrdinal::try_new(0).expect("ordinal")])
+            .unwrap()
+            .interpret(prepared)
+            .unwrap();
+        let accepted = fixture.session.receiving_port().accept(decoded).unwrap();
+        assert!(accepted.belongs_to(&fixture.session));
+        assert_eq!(accepted.row_count(), 7);
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.poll_completed(&mut cx).is_ready());
+        let mut outcome = None;
+        call.take_outcome_in(&mut outcome).unwrap();
+        let outcome = outcome.unwrap().expect("finish reaches the connector");
         assert!(matches!(
             outcome,
             novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted { .. }
         ));
         assert_eq!(fixture.session.finish_invocations(), 1);
-    }
-
-    /// The same composition, stopped by a failed participant. The connector is
-    /// never asked to commit, which is the whole point of splitting the gate.
-    #[test]
-    fn a_failed_participant_stops_the_composed_path_before_the_connector() {
-        use crate::query_execution::write_barrier::WriteCommitBarrier;
-
-        let fixture = fixture(1, 16);
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(empty_prepared());
-        barrier.observe_execution_terminals(false);
-        assert!(barrier.into_committable().is_err());
-        assert_eq!(fixture.session.finish_invocations(), 0);
-        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
     }
 
     /// A copy-on-write mutation and a distributed rewrite drive several

@@ -104,20 +104,6 @@ pub(crate) fn validate_target_snapshot_observed(
     Ok(())
 }
 
-fn published_target_snapshot_id(
-    projection: &StoredKeyedMvProjection,
-) -> Result<Option<i64>, String> {
-    if projection.facts.publication().is_some() {
-        projection
-            .facts
-            .publication_snapshot()
-            .map(Some)
-            .ok_or_else(|| "published Iceberg MV output has no provider snapshot ID".to_string())
-    } else {
-        Ok(projection.facts.metadata_version().snapshot_id())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +126,7 @@ mod tests {
             facts: fixture.build().expect("projection"),
         };
 
-        assert_eq!(published_target_snapshot_id(&projection).unwrap(), Some(12));
+        assert_eq!(projection.facts.publication_snapshot(), Some(12));
     }
 
     #[test]
@@ -154,7 +140,7 @@ mod tests {
             .build()
             .expect("never published projection"),
         };
-        assert_eq!(published_target_snapshot_id(&projection).unwrap(), None);
+        assert_eq!(projection.facts.publication_snapshot(), None);
         let mut empty = ProjectionFixture::new(
             ProductMvTarget::from_parts(Some("ice"), "sales", "mv"),
             Some(11),
@@ -165,7 +151,7 @@ mod tests {
             mv_id: 1,
             facts: empty.build().unwrap(),
         };
-        assert_eq!(published_target_snapshot_id(&empty).unwrap(), Some(11));
+        assert_eq!(empty.facts.publication_snapshot(), Some(11));
     }
 
     #[test]
@@ -198,7 +184,7 @@ mod tests {
             facts: fixture.build().unwrap(),
         };
         assert!(projection.facts.never_published());
-        assert_eq!(published_target_snapshot_id(&projection).unwrap(), Some(11));
+        assert_eq!(projection.facts.metadata_version().snapshot_id(), Some(11));
         let (_, current) =
             novarocks_mv_application::persistence::keyed_documents::keyed_view_fixture(
                 Some(12),

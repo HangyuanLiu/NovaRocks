@@ -29,10 +29,8 @@ pub(super) enum BuildError {
     ResourceExhausted,
     Allocation(TryReserveError),
     Original(novarocks_spi::connector::OriginalResultCheckError),
-    Control(novarocks_spi::connector::ConnectorError),
     Compile(novarocks_type_contract::CompileControlError),
     Constant(novarocks_functions::ConstantError),
-    Copy(novarocks_functions::selected_copy::CopyError),
     Kernel(novarocks_functions::KernelFailure),
     ArrayProjection(novarocks_functions::array_projection::ArrayProjectionFailure),
     Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
@@ -47,10 +45,8 @@ impl fmt::Display for BuildError {
                 f.write_str("COW AST construction resource exhausted")
             }
             Self::Original(error) => error.fmt(f),
-            Self::Control(error) => error.fmt(f),
             Self::Compile(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
-            Self::Copy(error) => error.fmt(f),
             Self::Kernel(error) => error.fmt(f),
             Self::ArrayProjection(error) => error.fmt(f),
             Self::Layout(error) => write!(f, "COW construction layout: {error:?}"),
@@ -65,10 +61,8 @@ impl std::error::Error for BuildError {
         match self {
             Self::Allocation(error) => Some(error),
             Self::Original(error) => Some(error),
-            Self::Control(error) => Some(error),
             Self::Compile(error) => Some(error),
             Self::Constant(error) => Some(error),
-            Self::Copy(error) => Some(error),
             Self::Kernel(error) => Some(error),
             Self::ArrayProjection(error) => Some(error),
             Self::ValueType(error) => Some(error),

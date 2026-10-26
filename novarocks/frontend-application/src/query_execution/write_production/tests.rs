@@ -138,10 +138,6 @@ fn decoder(
 #[test]
 fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_complete() {
     for targets in [1, 2] {
-        let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
-        barrier.observe_execution_terminals(true);
-        assert!(barrier.into_committable().is_err());
-
         let (control, mut driver) = original_runtime();
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))

@@ -229,20 +229,14 @@ impl From<crate::query_execution::dml::mutation_flow::CowFailure> for DmlExecuti
 /// Positive stage evidence retained independently of final publication.
 #[derive(Debug)]
 pub struct DmlStagedCreateFailure {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "retained as typed staged-create evidence in DML failure diagnostics"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retain the original positive staged-create receipt and finalization evidence in DML failure diagnostics."
     )]
     pub receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "retained as typed staged-create evidence in DML failure diagnostics"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retain the original positive staged-create receipt and finalization evidence in DML failure diagnostics."
     )]
     pub finalization: novarocks_spi::connector::ExternalMutationFinalization,
 }

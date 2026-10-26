@@ -122,10 +122,6 @@ impl MvCpuJob {
         Poll::Ready(original.retire_sources())
     }
 
-    pub(crate) async fn close(&mut self) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
-        std::future::poll_fn(|cx| self.poll_closed(cx)).await
-    }
-
     pub(crate) fn local_health_failure(
         &self,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {

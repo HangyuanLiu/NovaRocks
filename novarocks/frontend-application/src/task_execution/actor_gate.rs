@@ -1171,7 +1171,38 @@ mod tests {
 
     #[tokio::test]
     async fn ingress_refusal_after_unknown_admission_keeps_context_abort_owner() {
+        use crate::task_execution::abort_effect::{
+            NativeAbortEffect, NativeAbortEffectIntake, NativeAbortEffectSettlement,
+        };
+        use novarocks_query_application::coordination::{
+            ContextClosureState, LogicalExecutionJoinReadiness,
+        };
+
+        async fn next_abort(intake: &mut NativeAbortEffectIntake) -> NativeAbortEffect {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match intake.try_recv() {
+                        Ok(effect) => return effect,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            panic!("the original actor Abort intake must remain connected");
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the original actor must progress its Abort")
+        }
+
         let context = context(BackendProcessId::new_v7());
+        let (mut logical, drive, mut abort_intake) = logical_execution(context).await;
+        let (sink, mut gate, observer) = ActorGatedTaskOperationSink::pair(
+            Arc::new(CountingSink::default()),
+            Arc::new(CountingWake::default()),
+            NativeCompatibilityId::new([31; 32]),
+        );
         let mut owner = QueryContextOwner::new(
             context,
             0,
@@ -1185,21 +1216,60 @@ mod tests {
         else {
             panic!("the context must begin admission");
         };
-        owner
-            .on_admission_ack(
-                &OperationAcknowledgement::transport_unknown(
-                    request.envelope().operation_id(),
-                    OperationKind::AcquireQueryContextAdmissionTicket,
-                ),
-                MonotonicInstant::ORIGIN,
-            )
-            .unwrap();
-        assert!(
-            owner
-                .admission_intent(MonotonicInstant::ORIGIN)
-                .unwrap()
-                .is_some()
+        let retained = match sink.try_submit(batch(
+            context.backend_process_id(),
+            OperationIntent::AcquireQueryContextAdmissionTicket(request),
+        )) {
+            TaskOperationSubmit::Backpressured(retained) => retained,
+            other => panic!("the original actor must authorize admission first: {other:?}"),
+        };
+        assert_eq!(gate.drive(&drive).await.unwrap(), 1);
+        assert!(matches!(
+            sink.try_submit(retained),
+            TaskOperationSubmit::Accepted
+        ));
+        let unknown = OperationAcknowledgement::transport_unknown(
+            request.envelope().operation_id(),
+            OperationKind::AcquireQueryContextAdmissionTicket,
         );
+        observer.observe_acknowledgement(&unknown).unwrap();
+        owner
+            .on_admission_ack(&unknown, MonotonicInstant::ORIGIN)
+            .unwrap();
+        assert_eq!(gate.drive(&drive).await.unwrap(), 0);
+        assert!(
+            gate.admission_transport_unknowns
+                .contains(&request.envelope().operation_id())
+        );
+        let replay = owner
+            .admission_intent(MonotonicInstant::ORIGIN)
+            .unwrap()
+            .unwrap();
+        let OperationIntent::AcquireQueryContextAdmissionTicket(replayed_request) = replay else {
+            panic!("unknown admission must retain its original request");
+        };
+        assert_eq!(replayed_request.envelope(), request.envelope());
+        assert_eq!(replayed_request.context(), request.context());
+        assert_eq!(replayed_request.valid_for(), request.valid_for());
+        assert_eq!(
+            replayed_request.native_compatibility_id(),
+            request.native_compatibility_id()
+        );
+        assert!(
+            replayed_request.admission_epoch_capability() == request.admission_epoch_capability()
+        );
+        let retained = match sink.try_submit(batch(
+            context.backend_process_id(),
+            OperationIntent::AcquireQueryContextAdmissionTicket(replayed_request),
+        )) {
+            TaskOperationSubmit::Backpressured(retained) => retained,
+            other => panic!("the exact admission replay needs actor authorization: {other:?}"),
+        };
+        assert_eq!(gate.drive(&drive).await.unwrap(), 1);
+        assert!(matches!(
+            sink.try_submit(retained),
+            TaskOperationSubmit::Accepted
+        ));
         let refusal = OperationAcknowledgement::from_dispatch_result(
             request.envelope().operation_id(),
             OperationKind::AcquireQueryContextAdmissionTicket,
@@ -1208,6 +1278,7 @@ mod tests {
             ),
             AckPayload::None,
         );
+        observer.observe_acknowledgement(&refusal).unwrap();
         assert!(matches!(
             owner.on_admission_ack(&refusal, MonotonicInstant::ORIGIN),
             Err(TaskExecutionError::DispatchRejected {
@@ -1216,11 +1287,118 @@ mod tests {
             })
         ));
         assert!(!owner.is_released());
+        assert!(matches!(
+            gate.drive(&drive).await,
+            Err(TaskExecutionError::Actor(
+                LogicalExecutionActorError::Establish(EstablishIssueError::AdmissionRejected)
+            ))
+        ));
+        assert_eq!(
+            logical.actor_snapshot().await.unwrap().establish_error,
+            Some(EstablishIssueError::AdmissionRejected)
+        );
+        assert!(gate.prepare_convergence());
+        owner.begin_terminal_cleanup();
+        assert!(!owner.is_released());
         assert!(
             owner
-                .abort_intent(novarocks_execution::task_execution::AbortCause::QueryFailed)
-                .is_some()
+                .admission_intent(MonotonicInstant::ORIGIN)
+                .unwrap()
+                .is_none()
         );
+        drop(drive);
+        logical.abandon_running_attempt();
+
+        let first = next_abort(&mut abort_intake).await;
+        let OperationIntent::AbortQueryContext(first_request) = first.intent() else {
+            panic!("the original logical actor must own context Abort");
+        };
+        let first_request = *first_request;
+        assert_eq!(first_request.context(), context);
+        assert_eq!(
+            first_request.cause(),
+            novarocks_execution::task_execution::AbortCause::QueryFailed
+        );
+        let operation_id = first_request.envelope().operation_id();
+        let late = match first
+            .settle(&OperationAcknowledgement::transport_unknown(
+                operation_id,
+                OperationKind::AbortQueryContext,
+            ))
+            .unwrap()
+        {
+            NativeAbortEffectSettlement::TransportUnknown(late) => late,
+            NativeAbortEffectSettlement::WorkerSettled => {
+                panic!("unknown Abort cannot close the context")
+            }
+        };
+        assert!(!owner.is_released());
+        let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+        assert!(!matches!(
+            snapshot.closure(),
+            ContextClosureState::TerminalRetained | ContextClosureState::Gone
+        ));
+        assert!(!snapshot.closure().residual_resource_settled());
+        assert_eq!(late.identity().context(), context);
+        assert_eq!(late.identity().operation_id(), operation_id);
+
+        let second = next_abort(&mut abort_intake).await;
+        let OperationIntent::AbortQueryContext(second_request) = second.intent() else {
+            panic!("the exact actor replay must remain context Abort");
+        };
+        assert_eq!(second_request.envelope(), first_request.envelope());
+        assert_eq!(second_request.context(), first_request.context());
+        assert_eq!(second_request.cause(), first_request.cause());
+        let terminal = OperationAcknowledgement::worker_receipt(
+            operation_id,
+            OperationKind::AbortQueryContext,
+            OperationOutcome::ContextTerminalReceipt,
+            AckPayload::Context(QueryContextReceipt::new(
+                context,
+                QueryContextState::TerminalRetained,
+            )),
+        );
+        assert!(matches!(
+            second.settle(&terminal).unwrap(),
+            NativeAbortEffectSettlement::WorkerSettled
+        ));
+        late.resolved_by_other_generation();
+        // This is the same post-validation projection used by TaskRound. This
+        // test drives the authors directly, not the TaskRound dispatcher.
+        owner.observe_actor_abort_closure();
+        assert!(owner.is_released());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logical
+                    .stand_down_snapshot(context)
+                    .await
+                    .unwrap()
+                    .is_some_and(|snapshot| {
+                        snapshot.closure() == ContextClosureState::TerminalRetained
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exact Worker receipt must reach the original actor");
+        assert!(
+            !matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ),
+            "a terminal context is not actual Worker stop"
+        );
+        logical
+            .observe_worker_stopped_and_context_fenced(context)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

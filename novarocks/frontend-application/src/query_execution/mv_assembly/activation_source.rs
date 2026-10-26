@@ -137,19 +137,6 @@ impl MvWritePreparationCustody {
             assembly_ready: false,
         }
     }
-    pub(crate) fn session(&self) -> &Arc<ConnectorWriteSession> {
-        &self.session
-    }
-    pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        self.turn
-            .local_health_failure()
-            .or_else(|| self.provider.local_health_failure())
-            .or_else(|| self.io.local_health_failure())
-            .or_else(|| match &self.failure {
-                Some(MvWritePreparationFailure::Health(failure)) => Some(failure.clone()),
-                _ => None,
-            })
-    }
     /// This future only borrows the original custody stored in its Action.
     /// Failure is received here before its Product observer can be notified.
     pub(crate) async fn prepare(&mut self) -> Result<(), MvWritePreparationFailure> {

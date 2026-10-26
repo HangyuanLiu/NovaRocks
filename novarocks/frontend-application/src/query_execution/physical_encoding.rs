@@ -274,15 +274,6 @@ impl EncodedStaticPlan {
             access: mapping,
         })
     }
-    pub(crate) fn bind_access(
-        self,
-        access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
-            FrozenProviderRead,
-        >,
-    ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
-        let (_, capabilities) = split_frozen_reads(access);
-        self.bind_capabilities(capabilities)
-    }
     fn bind_capabilities(
         self,
         capabilities: BTreeMap<ProviderReadOccurrenceId, FrozenReadCapability>,

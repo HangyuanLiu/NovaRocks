@@ -282,7 +282,7 @@ mod tests {
     use crate::query_execution::internal_result_cpu::{
         InternalResultCpuOwner, InternalResultValue, admitted_internal_fixture,
     };
-    use crate::task_execution::status_intake::CondvarWake;
+    use crate::task_execution::status_intake::TestIntakeWake;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use std::{
         num::NonZeroU64,
@@ -385,7 +385,7 @@ mod tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             |source, _| Err::<InternalDomainSlot, _>(InternalDomainFailure::from(source)),
         );
         let failure = match claim(&mut job).await {
@@ -435,7 +435,7 @@ mod tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             move |slot, _| slot.finish_eof(end),
         );
         let checked_eof = claim(&mut eof).await.unwrap();
@@ -447,7 +447,7 @@ mod tests {
             checked_eof.track_actual_exit(&binding).unwrap(),
             cancellation.view(),
             &runtime,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             |slot, _| slot.finish_statistics(),
         );
         let finished = claim(&mut finalization).await.unwrap();
@@ -525,7 +525,7 @@ mod tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(CondvarWake::default()),
+            Arc::new(TestIntakeWake::default()),
             |(slot, reply), _| slot.apply_body(Arc::new(reply)),
         );
         assert!(claim(&mut job).await.is_err());

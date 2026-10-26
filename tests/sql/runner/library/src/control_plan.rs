@@ -1076,7 +1076,6 @@ mod tests {
             "SELECT 1",
             QueryMeta {
                 query_lifecycle_structured_assertion: Some(QueryLifecycleStructuredAssertion {
-                    error_source: None,
                     runtime_filter_availability: None,
                     runtime_filter_details: vec![],
                     runtime_filter_totals_at_least: vec![],

@@ -47,12 +47,6 @@ impl PreparationError {
             message,
         ))
     }
-    pub(crate) fn pre_commit(message: impl Into<String>) -> Self {
-        Self(MvApplicationError::new(
-            MvApplicationErrorKind::Engine,
-            message,
-        ))
-    }
 }
 impl std::fmt::Display for PreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,9 +89,6 @@ impl From<crate::mv::domain::lifecycle::RefreshError> for PreparationError {
             match e.kind {
                 crate::mv::domain::lifecycle::RefreshErrorKind::UserError => {
                     MvApplicationErrorKind::InvalidRequest
-                }
-                crate::mv::domain::lifecycle::RefreshErrorKind::PreCommitFailed => {
-                    MvApplicationErrorKind::Engine
                 }
             },
             e.message.clone(),

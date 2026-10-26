@@ -192,6 +192,7 @@ impl TaskNode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageNode {
     stage: StageRef,
+    #[cfg(test)]
     fragment_id: FragmentId,
     #[cfg(test)]
     tasks: Vec<TaskId>,
@@ -206,6 +207,7 @@ impl StageNode {
         self.stage.stage_id()
     }
 
+    #[cfg(test)]
     pub const fn fragment_id(&self) -> FragmentId {
         self.fragment_id
     }
@@ -698,13 +700,14 @@ pub(crate) fn build_task_graph_from_manifest(
     }
 
     let stages = stage_fragments
-        .iter()
-        .map(|(&stage_id, &fragment_id)| {
+        .keys()
+        .map(|&stage_id| {
             (
                 stage_id,
                 StageNode {
                     stage: StageRef::new(manifest.execution(), stage_id),
-                    fragment_id,
+                    #[cfg(test)]
+                    fragment_id: stage_fragments[&stage_id],
                     #[cfg(test)]
                     tasks: tasks
                         .iter()

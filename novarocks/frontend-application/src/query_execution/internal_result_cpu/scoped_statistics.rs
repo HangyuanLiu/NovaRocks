@@ -214,16 +214,6 @@ impl StatisticsPlanCpuJob {
         Self::return_access(original, custody);
         original.retire_sources()
     }
-    pub(crate) fn local_health_failure(
-        &self,
-    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
-        self.original.health_failure().map(|cause| {
-            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
-                "original Statistics CPU exit is unproven",
-                cause,
-            )
-        })
-    }
 }
 
 use novarocks_spi::connector::{
@@ -244,7 +234,6 @@ pub(super) enum CreatorCpuMode {
     InternalProvider,
     ForegroundBinding,
     ForegroundRead,
-    RewriteProvider,
     ProviderMetadata,
     ProviderMetadataSettlement(
         Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
@@ -579,8 +568,7 @@ impl StatisticsCpuPort for ScopedProviderCreatorCpu {
         })?;
         if matches!(
             self.mode,
-            CreatorCpuMode::RewriteProvider
-                | CreatorCpuMode::RewriteBound { .. }
+            CreatorCpuMode::RewriteBound { .. }
                 | CreatorCpuMode::ProviderMetadata
                 | CreatorCpuMode::ProviderMetadataSettlement(_)
         ) {

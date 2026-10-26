@@ -427,7 +427,6 @@ impl MvCreateStepOriginal {
                 cancellation,
                 io: self.io.clone(),
                 cpu: p.turn.take().unwrap(),
-                requests: self.requests.clone(),
             });
             self.in_foreign = false;
             let source = match constructed {

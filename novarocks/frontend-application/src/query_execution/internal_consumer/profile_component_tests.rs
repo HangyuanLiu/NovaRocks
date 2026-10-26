@@ -775,6 +775,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         release: Some(first_release),
         pending_upstream: None,
         scope,
+        cancellation_requester: None,
         capacity: result_capacity,
         clock: actor_clock,
         plan,

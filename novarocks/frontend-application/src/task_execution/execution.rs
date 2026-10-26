@@ -1513,7 +1513,6 @@ impl QueryTaskExecution {
                         _ => Ok(()),
                     })
             }
-            OperationKind::AbortQueryContext => owner.on_abort_ack(ack),
             kind => Err(TaskExecutionError::MissingReceipt(kind)),
         }
     }

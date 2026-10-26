@@ -933,12 +933,6 @@ fn routed_distributed_query_failure(
     }
 }
 
-fn dml_statement_result(
-    result: Result<(), crate::dml::DmlError>,
-) -> Result<StatementResult, RoutedExecutionError> {
-    dml_result(result).map(|()| StatementResult::Ok)
-}
-
 fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
     result.map_err(|mut error| {
         if let Some(original) = error.application_error() {
@@ -2577,7 +2571,7 @@ impl FrontendQuerySession {
             use crate::query_execution::dml::delete::{DeleteStatement, OwnedDeleteStatement};
             let borrowed = match &delete_statement {
                 OwnedDeleteStatement::Predicate(value) => DeleteStatement::Predicate(value),
-                OwnedDeleteStatement::Equality(value) => DeleteStatement::Equality(value),
+                OwnedDeleteStatement::Equality(_) => DeleteStatement::Equality,
             };
             if let Err(error) = dml.admit_delete_shape(borrowed, &sql) {
                 return Ok(self.governed_typed_error(
@@ -3603,10 +3597,6 @@ mod tests {
     use novarocks_workload_control::{
         CancellationReason as WorkCancellationReason, ResourceConfig,
     };
-
-    fn default_query_options() -> QueryOptions {
-        QueryOptions::from_proto(novarocks_proto_models::novarocks::QueryOptions::default())
-    }
 
     #[test]
     fn typed_command_result_capacity_follows_output_purpose() {

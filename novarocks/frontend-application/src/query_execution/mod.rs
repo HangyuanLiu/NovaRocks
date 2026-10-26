@@ -69,7 +69,6 @@ pub(crate) mod schedule;
 pub(crate) mod split_assignment;
 pub(crate) mod split_assignment_round;
 pub mod statistics;
-pub(crate) mod write_barrier;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
 

@@ -48,6 +48,7 @@ impl TerminationLatch {
         self.first.as_ref()
     }
 
+    #[cfg(test)]
     pub const fn is_latched(&self) -> bool {
         self.first.is_some()
     }

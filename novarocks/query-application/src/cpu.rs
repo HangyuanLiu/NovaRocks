@@ -2783,6 +2783,95 @@ mod joint_queue_tests {
         drop(receipt);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn undelivered_original_panic_drop_keeps_the_actual_successor_in_the_worker_entry() {
+        struct Successor(Arc<AtomicUsize>);
+        impl Drop for Successor {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Original {
+            dropped: Arc<AtomicUsize>,
+            successor: Option<Successor>,
+        }
+        impl Drop for Original {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                let successor = self.successor.take().unwrap();
+                if std::thread::panicking() {
+                    // A failed prerequisite must not abort the test binary.
+                    drop(successor);
+                } else {
+                    std::panic::panic_any(successor);
+                }
+            }
+        }
+        let (control, handle, mut driver) = joint_fixture();
+        let root = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let mut pending = request(&handle, &root.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let original_drops = Arc::new(AtomicUsize::new(0));
+        let successor_drops = Arc::new(AtomicUsize::new(0));
+        let input = Original {
+            dropped: Arc::clone(&original_drops),
+            successor: Some(Successor(Arc::clone(&successor_drops))),
+        };
+        let (started, did_start) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || -> usize {
+                        let _ = started.send(());
+                        let _ = released.recv_timeout(Duration::from_secs(5));
+                        std::panic::panic_any(input);
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        receive(&did_start).await;
+        let mut receipt = receipt.unwrap();
+        // Withdraw this actual result receiver before the original call returns.
+        // The same worker must destroy the undelivered original panic payload.
+        drop(receipt.receipt.take());
+        release.send(()).unwrap();
+        assert_eq!(
+            exited(&receipt).await,
+            Err(QueryBlockingActualExitFailure::FailedUnproven)
+        );
+        let cause = receipt.actual_exit_failure().unwrap();
+        assert!(cause.original_payload_is::<Successor>());
+        assert_eq!(original_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(successor_drops.load(Ordering::SeqCst), 0);
+        assert!(
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        let failure = owner.take_worker_failure().unwrap();
+        assert!(failure.cause().unwrap().shares_original_with(&cause));
+        let alias = cause.clone();
+        // Explicit failed-entry disposition and physical guard release are
+        // separate from the last raw payload alias. Neither reports source success.
+        drop(failure);
+        drop(cause);
+        drop(receipt);
+        assert_eq!(successor_drops.load(Ordering::SeqCst), 0);
+        drop(alias);
+        assert_eq!(successor_drops.load(Ordering::SeqCst), 1);
+    }
+
     struct DropCount(Arc<AtomicUsize>);
     impl Drop for DropCount {
         fn drop(&mut self) {

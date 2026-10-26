@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -59,55 +59,32 @@ pub trait StatusIntakeWake: std::fmt::Debug + Send + Sync {
     fn wake(&self);
 }
 
-/// Wakes a runner parked on a condition variable.
-///
-/// The coordinator's statement thread is blocking rather than async, so it
-/// parks here instead of on a `Notify` it would have to enter a runtime to
-/// await. It is a pacing aid and never a correctness condition: every wait is
-/// bounded, so a wake that is missed costs latency and nothing else.
+/// Test wake retaining the same asynchronous notification as its caller.
+/// Register before observing retained state so a racing wake is not lost.
 #[derive(Debug, Default)]
-pub struct CondvarWake {
-    woken: Mutex<bool>,
-    signal: Condvar,
+#[cfg(test)]
+pub struct TestIntakeWake {
     async_signal: tokio::sync::Notify,
 }
 
-impl CondvarWake {
+#[cfg(test)]
+impl TestIntakeWake {
     /// The same original wake also follows its owner into async residual
     /// supervision. Register before inspecting state to retain a racing wake.
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.async_signal.notified()
     }
-    /// Blocks until something wakes this, or `timeout` elapses.
-    ///
-    /// A wake that arrived while the caller was working is consumed here
-    /// rather than lost: without the flag, a publish between two waits would
-    /// be slept through, and on a control-plane-only turn nothing else would
-    /// arrive to end that sleep.
-    pub fn wait(&self, timeout: Duration) {
-        let mut woken = self.woken.lock().expect("task round wake lock");
-        if std::mem::take(&mut *woken) {
-            return;
-        }
-        let (mut guard, _) = self
-            .signal
-            .wait_timeout(woken, timeout)
-            .expect("task round wake condvar");
-        *guard = false;
-    }
 }
 
-impl StatusIntakeWake for CondvarWake {
+#[cfg(test)]
+impl StatusIntakeWake for TestIntakeWake {
     fn wake(&self) {
-        let mut woken = self.woken.lock().expect("task round wake lock");
-        *woken = true;
-        drop(woken);
-        self.signal.notify_all();
         self.async_signal.notify_one();
     }
 }
 
-impl std::task::Wake for CondvarWake {
+#[cfg(test)]
+impl std::task::Wake for TestIntakeWake {
     fn wake(self: Arc<Self>) {
         StatusIntakeWake::wake(self.as_ref());
     }

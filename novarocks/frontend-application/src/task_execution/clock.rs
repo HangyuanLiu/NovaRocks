@@ -26,16 +26,20 @@
 use std::sync::Mutex;
 #[cfg(test)]
 use std::time::Duration;
+#[cfg(test)]
 use std::time::Instant;
 
+#[cfg(test)]
 use novarocks_coordination_contract::{MonotonicClock, MonotonicInstant};
 
 /// Readings from this process's own monotonic timeline.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct ProcessMonotonicClock {
     origin: Instant,
 }
 
+#[cfg(test)]
 impl ProcessMonotonicClock {
     pub fn new() -> Self {
         Self {
@@ -44,12 +48,14 @@ impl ProcessMonotonicClock {
     }
 }
 
+#[cfg(test)]
 impl Default for ProcessMonotonicClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl MonotonicClock for ProcessMonotonicClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(self.origin.elapsed())

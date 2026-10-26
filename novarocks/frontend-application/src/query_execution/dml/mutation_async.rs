@@ -121,12 +121,6 @@ impl PreparedMutationFacts {
             Self::Merge(p) => &p.target_ref,
         }
     }
-    pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
-        match self {
-            Self::Update(p) => p.admitted_base_snapshot_id,
-            Self::Merge(p) => p.admitted_base_snapshot_id,
-        }
-    }
     pub(crate) fn is_copy_on_write(&self) -> bool {
         self.strategy() == ConnectorRowMutationStrategy::CopyOnWrite
     }
@@ -171,14 +165,8 @@ impl PreparedMutationFacts {
     }
     fn signed(&self) -> Result<&ConnectorRowMutationPreparation, String> {
         let preparations = match self {
-            Self::Update(p) => p
-                .cow_preparations
-                .as_ref()
-                .or_else(|| p.mor_write_target.as_ref().map(|p| &p.preparations)),
-            Self::Merge(p) => p
-                .cow_preparations
-                .as_ref()
-                .or_else(|| p.mor_write_target.as_ref().map(|p| &p.preparations)),
+            Self::Update(p) => p.cow_preparations.as_ref().or(p.mor_preparations.as_ref()),
+            Self::Merge(p) => p.cow_preparations.as_ref().or(p.mor_preparations.as_ref()),
         }
         .ok_or_else(|| "mutation preparation lost its original signed provider facts".to_owned())?;
         Ok(&preparations.preparation)
@@ -362,9 +350,6 @@ pub(crate) struct PreparedMorMutationWrite {
     bindings: Arc<QueryTableBindingStore>,
 }
 impl PreparedMorMutationWrite {
-    pub(crate) fn write_session(&self) -> Arc<ConnectorWriteSession> {
-        Arc::clone(&self.session)
-    }
     pub(crate) async fn compile_async(
         &self,
         provider: &FrontendCompletionCustody,
@@ -451,7 +436,7 @@ impl PreparedMorMutationWrite {
                 self.facts.execution(),
             )
         }));
-        Ok(finish_change_stream_write(
+        finish_change_stream_write(
             &self.state,
             completion,
             facts,
@@ -459,8 +444,7 @@ impl PreparedMorMutationWrite {
             &self.session,
             options,
             &control,
-        )?
-        .assembly)
+        )
     }
 }
 
@@ -621,9 +605,6 @@ pub(crate) struct PreparedCowMutationWrite {
 impl PreparedCowMutationWrite {
     pub(crate) fn target_count(&self) -> usize {
         self.write.targets.len()
-    }
-    pub(crate) fn write_session(&self) -> Arc<ConnectorWriteSession> {
-        Arc::clone(&self.write.write_session)
     }
     pub(crate) async fn compile_target_async(
         &self,

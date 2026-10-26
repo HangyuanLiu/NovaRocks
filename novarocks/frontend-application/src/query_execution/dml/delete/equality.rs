@@ -94,15 +94,13 @@ pub(super) async fn prepare_equality_delete_statement_async(
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
     let input = resolve_equality_delete_input(target_binding.metadata(), &column_names, &rows)?;
     // Keep RefHead observation on this exact generation before actual begin.
-    let current_snapshot_id =
-        crate::connector::metadata_read_reference_facts_with_planning_lease_async(
-            target_binding.lease().clone(),
-            connector_context.clone(),
-            &target.namespace,
-            &target.table,
-        )
-        .await?
-        .current_snapshot_id();
+    crate::connector::metadata_read_reference_facts_with_planning_lease_async(
+        target_binding.lease().clone(),
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+    )
+    .await?;
     let write_session = super::begin_delete_write_session_async(
         state,
         target_binding.lease(),
@@ -130,8 +128,6 @@ pub(super) async fn prepare_equality_delete_statement_async(
     Ok(super::PreparedDeleteWrite {
         state: state.clone(),
         target: target.clone(),
-        target_ref: target_ref.to_string(),
-        base_snapshot_id: current_snapshot_id,
         delete_query,
         sql_write_input,
         table_bindings,

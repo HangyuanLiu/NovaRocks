@@ -363,10 +363,6 @@ impl DomainReceiptMismatch {
             detail: detail.into(),
         }
     }
-
-    pub fn detail(&self) -> &str {
-        &self.detail
-    }
 }
 
 impl fmt::Display for DomainReceiptMismatch {

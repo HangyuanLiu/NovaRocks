@@ -391,15 +391,6 @@ pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
 }
 
 impl<'a> FrontendOptimizeTargetCapturePort<'a> {
-    pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
-        Self {
-            engine,
-            statement: false,
-            #[cfg(novarocks_dev_controls)]
-            receipt: None,
-        }
-    }
-
     pub(crate) fn for_statement(engine: &'a dyn TableMaintenanceEngine) -> Self {
         Self {
             engine,

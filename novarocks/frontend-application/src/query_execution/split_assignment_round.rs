@@ -993,6 +993,7 @@ impl SplitAssignmentRoundGuard {
 
     /// Whether the pump has published its final source profile or failure.
     /// This is a business result, not the round's independent local exit proof.
+    #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
         self.outcome
             .lock()
@@ -1013,6 +1014,7 @@ impl SplitAssignmentRoundGuard {
     /// deadline reporting the wait instead of the cause -- including the case
     /// ADR-0123 froze a bounded budget for, whose exhaustion is longer than a
     /// typical statement timeout and so could never be seen.
+    #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<SplitAssignmentDriverError> {
         self.failure
             .lock()
@@ -2020,7 +2022,6 @@ mod tests {
         drop(opened);
         until(|| control.snapshot().scopes.is_empty());
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(supervisor.take_original_failure().is_none());
         control.close_admission();
         assert!(control.shutdown().is_ok());
         runtime.block_on(executors.shutdown());
@@ -2056,10 +2057,17 @@ mod tests {
             );
         let (release, released) = mpsc::channel();
         let (started, ordinary_started) = mpsc::channel();
-        let ordinary = supervisor.spawn_ordinary(move || {
-            started.send(()).expect("publish ordinary start");
-            released.recv().expect("release ordinary call");
-        });
+        let mut ordinary =
+            supervisor.prepare_cpu_owned(Vec::new(), (started, released), |input, _| {
+                input.0.send(()).expect("publish ordinary start");
+                input.1.recv().expect("release ordinary call");
+                Some(())
+            });
+        std::future::poll_fn(|cx| {
+            let _ = ordinary.poll_progress(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         ordinary_started
             .recv_timeout(Duration::from_secs(2))
             .expect("ordinary call must start");
@@ -2083,7 +2091,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("cleanup must progress while another call is held");
         release.send(()).expect("release ordinary call");
-        ordinary.finish().await.expect("ordinary call finishes");
+        let mut ordinary_outcome = None;
+        ordinary.finish_in(&mut ordinary_outcome).await;
+        assert!(matches!(ordinary_outcome, Some(Ok(()))));
+        drop(ordinary);
         executors.shutdown().await;
     }
 

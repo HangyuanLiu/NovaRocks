@@ -55,6 +55,10 @@ pub struct StatisticsAttemptExecutorPorts {
     /// The composition root's single typed control registry. A collection is
     /// an ordinary typed read, so it resolves its relation through the same
     /// installed generation every statement does.
+    #[expect(
+        dead_code,
+        reason = "Retains the original process Connector control host through ANALYZE execution and teardown."
+    )]
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     backend_topology: BackendTopologyService,
     client: QueryExecutionClient,
@@ -87,7 +91,7 @@ impl StatisticsAttemptExecutorPorts {
             crate::native::data_runtime::FrontendDataRuntime,
         ),
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-        attempt_timeout: Duration,
+        runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         runtime: tokio::runtime::Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
@@ -104,7 +108,7 @@ impl StatisticsAttemptExecutorPorts {
             completion,
             execution_runtime,
             function_catalog,
-            attempt_timeout,
+            attempt_timeout: runtime_policy.max_attempt_duration(),
             runtime,
         }
     }
@@ -609,7 +613,6 @@ impl StatisticsState {
                     self.lease.take().unwrap(),
                     self.context.clone(),
                     self.cpu.clone(),
-                    self.ports.attempt_timeout,
                 )));
             }
             ActionPhase::AdmitCollection => {
@@ -1063,6 +1066,7 @@ impl FrontendStatisticsAttemptExecutor {
         .map_err(StatisticsApplicationError::new)
     }
 
+    #[cfg(test)]
     fn publication_outcome(
         outcome: ExternalMutationOutcome<novarocks_spi::connector::StatisticsReceipt>,
     ) -> StatisticsPublicationOutcome {
@@ -1173,7 +1177,6 @@ async fn begin_session(
     lease: ConnectorStatisticsLease,
     context: ConnectorRequestContext,
     cpu: Arc<dyn StatisticsCpuPort>,
-    timeout: Duration,
 ) -> Result<(), CoreStatisticsAttemptError> {
     // This stable slot remains owned by Action/Residual if its waiter unwinds.
     let mut original = slot.lock().await;
@@ -1230,11 +1233,7 @@ async fn begin_session(
     } else {
         original.program = Some(
             crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
-                table,
-                ordinal,
-                required,
-                crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(timeout)
-                    .map_err(failure)?,
+                table, ordinal, required,
             )
             .map_err(failure)?,
         );

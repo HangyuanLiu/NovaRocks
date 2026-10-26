@@ -369,6 +369,10 @@ struct FrontendExecutionRuntimeOwner {
     namespace: QueryProcessNamespace,
     native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
+    #[expect(
+        dead_code,
+        reason = "Retains the process runtime's installed original executor and Provider CPU capabilities at their original owner Drop boundary."
+    )]
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
@@ -710,12 +714,6 @@ impl FrontendExecutionRuntimeOwner {
                     "frontend joint progress service terminated before workload drain".to_string(),
                 );
             }
-            if let Some(detail) = self.connector_blocking_io.original_failure_detail() {
-                // Raw cause/backing stays in its original owner. Arbitrary Any
-                // destruction is not a new unbounded cleanup job or exit proof.
-                self.record_terminal_error(detail);
-                return Err("original Connector failure remains unresolved".to_owned());
-            }
             let revision = self
                 .workload
                 .as_ref()
@@ -774,7 +772,6 @@ impl FrontendExecutionRuntimeOwner {
                 .wait_progress(revision);
             tokio::select! {
                 _ = wait => {},
-                _ = self.connector_blocking_io.wait_failure() => {},
                 _ = std::future::poll_fn(|cx| self.deadline_supervisor.poll_exit(cx)) => {
                     return Err("frontend joint progress service terminated before workload drain".to_string());
                 }
@@ -3172,14 +3169,21 @@ mod tests {
         let (release, held) = std::sync::mpsc::channel();
         let (started, entered) = tokio::sync::oneshot::channel();
         let (returned, exited) = tokio::sync::oneshot::channel();
-        let job = host
-            .connector_blocking_io_supervisor()
-            .spawn_pinned(vec![pin], move || {
-                let _responsibility = responsibility;
-                let _ = started.send(());
-                held.recv().expect("release original Connector call");
-                let _ = returned.send(());
-            });
+        let mut job = host.connector_blocking_io_supervisor().prepare_cpu_owned(
+            vec![pin],
+            (responsibility, Some(started), held, Some(returned)),
+            |input, _| {
+                let _ = input.1.take().unwrap().send(());
+                input.2.recv().expect("release original Connector call");
+                let _ = input.3.take().unwrap().send(());
+                Some(())
+            },
+        );
+        std::future::poll_fn(|cx| {
+            let _ = job.poll_progress(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         tokio::time::timeout(Duration::from_secs(1), entered)
             .await
             .unwrap()
@@ -3187,7 +3191,6 @@ mod tests {
         root.owner.complete();
         root.business.release();
         drop(window);
-        drop(job);
         let first = host
             .shutdown_until(Instant::now() + Duration::from_millis(40))
             .await;
@@ -3198,6 +3201,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let mut outcome = None;
+        job.finish_in(&mut outcome).await;
+        assert!(matches!(outcome, Some(Ok(()))));
+        drop(job);
         let retry = host
             .shutdown_until(Instant::now() + Duration::from_secs(2))
             .await;
@@ -3212,137 +3219,6 @@ mod tests {
                 .scopes
                 .is_empty()
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn host_drain_keeps_opaque_cause_until_explicit_original_disposition() {
-        use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
-        struct Payload {
-            destroyed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            started: Option<tokio::sync::oneshot::Sender<()>>,
-            release: std::sync::mpsc::Receiver<()>,
-        }
-        impl Drop for Payload {
-            fn drop(&mut self) {
-                let _ = self.started.take().unwrap().send(());
-                self.release
-                    .recv()
-                    .expect("release original panic payload destructor");
-                self.destroyed
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-        let mut host = blocking_test_host("connector-panic-host").await;
-        let (root, window) = host
-            .execution_runtime_owner
-            .root_admission()
-            .try_begin_root_with_result(
-                WorkRequest::new(WorkClass::Management),
-                novarocks_workload_control::ResultWindowClass::Internal,
-            )
-            .unwrap();
-        let responsibility =
-            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
-                .unwrap();
-        let pin = responsibility.join_pin();
-        let destroyed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (payload_started, payload_entered) = tokio::sync::oneshot::channel();
-        let (release_payload, payload_held) = std::sync::mpsc::channel();
-        let payload = Payload {
-            destroyed: std::sync::Arc::clone(&destroyed),
-            started: Some(payload_started),
-            release: payload_held,
-        };
-        let (started, entered) = tokio::sync::oneshot::channel();
-        let job = host
-            .connector_blocking_io_supervisor()
-            .spawn_pinned(vec![pin], move || {
-                let _responsibility = responsibility;
-                let _ = started.send(());
-                std::panic::panic_any(payload);
-            });
-        // Arm rescue before any prerequisite can fail. Capture the facts and
-        // settle the actual Host before asserting, including when an earlier
-        // shutdown phase consumes the short fixture deadline.
-        let (disarm_watchdog, watch) = std::sync::mpsc::channel();
-        let rescue = release_payload.clone();
-        let watchdog = std::thread::spawn(move || {
-            if watch.recv_timeout(Duration::from_millis(500)).is_err() {
-                let _ = rescue.send(());
-            }
-        });
-        let callback_entered = matches!(
-            tokio::time::timeout(Duration::from_secs(1), entered).await,
-            Ok(Ok(()))
-        );
-        root.owner.complete();
-        root.business.release();
-        drop(window);
-        drop(job);
-        // The callback's start precedes its original blocking join. Establish
-        // the actual unclaimed failure before testing Host payload retirement,
-        // so another shutdown phase cannot consume this fixture's deadline.
-        let failure_published = tokio::time::timeout(
-            Duration::from_secs(1),
-            host.connector_blocking_io_supervisor().wait_failure(),
-        )
-        .await
-        .is_ok();
-        let began = Instant::now();
-        let blocked = host
-            .shutdown_until(Instant::now() + Duration::from_millis(40))
-            .await;
-        let shutdown_elapsed = began.elapsed();
-        let payload_started_by_deadline = !payload_entered.is_empty();
-        let held = host.execution_runtime_owner.workload_observation.snapshot();
-        let before_disposition_destroyed = destroyed.load(std::sync::atomic::Ordering::Acquire);
-        // Explicit legacy fixture disposition, not production Host policy:
-        // ordinary shutdown must leave this original opaque cause untouched.
-        let same_original = host
-            .connector_blocking_io_supervisor()
-            .take_original_failure();
-        let retained_original = same_original.is_some();
-        if let Some(original) = same_original {
-            host.connector_blocking_io_supervisor()
-                .retire_original_failure(original);
-        }
-        let _ = release_payload.send(());
-        let _ = disarm_watchdog.send(());
-        let watchdog_joined = watchdog.join().is_ok();
-        let verdict = host
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
-            .await;
-        let payload_entered = matches!(
-            tokio::time::timeout(Duration::from_secs(1), payload_entered).await,
-            Ok(Ok(()))
-        );
-        let after = host.execution_runtime_owner.workload_observation.snapshot();
-        let cleanup_complete = host.execution_runtime_owner.is_shutdown_complete();
-        host.shutdown_until(Instant::now() + Duration::from_secs(2))
-            .await
-            .expect("cleaned Host remains closed");
-        assert!(callback_entered && failure_published && payload_entered && watchdog_joined);
-        assert!(
-            blocked.is_err()
-                && !payload_started_by_deadline
-                && !before_disposition_destroyed
-                && retained_original
-        );
-        assert!(
-            shutdown_elapsed < Duration::from_millis(500),
-            "Host deadline blocked on its original panic payload destructor: {shutdown_elapsed:?}"
-        );
-        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
-        assert_eq!(held.root_responsibilities, 1);
-        assert!(
-            verdict
-                .expect_err("original unclaimed panic must be reported")
-                .to_string()
-                .contains("panicked")
-        );
-        assert!(destroyed.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(after.result_windows.held_positions, [0; 4]);
-        assert!(after.scopes.is_empty() && cleanup_complete);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

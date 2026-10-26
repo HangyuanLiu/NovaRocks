@@ -71,17 +71,6 @@ pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
         >,
     ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>;
 
-    fn start_computation(
-        &self,
-        computation: PreparedLogicalComputation,
-        owner: WorkOwner,
-        result_capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        reservation: Option<ReservedExecutionIdentity>,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> QueryExecutionFuture;
-
     fn start(
         &self,
         read: PreparedLogicalRead,

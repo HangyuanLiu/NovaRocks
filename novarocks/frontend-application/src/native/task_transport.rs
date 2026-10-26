@@ -3106,6 +3106,7 @@ async fn open_covered_subscription(
 }
 
 /// Actual same-factory F layout; does not construct a client, request or F.
+#[cfg(test)]
 pub(super) fn covered_subscription_future_layout() -> std::alloc::Layout {
     type CoveredSubscriptionFactory<F> = fn(
         Client,

@@ -346,7 +346,6 @@ impl StatisticsPlanCpuInput {
                 )
                 .unwrap(),
             ],
-            super::StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30)).unwrap(),
         )
         .unwrap();
         let cancellation =

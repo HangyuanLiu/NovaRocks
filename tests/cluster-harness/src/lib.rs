@@ -213,7 +213,6 @@ struct LifecycleConvergenceWireSnapshot {
     query_process_namespace: String,
     query_local_sequence: u64,
     query_attempt_id: u64,
-    error_source: Option<String>,
     #[serde(default)]
     failure_fact: Option<Vec<u8>>,
     #[serde(default)]
@@ -432,13 +431,6 @@ fn decode_query_lifecycle_structured_snapshot(
         wire.query_attempt_id > 0,
         "FE lifecycle snapshot query_attempt_id must be nonzero"
     );
-    let error_source = match wire.error_source.as_deref() {
-        None => None,
-        Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
-        Some("frontend-liveness") => Some(QueryLifecycleErrorSource::FrontendLiveness),
-        Some("no-outcome") => Some(QueryLifecycleErrorSource::NoOutcome),
-        Some(source) => bail!("unknown FE lifecycle snapshot error source {source:?}"),
-    };
     ensure!(
         wire.failure_fact.is_some() == wire.failure_detail.is_some()
             && wire.failure_fact.is_some() == wire.failure_site.is_some(),
@@ -453,7 +445,6 @@ fn decode_query_lifecycle_structured_snapshot(
         process_namespace,
         local_sequence: wire.query_local_sequence,
         attempt_id: wire.query_attempt_id,
-        error_source,
         failure_fact: decode_observed_failure_fact(wire.failure_fact.as_deref())?,
         failure_detail: wire.failure_detail,
         failure_site: wire
@@ -1110,16 +1101,6 @@ pub enum QueryLifecyclePhase {
     TerminalRetained,
 }
 
-/// Structured lifecycle facts exposed by a runner-owned cross-process
-/// cluster. T4 owns this test boundary; T7/T9 supply query-scoped values once
-/// their outcome and convergence contracts are implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryLifecycleErrorSource {
-    BackendAttestation,
-    FrontendLiveness,
-    NoOutcome,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredSnapshot {
     /// The immutable execution identity used to correlate all values below.
@@ -1128,7 +1109,6 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub process_namespace: u64,
     pub local_sequence: u64,
     pub attempt_id: u64,
-    pub error_source: Option<QueryLifecycleErrorSource>,
     /// The original physical attempt's typed terminal; no logical acceptance authority.
     pub failure_fact: Option<novarocks_execution_contract::failure::FailureFact>,
     pub failure_detail: Option<String>,
@@ -2426,8 +2406,7 @@ where
                     == Some(expected_execution_id.as_str())
                     && candidate.process_namespace == target.process_namespace
                     && candidate.local_sequence == target.local_sequence
-                    && candidate.attempt_id == target.attempt_id
-                    && candidate.error_source.is_none();
+                    && candidate.attempt_id == target.attempt_id;
                 if matches {
                     return Ok(candidate);
                 }
@@ -2438,7 +2417,7 @@ where
         }
         if Instant::now() >= deadline {
             bail!(
-                "timed out waiting for successful exact lifecycle target={target:?} execution_id={expected_execution_id}; before={before_execution_id:?}; latest_candidate={latest_candidate:?}; latest_error={latest_error:?}"
+                "timed out waiting for exact lifecycle target={target:?} execution_id={expected_execution_id}; before={before_execution_id:?}; latest_candidate={latest_candidate:?}; latest_error={latest_error:?}"
             );
         }
         thread::sleep(
@@ -2914,7 +2893,7 @@ pub trait ServerHandle: Send {
             self.query_lifecycle_structured_snapshot()
         })
     }
-    /// Wait for the successful projection of this exact, externally bound attempt.
+    /// Wait for the projection correlated with this exact, externally bound execution attempt.
     fn await_query_lifecycle_structured_snapshot_for_attempt(
         &mut self,
         target: QueryLifecycleAttemptTarget,
@@ -5360,9 +5339,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 observation.connection_id,
                 wire,
             )? {
-                if !require_success
-                    || (snapshot.error_source.is_none() && snapshot.failure_fact.is_none())
-                {
+                if !require_success || snapshot.failure_fact.is_none() {
                     return Ok(snapshot);
                 }
                 latest = Some(snapshot);
@@ -7120,7 +7097,6 @@ mod tests {
     fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {
         let mut value = serde_json::json!({
             "execution_id": execution_id,
-            "error_source": null,
             "runtime_filter": {
                 "kind": "available",
                 "participants": [{

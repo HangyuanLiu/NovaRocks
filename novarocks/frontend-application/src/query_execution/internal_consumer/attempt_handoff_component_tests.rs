@@ -77,6 +77,8 @@ pub(crate) struct OriginalAttempt {
     pub(crate) release: Option<OperationIntent>,
     pub(crate) pending_upstream: Option<crate::task_execution::tests::ManifestReleaseTail>,
     pub(crate) scope: novarocks_workload_control::WorkScope,
+    pub(crate) cancellation_requester:
+        Option<novarocks_workload_control::WorkCancellationRequester>,
     pub(crate) capacity: novarocks_workload_control::ResultCapacityHandle,
     clock: Arc<ManualClock>,
     pub(crate) plan: PlanSeal,
@@ -205,6 +207,7 @@ impl OriginalAttempt {
             (control, governed.owner, capacity, Some(governed.business))
         };
         let scope = work.scope();
+        let cancellation_requester = Some(work.cancellation_requester());
         let stage = scope
             .try_acquire(novarocks_workload_control::Stage::Execution)
             .unwrap();
@@ -264,6 +267,7 @@ impl OriginalAttempt {
                 release,
                 pending_upstream,
                 scope,
+                cancellation_requester,
                 capacity,
                 clock,
                 plan,
@@ -363,7 +367,31 @@ impl OriginalAttempt {
             }
         } else {
             assert!(self.pending_upstream.is_none());
-            assert!(self.round.execution().selected_task_failure().is_some());
+            if self.round.execution().selected_task_failure().is_none() {
+                let reason = self.scope.cancellation().unwrap().reason().unwrap();
+                let expected_kind = match reason {
+                    novarocks_workload_control::CancellationReason::Requested => {
+                        novarocks_query_application::api::QueryExecutionErrorKind::Cancelled
+                    }
+                    novarocks_workload_control::CancellationReason::DeadlineExceeded => {
+                        novarocks_query_application::api::QueryExecutionErrorKind::DeadlineExceeded
+                    }
+                    _ => panic!(
+                        "only the original requested cancellation or deadline may settle here"
+                    ),
+                };
+                let outcome = self.logical.original_internal_outcome();
+                assert_eq!(
+                    outcome
+                        .borrow()
+                        .as_ref()
+                        .expect("the same actor published its original control outcome")
+                        .as_ref()
+                        .unwrap_err()
+                        .kind(),
+                    expected_kind
+                );
+            }
             assert!(
                 self.round
                     .execution()
@@ -429,6 +457,7 @@ impl OriginalAttempt {
         if let Some(business) = self.business {
             business.release();
         }
+        drop(self.cancellation_requester.take());
         self._control
     }
 }

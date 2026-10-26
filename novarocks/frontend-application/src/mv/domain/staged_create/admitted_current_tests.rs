@@ -971,28 +971,106 @@ async fn admitted_current_rejects_a_foreign_catalog_before_metadata_or_document_
     fixture.assert_manageable();
 }
 
+// The existing pure StateStore provider implements original transactions.
+// This guard cannot bind physical work or grant an executor position.
+struct NoCurrentRepositoryPhysicalPort;
+impl novarocks_state_store_api::StateStoreExecutionPort for NoCurrentRepositoryPhysicalPort {
+    fn bind_original_in(
+        &self,
+        _: &Arc<dyn novarocks_state_store_api::StateStoreBlockingOriginal>,
+        _: std::time::Instant,
+        _: &mut Option<Box<dyn novarocks_state_store_api::StateStoreBlockingSlot>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        panic!("pure Current repository fixture must not dispatch physical work")
+    }
+    fn request_progress(&self) {}
+}
+struct OriginalCurrentRepositoryFixture {
+    host: novarocks_state_store_runtime::StateStoreHost,
+    port: Arc<dyn novarocks_state_store_api::StateStoreExecutionPort>,
+    repository: Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>,
+}
+impl OriginalCurrentRepositoryFixture {
+    async fn new() -> Self {
+        let host = crate::state_store::testing::open_persistent(format!(
+            "metadata-only-current-{}",
+            uuid::Uuid::now_v7(),
+        ))
+        .await;
+        let repository =
+            novarocks_mv_application::state_store_repository::StateStoreMvRepository::open(
+                host.state_store().unwrap(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        Self {
+            host,
+            port: Arc::new(NoCurrentRepositoryPhysicalPort),
+            repository,
+        }
+    }
+    fn requests(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests> {
+        Arc::new(novarocks_state_store_api::StateStoreExecutionContext::new(
+            &self.port,
+            context.deadline(),
+        ))
+    }
+    async fn close(mut self) {
+        drop(self.repository);
+        drop(self.port);
+        self.host
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_only_current_renewal_installs_fresh_generation_in_the_same_repository() {
     use novarocks_mv_application::process_runtime::ProcessRuntime;
     use novarocks_mv_application::readiness::MvKeyedReadinessService;
     let fixture = Fixture::new(vec![]);
-    let repository = crate::mv::domain::test_admission::keyed_repository().await;
-    let service = MvKeyedReadinessService::new(repository, Arc::new(ProcessRuntime::default()));
+    let repository = OriginalCurrentRepositoryFixture::new().await;
+    let mut cpu = CurrentCpuFixture::new();
+    let service = MvKeyedReadinessService::new(
+        repository.repository.clone(),
+        Arc::new(ProcessRuntime::default()),
+    );
     let readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
         service.clone(),
         tokio::runtime::Handle::current(),
         fixture.entrance.clone(),
     );
-    let source = ManagedTargetCurrentSource {
-        entrance: &fixture.entrance,
-        connector_control: &fixture.resolver,
-        published: None,
-        convergence: MvConvergence::AdmittedCurrent,
-    };
-    service
-        .observe_and_install(uuid::Uuid::now_v7(), fixture.request(), &source)
-        .await
-        .unwrap();
+    let view = readiness.in_requests(repository.requests(&context()));
+    let initial_registration = super::CurrentProjectionRegistration::new();
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        super::install_admitted_current_projection_async_in(
+            &fixture.entrance,
+            &view,
+            &fixture.resolver,
+            fixture.catalog.clone(),
+            fixture.target.clone(),
+            uuid::Uuid::now_v7(),
+            context(),
+            &cpu.factory,
+            &initial_registration,
+        ),
+    )
+    .await
+    .unwrap();
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        std::future::poll_fn(|cx| initial_registration.poll_registration_closed(cx)),
+    )
+    .await;
+    drop(initial_registration);
     let before = service.load_ready(&fixture.target).await.unwrap().unwrap();
     let next = ConnectorCommittedVersion::try_new(
         Bytes::from_static(b"expired-history-same-current"),
@@ -1001,14 +1079,22 @@ async fn metadata_only_current_renewal_installs_fresh_generation_in_the_same_rep
     .unwrap();
     fixture.caps.current.lock().unwrap().metadata_version = next.clone();
     assert_ne!(before.projection.facts.metadata_version(), &next);
-    super::install_metadata_only_current_projection(
-        &fixture.entrance,
-        &readiness,
-        &fixture.resolver,
-        fixture.catalog.clone(),
-        Arc::new(before.projection.facts.clone()),
-        context(),
+    let registration = super::CurrentProjectionRegistration::new();
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        super::install_metadata_only_current_projection_async_in(
+            &fixture.entrance,
+            &view,
+            &fixture.resolver,
+            fixture.catalog.clone(),
+            Arc::new(before.projection.facts.clone()),
+            context(),
+            &cpu.factory,
+            &registration,
+        ),
     )
+    .await
     .unwrap();
     let after = service.load_ready(&fixture.target).await.unwrap().unwrap();
     assert_eq!(after.projection.mv_id, before.projection.mv_id);
@@ -1037,6 +1123,17 @@ async fn metadata_only_current_renewal_installs_fresh_generation_in_the_same_rep
             .acquire(fixture.management_request(), || false)
             .unwrap(),
     );
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        std::future::poll_fn(|cx| registration.poll_registration_closed(cx)),
+    )
+    .await;
+    drop(registration);
+    drop(view);
+    drop((readiness, service));
+    cpu.close().await;
+    repository.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1044,43 +1141,93 @@ async fn metadata_only_current_renewal_refuses_a_changed_carrier_on_its_actual_r
     use novarocks_mv_application::process_runtime::ProcessRuntime;
     use novarocks_mv_application::readiness::MvKeyedReadinessService;
     let fixture = Fixture::new(vec![]);
-    let repository = crate::mv::domain::test_admission::keyed_repository().await;
-    let service = MvKeyedReadinessService::new(repository, Arc::new(ProcessRuntime::default()));
+    let repository = OriginalCurrentRepositoryFixture::new().await;
+    let mut cpu = CurrentCpuFixture::new();
+    let service = MvKeyedReadinessService::new(
+        repository.repository.clone(),
+        Arc::new(ProcessRuntime::default()),
+    );
     let readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
         service.clone(),
         tokio::runtime::Handle::current(),
         fixture.entrance.clone(),
     );
-    let source = ManagedTargetCurrentSource {
-        entrance: &fixture.entrance,
-        connector_control: &fixture.resolver,
-        published: None,
-        convergence: MvConvergence::AdmittedCurrent,
-    };
-    service
-        .observe_and_install(uuid::Uuid::now_v7(), fixture.request(), &source)
-        .await
-        .unwrap();
+    let view = readiness.in_requests(repository.requests(&context()));
+    let initial_registration = super::CurrentProjectionRegistration::new();
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        super::install_admitted_current_projection_async_in(
+            &fixture.entrance,
+            &view,
+            &fixture.resolver,
+            fixture.catalog.clone(),
+            fixture.target.clone(),
+            uuid::Uuid::now_v7(),
+            context(),
+            &cpu.factory,
+            &initial_registration,
+        ),
+    )
+    .await
+    .unwrap();
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        std::future::poll_fn(|cx| initial_registration.poll_registration_closed(cx)),
+    )
+    .await;
+    drop(initial_registration);
     let before = service.load_ready(&fixture.target).await.unwrap().unwrap();
     fixture.caps.advance_to_committed_slot();
-    let error = super::install_metadata_only_current_projection(
-        &fixture.entrance,
-        &readiness,
-        &fixture.resolver,
-        fixture.catalog.clone(),
-        Arc::new(before.projection.facts.clone()),
-        context(),
+    let registration = super::CurrentProjectionRegistration::new();
+    let error = current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        super::install_metadata_only_current_projection_async_in(
+            &fixture.entrance,
+            &view,
+            &fixture.resolver,
+            fixture.catalog.clone(),
+            Arc::new(before.projection.facts.clone()),
+            context(),
+            &cpu.factory,
+            &registration,
+        ),
     )
+    .await
     .unwrap_err();
     assert!(
-        error.contains("carrier changed during metadata-only Current renewal"),
+        error
+            .to_string()
+            .contains("carrier changed during metadata-only Current renewal"),
         "{error}"
     );
     assert!(service.load_ready(&fixture.target).await.is_err());
     assert_eq!(
         *fixture.caps.events.lock().unwrap(),
-        vec!["capture", "observe", "capture", "observe"]
+        vec![
+            "async-capture",
+            "capture",
+            "async-observe",
+            "observe",
+            "async-capture",
+            "capture",
+            "async-observe",
+            "observe"
+        ]
     );
+    current_with_driver(
+        &cpu.control,
+        &mut cpu.driver,
+        std::future::poll_fn(|cx| registration.poll_registration_closed(cx)),
+    )
+    .await;
+    drop(registration);
+    drop(view);
+    drop((readiness, service));
+    cpu.close().await;
+    repository.close().await;
 }
 
 struct CurrentCpuFixture {
@@ -1114,7 +1261,7 @@ impl CurrentCpuFixture {
             window,
             cancel.view(),
             tokio::runtime::Handle::current(),
-            Arc::new(crate::task_execution::status_intake::CondvarWake::default()),
+            Arc::new(crate::task_execution::status_intake::TestIntakeWake::default()),
         );
         Self {
             owner,

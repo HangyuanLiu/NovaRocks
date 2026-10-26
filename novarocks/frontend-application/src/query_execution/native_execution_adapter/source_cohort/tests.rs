@@ -237,10 +237,22 @@ async fn actual_scan_receiving_cell_holds_child_through_original_close_job() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let probe = Arc::clone(&entered);
     let supervisor = ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current());
-    let job = supervisor.spawn_pinned_source_close(vec![responsibility.join_pin()], move |_| {
-        probe.notify_one();
-        blocked.recv().unwrap();
-    });
+    let mut physical =
+        crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(&supervisor);
+    let mut job = supervisor.prepare_cpu_retirement(
+        vec![responsibility.join_pin()],
+        (probe, blocked),
+        |input, _| {
+            input.0.notify_one();
+            input.1.recv().unwrap();
+            Some(())
+        },
+    );
+    std::future::poll_fn(|cx| {
+        let _ = job.poll_progress(cx);
+        std::task::Poll::Ready(())
+    })
+    .await;
     entered.notified().await;
     drop(responsibility);
     assert!(
@@ -248,16 +260,19 @@ async fn actual_scan_receiving_cell_holds_child_through_original_close_job() {
         "source close has not actually exited"
     );
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(3), job.finish())
+    let mut outcome = None;
+    tokio::time::timeout(Duration::from_secs(3), job.finish_in(&mut outcome))
         .await
-        .unwrap()
         .unwrap();
+    assert!(matches!(outcome, Some(Ok(()))));
+    drop(job);
     drop(backing);
     assert!(
         !control.snapshot().scopes.iter().any(|s| s.id == child_id),
         "actual original close and final backing are the exit cut"
     );
     drop((admission, cohort, alias, grant, capacity, scope));
+    physical.shutdown().await;
     finish(control, root, driver);
 }
 

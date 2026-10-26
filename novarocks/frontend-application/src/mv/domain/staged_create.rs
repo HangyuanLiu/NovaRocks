@@ -115,32 +115,6 @@ pub(crate) fn install_admitted_current_projection(
     )
 }
 
-/// Renew the exact metadata generation after external metadata maintenance.
-/// The actual installation read must retain every current MV carrier fact.
-pub(crate) fn install_metadata_only_current_projection(
-    entrance: &ManagementEntrance,
-    readiness: &crate::mv::domain::readiness::MvReadinessPort,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    catalog: CatalogHandle,
-    expected: std::sync::Arc<
-        novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
-    >,
-    context: ConnectorRequestContext,
-) -> Result<(), String> {
-    install_current_projection(
-        entrance,
-        readiness,
-        connector_control,
-        catalog,
-        expected.target(),
-        uuid::Uuid::now_v7(),
-        None,
-        MvConvergence::MetadataOnlyCurrent { expected },
-        context,
-        "metadata-maintained",
-    )
-}
-
 pub(crate) fn metadata_only_current_matches(
     expected: &novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
     observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,

@@ -28,7 +28,7 @@ use crate::native::fragment_transport::{
     DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
 };
 use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
-use crate::task_execution::status_intake::CondvarWake;
+use crate::task_execution::status_intake::TestIntakeWake;
 use novarocks_execution_contract::{
     DomainVersion, OperationKind, OperationOutcome, QueryContextReceipt, QueryContextState,
     ReleaseOutcome, TaskIdentity,
@@ -134,7 +134,7 @@ async fn pending_final_info_survives_borrowed_wait_cancel_and_stop_starting_unti
     // Poll the actual collector directly on the original TaskRound fixture.
     // No coordinator runtime bridge or replacement source is constructed.
     let mut collector =
-        TaskFinalInfoCollector::new(transport, true, &round, Arc::new(CondvarWake::default()));
+        TaskFinalInfoCollector::new(transport, true, &round, Arc::new(TestIntakeWake::default()));
     let mut wait = Box::pin(poll_fn(|cx| {
         collector.poll_observe(&round, cx);
         if collector.is_closed() {
@@ -275,7 +275,7 @@ async fn terminal_frontier_reads_each_original_task_once_and_wakes_each_ready_su
         release: Mutex::new(gates),
         probe: Arc::clone(&probe),
     });
-    let wake = Arc::new(CondvarWake::default());
+    let wake = Arc::new(TestIntakeWake::default());
     let mut collector =
         TaskFinalInfoCollector::new(Arc::clone(&transport), true, &round, wake.clone());
     let mut cx = Context::from_waker(Waker::noop());

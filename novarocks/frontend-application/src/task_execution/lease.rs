@@ -32,14 +32,6 @@ impl RequestedLeaseDurations {
         steady: Duration::from_secs(5),
     };
 
-    pub const fn new(initial: Duration, steady: Duration) -> Option<Self> {
-        if initial.is_zero() || steady.is_zero() {
-            None
-        } else {
-            Some(Self { initial, steady })
-        }
-    }
-
     pub const fn initial(self) -> Duration {
         self.initial
     }
@@ -51,6 +43,7 @@ impl RequestedLeaseDurations {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RenewSchedule {
+    #[cfg(test)]
     conservative_expiry: MonotonicInstant,
     next_renew_at: MonotonicInstant,
 }
@@ -67,22 +60,22 @@ impl RenewSchedule {
                 .saturating_sub(Self::SAFETY_MARGIN),
         );
         Self {
+            #[cfg(test)]
             conservative_expiry,
             next_renew_at: first_third.min(latest_safe),
         }
     }
 
+    #[cfg(test)]
     pub const fn conservative_expiry(self) -> MonotonicInstant {
         self.conservative_expiry
     }
+    #[cfg(test)]
     pub const fn next_renew_at(self) -> MonotonicInstant {
         self.next_renew_at
     }
     pub fn must_renew_at(self, now: MonotonicInstant) -> bool {
         now.has_reached(self.next_renew_at)
-    }
-    pub fn delay_from(self, now: MonotonicInstant) -> Duration {
-        self.next_renew_at.saturating_duration_since(now)
     }
 }
 
