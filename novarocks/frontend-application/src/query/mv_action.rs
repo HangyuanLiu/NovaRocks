@@ -18,7 +18,10 @@
 //! The original SQL Root owns the entire serial MV command and every tail.
 //! A data-producing step alone borrows the common Native stage author.
 
+mod control;
+mod control_create;
 mod dependencies;
+pub(crate) use control::MvControlRequest;
 mod native;
 mod step;
 
@@ -28,7 +31,10 @@ use crate::query_execution::{
     maintenance::io_admission::MetadataIoAdmission, mv_native_write::MvRefreshProviderActivation,
 };
 use crate::state_store::execution::{StateStoreOriginalBinding, StateStoreOriginalOwner};
-use novarocks_mv_application::{activity::MvActivityOwner, service::MvKeyedProductService};
+use novarocks_mv_application::{
+    activity::MvActivityOwner,
+    service::{MvKeyedProductService, MvProductOperations},
+};
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
     api::{
@@ -113,6 +119,11 @@ impl From<QueryServiceError> for MvPhaseFailure {
 }
 
 pub(crate) enum MvCommandRequest {
+    Create {
+        target: SqlMvTarget,
+        statement: crate::mv::domain::application::MvCreateStatement,
+    },
+    Control(MvControlRequest),
     Refresh {
         statement: MvRefreshRequest,
         requested: SqlMvTarget,
@@ -130,12 +141,16 @@ pub(crate) enum MvCommandRequest {
 impl MvCommandRequest {
     fn target(&self) -> &SqlMvTarget {
         match self {
+            Self::Create { target, .. } => target,
+            Self::Control(request) => request.target(),
             Self::Refresh { requested, .. } | Self::ScheduledRefresh { requested, .. } => requested,
             Self::Repartition { target, .. } => target,
         }
     }
     fn owner(&self) -> MvActivityOwner {
         match self {
+            Self::Create { .. } => MvActivityOwner::Create,
+            Self::Control(request) => request.owner(),
             Self::Refresh { .. } => MvActivityOwner::ManualRefresh,
             Self::ScheduledRefresh { .. } => MvActivityOwner::ScheduledRefresh,
             Self::Repartition { .. } => MvActivityOwner::Repartition,
@@ -143,6 +158,11 @@ impl MvCommandRequest {
     }
 }
 pub(super) enum StepRequest {
+    Create {
+        target: SqlMvTarget,
+        statement: crate::mv::domain::application::MvCreateStatement,
+    },
+    Control(MvControlRequest),
     Iceberg {
         target: SqlMvTarget,
         statement: MvRefreshRequest,
@@ -159,7 +179,7 @@ struct CommandInput {
     current_database: String,
     ports: IcebergMvCorePorts,
     activation: Arc<dyn MvRefreshProviderActivation>,
-    product: Arc<MvKeyedProductService>,
+    product: Arc<MvProductOperations>,
     services: MvExecutionServices,
     request: MvCommandRequest,
     execution: QueryExecutionContext,
@@ -220,7 +240,7 @@ pub(crate) fn prepare(
         current_database,
         ports,
         activation,
-        product,
+        product.original_operations(),
         services,
         request,
         execution,
@@ -234,7 +254,7 @@ pub(crate) fn prepare_in(
     current_database: String,
     ports: IcebergMvCorePorts,
     activation: Arc<dyn MvRefreshProviderActivation>,
-    product: Arc<MvKeyedProductService>,
+    product: Arc<MvProductOperations>,
     services: MvExecutionServices,
     request: MvCommandRequest,
     execution: QueryExecutionContext,
@@ -401,28 +421,30 @@ impl MvCommandOriginal {
             .as_ref()
             .ok_or_else(|| service("MV action lost its original Root owner"))?;
         if self.io.is_none() {
-            let catalog = self
-                .input
-                .request
-                .target()
-                .catalog
-                .as_deref()
-                .ok_or_else(|| service("MV refresh requires an Iceberg catalog"))?;
-            let selected = self
-                .input
-                .ports
-                .connector_control()
-                .acquire_current(&ConnectorInstanceId::parse(catalog).map_err(original_error)?)
-                .map_err(original_error)?;
-            let write = self
-                .input
-                .services
-                .connector_control
-                .acquire_exact_write_stack(selected.control_runtime_id())
-                .map_err(original_error)?;
-            let profile = write.session().io_profile().map_err(original_error)?;
-            let mut dependencies = profile.initial_dependencies().to_vec();
-            dependencies.extend_from_slice(self.input.state_store.blocking_dependency_facts());
+            let mut dependencies = self.input.state_store.blocking_dependency_facts().to_vec();
+            if !matches!(&self.input.request, MvCommandRequest::Control(_)) {
+                let catalog = self
+                    .input
+                    .request
+                    .target()
+                    .catalog
+                    .as_deref()
+                    .ok_or_else(|| service("MV write requires an Iceberg catalog"))?;
+                let selected = self
+                    .input
+                    .ports
+                    .connector_control()
+                    .acquire_current(&ConnectorInstanceId::parse(catalog).map_err(original_error)?)
+                    .map_err(original_error)?;
+                let write = self
+                    .input
+                    .services
+                    .connector_control
+                    .acquire_exact_write_stack(selected.control_runtime_id())
+                    .map_err(original_error)?;
+                let profile = write.session().io_profile().map_err(original_error)?;
+                dependencies.extend_from_slice(profile.initial_dependencies());
+            }
             self.io = Some(
                 MetadataIoAdmission::for_original_source(work, dependencies)
                     .map_err(original_error)?,
@@ -609,8 +631,11 @@ impl MvCommandOriginal {
             }
             Poll::Ready(Ok(())) => {}
         };
+        let mut graph_closed = true;
         if let Some(graph) = self.graph.as_mut() {
-            receive(graph.poll_closed(cx));
+            let polled = graph.poll_closed(cx);
+            graph_closed = matches!(&polled, Poll::Ready(Ok(())));
+            receive(polled);
         }
         if let Some(active) = self.active.as_mut() {
             receive(active.poll_closed(cx));
@@ -622,7 +647,19 @@ impl MvCommandOriginal {
             self.health = Some(error);
             return Poll::Pending;
         }
-        if pending {
+        // Logical inventory may remain in these same originals after their
+        // last possible domain request. Release the StateStore and MIO physical
+        // resources independently, while retaining the original lease/custody.
+        let physical_closed = graph_closed
+            && self
+                .active
+                .as_ref()
+                .is_none_or(step::MvStepOriginal::physical_exit_observed)
+            && self
+                .retired
+                .iter()
+                .all(step::MvStepOriginal::physical_exit_observed);
+        if pending && !physical_closed {
             return Poll::Pending;
         }
         if !self.initialized {
@@ -667,7 +704,11 @@ impl MvCommandOriginal {
                 Poll::Ready(Ok(_)) => {}
             }
         }
-        Poll::Ready(Ok(()))
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 }
 impl GovernedStatementAction for MvAction {

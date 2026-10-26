@@ -466,6 +466,31 @@ pub struct MetadataMaintenanceObservation {
     result: Option<Result<Option<u64>, ConnectorError>>,
     poll_unproven: bool,
 }
+/// The original background source already formed this exact metadata
+/// handle on its selected Provider metadata CPU. This constructor borrows
+/// that same generation; it does not load or create another schema.
+pub(crate) fn begin_captured_max_compactable_data_files(
+    resolver: &dyn ConnectorMetadataMaintenanceResolver,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+    cpu: std::sync::Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+) -> Result<novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution, ConnectorError> {
+    let lease = resolver.acquire_exact_metadata_maintenance(planning.control_runtime_id())?;
+    if metadata.identity.instance_id != lease.descriptor().instance_id
+        || metadata.table.owner() != &lease.descriptor().instance_id
+        || planning.control_runtime_id() != lease.control_runtime_id()
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "captured maintenance metadata belongs to another exact generation",
+        ));
+    }
+    let request =
+        ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table.clone(), context)?;
+    lease.begin_read_max_compactable_data_files(request, cpu)
+}
+
 impl MetadataMaintenanceObservation {
     pub fn try_new(
         resolver: &dyn ConnectorMetadataMaintenanceResolver,

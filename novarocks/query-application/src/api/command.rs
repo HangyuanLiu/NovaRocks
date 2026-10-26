@@ -160,6 +160,7 @@ pub struct CommandError {
     message: Arc<str>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     execution_failure: Option<crate::execution_error::ExecutionFailureInput>,
+    user_error: Option<novarocks_user_error::UserError>,
     external_effect_disposition: Option<StatementExternalEffectDisposition>,
 }
 
@@ -170,6 +171,7 @@ impl CommandError {
             message: message.into(),
             compile_control: None,
             execution_failure: None,
+            user_error: None,
             external_effect_disposition: None,
             failure_cause: None,
         }
@@ -208,6 +210,17 @@ impl CommandError {
         let mut error = Self::new(CommandErrorKind::Failed, input.user_error().to_string());
         error.execution_failure = Some(input);
         error
+    }
+
+    /// Preserve a domain-authored descriptor without reducing it to Display.
+    pub fn from_user_error(error: novarocks_user_error::UserError) -> Self {
+        let mut failure = Self::new(CommandErrorKind::Failed, error.to_string());
+        failure.user_error = Some(error);
+        failure
+    }
+
+    pub fn user_error(&self) -> Option<&novarocks_user_error::UserError> {
+        self.user_error.as_ref()
     }
 
     pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {

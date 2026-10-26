@@ -47,14 +47,14 @@ use tokio::sync::Notify;
 // This probe uses the real ordinary QB result/footer. Its only operation is a
 // rescueable physical gate; it does not synthesize a SQLite transaction result
 // or copy a provider's adjudication algorithm.
-struct Gate {
+pub(crate) struct Gate {
     open: Mutex<bool>,
     condition: Condvar,
     entered: AtomicBool,
     notification: Notify,
 }
 impl Gate {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             open: Mutex::new(false),
             condition: Condvar::new(),
@@ -70,7 +70,7 @@ impl Gate {
             open = self.condition.wait(open).unwrap();
         }
     }
-    async fn reached(&self) {
+    pub(crate) async fn reached(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let notice = self.notification.notified();
@@ -85,23 +85,23 @@ impl Gate {
         .await
         .expect("the actual worker must reach its rescueable gate");
     }
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         *self.open.lock().unwrap() = true;
         self.condition.notify_all();
     }
 }
-struct Rescue(Arc<Gate>);
+pub(crate) struct Rescue(pub(crate) Arc<Gate>);
 impl Drop for Rescue {
     fn drop(&mut self) {
         self.0.release();
     }
 }
-struct PauseResultWake {
-    caller: std::thread::ThreadId,
-    caller_wakes: AtomicUsize,
-    read_returned: Arc<AtomicBool>,
-    once: AtomicBool,
-    footer: Arc<Gate>,
+pub(crate) struct PauseResultWake {
+    pub(crate) caller: std::thread::ThreadId,
+    pub(crate) caller_wakes: AtomicUsize,
+    pub(crate) read_returned: Arc<AtomicBool>,
+    pub(crate) once: AtomicBool,
+    pub(crate) footer: Arc<Gate>,
 }
 impl Wake for PauseResultWake {
     fn wake(self: Arc<Self>) {
@@ -125,15 +125,15 @@ impl Wake for PauseResultWake {
 
 // One original receiving slot, first Get, then an idle obligation, then Close.
 // Only actual receive_exit advances either phase. Idle is never complete.
-struct IdleOriginal {
-    instance: InstanceScope,
-    slot: Mutex<Option<Box<dyn StateStoreBlockingSlot>>>,
-    read: Arc<Gate>,
-    read_returned: Arc<AtomicBool>,
-    close: Arc<Gate>,
-    closing: AtomicBool,
-    results: AtomicUsize,
-    exits: AtomicUsize,
+pub(crate) struct IdleOriginal {
+    pub(crate) instance: InstanceScope,
+    pub(crate) slot: Mutex<Option<Box<dyn StateStoreBlockingSlot>>>,
+    pub(crate) read: Arc<Gate>,
+    pub(crate) read_returned: Arc<AtomicBool>,
+    pub(crate) close: Arc<Gate>,
+    pub(crate) closing: AtomicBool,
+    pub(crate) results: AtomicUsize,
+    pub(crate) exits: AtomicUsize,
 }
 impl IdleOriginal {
     fn request(phase: Phase) -> Request {

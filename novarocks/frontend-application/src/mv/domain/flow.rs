@@ -131,6 +131,28 @@ pub(crate) fn initial_refresh_configuration_for_create(
     }
 }
 
+/// The single pure configuration transition shared by synchronous and original callers.
+pub(crate) fn configuration_after_alter(
+    configuration: &ConfigurationDocument,
+    action: &MvAlterAction,
+) -> Result<novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration, String>
+{
+    let current = desired_refresh_configuration(configuration)
+        .map_err(|error| format!("stored Iceberg MV refresh configuration is invalid: {error}"))?;
+    match action {
+        MvAlterAction::SetRefresh(policy) => {
+            let (policy, interval_ms) = stored_refresh_policy(policy);
+            current.with_policy(policy, interval_ms)
+        }
+        MvAlterAction::PauseRefresh => current.with_paused(true),
+        MvAlterAction::ResumeRefresh => current.with_paused(false),
+        MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
+            unreachable!("repartition and properties returned before metadata update")
+        }
+    }
+    .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
+}
+
 fn load_definition_for_alter(
     readiness: &MvReadinessPort,
     current_catalog: Option<&str>,
@@ -294,23 +316,7 @@ pub fn alter_mv_with_ports(
     crate::mv::domain::iceberg_refresh::update_iceberg_mv_configuration_with_ports(
         ports,
         &definition,
-        |configuration| {
-            let current = desired_refresh_configuration(configuration).map_err(|error| {
-                format!("stored Iceberg MV refresh configuration is invalid: {error}")
-            })?;
-            match &stmt.action {
-                MvAlterAction::SetRefresh(policy) => {
-                    let (policy, interval_ms) = stored_refresh_policy(policy);
-                    current.with_policy(policy, interval_ms)
-                }
-                MvAlterAction::PauseRefresh => current.with_paused(true),
-                MvAlterAction::ResumeRefresh => current.with_paused(false),
-                MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
-                    unreachable!("repartition and properties returned before metadata update")
-                }
-            }
-            .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
-        },
+        |configuration| configuration_after_alter(configuration, &stmt.action),
         connector_context,
     )
     .map_err(|error| format!("update Iceberg MV refresh configuration failed: {error}"))?;

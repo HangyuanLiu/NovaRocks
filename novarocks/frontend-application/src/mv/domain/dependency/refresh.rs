@@ -149,6 +149,12 @@ pub(crate) struct MvRefreshGraphFacts {
     dependencies: Vec<Vec<StoredMvDependency>>,
 }
 
+impl MvRefreshGraphFacts {
+    pub(crate) fn into_parts(self) -> (Vec<LoadedKeyedMvProjection>, Vec<Vec<StoredMvDependency>>) {
+        (self.projections, self.dependencies)
+    }
+}
+
 pub(crate) async fn capture_refresh_graph(
     readiness: &MvReadinessExecution<'_>,
 ) -> Result<MvRefreshGraphFacts, novarocks_mv_application::repository::MvRepositoryError> {

@@ -753,7 +753,7 @@ fn retained_target_field_id_by_name(
 
 /// Reparse D's immutable effective SQL under its own frozen resolution context.
 /// The session that happens to issue the statement never resolves these names.
-fn canonical_mv_select_query(
+pub(crate) fn canonical_mv_select_query(
     projection: &StoredKeyedMvProjection,
 ) -> Result<novarocks_parser::ast::Query, String> {
     let effective_sql = projection.facts.definition().query.effective_sql.clone();

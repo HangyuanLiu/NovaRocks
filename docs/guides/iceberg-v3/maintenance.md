@@ -56,9 +56,11 @@ StateStore 在本领域仅可保存 GC first-observation Accelerator；该记录
 也不授予 catalog mutation、跨重启接管或删除权。所有手动与自动维护仍须通过实际 Provider 能力准入；
 是否配置 StateStore 都不能解除扫描 GC 的缺证限制。
 
-当前 lifecycle 只支持单 FE owner。关闭 FE 时会先停止并 join maintenance worker，再释放
-StateStore；它不提供多 FE lease、takeover 或 fencing。多 FE active/standby 的 claim 与
-destructive-action fencing 属于后续 CP-4。
+当前 lifecycle 只支持单 FE owner。关闭先停止新 job，通知现有 owner，并继续观察原 worker、
+Provider/CPU Source 及 StateStore 动作的实际退出。shutdown 等待期限结束不等于这些对象已关闭；
+未退出的原责任仍由同一监督者保管，不能只因 job 终态就释放其访问能力或关闭仍被借用的 Store。
+该边界不提供多 FE lease、takeover 或 fencing。多 FE active/standby 的 claim 与
+破坏性操作 fencing 需要独立协议。
 
 ## ✅ Whole-table OPTIMIZE
 
@@ -73,18 +75,23 @@ SHOW ALTER TABLE OPTIMIZE
 
 `ALTER TABLE ... OPTIMIZE` 在当前进程的 job runtime 接受后返回，rewrite 由 Frontend
 Application 的 maintenance worker 异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
-作为终态。Spark-style `CALL ...rewrite_data_files(...)` 则在同一语句内返回 action 结果。
+作为业务终态；这不证明残余 Provider/Native/CPU 工作或对象回收已经退出。
+Spark-style `CALL ...rewrite_data_files(...)` 则在同一语句内返回 action 结果。
 
 行为：
 
 - 把当前 snapshot 的所有 data file 重写到一组新 file（按当前 partition spec）
 - 同时合并 V2 position-delete / V3 DV：被删行不出现在新 file 中，DV blob 在重写完成后失效
 - 跨历史 partition spec：所有老文件按其 spec 解释，重写到当前 spec
-- 写出新 manifest，老文件由 EXPIRE SNAPSHOTS 路径回收
+- 写出新 manifest；老 snapshot 过期与其文件回收分别取证，不能由新快照提交推断老文件已经删除
 - V3 row-lineage 表保留现有 `_row_id` 与 `_last_updated_sequence_number`，rewrite 不分配新 row ID
 
-实现入口：`novarocks/frontend-application/src/table_maintenance/{mod,worker}.rs` 与
-`novarocks/connector/iceberg/src/commit/rewrite_data_files.rs`。
+SQL 入口为 `novarocks/frontend-application/src/query/maintenance_action.rs`；后台接收与执行位于
+`novarocks/frontend-application/src/table_maintenance/{mod,worker}.rs` 和
+`novarocks/frontend-application/src/query_execution/maintenance/rewrite_job.rs`。
+Table Maintenance 的共享业务算法位于 `novarocks/table-maintenance/src/product.rs`，
+Iceberg 的重写事实与提交实现位于 `novarocks/connector/iceberg/src/commit/rewrite_data_files.rs`。
+这些入口说明当前接线；完整迁移、删旧和原生验收尚未由本文宣告完成。
 
 ## ❌ OPTIMIZE 增量
 
@@ -102,7 +109,13 @@ ALTER TABLE orders OPTIMIZE WHERE country = 'CN';               -- 仅压指定 
 
 ### 行为
 
-删除 `metadata.json` 中不被任何 ref 祖先链覆盖的快照，物理删除其 orphan 文件。OLDER THAN 和 RETAIN LAST 可单独或组合使用，两个条件取交集：只有同时满足"早于时间戳"且"不属于最近 N 个"的 snapshot 才会被删。
+从 `metadata.json` 中移除满足保留策略且未受保护的快照。OLDER THAN 和 RETAIN LAST 可单独或组合使用，
+两个条件取交集：同时指定时，只有既早于时间戳、又不属于最近 N 个的 snapshot 才会被过期。
+
+快照元数据发布与物理文件回收是不同事实。Provider 保留原过期计划、提交证据与回收结果，
+文件删除仍核对实际引用、访问权限和相应回收前提。已提交的快照过期不保证所有文件已经删除；
+后续回收失败不能改写提交事实。该路径也不授予任意扫描表目录、删除足够老文件的权限，
+`REMOVE ORPHAN FILES` 仍受下节的 UNPROVEN 限制。
 
 ### 示例
 
@@ -123,7 +136,7 @@ ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST
 ### 入口
 
 `novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs` 与
-`novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/expire_snapshots.rs`
+`novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/{retention,reclamation}.rs`
 
 ## 受限：REMOVE ORPHAN FILES 与其它扫描回收
 
@@ -186,6 +199,18 @@ operation/journal 与访问能力仍由同一稳定 Call/残留保管；GC 的 P
 publication，也不能把该扫描的 unsupported 错误投成新 CTAS 的 AppliedButUnusable。
 目前不承诺跨 FE/BE 崩溃可重建全部产物清单、自动回收或无孤儿；恢复这类能力需要独立协议与证明。
 
+### 发布、必要收尾与公开结果
+
+维护 Action 使用 Provider 原 publication journal 的准确派发前沿。取得来源、进入 Future 或开始
+结果形成不证明请求已派发；原 journal 仍能证明未派发时，结果保持 KnownUncommitted。
+一旦可能派发，只能观察和裁定同一次 publication，不能因取消或等待超时重发整个维护 SQL。
+KnownCommitted 后推进必要 finalize；晚到取消不抹掉既有提交效果。NoOp 也不能冒充真实提交。
+
+当前 Cleanup 原 Source 先保存 journal 的 disposition、Applied 与原失败原因，再形成 receipt；
+后继 CPU 拒绝不能把已知提交/拒绝改写成 Unknown。必要 finalization 失败保留已有效果并报告业务
+未完成；仅安全 GC 未完成不翻转已完成业务。错误公开投影须同时保留原失败与 publication 知识，
+KnownUncommitted 只描述该 publication，不独自授予整条语句的重试许可。
+
 ### 实际资源与等待边界
 
 Provider 异步 I/O 由原稳定 Source 与同 Root 的 metadata 能力推进，真正阻塞调用使用原
@@ -194,18 +219,32 @@ executor。普通 Full 可取消等待，不另起 pool 或把整个维护流程
 运行位置。必要 finalize 与安全 GC 的完成分别取证，不能因空槽、NeededReady 或业务成功
 宣布 cleanup Complete。
 
-实际 buffer 复制按同预算的 old+new 并存峰授权，最后实际 alias 退出才退款。same operation
-自持数据造成不足时 typed 拒绝，不等待自己；完整 D 与来源检查不变，不新增依赖域 cleanup
-配额、SDK 对象图 invoice 或 worker 最低数。共享 executor 全部阻塞时，清理也可能等待到期限。
-这些规则不改变扫描的 UNPROVEN 拒绝：仍须在 list/delete 前拒绝，精确 owned-ref 与
-operation-owned cleanup 不因扫描不受支持而被禁用。实现迁移及手动/自动的原生与最终
-全工作区验证仍待完成。
+维护 Source 借原 active Root owner 的结果保管能力；Rewrite 计划与 begin 的初始依赖来自
+同一实际 Provider/runtime，动态发现路由后先在同 Root 续接完整依赖事实，再开始该请求。
+来源身份、generation、scope 与依赖完整性不授予计算或字节容量，也不要求 SDK 私有对象图报价。
+
+同 Root 的实际 retained payload 累计使用原 Internal 结果字节预算；各段计算位置独立管理，
+不因仍保留上段结果就继续占已退出的计算位置。buffer 复制/扩容前授权 old+new 的实际并存峰，
+最后实际 alias 退出才退款；转移原件不重复收费。当前保留量加下一段所需空间超过原预算，且只能
+等自己释放时，明确 typed Resource 拒绝，不丢弃 union、不逐段清零，也不隐含 spill。
+Client 返回结果仍使用原 Client window。物理 CPU、Blocking 队列与 Native transport 各沿原配置
+背压，不能由结果窗口数推导 worker 数，也不新增每依赖域 cleanup 配额或最低线程公式。
+
+共享 executor 的全部 worker 永久阻塞时，其它业务与结算也可能等待到各自原期限；本文不承诺
+故障域独立执行位置或整进程内存上界。job 的业务终态与历史裁剪分开，仍有原退出观察、Unknown
+或实际对象责任的记录不能为压缩历史而驱逐。
+
+这些规则不改变扫描的 UNPROVEN 拒绝：仍须在 list/delete 前拒绝。owned-ref 成熟度记录与
+exact CAS 不能自行解除该限制；精确 operation-owned cleanup 继续依据原 ledger 的独立安全事实。
+实现迁移及手动/自动调用面的原生与最终全工作区验证仍待完成，本文不提供性能测量结论。
 
 ### 入口
 
 `novarocks/connector/iceberg/src/catalog_control/{cleanup_maintenance,cleanup_candidates,unanchored_ctas_cleanup}.rs`，
 owned-ref 选择位于同目录的 `owned_ref_cleanup.rs`，first-observation 位于
-`novarocks/table-maintenance/src/gc_observation.rs`。SPI 的能力作者位于 `novarocks/spi/src/connector/cleanup_maintenance.rs`，Table Maintenance
+`novarocks/table-maintenance/src/gc_observation.rs`，其 `observe_in` 借实际执行 context，
+复用同一成熟度算法。它保留原 StateStore failure/CommitObservation，不把 observation 成熟当作
+外部对象可删除或动作已退出的证明。SPI 的能力作者位于 `novarocks/spi/src/connector/cleanup_maintenance.rs`，Table Maintenance
 入口位于 `novarocks/table-maintenance/src/product.rs`。原安全准入与拒绝仍须对实际二进制验收；
 普通提交、精确 operation-owned 清理与独立安全 metadata 维护不因该扫描限制而停用。
 

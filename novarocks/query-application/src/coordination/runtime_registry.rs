@@ -1103,6 +1103,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
         notice
     }
 
+    pub(crate) fn record_process_failure(&self, failure: crate::api::StatementNativeHealthFailure) {
+        self.inner.statement_native.record_unproven_exit(failure);
+    }
+
     pub(crate) fn record_native_supervision_panic(&self, original: Box<dyn std::any::Any + Send>) {
         self.inner
             .statement_native

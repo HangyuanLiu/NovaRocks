@@ -58,13 +58,16 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .target_binding(source, &iceberg_target, connector_context)
         .await
         .map_err(RefreshError::from)?;
-    if let Err(snapshot_error) = validate_target_snapshot(
+    if let Err(snapshot_error) = validate_target_snapshot_original(
+        io,
+        source,
         &iceberg_target,
         &mv_definition,
         &target_binding,
-        source.management_entrance()?.as_ref(),
         connector_context,
-    ) {
+    )
+    .await
+    {
         reconcile_published_lake_projection(
             io,
             source,
@@ -1462,4 +1465,27 @@ async fn reconcile_published_lake_projection(
     )
     .await?;
     Ok(())
+}
+
+/// The original document observation runs outside the pure reader's CPU turn.
+pub(crate) async fn validate_target_snapshot_original(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    definition: &StoredKeyedMvProjection,
+    binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), RefreshError> {
+    let documents = binding.lease().derive_document_storage_lease()?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        binding.identity().clone(),
+        definition.facts.source_revision().target_object_id.clone(),
+        context.clone(),
+    );
+    let observed = io.observe_current(source, &documents, request).await?;
+    crate::mv::domain::refresh::target::validate_target_snapshot_observed(
+        target, definition, binding, &observed,
+    )
+    .map_err(Into::into)
 }

@@ -227,6 +227,7 @@ pub struct MvBackgroundEngineError {
     kind: MvBackgroundEngineErrorKind,
     message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
 }
 
 impl MvBackgroundEngineError {
@@ -235,9 +236,20 @@ impl MvBackgroundEngineError {
             kind,
             message: message.into(),
             compile_control: None,
+            original_failure: None,
         }
     }
 
+    pub fn with_original_failure(
+        mut self,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        self.original_failure = Some(cause);
+        self
+    }
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original_failure.as_ref()
+    }
     pub fn with_compile_control(
         mut self,
         control: Option<novarocks_type_contract::CompileControlError>,
@@ -264,7 +276,13 @@ impl fmt::Display for MvBackgroundEngineError {
     }
 }
 
-impl std::error::Error for MvBackgroundEngineError {}
+impl std::error::Error for MvBackgroundEngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_failure
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Facts needed to apply automatic-maintenance policy without a provider
 /// metadata object or property-map fallback. Absent facts remain unknown.

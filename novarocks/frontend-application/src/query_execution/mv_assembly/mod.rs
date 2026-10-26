@@ -8,6 +8,8 @@ pub(crate) mod activation_cpu;
 pub(crate) mod activation_preparation;
 mod activation_request;
 mod activation_source;
+pub(crate) mod create_preparation;
+pub(crate) mod create_publication;
 pub(crate) mod first_refresh_staging;
 pub mod iceberg_activation;
 pub(crate) mod incremental_staging;

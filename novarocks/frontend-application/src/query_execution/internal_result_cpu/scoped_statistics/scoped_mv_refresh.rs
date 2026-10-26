@@ -40,8 +40,8 @@ impl InternalResultCpu {
         cancellation: QueryCancellationView,
         runtime: &tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
-    ) -> MvRefreshCpuJob {
-        MvRefreshCpuJob {
+    ) -> MvCpuJob {
+        MvCpuJob {
             original: self.submit_creator_input(
                 ClosedCreatorInput::MvRefresh(turn),
                 window,
@@ -57,10 +57,14 @@ impl InternalResultCpu {
 
 /// The result graph remains in the same original Source. This facade receives
 /// only the existing CPU marker and joins its physical worker and forwarder.
-pub(crate) struct MvRefreshCpuJob {
+pub(crate) struct MvCpuJob {
     original: ProviderReadCpuJob,
 }
-impl MvRefreshCpuJob {
+impl MvCpuJob {
+    pub(super) fn from_original(original: ProviderReadCpuJob) -> Self {
+        Self { original }
+    }
+
     pub(crate) fn poll_finish_in(
         &mut self,
         cx: &mut Context<'_>,

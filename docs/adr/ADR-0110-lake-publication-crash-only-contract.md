@@ -23,6 +23,16 @@ code-anchors:
 
 ## 问题
 
+> **当前适用范围：** [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)
+> 部分替代本条从本地 statement deadline 推导外部效果上界、以及无条件年龄窗 GC 的规则。
+> 下文保留原决策及其取舍；target OCC、statement autocommit 和没有持久 takeover 的边界继续有效。
+> 本地等待结束不能证明已发请求不会迟到生效，`candidate_age > max_attempt_duration + propagation_margin`
+> 只有在 Provider 能独立证明真实 writer/外部效果上界或有效 fencing，并覆盖时钟、列举、并发与 Unknown
+> 保护时才可作为安全条件。当前 REST/Hadoop 的 orphan、owned-ref 成熟回收和无表锚 CTAS 根扫描
+> 证明为 UNPROVEN；SQL 手动与自动入口均不能仅凭对象年龄、当前不可达或 first-observation 取得删除权。
+> 精确 operation-owned cleanup 仍按原 ledger、实际不再使用与 Unknown 保护等独立事实处理，不能从
+> 扫描缺证反推它也被禁用。ADR-0198 的实现状态仍为 pending，不据此宣称跨崩溃自动回收或全部入口验收完成。
+
 在不保留跨进程恢复、takeover 或自动补偿的前提下，NovaRocks 如何让每次 lake 写入只在一个 Catalog frontier
 上得到 old-or-new 结果，并安全回收 crash 残留的对象、内部 ref 与无表锚 CTAS 文件？
 

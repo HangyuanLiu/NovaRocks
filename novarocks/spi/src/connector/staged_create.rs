@@ -813,7 +813,471 @@ pub enum ConnectorStagedCreatePublicationAdjudicationOutcome {
     },
 }
 
+/// One original publication, not a new dispatch or cleanup authority.
+/// The caller installs the returned strong Source before polling it.
+pub trait ConnectorStagedCreatePublicationSource: Send + Sync {
+    /// The same journal crossed its actual dispatch-start cut. No conclusion,
+    /// retry, abort or finalization authority follows from this observation.
+    fn dispatch_started(&self) -> bool;
+    fn poll_progress(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()>;
+    fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStagedCreateNeededCommitted {
+    pub effect: ExternalMutationEffect,
+    pub receipt: ConnectorStagedCreateReceipt,
+    pub finalization: ExternalMutationFinalization,
+}
+struct PublicationIdentity {
+    lease: ConnectorStagedCreateLease,
+    operation: ConnectorStagedCreateOperationId,
+    dispatch: ConnectorStagedCreateOperationId,
+    digest: [u8; 32],
+    write: BoundWriteProof,
+}
+#[derive(Default)]
+struct PublicationFacts {
+    confirmed_not_dispatched: bool,
+    applied: Option<ConnectorStagedCreateReceipt>,
+    needed: Option<ConnectorStagedCreateNeededCommitted>,
+    context: Option<Result<ConnectorRequestContext, ConnectorError>>,
+    raw: Option<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>>,
+    validation: Option<Result<(), ConnectorError>>,
+}
+struct PublicationObservationInner {
+    source: std::sync::OnceLock<std::sync::Weak<dyn ConnectorStagedCreatePublicationSource>>,
+    identity: std::sync::OnceLock<PublicationIdentity>,
+    facts: Mutex<PublicationFacts>,
+    foreign: std::sync::atomic::AtomicBool,
+    exited: std::sync::atomic::AtomicBool,
+}
+/// Facts are shared independently of the strong original Source slot. The
+/// Provider may retain this observer without creating Source -> owner cycles.
+#[derive(Clone)]
+pub struct ConnectorStagedCreatePublicationObservation(Arc<PublicationObservationInner>);
+impl Default for ConnectorStagedCreatePublicationObservation {
+    fn default() -> Self {
+        Self(Arc::new(PublicationObservationInner {
+            source: std::sync::OnceLock::new(),
+            identity: std::sync::OnceLock::new(),
+            facts: Mutex::new(PublicationFacts::default()),
+            foreign: std::sync::atomic::AtomicBool::new(false),
+            exited: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+}
+impl ConnectorStagedCreatePublicationObservation {
+    /// A read-only loan of the installed original Source, outside facts locks.
+    /// False is not proof of non-dispatch; only its explicit negative fact is.
+    pub fn dispatch_started(&self) -> bool {
+        self.0
+            .source
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|source| source.dispatch_started())
+    }
+    fn identity(&self) -> Result<&PublicationIdentity, ConnectorError> {
+        self.0
+            .identity
+            .get()
+            .ok_or_else(|| invalid("staged publication has no original request"))
+    }
+    fn validate_receipt(
+        &self,
+        receipt: &ConnectorStagedCreateReceipt,
+    ) -> Result<(), ConnectorError> {
+        let identity = self.identity()?;
+        identity.lease.validate_receipt(
+            receipt,
+            identity.dispatch,
+            ConnectorStagedCreateReceiptPhase::Published,
+        )
+    }
+    /// Negative knowledge recorded by the same preparation-refusal author.
+    /// An empty observation, missing Applied or a raw error proves nothing.
+    /// This observation grants no abort right without the lease's exact proof.
+    pub fn confirmed_not_dispatched(&self) -> bool {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .confirmed_not_dispatched
+    }
+    pub fn applied_receipt(&self) -> Option<ConnectorStagedCreateReceipt> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .applied
+            .clone()
+    }
+    pub fn needed_committed(&self) -> Option<ConnectorStagedCreateNeededCommitted> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .needed
+            .clone()
+    }
+    pub fn finalization_context(&self) -> Option<Result<ConnectorRequestContext, ConnectorError>> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .clone()
+    }
+    pub fn raw_outcome(
+        &self,
+    ) -> Option<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .raw
+            .clone()
+    }
+    pub fn validation(&self) -> Option<Result<(), ConnectorError>> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .validation
+            .clone()
+    }
+    pub fn provider_exited(&self) -> bool {
+        self.0.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// True only during an actual foreign poll/Drop, or after its unwind. A
+    /// normal Pending clears it and does not prove the original F has exited.
+    pub fn foreign_exit_unproven(&self) -> bool {
+        self.0.foreign.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+/// Only the selected Provider factory receives this recorder. Public readers
+/// cannot manufacture dispatch, finite-context, or actual-exit observations.
+#[derive(Clone)]
+pub struct ConnectorStagedCreatePublicationRecorder {
+    observation: ConnectorStagedCreatePublicationObservation,
+}
+impl std::ops::Deref for ConnectorStagedCreatePublicationRecorder {
+    type Target = ConnectorStagedCreatePublicationObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+impl ConnectorStagedCreatePublicationRecorder {
+    pub fn enter_foreign(&self) {
+        assert!(
+            !self
+                .observation
+                .0
+                .foreign
+                .swap(true, std::sync::atomic::Ordering::AcqRel),
+            "poisoned original publication cannot be repolled"
+        );
+    }
+    pub fn leave_pending(&self) {
+        self.observation
+            .0
+            .foreign
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub fn record_provider_exit(&self) {
+        self.observation
+            .0
+            .exited
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.observation
+            .0
+            .foreign
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub fn record_applied_receipt(
+        &self,
+        receipt: &ConnectorStagedCreateReceipt,
+    ) -> Result<(), ConnectorError> {
+        self.validate_receipt(receipt)?;
+        if receipt.effect() != ExternalMutationEffect::Applied {
+            return Err(invalid(
+                "staged Applied requires its actual Applied receipt",
+            ));
+        }
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(prior) = &facts.applied {
+            if prior != receipt {
+                return Err(invalid(
+                    "staged Applied cannot replace its original receipt",
+                ));
+            }
+        } else {
+            facts.applied = Some(receipt.clone());
+        }
+        Ok(())
+    }
+    pub fn record_finalization_context(
+        &self,
+        receipt: &ConnectorStagedCreateReceipt,
+        context: Result<ConnectorRequestContext, ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        self.validate_receipt(receipt)?;
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if facts.applied.as_ref() != Some(receipt) {
+            return Err(invalid(
+                "staged finalization context requires the same actual Applied receipt",
+            ));
+        }
+        if facts.context.is_some() {
+            return Err(invalid("staged finalization context is received only once"));
+        }
+        facts.context = Some(context);
+        Ok(())
+    }
+    pub fn record_needed_committed(
+        &self,
+        effect: ExternalMutationEffect,
+        receipt: &ConnectorStagedCreateReceipt,
+        finalization: &ExternalMutationFinalization,
+    ) -> Result<(), ConnectorError> {
+        self.validate_receipt(receipt)?;
+        if receipt.effect() != effect {
+            return Err(invalid("staged necessary effect contradicts its receipt"));
+        }
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if effect == ExternalMutationEffect::Applied && facts.applied.as_ref() != Some(receipt) {
+            return Err(invalid(
+                "staged necessary Applied has no original positive receipt",
+            ));
+        }
+        let needed = ConnectorStagedCreateNeededCommitted {
+            effect,
+            receipt: receipt.clone(),
+            finalization: finalization.clone(),
+        };
+        if let Some(prior) = &facts.needed {
+            if prior != &needed {
+                return Err(invalid("staged necessary facts cannot be replaced"));
+            }
+        } else {
+            facts.needed = Some(needed);
+        }
+        Ok(())
+    }
+    /// Receive first, validate second, then expose the original lease state;
+    /// none of these steps can erase an already received positive journal fact.
+    pub fn record_preparation_refusal(&self, error: ConnectorError) {
+        {
+            let facts = self
+                .observation
+                .0
+                .facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                facts.applied.is_none() && facts.needed.is_none(),
+                "a preparation refusal cannot erase received publication facts"
+            );
+        }
+        self.record_raw_in(Err(error), true);
+    }
+    pub fn record_raw(&self, raw: Result<ConnectorStagedCreatePublishOutcome, ConnectorError>) {
+        self.record_raw_in(raw, false);
+    }
+    fn record_raw_in(
+        &self,
+        raw: Result<ConnectorStagedCreatePublishOutcome, ConnectorError>,
+        before_dispatch: bool,
+    ) {
+        {
+            let mut facts = self
+                .observation
+                .0
+                .facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                facts.raw.is_none(),
+                "one original staged publication outcome"
+            );
+            facts.raw = Some(raw.clone());
+        }
+        let identity = self
+            .identity()
+            .expect("installed original publication identity");
+        let mut validation = match &raw {
+            Ok(outcome) => identity
+                .lease
+                .validate_publish_outcome(identity.dispatch, outcome),
+            Err(error) => Err(error.clone()),
+        };
+        match &raw {
+            Ok(ConnectorStagedCreatePublishOutcome::Applied { receipt, .. })
+                if receipt.effect() != ExternalMutationEffect::Applied =>
+            {
+                validation = Err(invalid(
+                    "staged Applied raw outcome has a non-Applied receipt",
+                ))
+            }
+            Ok(ConnectorStagedCreatePublishOutcome::NoOp { receipt, .. })
+                if receipt.effect() != ExternalMutationEffect::NoOp =>
+            {
+                validation = Err(invalid("staged NoOp raw outcome has an effectful receipt"))
+            }
+            _ => {}
+        }
+        {
+            let facts = self
+                .observation
+                .0
+                .facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(applied) = &facts.applied {
+                if !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,..}) if receipt==applied)
+                {
+                    validation = Err(invalid(
+                        "staged raw outcome contradicts its original Applied receipt",
+                    ));
+                }
+            }
+            if let Some(needed) = &facts.needed {
+                if !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,finalization}|ConnectorStagedCreatePublishOutcome::NoOp{receipt,finalization}) if receipt==&needed.receipt && finalization==&needed.finalization)
+                {
+                    validation = Err(invalid(
+                        "staged raw outcome contradicts its necessary facts",
+                    ));
+                }
+            }
+        }
+        if before_dispatch && raw.is_err() {
+            identity.lease.record_after_dispatch(
+                identity.operation,
+                Some(LeaseOperationState::Unpublished {
+                    handle_digest: identity.digest,
+                    bound_write: Some(identity.write),
+                }),
+            );
+        } else if validation.is_ok() {
+            let state = match &raw {
+                Ok(ConnectorStagedCreatePublishOutcome::Applied { .. }) => {
+                    LeaseOperationState::Published
+                }
+                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. }) => {
+                    LeaseOperationState::PublicationUnknown {
+                        evidence_digest: evidence.digest(),
+                        handle_digest: identity.digest,
+                        bound_write: identity.write,
+                    }
+                }
+                _ => LeaseOperationState::Unpublished {
+                    handle_digest: identity.digest,
+                    bound_write: Some(identity.write),
+                },
+            };
+            identity
+                .lease
+                .record_after_dispatch(identity.operation, Some(state));
+        } else {
+            identity.lease.set_unknown_without_evidence(
+                identity.operation,
+                Some(identity.digest),
+                Some(identity.write),
+            );
+        }
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Publish only after the exact original Unpublished/bound-write row
+        // has been restored above; no consumer reconstructs this from absence.
+        facts.confirmed_not_dispatched = before_dispatch && raw.is_err();
+        facts.validation = Some(validation);
+    }
+}
+/// Caller-owned strong original slot, installed before the first foreign poll.
+#[derive(Clone, Default)]
+pub struct ConnectorStagedCreatePublicationReceiving {
+    observation: ConnectorStagedCreatePublicationObservation,
+    source: Arc<std::sync::OnceLock<Arc<dyn ConnectorStagedCreatePublicationSource>>>,
+}
+impl ConnectorStagedCreatePublicationReceiving {
+    pub fn observation(&self) -> ConnectorStagedCreatePublicationObservation {
+        self.observation.clone()
+    }
+    pub fn original_owner(&self) -> Option<Arc<dyn ConnectorStagedCreatePublicationSource>> {
+        self.source.get().cloned()
+    }
+}
+pub struct ConnectorStagedCreatePublication {
+    receiving: ConnectorStagedCreatePublicationReceiving,
+}
+impl ConnectorStagedCreatePublication {
+    pub fn observation(&self) -> ConnectorStagedCreatePublicationObservation {
+        self.receiving.observation()
+    }
+    pub fn poll_result(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>> {
+        let source = self
+            .receiving
+            .source
+            .get()
+            .expect("installed original publication");
+        let progress = source.poll_progress(cx);
+        let observation = self.receiving.observation();
+        if let Some(result) = observation.raw_outcome() {
+            if let Some(validation) = observation.validation() {
+                validation?;
+                return std::task::Poll::Ready(result);
+            }
+        }
+        assert!(
+            progress.is_pending(),
+            "closed original publication has no received outcome"
+        );
+        std::task::Poll::Pending
+    }
+    pub fn poll_closed(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.receiving
+            .source
+            .get()
+            .expect("installed original publication")
+            .poll_closed(cx)
+    }
+}
+
 pub trait ConnectorStagedCreate: Send + Sync {
+    /// Pure construction only. Unsupported does not invoke the legacy method.
+    fn begin_publish_original(
+        &self,
+        _request: ConnectorStagedCreatePublishRequest,
+        _observation: ConnectorStagedCreatePublicationRecorder,
+    ) -> Result<Arc<dyn ConnectorStagedCreatePublicationSource>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not support original staged publication",
+        ))
+    }
+
     fn prepare_async(
         &self,
         _request: ConnectorStagedCreatePrepareRequest,
@@ -1576,6 +2040,72 @@ impl ConnectorStagedCreateLease {
         };
         self.record_after_dispatch(operation_id, state);
         Ok(outcome)
+    }
+
+    /// The fixed receiving slot is claimed before the actual Provider factory.
+    /// The factory forms a strong Source; only the returned execution polls it.
+    pub fn begin_publish_original(
+        &self,
+        request: ConnectorStagedCreatePublishRequest,
+        receiving: &ConnectorStagedCreatePublicationReceiving,
+    ) -> Result<ConnectorStagedCreatePublication, ConnectorError> {
+        let write = self.require_bound_write(&request.handle, &request.write)?;
+        match &request.payload {
+            ConnectorStagedCreatePublicationPayload::Ordinary
+                if request.handle.document_target().is_none() => {}
+            ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
+                intent.validate_for_handle(&request.handle)?
+            }
+            _ => {
+                return Err(invalid(
+                    "staged create publication payload does not match its prepared target mode",
+                ));
+            }
+        }
+        let identity = PublicationIdentity {
+            lease: self.clone(),
+            operation: request.handle.operation_id(),
+            dispatch: request.operation_id,
+            digest: request.handle.digest(),
+            write,
+        };
+        receiving
+            .observation
+            .0
+            .identity
+            .set(identity)
+            .map_err(|_| invalid("original staged publication receiving is already claimed"))?;
+        let recorder = ConnectorStagedCreatePublicationRecorder {
+            observation: receiving.observation(),
+        };
+        let source = match self
+            .capability
+            .begin_publish_original(request, recorder.clone())
+        {
+            Ok(source) => source,
+            Err(error) => {
+                // The factory contract is pure construction, before any F or
+                // I/O. Preserve this explicit refusal in the original row.
+                recorder.record_preparation_refusal(error.clone());
+                return Err(error);
+            }
+        };
+        assert!(
+            receiving
+                .observation
+                .0
+                .source
+                .set(Arc::downgrade(&source))
+                .is_ok(),
+            "one original staged publication observer"
+        );
+        assert!(
+            receiving.source.set(source).is_ok(),
+            "one original staged publication Source"
+        );
+        Ok(ConnectorStagedCreatePublication {
+            receiving: receiving.clone(),
+        })
     }
 
     pub async fn publish_async(
@@ -2710,6 +3240,378 @@ mod tests {
     use super::*;
     use crate::connector::{CatalogVersion, ConnectorInstanceId, ConnectorProviderId};
 
+    fn original_publication_observation() -> (
+        ConnectorStagedCreatePublicationRecorder,
+        ConnectorStagedCreateLease,
+        ConnectorMutationOperationId,
+    ) {
+        let (descriptor, incarnation) = owner();
+        let capability = Arc::new(FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            unusable_prepare: false,
+            noop_publish: false,
+            conflict_publish: false,
+            unknown_abort: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorProviderBindingKey {
+                instance_id: descriptor.instance_id,
+                incarnation,
+            },
+            capability,
+            || {},
+        )
+        .unwrap();
+        let operation = ConnectorMutationOperationId::new();
+        let observation = ConnectorStagedCreatePublicationObservation::default();
+        assert!(
+            observation
+                .0
+                .identity
+                .set(PublicationIdentity {
+                    lease: lease.clone(),
+                    operation,
+                    dispatch: operation,
+                    digest: [7; 32],
+                    write: BoundWriteProof {
+                        receipt_digest: [8; 32],
+                        row_count: 0
+                    }
+                })
+                .is_ok()
+        );
+        (
+            ConnectorStagedCreatePublicationRecorder { observation },
+            lease,
+            operation,
+        )
+    }
+
+    #[test]
+    fn original_publication_receives_exact_applied_and_one_absolute_context_without_exit() {
+        let (observation, lease, operation) = original_publication_observation();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap();
+        let stage_receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Prepared,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap();
+        assert!(
+            observation.record_applied_receipt(&stage_receipt).is_err(),
+            "the staging receipt is not final publication evidence"
+        );
+        let original = context();
+        let deadline = original.deadline();
+        assert!(observation.finalization_context().is_none());
+        observation.record_applied_receipt(&receipt).unwrap();
+        observation
+            .record_finalization_context(&receipt, Ok(original))
+            .unwrap();
+        assert_eq!(
+            observation
+                .finalization_context()
+                .unwrap()
+                .unwrap()
+                .deadline(),
+            deadline
+        );
+        assert!(
+            observation
+                .record_finalization_context(&receipt, Ok(context()))
+                .is_err()
+        );
+        assert_eq!(
+            observation
+                .finalization_context()
+                .unwrap()
+                .unwrap()
+                .deadline(),
+            deadline
+        );
+        assert!(observation.needed_committed().is_none());
+        assert!(!observation.provider_exited());
+        observation
+            .record_needed_committed(
+                ExternalMutationEffect::Applied,
+                &receipt,
+                &ExternalMutationFinalization::Complete,
+            )
+            .unwrap();
+        observation.record_raw(Ok(ConnectorStagedCreatePublishOutcome::Applied {
+            receipt: receipt.clone(),
+            finalization: ExternalMutationFinalization::Complete,
+        }));
+        assert_eq!(observation.validation().unwrap(), Ok(()));
+        assert_eq!(observation.applied_receipt(), Some(receipt));
+        assert!(
+            !observation.provider_exited(),
+            "a received result never proves the opaque Future Drop"
+        );
+        assert!(matches!(
+            lease.operations.lock().unwrap().get(&operation),
+            Some(LeaseOperationState::Published)
+        ));
+        observation.enter_foreign();
+        assert!(observation.foreign_exit_unproven());
+        observation.record_provider_exit();
+        assert!(observation.provider_exited());
+        assert!(!observation.foreign_exit_unproven());
+    }
+
+    #[test]
+    fn original_publication_noop_unknown_and_preparation_refusal_do_not_forge_applied_or_cleanup() {
+        let (noop, lease, operation) = original_publication_observation();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::NoOp,
+            Bytes::new(),
+        )
+        .unwrap();
+        assert!(noop.record_applied_receipt(&receipt).is_err());
+        assert!(
+            noop.record_finalization_context(&receipt, Ok(context()))
+                .is_err()
+        );
+        noop.record_needed_committed(
+            ExternalMutationEffect::NoOp,
+            &receipt,
+            &ExternalMutationFinalization::Complete,
+        )
+        .unwrap();
+        noop.record_raw(Ok(ConnectorStagedCreatePublishOutcome::NoOp {
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        }));
+        assert!(noop.applied_receipt().is_none());
+        assert!(noop.finalization_context().is_none());
+        assert_eq!(noop.validation().unwrap(), Ok(()));
+
+        let (unknown, lease, operation) = original_publication_observation();
+        assert!(!unknown.confirmed_not_dispatched());
+        let evidence = ExternalMutationEvidence::try_new(
+            1,
+            lease.capability.descriptor().clone(),
+            lease.owner().incarnation,
+            operation,
+            "staged-create-publish",
+            Bytes::from_static(b"unknown-original"),
+        )
+        .unwrap();
+        unknown.record_raw(Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
+            failure: ConnectorMutationFailure::new(
+                super::super::ConnectorMutationFailureKind::Unavailable,
+                "original unknown",
+            ),
+            evidence,
+        }));
+        assert!(unknown.applied_receipt().is_none());
+        assert!(unknown.needed_committed().is_none());
+        assert!(unknown.finalization_context().is_none());
+        assert!(!unknown.provider_exited());
+
+        let (expired, lease, operation) = original_publication_observation();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap();
+        expired.record_applied_receipt(&receipt).unwrap();
+        let original = ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "original journal finalization grant expired",
+        );
+        expired
+            .record_finalization_context(&receipt, Err(original.clone()))
+            .unwrap();
+        assert_eq!(
+            expired.finalization_context().unwrap().err().unwrap(),
+            original
+        );
+        assert!(
+            expired
+                .record_finalization_context(&receipt, Ok(context()))
+                .is_err()
+        );
+        assert!(
+            expired.applied_receipt().is_some(),
+            "finite refusal cannot erase actual Applied"
+        );
+
+        assert!(!unknown.confirmed_not_dispatched());
+        let (refused, lease, operation) = original_publication_observation();
+        assert!(!refused.confirmed_not_dispatched());
+        let cause = ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "original preparation stopped before dispatch",
+        );
+        refused.record_preparation_refusal(cause.clone());
+        assert!(refused.confirmed_not_dispatched());
+        assert_eq!(refused.raw_outcome().unwrap().unwrap_err(), cause);
+        assert!(refused.needed_committed().is_none());
+        assert!(refused.applied_receipt().is_none());
+        assert!(
+            matches!(
+                lease.operations.lock().unwrap().get(&operation),
+                Some(LeaseOperationState::Unpublished { .. })
+            ),
+            "a proved preparation refusal must not become Unknown"
+        );
+    }
+
+    #[test]
+    fn pure_original_factory_refusal_preserves_unpublished_bound_write() {
+        let (_, lease, _) = original_publication_observation();
+        let operation = ConnectorMutationOperationId::new();
+        let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = lease
+            .prepare(prepare_request(lease.owner().clone(), operation))
+            .unwrap()
+        else {
+            panic!("actual prepared target required")
+        };
+        let write = write_proof(1);
+        lease.bind_write(handle.clone(), write.clone()).unwrap();
+        let receiving = ConnectorStagedCreatePublicationReceiving::default();
+        let error = match lease.begin_publish_original(
+            ConnectorStagedCreatePublishRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                handle: handle.clone(),
+                write: write.clone(),
+                payload: ConnectorStagedCreatePublicationPayload::Ordinary,
+                context: context(),
+            },
+            &receiving,
+        ) {
+            Ok(_) => panic!("this explicit fixture has no original publication capability"),
+            Err(error) => error,
+        };
+        let observation = receiving.observation();
+        assert!(observation.confirmed_not_dispatched());
+        assert_eq!(observation.raw_outcome().unwrap().unwrap_err(), error);
+        assert!(!observation.dispatch_started());
+        assert!(observation.applied_receipt().is_none());
+        assert!(receiving.original_owner().is_none());
+        // This is an actual lease check, not a rule inferred from no receipt.
+        lease
+            .abort(ConnectorStagedCreateAbortRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                handle,
+                write: Some(write),
+                context: context(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn original_receiving_keeps_needed_and_weak_source_separate_from_actual_exit() {
+        struct HeldOriginal {
+            recorder: ConnectorStagedCreatePublicationRecorder,
+            receipt: ConnectorStagedCreateReceipt,
+            received: std::sync::atomic::AtomicBool,
+            finished: std::sync::atomic::AtomicBool,
+        }
+        impl ConnectorStagedCreatePublicationSource for HeldOriginal {
+            fn dispatch_started(&self) -> bool {
+                self.received.load(Ordering::Acquire)
+            }
+            fn poll_progress(&self, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+                if !self.received.swap(true, Ordering::AcqRel) {
+                    self.recorder.record_applied_receipt(&self.receipt).unwrap();
+                    self.recorder
+                        .record_needed_committed(
+                            ExternalMutationEffect::Applied,
+                            &self.receipt,
+                            &ExternalMutationFinalization::Complete,
+                        )
+                        .unwrap();
+                    self.recorder
+                        .record_raw(Ok(ConnectorStagedCreatePublishOutcome::Applied {
+                            receipt: self.receipt.clone(),
+                            finalization: ExternalMutationFinalization::Complete,
+                        }));
+                }
+                if self.finished.load(Ordering::Acquire) {
+                    self.recorder.record_provider_exit();
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+            fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+                self.poll_progress(cx)
+            }
+        }
+        // Only the actual producer-shaped fixture receives a recorder. It
+        // grants no CPU/IO/Root capability or claim of full Provider coverage.
+        let (recorder, lease, operation) = original_publication_observation();
+        let observation = recorder.observation.clone();
+        let actual = Arc::new(HeldOriginal {
+            recorder,
+            receipt: ConnectorStagedCreateReceipt::try_new(
+                lease.owner().clone(),
+                operation,
+                ConnectorStagedCreateReceiptPhase::Published,
+                ExternalMutationEffect::Applied,
+                Bytes::new(),
+            )
+            .unwrap(),
+            received: false.into(),
+            finished: false.into(),
+        });
+        let source: Arc<dyn ConnectorStagedCreatePublicationSource> = actual.clone();
+        let weak = Arc::downgrade(&actual);
+        assert!(observation.0.source.set(Arc::downgrade(&source)).is_ok());
+        let receiving = ConnectorStagedCreatePublicationReceiving {
+            observation: observation.clone(),
+            source: Default::default(),
+        };
+        assert!(receiving.source.set(source).is_ok());
+        let mut execution = ConnectorStagedCreatePublication {
+            receiving: receiving.clone(),
+        };
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(!observation.dispatch_started());
+        assert!(matches!(
+            execution.poll_result(&mut cx),
+            std::task::Poll::Ready(Ok(ConnectorStagedCreatePublishOutcome::Applied { .. }))
+        ));
+        assert!(observation.needed_committed().is_some());
+        assert!(observation.dispatch_started());
+        assert!(!observation.provider_exited());
+        assert!(execution.poll_closed(&mut cx).is_pending());
+        actual.finished.store(true, Ordering::Release);
+        assert!(execution.poll_closed(&mut cx).is_ready());
+        assert!(observation.provider_exited());
+        drop(actual);
+        drop(execution);
+        drop(receiving);
+        assert!(
+            weak.upgrade().is_none(),
+            "read observer must not pin the original Source"
+        );
+    }
     #[test]
     fn unanchored_ctas_cleanup_provenance_is_target_bound_and_tamper_evident() {
         let instance_id = ConnectorInstanceId::parse("ice").unwrap();

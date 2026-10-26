@@ -20,8 +20,8 @@
 use std::fmt;
 
 use crate::product::{
-    MvCommand, MvCreatedTarget, MvOperationContext, MvProductError, MvProductErrorKind,
-    MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
+    MvCommand, MvCreatePublicationOutcome, MvCreatedTarget, MvOperationContext, MvProductError,
+    MvProductErrorKind, MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
 use crate::readiness::{MvDropReadiness, MvKeyedProjectionDeleteGuard};
@@ -202,6 +202,43 @@ pub trait MvCreateProviderPort: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 }
 
+/// Borrowed progress of one original CREATE. Each poll may only advance its
+/// named phase. The outer Source retains the raw result before dropping a
+/// completed child Future, and retains every in-flight input through actual
+/// exit. The product owns ordering and policy; this port owns no retry policy.
+pub trait MvCreateProgressPort: Send {
+    fn poll_stage_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        command: &MvCommand,
+    ) -> std::task::Poll<Result<MvStagedTarget, MvProviderFailure>>;
+    fn poll_publish_staged_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> std::task::Poll<Result<MvCreatePublicationOutcome, MvProviderFailure>>;
+    fn poll_abort_staged_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_install_created_projection(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvCreatedTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_register_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvCreatedTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+}
+
 /// Provider effect required by the product-owned DROP transition.
 pub trait MvDropProviderPort: Send + Sync {
     fn drop_target(
@@ -257,6 +294,38 @@ pub trait MvDropProjectionPort<G = MvKeyedProjectionDeleteGuard>: Send + Sync {
         operation: MvOperationContext,
         guard: G,
     ) -> Result<(), MvProviderFailure>;
+}
+
+/// DROP borrows the same original provider and exact projection-delete guard.
+/// The first projection-delete poll may move `guard` into its stable Source;
+/// a Pending result never permits dropping it or acquiring another guard.
+/// As with CREATE, the Source receives raw results before child Future Drop.
+pub trait MvDropProgressPort<G>: Send {
+    fn poll_prepare_drop(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> std::task::Poll<Result<MvDropReadiness<G>, MvProviderFailure>>;
+    fn poll_drop_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_delete_after_provider_drop(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        guard: &mut Option<G>,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_unregister_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
 }
 
 /// One request-local refresh capability borrowed by the product transition.

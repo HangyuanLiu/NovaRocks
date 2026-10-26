@@ -47,11 +47,12 @@ use novarocks_sql::compiler::SessionOptimizerSettings;
 
 use super::{
     activity::canonical_mv_target,
-    create,
-    maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
-    refresh,
+    create, refresh,
     scheduler::{self, ScheduledRefreshDisposition, ScheduledRefreshRequest},
 };
+
+#[path = "service/background_original.rs"]
+mod background_original;
 
 /// Frontend composition and statement adapter for materialized-view products.
 ///
@@ -168,6 +169,8 @@ impl FrontendMvProductAdapter {
             readiness: Arc::clone(&self.readiness),
             refresh: dependencies,
             background_engine: bindings.engine,
+            ports: bindings.ports,
+            execution: bindings.execution,
             topology,
             role: self.execution_role,
             maintenance_config: self.maintenance_config.clone(),
@@ -306,6 +309,8 @@ struct RefreshWorkerDependencies {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
     background_engine: Arc<dyn MvBackgroundEngine>,
+    ports: crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
+    execution: crate::query::mv_action::MvExecutionServices,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
     maintenance_config: MaintenanceCoordinatorConfig,
@@ -315,11 +320,22 @@ struct RefreshWorkerDependencies {
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
-    /// The MV product owns bare lifecycle threads. This handle lets those
-    /// threads await the shared warehouse queue without blocking a Tokio
-    /// worker or creating a local admission queue.
+    /// The existing FE runtime hosts the two original serial asynchronous
+    /// tasks and the shared warehouse queue; no worker or local queue is added.
     runtime: tokio::runtime::Handle,
     startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
+}
+
+struct MvBackgroundHealth(novarocks_query_application::api::QueryExecutionClient);
+impl novarocks_mv_application::process_runtime::MvBackgroundHealthPort for MvBackgroundHealth {
+    fn record_failure(&self, cause: Arc<dyn std::error::Error + Send + Sync>) {
+        self.0.report_process_failure(
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "MV background original source failed before actual closure",
+                cause,
+            ),
+        );
+    }
 }
 
 fn start_background_workers(
@@ -333,59 +349,20 @@ fn start_background_workers(
     );
     let maintenance_interval =
         Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
-    let maintenance = Arc::new(FrontendMaintenanceWorker::new(
-        FrontendMaintenanceWorkerDependencies {
-            readiness: Arc::clone(&dependencies.readiness),
-            background_engine: Arc::clone(&dependencies.background_engine),
-            table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
-            table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
-            connector_control: Arc::clone(&dependencies.refresh.connector_control),
-            product_service: Arc::clone(&dependencies.product_service),
-            root_admission: dependencies.root_admission.clone(),
-            coordinator_config: dependencies.maintenance_config.clone(),
-            attempt_timeout: dependencies.attempt_timeout,
-            runtime: tokio::runtime::Handle::current(),
-        },
-    ));
-    // The startup statement is re-read on every maintenance tick, not once at
-    // startup: it can be written after this process is already serving, and
-    // the window it starts usually has not elapsed when it arrives.
-    let continuation_inputs = dependencies.startup_isolation.clone().map(|source| {
-        (
-            source,
-            Arc::clone(&dependencies.readiness),
-            Arc::clone(&dependencies.refresh.connector_control),
-            Arc::clone(&dependencies.product_service),
-        )
-    });
-    let refresh_task_dependencies = dependencies;
+    let scheduler = background_original::SchedulerOriginal::new(
+        background_original::OriginalWorkerDependencies::from(&dependencies),
+    );
+    let maintenance = background_original::MaintenanceOriginal::new(&dependencies);
     MvBackgroundRuntime::start(
+        &dependencies.runtime,
+        Arc::new(MvBackgroundHealth(dependencies.execution.client.clone())),
         interval,
         maintenance_interval,
         MvBackgroundTasks::new(
             Box::new(move |stop, maintenance_wakeup_tx| {
-                run_refresh_event(&refresh_task_dependencies, stop, maintenance_wakeup_tx);
+                Box::pin(scheduler.clone().run(stop, maintenance_wakeup_tx))
             }),
-            Box::new(move |_| {
-                // The original joined bare-thread event owns this whole pass F.
-                // Async physical leaves run here; none joins inside QB/facts.
-                if let Err(error) = maintenance
-                    .runtime_handle()
-                    .block_on(maintenance.run_once_async(now_unix_millis()))
-                {
-                    tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
-                }
-                if let Some((source, readiness, connector_control, product_service)) =
-                    continuation_inputs.as_ref()
-                {
-                    run_startup_continuation(
-                        source,
-                        readiness,
-                        connector_control.as_ref(),
-                        product_service,
-                    );
-                }
-            }),
+            Box::new(move |stop| Box::pin(maintenance.clone().run(stop))),
         ),
     )
     .map_err(|error| {
@@ -789,8 +766,6 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod shutdown_tests {
-    use std::sync::mpsc;
-    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{MvBackgroundRuntime, application_disposition};
@@ -812,59 +787,48 @@ mod shutdown_tests {
 
     #[tokio::test]
     async fn shared_deadline_retains_the_same_mv_worker_join_for_retry() {
-        let (stop_tx, _stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
-        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let refresh_worker = thread::spawn(move || {
-            let _ = release_rx.recv();
+        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let refresh_worker = tokio::spawn(async move {
+            let _ = release_rx.await;
         });
-        let maintenance_worker = thread::spawn(|| {});
+        let maintenance_worker = tokio::spawn(async {});
         let mut runtime = MvBackgroundRuntime::new(
-            stop_tx,
+            novarocks_mv_application::process_runtime::MvBackgroundStop::default(),
             refresh_worker,
-            maintenance_stop_tx,
             maintenance_wakeup_tx,
             maintenance_worker,
         );
-
         let error = runtime
             .stop_and_join_until(Instant::now() + Duration::from_millis(10))
             .await
             .expect_err("blocked MV worker must respect the shared deadline");
         assert!(error.contains("shared shutdown deadline"));
-
         release_tx.send(()).unwrap();
         runtime
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("the retained MV worker join remains retryable");
     }
-
     #[tokio::test]
     async fn retry_still_joins_mv_maintenance_after_refresh_already_stopped() {
-        let (stop_tx, _stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
-        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let refresh_worker = thread::spawn(|| {});
-        let maintenance_worker = thread::spawn(move || {
-            let _ = release_rx.recv();
+        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let maintenance_worker = tokio::spawn(async move {
+            let _ = release_rx.await;
         });
+        let refresh_worker = tokio::spawn(async {});
         let mut runtime = MvBackgroundRuntime::new(
-            stop_tx,
+            novarocks_mv_application::process_runtime::MvBackgroundStop::default(),
             refresh_worker,
-            maintenance_stop_tx,
             maintenance_wakeup_tx,
             maintenance_worker,
         );
-
         let error = runtime
             .stop_and_join_until(Instant::now() + Duration::from_millis(10))
             .await
             .expect_err("blocked MV maintenance must respect the shared deadline");
         assert!(error.contains("shared shutdown deadline"));
-
         release_tx.send(()).unwrap();
         runtime
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))

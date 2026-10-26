@@ -111,6 +111,25 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         overlays,
     );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+    compile_captured_refresh_explain(
+        ports,
+        &rewrite,
+        target_binding_id,
+        &catalog,
+        level,
+        connector_context,
+    )
+}
+
+/// The unique pure SQL explain author; its catalog cannot perform live I/O.
+fn compile_captured_refresh_explain(
+    ports: &IcebergMvCorePorts,
+    rewrite: &IcebergMvRewriteContext,
+    target_binding_id: novarocks_sql::binding::SqlTableBindingId,
+    catalog: &dyn novarocks_sql::compiler::SqlCatalogSnapshot,
+    level: novarocks_sql::compiler::ExplainLevel,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Vec<String>, novarocks_sql::compiler::SqlCompileError> {
     novarocks_sql::compiler::compile_imv_refresh_explain_lines(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
             canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
@@ -122,7 +141,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             current_database: rewrite.current_database.clone(),
             optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
-            catalog: &catalog,
+            catalog,
             functions: ports.function_catalog().as_ref(),
             constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
             constant_policy: ports.constant_policy(),
@@ -132,4 +151,139 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             level,
         },
     )
+}
+
+/// Read-only inputs; no refresh identity, publication admission or writer.
+pub(crate) struct MvExplainPreparationInput {
+    pub(crate) ports: IcebergMvCorePorts,
+    pub(crate) current_catalog: Option<String>,
+    pub(crate) current_database: String,
+    pub(crate) statement: MvRefreshRequest,
+    pub(crate) level: novarocks_sql::compiler::ExplainLevel,
+    pub(crate) context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+/// Suspends only at the existing named I/O gate. The original reader executes
+/// the pure turns and retains all exact observations across every suspension.
+pub(crate) async fn explain_original(
+    input: MvExplainPreparationInput,
+    io: &super::refresh_preparation::io_gate::MvRefreshPreparationIo,
+) -> Result<Vec<String>, crate::mv::domain::application::MvApplicationError> {
+    explain_original_inner(input, io)
+        .await
+        .map_err(|error| error.0)
+}
+async fn explain_original_inner(
+    input: MvExplainPreparationInput,
+    io: &super::refresh_preparation::io_gate::MvRefreshPreparationIo,
+) -> Result<Vec<String>, super::refresh_preparation::async_facts::PreparationError> {
+    use super::refresh_preparation::async_original::{
+        MvCatalogCaptureInput, MvCatalogCaptureQuery, capture_catalog,
+    };
+    use crate::mv::domain::refresh::rewrite_context::RefreshRewriteInputs;
+    let ports = &input.ports;
+    let context = &input.context;
+    let target = resolve_refresh_target(
+        input.current_catalog.as_deref(),
+        &input.current_database,
+        &input.statement.name_parts,
+    )?;
+    let projection = io.definition(ports, &target).await?;
+    let binding = io.target_binding(ports, &target, context).await?;
+    let schema = crate::mv::domain::storage_observation::observe_schema_validation(
+        ports.storage_observation(),
+        binding.lease(),
+        binding.metadata(),
+        context.clone(),
+    )?;
+    let runtime_bindings = crate::mv::domain::refresh::schema_contract::validate_projection_target(
+        &projection,
+        &schema,
+    )?;
+    let pin = io.capture_pin(ports, &projection, context).await?;
+    let baseline =
+        crate::mv::domain::iceberg_refresh::build_refresh_state_baseline(&projection, &binding)?;
+    let query = super::refresh_preparation::canonical_mv_select_query(&projection)?;
+    let aggregate = super::refresh_preparation::pure_reader::frozen_refresh_aggregate_analysis(
+        io,
+        ports,
+        &projection,
+        &query,
+        context,
+    )
+    .await?;
+    let lease = binding.lease().clone();
+    let rewrite =
+        crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
+            io,
+            RefreshRewriteInputs {
+                connector_control: ports.connector_control(),
+                connector_context: context,
+                projection: Arc::new(projection),
+                pin: &pin,
+                state_baseline: &baseline,
+                target_binding: &binding,
+                target_observation: &schema,
+                runtime_bindings: &runtime_bindings,
+                join_analysis: novarocks_sql::planning::mv::extract_refresh_join_analysis(&query)?,
+                aggregate,
+            },
+        )
+        .await?;
+    let table = novarocks_types::naming::TableIdentity {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    };
+    let current_binding = io
+        .target_binding_with_lease(ports.storage_observation(), &table, lease.clone(), context)
+        .await?;
+    crate::mv::domain::iceberg_refresh::async_preparation::validate_target_snapshot_original(
+        io,
+        ports,
+        &target,
+        &rewrite.mv_definition,
+        &current_binding,
+        context,
+    )
+    .await?;
+    if current_binding.table_uuid() != rewrite.target_table_uuid {
+        return Err("EXPLAIN REFRESH target UUID differs from its rewrite context".into());
+    }
+    let bindings = Arc::new(QueryTableBindingStore::try_new()?);
+    let target_binding_id =
+        super::query_local_bindings::bind_imv_target_query_table_in_store_from_rewrite_original(
+            io, &rewrite, &bindings, &lease, context, None,
+        )
+        .await?;
+    let overlays = super::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs_original(
+        io, ports.connector_control(), context, &rewrite,
+    ).await?;
+    let captured = capture_catalog(
+        MvCatalogCaptureInput {
+            query: MvCatalogCaptureQuery::Query(Box::new(
+                (*rewrite.canonical_select_query).clone(),
+            )),
+            ports: ports.clone(),
+            current_catalog: rewrite.current_catalog.clone(),
+            current_database: rewrite.current_database.clone(),
+            context: context.clone(),
+            control: crate::query_execution::planning::sql_compile_control_from_connector_request(
+                context,
+            ),
+            bindings,
+            overlays,
+        },
+        io,
+    )
+    .await?;
+    compile_captured_refresh_explain(
+        ports,
+        &rewrite,
+        target_binding_id,
+        &captured.catalog,
+        input.level,
+        context,
+    )
+    .map_err(Into::into)
 }

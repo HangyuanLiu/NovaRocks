@@ -448,6 +448,12 @@ impl LogicalExecutionSupervisor {
         self.join.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
+    /// Process-health observation is independent of the service task's exit.
+    /// The existing registry retains its original cause and source owner.
+    pub fn process_failure(&self) -> Option<QueryExecutionError> {
+        self.registry.statement_native_health()
+    }
+
     /// Borrows the original source's same cause; no absence or root task
     /// completion is projected as action exit.
     pub fn statement_action_failure(
@@ -796,6 +802,10 @@ impl fmt::Debug for QueryExecutionDriverHandle {
 }
 
 impl QueryExecutionDriver for QueryExecutionDriverHandle {
+    fn report_process_failure(&self, failure: crate::api::StatementNativeHealthFailure) {
+        self.registry.record_process_failure(failure);
+    }
+
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
         if *self.shutdown.borrow() || self.shutdown.has_changed().is_err() {
             return Err(QueryExecutionError::new(
@@ -9631,6 +9641,64 @@ mod tests {
         };
         acknowledge_all_control(&first_control);
         first_control.finish().await;
+    }
+
+    #[tokio::test]
+    async fn process_source_health_is_observed_before_the_original_service_exits() {
+        #[derive(Debug)]
+        struct OriginalCause(Arc<AtomicU64>);
+        impl std::fmt::Display for OriginalCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("original process source failure")
+            }
+        }
+        impl std::error::Error for OriginalCause {}
+        impl Drop for OriginalCause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut control = governance_empty();
+        let (mut supervisor, client) = test_supervisor(
+            &control,
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x61),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        assert!(supervisor.process_failure().is_none());
+        let drops = Arc::new(AtomicU64::new(0));
+        let cause = Arc::new(OriginalCause(drops.clone()));
+        let original = Arc::downgrade(&cause);
+        client.report_process_failure(
+            crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "original background source failed",
+                cause,
+            ),
+        );
+        // The production driver has already accepted the same cause into the
+        // original health cell. No logical Work or Native identity is minted.
+        let observed = supervisor.process_failure().is_some();
+        tokio::task::yield_now().await;
+        let still_live = !supervisor.service_has_exited();
+        let retained = original.upgrade().is_some() && drops.load(Ordering::SeqCst) == 0;
+        let roots = control.snapshot().root_responsibilities;
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        supervisor.abandon_for_process_exit();
+        drop(client);
+        drop(supervisor);
+        acknowledge_all_control(&control);
+        control.finish().await;
+        assert!(observed && still_live && retained);
+        assert_eq!(roots, 0);
+        assert!(matches!(
+            shutdown,
+            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -179,6 +179,9 @@ impl Holder {
 }
 
 pub(crate) struct CowComputationOutput {
+    // The Native launcher borrows a Weak; this original result holder keeps
+    // its same first-attempt credential author alive through projection.
+    initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
     holder: Arc<Holder>,
     // Alias of the actual consumer creator's admitted payload/window. The
     // manifest capability is weak identity and creates no computation grant.
@@ -194,6 +197,7 @@ pub(crate) struct ReadyCowComputation {
     pub(crate) binding: QueryResultCapacityBinding,
     pub(crate) selection: ConnectorRowMutationSelection,
     pub(crate) credentials: Option<Arc<AttemptCredentialStorage>>,
+    _initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
 }
 pub(crate) struct ReadyStatisticsComputation {
     pub(crate) ready: ComputationReadyToken,
@@ -228,6 +232,7 @@ impl CowComputationOutput {
             })?,
             selection,
             credentials: staged._credentials,
+            _initial: Arc::clone(&self.initial),
         })
     }
     pub(crate) fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
@@ -349,6 +354,7 @@ pub(crate) fn cow_computation_consumer(
     plan: PlanSeal,
     original: CowMatchComputationSeed,
     runtime: DecodedConsumerRuntime,
+    initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
 ) -> Result<
     (
         Arc<dyn InternalComputationConsumer>,
@@ -380,7 +386,15 @@ pub(crate) fn cow_computation_consumer(
         InternalDomainState::Cow(Box::new(original)),
         runtime,
     )?;
-    Ok((consumer, offers, CowComputationOutput { holder, binding }))
+    Ok((
+        consumer,
+        offers,
+        CowComputationOutput {
+            initial,
+            holder,
+            binding,
+        },
+    ))
 }
 
 pub(crate) fn statistics_computation_consumer(
@@ -439,6 +453,7 @@ pub(crate) fn prepare_cow_computation(
         template.native_manifest_template().plan(),
         original,
         runtime,
+        initial.credentials(),
     )?;
     let prepared = crate::query_execution::logical_execution::PreparedLogicalComputation::new(
         description,

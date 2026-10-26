@@ -570,7 +570,10 @@ impl FrontendExecutionRuntimeOwner {
     }
 
     fn mark_ready(&self) -> Result<(), novarocks_workload_control::WorkError> {
-        if self.deadline_supervisor.has_exited() || self.supervisor.service_has_exited() {
+        if self.deadline_supervisor.has_exited()
+            || self.supervisor.service_has_exited()
+            || self.supervisor.process_failure().is_some()
+        {
             self.close_admission();
             return Err(novarocks_workload_control::WorkError::Closed);
         }
@@ -2022,11 +2025,16 @@ impl FrontendApplicationHost {
     }
 
     /// Pure level observation; original joins and causes stay with their owners.
-    pub(crate) fn workload_progress_has_exited(&self) -> bool {
+    pub(crate) fn workload_progress_has_failed(&self) -> bool {
         self.execution_runtime_owner
             .deadline_supervisor
             .has_exited()
             || self.execution_runtime_owner.supervisor.service_has_exited()
+            || self
+                .execution_runtime_owner
+                .supervisor
+                .process_failure()
+                .is_some()
     }
 
     /// Diagnostic borrowing never consumes or disposes the original cause.

@@ -325,6 +325,7 @@ impl ReservedExecutionIdentity {
 
 /// Crate-private process driver behind the bounded client capability.
 pub(crate) trait QueryExecutionDriver: Send + Sync + 'static {
+    fn report_process_failure(&self, failure: crate::api::StatementNativeHealthFailure);
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError>;
     fn prepare_observed_start(
         &self,
@@ -417,6 +418,12 @@ impl QueryExecutionClient {
         Self {
             driver: Arc::new(driver),
         }
+    }
+
+    /// Report an original process-owned source whose local exit is unproven.
+    /// This neither creates a logical execution nor disposes the source.
+    pub fn report_process_failure(&self, failure: crate::api::StatementNativeHealthFailure) {
+        self.driver.report_process_failure(failure);
     }
 
     /// Construct the original move-only input header before borrowing a stable

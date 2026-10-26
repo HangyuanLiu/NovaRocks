@@ -184,18 +184,35 @@ async fn empty_reservation_drop_releases_only_unstarted_original_child() {
 async fn requested_stop_joins_same_original_handle_before_child_completion() {
     let (control, root) = work(2);
     let (mut owner, port) = owner(2);
+    let (entered, original_entered) = tokio::sync::oneshot::channel();
     let lease = port
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
-        .start(std::future::pending())
+        .start(async move {
+            entered.send(tokio::task::id()).unwrap();
+            std::future::pending::<()>().await;
+        })
         .unwrap();
-    let id = {
+    let original_id = tokio::time::timeout(Duration::from_secs(2), original_entered)
+        .await
+        .expect("the original subscription task must actually enter")
+        .unwrap();
+    let mut joined_id = None;
+    until(|| {
         let state = owner.core.state.lock().unwrap();
         match &state.records[lease.index].as_ref().unwrap().state {
-            OriginalState::Running(handle) => handle.id(),
-            _ => unreachable!(),
+            OriginalState::Running(handle) => {
+                joined_id = Some(handle.id());
+                true
+            }
+            // The reaper lends this SAME handle outside Core for each poll.
+            // Its temporary phase is not a terminal or a replacement task.
+            OriginalState::Polling => false,
+            _ => panic!("the entered pending original cannot retire before stop"),
         }
-    };
+    })
+    .await;
+    assert_eq!(joined_id, Some(original_id));
     lease.stop();
     drop(lease);
     let actual = owner
@@ -215,7 +232,6 @@ async fn requested_stop_joins_same_original_handle_before_child_completion() {
             .iter()
             .all(Option::is_none)
     );
-    let _actual_original_id = id;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

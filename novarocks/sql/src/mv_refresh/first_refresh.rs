@@ -442,8 +442,7 @@ pub fn analyze_join_first_refresh_connector_write(
         );
     }
     let settings = context.optimizer_settings.clone();
-    let mut query = *context.canonical_query;
-    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let query = *context.canonical_query;
     let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
     let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
         .map_err(crate::compiler::SqlCompileError::from)?;
@@ -612,8 +611,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
     validate_join_incremental_routes(&context.routes)?;
     let snapshot = context.rewrite_snapshot.snapshot();
     validate_join_incremental_snapshot(snapshot)?;
-    let mut query = *context.canonical_query;
-    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let query = *context.canonical_query;
     let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
     let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
         .map_err(crate::compiler::SqlCompileError::from)?;
@@ -823,6 +821,8 @@ pub fn analyze_mv_incremental_refresh_change_stream(
     context: SqlMvIncrementalRefreshAnalyzeContext<'_>,
 ) -> Result<SqlMvIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> {
     validate_join_incremental_routes(&context.routes)?;
+    // Definition occurrences name canonical catalogs. Preserve that identity
+    // through the captured catalog and the exact admitted-scan validator.
     let mut query = *context.canonical_query;
     if matches!(
         context.imv_rewrite.validation,
@@ -834,7 +834,6 @@ pub fn analyze_mv_incremental_refresh_change_stream(
             context.imv_rewrite.snapshot(),
         )?;
     }
-    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
     let request = canonical_incremental_change_stream_request(
         query,
         &context.imv_rewrite,
@@ -3209,6 +3208,122 @@ mod tests {
             -> Result<SqlMvIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> =
             analyze_mv_incremental_refresh_change_stream;
         let _: FinalMvIncrementalCompile = compile_final_mv_incremental_refresh_change_stream;
+    }
+
+    #[test]
+    fn incremental_analysis_consumes_captured_canonical_occurrence_identity() {
+        use crate::compiler::{
+            CatalogRelationFact, SqlCapturedCatalogPreparation, SqlCompileControl,
+        };
+        use crate::planner::table::{
+            ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+        };
+        use crate::planning::dml::{
+            DmlChangeStreamRoute, DmlWritePlanInput, DmlWriteTarget, DmlWriteTargetField,
+        };
+        use novarocks_spi::connector::write_stack::{
+            ConnectorWriteColocation, ConnectorWriteLayoutPreference,
+            ConnectorWriteRouteRequirements, WriteTargetOrdinal,
+        };
+        use novarocks_spi::connector::{
+            ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+            ConnectorWriteRouteId,
+        };
+        let column = novarocks_types::schema::ColumnDef {
+            name: "k".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        // Both qualified and definition-context lookup must preserve ice.db.b.
+        // This executes the production incremental analyzer and its unchanged
+        // ordered-occurrence validator, not only a request constructor.
+        for (sql, current_catalog) in [
+            ("SELECT k FROM ice.db.b", None),
+            ("SELECT k FROM b", Some("ice")),
+        ] {
+            let query = parse_query(sql);
+            let capture = SqlCapturedCatalogPreparation::try_new(
+                query.clone(),
+                current_catalog,
+                "db",
+                SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let [need] = capture.needs() else {
+                panic!("one canonical base")
+            };
+            assert_eq!(need.relation().fqn(), "ice.db.b");
+            let table = TableDef {
+                name: "b".into(),
+                columns: vec![column.clone()],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: ScanSource::Sql(SqlScanSource::new(
+                    SqlTableBindingId::new_for_test(1),
+                    SqlTableIdentity::try_new("ice".into(), "db".into(), "b".into()).unwrap(),
+                    SqlScanKind::FrozenInputSet {
+                        version: crate::planner::table::SqlTableVersionSelector::Snapshot(22),
+                    },
+                )),
+            };
+            let fact = CatalogRelationFact::resolved(
+                need,
+                crate::catalog::ResolvedAnalyzerTable::from_planner(Some("ice"), "db", table),
+            )
+            .unwrap();
+            let catalog = capture.capture(&[fact]).unwrap();
+            let token = ConnectorWriteFieldToken::from_bytes([1; 32]);
+            let route = DmlChangeStreamRoute {
+                route_id: ConnectorWriteRouteId::from_bytes([2; 32]),
+                write_target_ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
+                accepted_effects: vec![ConnectorRowMutationEffect::Insert],
+                input_ordinals: vec![ConnectorMutationRouteInput::new(token, 0)],
+                requirements: ConnectorWriteRouteRequirements {
+                    colocation: ConnectorWriteColocation::None,
+                    layout: ConnectorWriteLayoutPreference::None,
+                },
+                sink: DmlWritePlanInput::try_new(
+                    crate::planning::dml::DmlWriteSinkMode::Data,
+                    DmlWriteTarget {
+                        binding: sqlx2_target_binding(),
+                        catalog: "ice".into(),
+                        namespace: "db".into(),
+                        table: "mv".into(),
+                        fields: vec![DmlWriteTargetField {
+                            token,
+                            column: column.clone(),
+                            is_hidden: false,
+                        }],
+                    },
+                    vec![column.clone()],
+                    crate::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                )
+                .unwrap(),
+            };
+            let result = analyze_mv_incremental_refresh_change_stream(
+                SqlMvIncrementalRefreshAnalyzeContext {
+                    canonical_query: Box::new(query),
+                    imv_rewrite: crate::compiler::SqlImvPlanningInput::new(
+                        crate::compiler::mv_rewrite::test_incremental_snapshot_handle(),
+                        crate::compiler::SqlImvRewriteValidation::None,
+                    ),
+                    write_mode: SqlMvIncrementalWriteMode::FastAppend,
+                    routes: vec![route],
+                    current_catalog: current_catalog.map(str::to_owned),
+                    current_database: "db".into(),
+                    environment: crate::compiler::SqlPlanningEnvironment::Distributed,
+                    catalog: &catalog,
+                    functions: crate::functions::builtin_sql_function_catalog(),
+                    constant_evaluator: crate::compiler::noop_constant_evaluator(),
+                    constant_policy: crate::constant::test_constant_policy(),
+                    control: SqlCompileControl::unbounded(),
+                },
+            );
+            if let Err(error) = result {
+                panic!("canonical incremental analysis failed for {sql}: {error}");
+            }
+        }
     }
 
     #[test]

@@ -174,6 +174,17 @@ pub fn validate_target_snapshot(
         context.clone(),
     );
     let (observed,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&documents,request,Default::default(),entrance).map_err(|e|e.to_string())?;
+    validate_target_snapshot_observed(target, mv_definition, binding, &observed)
+}
+
+/// Validate the original target fence using an already observed exact Current.
+/// This pure author is shared by synchronous and asynchronous observation.
+pub(crate) fn validate_target_snapshot_observed(
+    target: &IcebergMvTarget,
+    mv_definition: &StoredKeyedMvProjection,
+    binding: &MvTargetBinding,
+    observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+) -> Result<(), String> {
     if observed.view.current_snapshot != binding.current_snapshot_id() {
         return Err(format!(
             "MV target {}.{}.{} changed during refresh planning",

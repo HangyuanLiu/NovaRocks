@@ -327,7 +327,7 @@ fn bind_incremental_write_dataflow(
                 refresh_rewrite,
             )?;
             let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-                None,
+                refresh_rewrite.current_catalog.as_deref(),
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
                 crate::catalog_application::query_materializer::iceberg_table_binding_loader(
@@ -353,7 +353,7 @@ fn bind_incremental_write_dataflow(
                     imv_rewrite: imv_rewrite_input,
                     write_mode,
                     routes: sealed_change_stream_routes,
-                    current_catalog: None,
+                    current_catalog: refresh_rewrite.current_catalog.clone(),
                     current_database: refresh_rewrite.current_database.clone(),
                     environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
                     catalog: &catalog,
@@ -429,7 +429,7 @@ fn bind_incremental_write_dataflow(
             let catalog_service_snapshot =
                 crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
             let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-                None,
+                refresh_rewrite.current_catalog.as_deref(),
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
                 crate::catalog_application::query_materializer::iceberg_table_binding_loader(
@@ -448,7 +448,7 @@ fn bind_incremental_write_dataflow(
                     join_mode,
                     write_mode,
                     routes: sealed_change_stream_routes,
-                    current_catalog: None,
+                    current_catalog: refresh_rewrite.current_catalog.clone(),
                     current_database: refresh_rewrite.current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
                     environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,

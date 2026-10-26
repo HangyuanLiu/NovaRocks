@@ -103,6 +103,39 @@ impl MvCommandExecutor {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         novarocks_query_application::api::CommandError,
     > {
+        if matches!(
+            statement,
+            MaterializedViewStatement::Show(_) | MaterializedViewStatement::ExplainRefresh(_)
+        ) {
+            let services = self.execution_services.clone().ok_or_else(|| {
+                novarocks_query_application::api::CommandError::new(
+                    novarocks_query_application::api::CommandErrorKind::Unsupported,
+                    "MV execution services are unavailable",
+                )
+            })?;
+            let request = match statement {
+                MaterializedViewStatement::Show(show) => crate::query::mv_read_action::ReadRequest::Show {
+                    catalog: context.session().current_catalog().map(str::to_owned),
+                    statement: lower_typed_show(show)?,
+                },
+                MaterializedViewStatement::ExplainRefresh(explain) => crate::query::mv_read_action::ReadRequest::Explain(
+                    crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
+                        ports: self.ports.clone(),
+                        current_catalog: context.session().current_catalog().map(str::to_owned),
+                        current_database: context.session().current_database().to_owned(),
+                        statement: lower_typed_refresh(&explain.refresh)?,
+                        level: lower_typed_explain_level(explain.level),
+                        context: command_context.connector_context().clone(),
+                    }),
+                _ => unreachable!(),
+            };
+            return crate::query::mv_read_action::prepare(
+                self.ports.clone(),
+                services,
+                request,
+                context.execution().clone(),
+            );
+        }
         use crate::query::mv_action::{MvCommandRequest, prepare};
         let catalog = context.session().current_catalog();
         let database = context.session().current_database();
@@ -133,11 +166,32 @@ impl MvCommandExecutor {
                     fields: fields.iter().map(IcebergPartitionFieldExpr::from).collect(),
                 }
             }
-            _ => {
-                return Err(novarocks_query_application::api::CommandError::new(
-                    novarocks_query_application::api::CommandErrorKind::Unsupported,
-                    "MV asynchronous data action requires REFRESH or REPARTITION",
-                ));
+            MaterializedViewStatement::Create(create) => {
+                let statement = lower_typed_create(create)?;
+                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Create { target, statement }
+            }
+            MaterializedViewStatement::Drop(drop) => {
+                let statement = MvDropStatement {
+                    name_parts: lower_typed_name_parts(&drop.name)?,
+                    if_exists: drop.if_exists,
+                };
+                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Control(crate::query::mv_action::MvControlRequest::Drop {
+                    target,
+                    statement,
+                })
+            }
+            MaterializedViewStatement::Alter(alter) => {
+                let statement = lower_typed_alter(alter)?;
+                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Control(crate::query::mv_action::MvControlRequest::Alter {
+                    target,
+                    statement,
+                })
+            }
+            MaterializedViewStatement::Show(_) | MaterializedViewStatement::ExplainRefresh(_) => {
+                unreachable!("MV read statements were selected before the mutation action")
             }
         };
         let services = self.execution_services.clone().ok_or_else(|| {
@@ -593,15 +647,16 @@ fn mv_command_error(
             Some(error) => {
                 novarocks_query_application::api::CommandError::from_compile_control(error)
             }
+            None if error.kind()
+                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
+            {
+                novarocks_query_application::api::CommandError::from_user_error(
+                    error.to_user_error(None),
+                )
+            }
             None => novarocks_query_application::api::CommandError::new(
                 novarocks_query_application::api::CommandErrorKind::Failed,
-                if error.kind()
-                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
-                {
-                    error.to_user_error(None).to_string()
-                } else {
-                    error.to_string()
-                },
+                error.to_string(),
             ),
         },
         error => novarocks_query_application::api::CommandError::new(

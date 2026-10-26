@@ -231,7 +231,7 @@ pub struct CatalogServiceMaterializer<'a> {
     /// They are intentionally kept next to the binding store instead of the
     /// shared memory catalog: SQL can only observe their projected tokenized
     /// scan after this materializer has admitted the exact connector lease.
-    query_local_overlays: HashMap<(String, String), QueryLocalTableOverlay>,
+    query_local_overlays: HashMap<(String, String, String), QueryLocalTableOverlay>,
 }
 
 /// One application-owned relation overlay for a generated query.
@@ -242,6 +242,7 @@ pub struct CatalogServiceMaterializer<'a> {
 /// prevents a synthetic relation from leaking into the shared catalog.
 #[derive(Clone)]
 pub struct QueryLocalTableOverlay {
+    catalog: String,
     namespace: String,
     table: String,
     key: QueryTableBindingKey,
@@ -259,17 +260,34 @@ impl QueryLocalTableOverlay {
         + Sync
         + 'static,
     ) -> Self {
-        let namespace = namespace.into();
+        Self::for_catalog("default_catalog", namespace, table, key, materialize)
+    }
+
+    /// A frozen definition relation retains its canonical catalog identity.
+    /// Generated local relations use `new` instead; the two lookup domains do
+    /// not alias, even when their namespace and table names are identical.
+    pub(crate) fn for_catalog(
+        catalog: impl Into<String>,
+        namespace: impl Into<String>,
+        table: impl Into<String>,
+        key: QueryTableBindingKey,
+        materialize: impl Fn(SqlTableBindingId) -> Result<QueryTableBinding, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         Self {
+            catalog: catalog.into(),
+            namespace: namespace.into(),
             table: table.into(),
-            namespace,
             key,
             materialize: Arc::new(materialize),
         }
     }
 
-    fn key(&self) -> (String, String) {
+    fn key(&self) -> (String, String, String) {
         (
+            self.catalog.to_ascii_lowercase(),
             self.namespace.to_ascii_lowercase(),
             self.table.to_ascii_lowercase(),
         )
@@ -415,6 +433,23 @@ impl<'a> CatalogServiceMaterializer<'a> {
         override_catalog.or(self.current_catalog)
     }
 
+    fn query_overlay(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Option<QueryLocalTableOverlay> {
+        self.query_local_overlays
+            .get(&(
+                self.effective_catalog(catalog)
+                    .unwrap_or("default_catalog")
+                    .to_ascii_lowercase(),
+                database.to_ascii_lowercase(),
+                table.to_ascii_lowercase(),
+            ))
+            .cloned()
+    }
+
     fn resolve_table_for_analysis_once(
         &self,
         catalog: Option<&str>,
@@ -423,11 +458,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
-                if let Some(overlay) = self
-                    .query_local_overlays
-                    .get(&(database.to_ascii_lowercase(), table.to_ascii_lowercase()))
-                    .cloned()
-                {
+                if let Some(overlay) = self.query_overlay(catalog, database, table) {
                     return self.resolve_query_local_overlay(overlay, database, table);
                 }
                 let local = self
@@ -449,6 +480,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
             }
             Some(catalog) => {
                 let observation = self.require_catalog_admission(catalog)?;
+                if let Some(overlay) = self.query_overlay(Some(catalog), database, table) {
+                    let resolved = self.resolve_query_local_overlay(overlay, database, table)?;
+                    self.verify_catalog_admission(catalog, observation.as_ref())?;
+                    return Ok(resolved);
+                }
                 let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
                 let token = self.bind_for_sql(key, |binding_id| {
                     self.loader
@@ -475,6 +511,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         database: &str,
         table: &str,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        let catalog = overlay.catalog.clone();
         let token = self.bind_for_sql(overlay.key, |binding_id| {
             (overlay.materialize)(binding_id).map_err(CatalogResolutionError::failed)
         })?;
@@ -484,6 +521,20 @@ impl<'a> CatalogServiceMaterializer<'a> {
             .map_err(CatalogResolutionError::failed)?
             .resolved
             .clone();
+        if catalog != "default_catalog" {
+            let identity =
+                novarocks_sql::planning::catalog::materialization_identity_facts(&resolved);
+            if !identity.catalog().eq_ignore_ascii_case(&catalog)
+                || !identity.namespace().eq_ignore_ascii_case(database)
+                || !identity.table().eq_ignore_ascii_case(table)
+            {
+                return Err(CatalogResolutionError::failed(format!(
+                    "frozen relation `{}` does not match `{catalog}.{database}.{table}`",
+                    identity.fqn()
+                )));
+            }
+            return Ok(resolved);
+        }
         // Only the SQL lookup is local. Its token still names the original
         // Provider binding, including the exact frozen snapshot and lease.
         novarocks_sql::planning::catalog::project_query_local_overlay_name(
@@ -567,6 +618,9 @@ impl<'a> CatalogServiceMaterializer<'a> {
         database: &str,
         table: &str,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        if self.query_overlay(catalog, database, table).is_some() {
+            return self.resolve_table_for_analysis_once(catalog, database, table);
+        }
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
                 self.resolve_table_for_analysis_once(catalog, database, table)
@@ -719,6 +773,19 @@ impl CatalogServiceMaterializer<'_> {
             return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
         }
         let observation = self.original_catalog_admission(catalog)?;
+        if metadata_kind.is_none()
+            && let Some(overlay) =
+                self.query_overlay(Some(catalog), &relation.namespace, &relation.table)
+        {
+            let resolved =
+                self.resolve_query_local_overlay(overlay, &relation.namespace, &relation.table);
+            if self.original_catalog_admission(catalog)? != observation {
+                return Err(contract_error(
+                    "catalog attachment generation changed while acquiring its planning lease",
+                ));
+            }
+            return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
+        }
         let key = match metadata_kind {
             None => {
                 QueryTableBindingKey::analysis_lookup(catalog, &relation.namespace, &relation.table)
@@ -2014,6 +2081,108 @@ mod tests {
             Ok(_) => panic!("failed original metadata may not be loaded again"),
         };
         assert_eq!(repeated.original_failure(), Some(&cause));
+    }
+
+    #[test]
+    fn original_mv_catalog_keeps_canonical_frozen_relations_separate_from_local_names() {
+        let controls = crate::connector::FixtureControlResolver::new(
+            crate::connector::FixtureConnectorRegistry::new(),
+        );
+        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let creations = Arc::new(AtomicUsize::new(0));
+        let overlays = ["ice", "other"]
+            .into_iter()
+            .map(|catalog| {
+                let creations = creations.clone();
+                QueryLocalTableOverlay::for_catalog(
+                    catalog,
+                    "db",
+                    "orders",
+                    QueryTableBindingKey::snapshot(catalog, "db", "orders", 7),
+                    move |binding| {
+                        creations.fetch_add(1, Ordering::Relaxed);
+                        let mut facts = frozen_overlay_binding(binding);
+                        facts.resolved = test_connector_read_materialization(
+                            catalog,
+                            "orders",
+                            binding,
+                            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(7),
+                        );
+                        Ok(facts)
+                    },
+                )
+            })
+            .collect();
+        let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
+            Some("ice"),
+            &service,
+            bindings.clone(),
+            Box::new(OverlayLoader),
+            overlays,
+        );
+        // Real SQL SchemaOnly prepass -> original application lookup -> exact
+        // captured catalog; an empty resolver cannot supply a fallback lease.
+        let preparation =
+            original_schema_need("SELECT 1 FROM ice.db.orders a JOIN other.db.orders b ON 1 = 1");
+        let facts = preparation
+            .needs()
+            .iter()
+            .map(|need| {
+                let OriginalCatalogLookup::Fact(fact) = materializer
+                    .begin_original_catalog_lookup(need, &controls)
+                    .unwrap()
+                else {
+                    panic!("an exact frozen relation must not reload live metadata");
+                };
+                fact
+            })
+            .collect::<Vec<_>>();
+        let catalog = preparation.capture(&facts).unwrap();
+        let mut tokens = Vec::new();
+        for name in ["ice", "other"] {
+            let resolved = catalog
+                .provider()
+                .resolve_table_for_analysis(Some(name), "db", "orders")
+                .unwrap();
+            assert_eq!(
+                novarocks_sql::planning::catalog::materialization_identity_facts(&resolved).fqn(),
+                format!("{name}.db.orders"),
+            );
+            let token = novarocks_sql::planning::catalog::table_binding_id(&resolved);
+            assert_eq!(
+                novarocks_sql::planning::catalog::frozen_input_snapshot_id(&resolved),
+                Some(7),
+            );
+            assert_eq!(
+                novarocks_sql::planning::catalog::table_binding_id(
+                    &bindings.binding(token).unwrap().resolved
+                ),
+                token,
+            );
+            tokens.push(token);
+        }
+        assert_ne!(tokens[0], tokens[1]);
+        assert_eq!(creations.load(Ordering::Relaxed), 2);
+        let repeated = materializer
+            .resolve_table_for_analysis(None, "DB", "ORDERS")
+            .unwrap();
+        assert_eq!(
+            novarocks_sql::planning::catalog::table_binding_id(&repeated),
+            tokens[0]
+        );
+        assert_eq!(creations.load(Ordering::Relaxed), 2);
+        assert!(
+            materializer
+                .resolve_table_for_analysis(Some("default_catalog"), "db", "orders")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .provider()
+                .resolve_table_for_analysis(Some("foreign"), "db", "orders")
+                .is_err()
+        );
     }
 
     #[test]

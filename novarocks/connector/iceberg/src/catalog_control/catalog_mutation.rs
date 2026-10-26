@@ -60,6 +60,8 @@ use crate::reconcile_payload::{
 };
 use crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY;
 
+#[path = "catalog_mutation/async_existing.rs"]
+mod async_existing;
 #[path = "catalog_mutation/keyed.rs"]
 mod keyed;
 
@@ -181,6 +183,13 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 + 'a,
         >,
     > {
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::DropTable { .. }
+                | ConnectorCatalogMutationOperation::AlterProperties { .. }
+        ) {
+            return async_existing::execute_async(self, request, receiving);
+        }
         Box::pin(async move {
             if let Err(error) = ConnectorCatalogMutation::admit(self, &request) {
                 return Ok(known_uncommitted(error));
@@ -435,61 +444,126 @@ fn execute_existing_publication(
     request: &ConnectorCatalogMutationRequest,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
-    use crate::commit::staging::PreparedChange;
-    let prepared = provider.runtime().resources().catalog_runtime().observe_preparation(|| {
-        let prepare = || -> crate::catalog::publication_dispatch::PreparationResult<_> {
-            let table = match &request.operation {
-                ConnectorCatalogMutationOperation::AlterSchema { table, .. }
-                | ConnectorCatalogMutationOperation::AlterPartitionSpec { table, .. }
-                | ConnectorCatalogMutationOperation::AlterProperties { table, .. }
-                | ConnectorCatalogMutationOperation::AlterRef { table, .. } => table,
-                _ => return Err(internal("Catalog mutation has no table publication lowerer").into()),
-            };
-            ensure_owner(provider, &table.instance_id)?;
-            let is_ref = matches!(&request.operation, ConnectorCatalogMutationOperation::AlterRef { .. });
-            let (guard, loaded) = if is_ref {
-                let (guard, loaded) = provider.runtime().coordinate_table_for_request(&table.namespace, &table.table, &request.context)?;
-                (Some(guard), loaded)
-            } else {
-                (None, provider.runtime().load_table_classified_for_request(&table.namespace, &table.table, &request.context)
-                    .map_err(|(kind, message)| ConnectorError::new(kind, message))?)
-            };
-            let metadata = loaded.table.metadata();
-            let change = match &request.operation {
-                ConnectorCatalogMutationOperation::AlterSchema { changes, .. } => prepare_schema_change(provider.runtime(), &loaded.table, changes, &request.context)?,
-                ConnectorCatalogMutationOperation::AlterPartitionSpec { add, drop, .. } => prepare_partition_change(metadata, add, drop)?,
-                ConnectorCatalogMutationOperation::AlterProperties { changes, authority, expected_committed_partitioning, .. } => {
-                    if changes.is_empty() { return Err(invalid("Iceberg property mutation is empty").into()); }
-                    let mut requirements = Vec::new();
-                    if let Some(expected) = expected_committed_partitioning {
-                        if committed_partitioning_from_metadata(metadata, metadata.default_partition_spec_id())? != *expected {
-                            return Err(crate::catalog::publication_dispatch::PreparationFailure(ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, "Iceberg default partitioning changed before guarded property mutation")));
+    let prepared = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || {
+                let prepare = || -> crate::catalog::publication_dispatch::PreparationResult<_> {
+                    let table = match &request.operation {
+                        ConnectorCatalogMutationOperation::AlterSchema { table, .. }
+                        | ConnectorCatalogMutationOperation::AlterPartitionSpec { table, .. }
+                        | ConnectorCatalogMutationOperation::AlterProperties { table, .. }
+                        | ConnectorCatalogMutationOperation::AlterRef { table, .. } => table,
+                        _ => {
+                            return Err(internal(
+                                "Catalog mutation has no table publication lowerer",
+                            )
+                            .into());
                         }
-                        requirements.push(TableRequirement::DefaultSpecIdMatch { default_spec_id: expected.spec_id() });
-                    }
-                    PreparedChange { updates: property_updates(metadata, changes, *authority)?, requirements }
-                }
-                ConnectorCatalogMutationOperation::AlterRef { action, .. } => {
-                    lower_ref_action(action.clone(), metadata, &table.namespace, &table.table, provider.descriptor().instance_id.as_str())?.prepare(&loaded.table).map_err(crate::catalog::publication_dispatch::PreparationFailure)?
-                }
-                _ => unreachable!(),
-            };
-            let token = OperationToken::from_mutation(request.operation_id);
-            let frozen = crate::commit::staging::freeze_existing_change(
-                loaded.table.identifier().clone(), "main", metadata,
-                loaded.table.metadata_location().ok_or_else(|| invalid("Table publication requires an authoritative metadata location"))?,
-                if is_ref { RequestShape::RefRetention } else { RequestShape::MetadataOnly },
-                AttemptToken::new(token, 0), change, &request.context,
-            ).map_err(|error| invalid(error.to_string()))?;
-            let external_evidence = evidence(provider, request.operation_id, request.operation.kind(), IcebergMutationEvidenceTarget::TableVersion {
-                namespace: table.namespace.to_string(), table: table.table.to_string(), table_uuid: metadata.uuid().to_string(),
-                before_metadata_location: loaded.table.metadata_location().map(str::to_owned),
-            })?;
-            let seed = receipt(provider, request.operation_id, request.operation.kind())?;
-            Ok((guard, frozen, external_evidence, seed, table.clone()))
-        };
-        prepare()
-    }, |error: &crate::catalog::publication_dispatch::PreparationFailure| error.0.clone());
+                    };
+                    ensure_owner(provider, &table.instance_id)?;
+                    let is_ref = matches!(
+                        &request.operation,
+                        ConnectorCatalogMutationOperation::AlterRef { .. }
+                    );
+                    let (guard, loaded) = if is_ref {
+                        let (guard, loaded) = provider.runtime().coordinate_table_for_request(
+                            &table.namespace,
+                            &table.table,
+                            &request.context,
+                        )?;
+                        (Some(guard), loaded)
+                    } else {
+                        (
+                            None,
+                            provider
+                                .runtime()
+                                .load_table_classified_for_request(
+                                    &table.namespace,
+                                    &table.table,
+                                    &request.context,
+                                )
+                                .map_err(|(kind, message)| ConnectorError::new(kind, message))?,
+                        )
+                    };
+                    let metadata = loaded.table.metadata();
+                    let change = match &request.operation {
+                        ConnectorCatalogMutationOperation::AlterSchema { changes, .. } => {
+                            prepare_schema_change(
+                                provider.runtime(),
+                                &loaded.table,
+                                changes,
+                                &request.context,
+                            )?
+                        }
+                        ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                            add, drop, ..
+                        } => prepare_partition_change(metadata, add, drop)?,
+                        ConnectorCatalogMutationOperation::AlterProperties {
+                            changes,
+                            authority,
+                            expected_committed_partitioning,
+                            ..
+                        } => prepare_property_change(
+                            metadata,
+                            changes,
+                            *authority,
+                            expected_committed_partitioning.as_ref(),
+                        )?,
+                        ConnectorCatalogMutationOperation::AlterRef { action, .. } => {
+                            lower_ref_action(
+                                action.clone(),
+                                metadata,
+                                &table.namespace,
+                                &table.table,
+                                provider.descriptor().instance_id.as_str(),
+                            )?
+                            .prepare(&loaded.table)
+                            .map_err(crate::catalog::publication_dispatch::PreparationFailure)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    let token = OperationToken::from_mutation(request.operation_id);
+                    let frozen = crate::commit::staging::freeze_existing_change(
+                        loaded.table.identifier().clone(),
+                        "main",
+                        metadata,
+                        loaded.table.metadata_location().ok_or_else(|| {
+                            invalid("Table publication requires an authoritative metadata location")
+                        })?,
+                        if is_ref {
+                            RequestShape::RefRetention
+                        } else {
+                            RequestShape::MetadataOnly
+                        },
+                        AttemptToken::new(token, 0),
+                        change,
+                        &request.context,
+                    )
+                    .map_err(|error| invalid(error.to_string()))?;
+                    let external_evidence = evidence(
+                        provider,
+                        request.operation_id,
+                        request.operation.kind(),
+                        IcebergMutationEvidenceTarget::TableVersion {
+                            namespace: table.namespace.to_string(),
+                            table: table.table.to_string(),
+                            table_uuid: metadata.uuid().to_string(),
+                            before_metadata_location: loaded
+                                .table
+                                .metadata_location()
+                                .map(str::to_owned),
+                        },
+                    )?;
+                    let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+                    Ok((guard, frozen, external_evidence, seed, table.clone()))
+                };
+                prepare()
+            },
+            |error: &crate::catalog::publication_dispatch::PreparationFailure| error.0.clone(),
+        );
     let (_guard, frozen, external_evidence, seed, table) = match prepared {
         Ok(prepared) => prepared,
         Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) => {
@@ -1370,6 +1444,39 @@ fn validate_partition_transform(
             .map_err(|error| format!("invalid Iceberg partition transform: {error}"))?,
     }
     Ok(())
+}
+
+/// The same pure property/expected-partitioning author serves both callers.
+fn prepare_property_change(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    changes: &[ConnectorPropertyChange],
+    authority: ConnectorPropertyAuthority,
+    expected: Option<&ConnectorCommittedPartitioning>,
+) -> crate::catalog::publication_dispatch::PreparationResult<crate::commit::staging::PreparedChange>
+{
+    if changes.is_empty() {
+        return Err(invalid("Iceberg property mutation is empty").into());
+    }
+    let mut requirements = Vec::new();
+    if let Some(expected) = expected {
+        if committed_partitioning_from_metadata(metadata, metadata.default_partition_spec_id())?
+            != *expected
+        {
+            return Err(crate::catalog::publication_dispatch::PreparationFailure(
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "Iceberg default partitioning changed before guarded property mutation",
+                ),
+            ));
+        }
+        requirements.push(TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: expected.spec_id(),
+        });
+    }
+    Ok(crate::commit::staging::PreparedChange {
+        updates: property_updates(metadata, changes, authority)?,
+        requirements,
+    })
 }
 
 fn property_updates(
@@ -9135,6 +9242,8 @@ mod tests {
             assert!(!receiving.foreign_exit_unproven());
             assert_eq!(observed.validation(), Some(&Ok(())));
             assert_eq!(observed.needed_validation(), Some(&Ok(())));
+            let context = observed.finalization_context().unwrap().as_ref().unwrap();
+            assert!(context.necessary_finalization_deadline_cap().is_some());
             let applied = observed.applied_receipt().unwrap();
             assert_eq!(applied.descriptor(), provider.descriptor());
             assert_eq!(applied.incarnation(), provider.incarnation());
@@ -9315,7 +9424,7 @@ mod tests {
                 entered_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("actual async keyed post-publication reload entered");
-                let owner_address = {
+                let (owner_address, finalization_deadline) = {
                     let observed = receiving.observation();
                     let applied = observed
                         .applied_receipt()
@@ -9332,7 +9441,12 @@ mod tests {
                         .original_owner()
                         .expect("same actual journal and operation are already received");
                     owner.validate_owner(&expected_owner).unwrap();
-                    owner as *const _ as usize
+                    let context = observed.finalization_context().unwrap().as_ref().unwrap();
+                    assert_eq!(
+                        context.necessary_finalization_deadline_cap(),
+                        Some(context.deadline())
+                    );
+                    (owner as *const _ as usize, context.deadline())
                 };
                 let snapshot = root.snapshot();
                 for phase in [P::Evidence, P::Dispatch, P::PreDispatch] {
@@ -9356,6 +9470,9 @@ mod tests {
                     assert!(observed.needed_committed().is_none());
                     assert!(observed.raw_outcome().is_none());
                     assert!(!observed.provider_exited());
+                    let context = observed.finalization_context().unwrap().as_ref().unwrap();
+                    assert_eq!(context.deadline(), finalization_deadline);
+                    context.check_active().unwrap();
                 }
                 drop(release);
                 worker.join().unwrap().unwrap();
@@ -9397,6 +9514,15 @@ mod tests {
                     cleanup,
                     &ExternalMutationFinalization::Complete,
                     "the SAME original journal reports actual safe GC"
+                );
+                assert_eq!(
+                    observed
+                        .finalization_context()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .deadline(),
+                    finalization_deadline
                 );
                 assert!(observed.provider_exited());
                 assert!(!receiving.foreign_exit_unproven());
@@ -9549,5 +9675,350 @@ mod tests {
             metadata_file_count(after.table.metadata().location()),
             before_files
         );
+    }
+
+    #[test]
+    fn async_property_publication_retains_original_and_applies_then_noops() {
+        use novarocks_spi::connector::ConnectorCatalogMutationReceiving;
+        let (executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let lease = document_control_planning_lease(&provider)
+            .derive_mutation_lease()
+            .unwrap();
+        let before = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let partitioning = committed_partitioning_from_metadata(
+            before.table.metadata(),
+            before.table.metadata().default_partition_spec_id(),
+        )
+        .unwrap();
+        let uuid = before.table.metadata().uuid();
+        let target = ConnectorProviderBindingKey {
+            instance_id: provider.descriptor().instance_id.clone(),
+            incarnation: provider.incarnation(),
+        };
+        for (change, expected_effect) in [
+            (
+                ConnectorPropertyChange::Set {
+                    key: "owner".into(),
+                    value: "async-original".into(),
+                },
+                ExternalMutationEffect::Applied,
+            ),
+            (
+                ConnectorPropertyChange::Unset {
+                    key: "missing".into(),
+                    if_exists: true,
+                },
+                ExternalMutationEffect::NoOp,
+            ),
+        ] {
+            let operation_id = ConnectorMutationOperationId::new();
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            executor
+                .block_on(lease.execute_async_in(
+                    ConnectorCatalogMutationRequest {
+                        operation_id,
+                        target: target.clone(),
+                        context: context(),
+                        operation: ConnectorCatalogMutationOperation::AlterProperties {
+                            table: table.clone(),
+                            changes: vec![change],
+                            authority: ConnectorPropertyAuthority::UserStatement,
+                            expected_committed_partitioning: Some(partitioning.clone()),
+                        },
+                    },
+                    &receiving,
+                ))
+                .unwrap();
+            let observed = receiving.observation();
+            assert_eq!(observed.validation(), Some(&Ok(())));
+            assert!(observed.provider_exited());
+            observed
+                .original_owner()
+                .unwrap()
+                .validate_owner(&target)
+                .unwrap();
+            let Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+                cleanup,
+            })) = observed.raw_outcome()
+            else {
+                panic!("actual property publication must have its committed outcome")
+            };
+            assert_eq!(*effect, expected_effect);
+            assert_eq!(receipt.operation_id(), operation_id);
+            assert_eq!(finalization, &ExternalMutationFinalization::Complete);
+            assert_eq!(cleanup, &ExternalMutationFinalization::Complete);
+            assert_eq!(
+                observed.applied_receipt().is_some(),
+                expected_effect == ExternalMutationEffect::Applied
+            );
+            assert!(observed.needed_committed().is_some());
+            assert_eq!(observed.needed_validation(), Some(&Ok(())));
+            match expected_effect {
+                ExternalMutationEffect::Applied => {
+                    let context = observed.finalization_context().unwrap().as_ref().unwrap();
+                    assert!(context.necessary_finalization_deadline_cap().is_some());
+                }
+                ExternalMutationEffect::NoOp => assert!(observed.finalization_context().is_none()),
+            }
+            drop(observed);
+            assert!(!receiving.foreign_exit_unproven());
+        }
+        let current = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context())
+            .unwrap();
+        assert_eq!(current.table.metadata().uuid(), uuid);
+        assert_eq!(
+            current.table.metadata().properties()["owner"],
+            "async-original"
+        );
+        assert_eq!(
+            committed_partitioning_from_metadata(
+                current.table.metadata(),
+                current.table.metadata().default_partition_spec_id()
+            )
+            .unwrap(),
+            partitioning
+        );
+    }
+
+    #[test]
+    fn async_property_partition_conflict_is_original_uncommitted_without_dispatch() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_spi::connector::ConnectorCatalogMutationReceiving;
+        let (executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let before_location = loaded.table.metadata_location().map(str::to_owned);
+        let current = committed_partitioning_from_metadata(
+            loaded.table.metadata(),
+            loaded.table.metadata().default_partition_spec_id(),
+        )
+        .unwrap();
+        let first = &current.fields()[0];
+        let mut fields = current.fields().to_vec();
+        fields[0] = novarocks_spi::connector::ConnectorCommittedPartitionField::try_new(
+            first.partition_field_id(),
+            format!("{}_changed", first.partition_field_name()),
+            first.source_field_id(),
+            first.source_column_name(),
+            first.position(),
+            first.transform(),
+        )
+        .unwrap();
+        let expected = ConnectorCommittedPartitioning::try_new(current.spec_id(), fields).unwrap();
+        let changes = vec![ConnectorPropertyChange::Set {
+            key: "owner".into(),
+            value: "must-not-apply".into(),
+        }];
+        let original_failure = match prepare_property_change(
+            loaded.table.metadata(),
+            &changes,
+            ConnectorPropertyAuthority::UserStatement,
+            Some(&expected),
+        ) {
+            Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) => failure,
+            Ok(_) => panic!("the original partition author must reject the mismatch"),
+        };
+        let lease = document_control_planning_lease(&provider)
+            .derive_mutation_lease()
+            .unwrap();
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        let target = ConnectorProviderBindingKey {
+            instance_id: provider.descriptor().instance_id.clone(),
+            incarnation: provider.incarnation(),
+        };
+        executor
+            .block_on(lease.execute_async_in(
+                ConnectorCatalogMutationRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    target: target.clone(),
+                    context: context(),
+                    operation: ConnectorCatalogMutationOperation::AlterProperties {
+                        table: table.clone(),
+                        changes,
+                        authority: ConnectorPropertyAuthority::UserStatement,
+                        expected_committed_partitioning: Some(expected),
+                    },
+                },
+                &receiving,
+            ))
+            .unwrap();
+        let observed = receiving.observation();
+        assert!(observed.provider_exited());
+        assert_eq!(observed.validation(), Some(&Ok(())));
+        observed
+            .original_owner()
+            .unwrap()
+            .validate_owner(&target)
+            .unwrap();
+        assert!(observed.applied_receipt().is_none());
+        assert!(observed.needed_committed().is_none());
+        let Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup })) =
+            observed.raw_outcome()
+        else {
+            panic!("the actual partition guard must reject before dispatch")
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+        assert_eq!(failure.message(), original_failure.message());
+        assert_eq!(failure.failure_fact(), original_failure.failure_fact());
+        assert_eq!(cleanup, &ExternalMutationFinalization::Complete);
+        drop(observed);
+        assert!(!receiving.foreign_exit_unproven());
+        let after = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context())
+            .unwrap();
+        assert_eq!(
+            after.table.metadata_location().map(str::to_owned),
+            before_location
+        );
+        assert!(!after.table.metadata().properties().contains_key("owner"));
+    }
+
+    #[test]
+    fn async_drop_publication_preserves_positive_receipt_and_missing_noop() {
+        use novarocks_spi::connector::ConnectorCatalogMutationReceiving;
+        let (executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let lease = document_control_planning_lease(&provider)
+            .derive_mutation_lease()
+            .unwrap();
+        let target = ConnectorProviderBindingKey {
+            instance_id: provider.descriptor().instance_id.clone(),
+            incarnation: provider.incarnation(),
+        };
+        for (policy, effect) in [
+            (DropPolicy::FailIfMissing, ExternalMutationEffect::Applied),
+            (DropPolicy::NoOpIfMissing, ExternalMutationEffect::NoOp),
+        ] {
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            let operation_id = ConnectorMutationOperationId::new();
+            executor
+                .block_on(lease.execute_async_in(
+                    ConnectorCatalogMutationRequest {
+                        operation_id,
+                        target: target.clone(),
+                        context: context(),
+                        operation: ConnectorCatalogMutationOperation::DropTable {
+                            table: table.clone(),
+                            policy,
+                            data_disposition: ConnectorDropTableDataDisposition::Retain,
+                        },
+                    },
+                    &receiving,
+                ))
+                .unwrap();
+            let observed = receiving.observation();
+            assert!(observed.provider_exited());
+            assert_eq!(observed.validation(), Some(&Ok(())));
+            observed
+                .original_owner()
+                .unwrap()
+                .validate_owner(&target)
+                .unwrap();
+            let Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: actual,
+                receipt,
+                finalization,
+                cleanup,
+            })) = observed.raw_outcome()
+            else {
+                panic!("actual drop or absent-table noop must be retained")
+            };
+            assert_eq!(*actual, effect);
+            assert_eq!(receipt.operation_id(), operation_id);
+            assert_eq!(finalization, &ExternalMutationFinalization::Complete);
+            assert_eq!(cleanup, &ExternalMutationFinalization::Complete);
+            assert_eq!(
+                observed.applied_receipt().is_some(),
+                effect == ExternalMutationEffect::Applied
+            );
+            assert!(observed.needed_committed().is_some());
+            assert_eq!(
+                observed.finalization_context().is_some(),
+                effect == ExternalMutationEffect::Applied
+            );
+            drop(observed);
+            assert!(!receiving.foreign_exit_unproven());
+            let exists = executor
+                .block_on(provider.runtime().novarocks_catalog().table_exists(
+                    CatalogTableName::new(table.namespace.to_string(), table.table.to_string()),
+                ))
+                .unwrap();
+            assert!(!exists);
+        }
+    }
+
+    #[test]
+    fn async_rest_drop_uses_one_dispatch_and_only_applied_authorizes_purge() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::ConnectorCatalogMutationReceiving;
+        for code in [204, 503] {
+            let path = "/v1/namespaces/atomic/tables/events";
+            let server = TestServer::start(Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on("GET", path, Reply::json(200, &serde_json::json!({
+                    "metadata-location":"memory://warehouse/managed/mv/metadata/old.json",
+                    "metadata":test_metadata(HashMap::new()),
+                })))
+                .on("DELETE", path, Reply::status(code)));
+            let (executor, provider) = variant_definition_provider(&server.url());
+            let lease = document_control_planning_lease(&provider)
+                .derive_mutation_lease()
+                .unwrap();
+            let request = drop_request(&provider, DropPolicy::FailIfMissing, true);
+            let target = request.target.clone();
+            let operation_id = request.operation_id;
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            executor
+                .block_on(lease.execute_async_in(request, &receiving))
+                .unwrap();
+            let observed = receiving.observation();
+            assert!(observed.provider_exited());
+            assert_eq!(observed.validation(), Some(&Ok(())));
+            observed
+                .original_owner()
+                .unwrap()
+                .validate_owner(&target)
+                .unwrap();
+            if code == 204 {
+                assert!(matches!(
+                    observed.raw_outcome(),
+                    Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    }))
+                ));
+                assert!(observed.applied_receipt().is_some());
+                assert!(observed.needed_committed().is_some());
+                assert!(matches!(observed.finalization_context(), Some(Ok(_))));
+            } else {
+                let Some(Ok(ExternalMutationOutcome::CommitUnknown { evidence, .. })) =
+                    observed.raw_outcome()
+                else {
+                    panic!("an uncertain DELETE stays Unknown")
+                };
+                assert_eq!(evidence.operation_id(), operation_id);
+                assert!(observed.applied_receipt().is_none());
+                assert!(observed.needed_committed().is_none());
+                assert!(observed.finalization_context().is_none());
+            }
+            drop(observed);
+            assert!(!receiving.foreign_exit_unproven());
+            assert_eq!(server.requests_to("DELETE", path).len(), 1);
+            let requests = provider.runtime().drop_cleanup().take_eligible(i64::MAX);
+            assert_eq!(requests.len(), usize::from(code == 204));
+        }
     }
 }

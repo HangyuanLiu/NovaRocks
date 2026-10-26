@@ -106,7 +106,7 @@ impl CurrentProjectionMetadataCpu {
             }
         }
     }
-    fn port_for(
+    pub(crate) fn port_for(
         &self,
         lease: &ConnectorControlPlanningLease,
     ) -> Result<Arc<dyn ProviderMetadataCpuPort>, WorkError> {
@@ -136,7 +136,7 @@ impl CurrentProjectionMetadataCpu {
 }
 
 #[derive(Debug)]
-pub(super) enum CaptureFailure {
+pub(crate) enum CaptureFailure {
     Admission(WorkError),
     Provider(ConnectorError),
 }
@@ -150,7 +150,7 @@ impl CaptureFailure {
             }
         }
     }
-    pub(super) fn into_application(self) -> crate::mv::domain::application::MvApplicationError {
+    pub(crate) fn into_application(self) -> crate::mv::domain::application::MvApplicationError {
         use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
         match self {
             Self::Provider(error) => {
@@ -183,7 +183,7 @@ struct Call {
     exited: bool,
     owners_retired: bool,
 }
-pub(super) struct CurrentMetadataCapture {
+pub(crate) struct CurrentMetadataCapture {
     call: Mutex<Call>,
     health: StatementNativeHealthFailure,
 }
@@ -234,7 +234,7 @@ impl Drop for FutureLoan<'_> {
     }
 }
 impl CurrentMetadataCapture {
-    pub(super) fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             call: Mutex::new(Call::default()),
             health: StatementNativeHealthFailure::actual_exit_unproven(
@@ -302,7 +302,7 @@ impl CurrentMetadataCapture {
         };
         Ok(())
     }
-    pub(super) fn poll_progress(&self, cx: &mut Context<'_>) -> Poll<()> {
+    pub(crate) fn poll_progress(&self, cx: &mut Context<'_>) -> Poll<()> {
         let future = {
             let mut call = self.call.lock().unwrap_or_else(|p| p.into_inner());
             if call.in_foreign {
@@ -337,7 +337,7 @@ impl CurrentMetadataCapture {
             }
         }
     }
-    pub(super) fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
+    pub(crate) fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
         std::task::ready!(self.poll_progress(cx));
         let retired = {
             let mut call = self.call.lock().unwrap_or_else(|p| p.into_inner());
@@ -362,7 +362,7 @@ impl CurrentMetadataCapture {
         call.in_foreign = false;
         Poll::Ready(())
     }
-    pub(super) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
+    pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         let (unproven, port) = {
             let call = self.call.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -380,7 +380,7 @@ impl CurrentMetadataCapture {
             )
         })
     }
-    pub(super) async fn capture(
+    pub(crate) async fn capture(
         self: &Arc<Self>,
         lease: &ConnectorControlPlanningLease,
         factory: &CurrentProjectionMetadataCpu,

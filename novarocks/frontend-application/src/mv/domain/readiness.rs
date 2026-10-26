@@ -835,7 +835,6 @@ mod controlled_wipe_tests {
         service::MvKeyedProductService,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     async fn product_and_port() -> (
@@ -871,23 +870,23 @@ mod controlled_wipe_tests {
             .claim_call("ice", "sales", "orders", "wipe")
             .unwrap();
         let (product, port, repository) = product_and_port().await;
-        let (refresh_stop_tx, refresh_stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
-        let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
+        let stop = novarocks_mv_application::process_runtime::MvBackgroundStop::default();
+        let refresh_stop = stop.clone();
+        let maintenance_stop = stop.clone();
+        let (wakeup_tx, _wakeup_rx) = tokio::sync::mpsc::channel(1);
         let refresh_exited = Arc::new(AtomicBool::new(false));
         let maintenance_exited = Arc::new(AtomicBool::new(false));
         let refresh_fact = refresh_exited.clone();
         let maintenance_fact = maintenance_exited.clone();
         let runtime = MvBackgroundRuntime::new(
-            refresh_stop_tx,
-            std::thread::spawn(move || {
-                refresh_stop_rx.recv().unwrap();
+            stop,
+            tokio::spawn(async move {
+                refresh_stop.cancelled().await;
                 refresh_fact.store(true, Ordering::Release);
             }),
-            maintenance_stop_tx,
             wakeup_tx,
-            std::thread::spawn(move || {
-                maintenance_stop_rx.recv().unwrap();
+            tokio::spawn(async move {
+                maintenance_stop.cancelled().await;
                 maintenance_fact.store(true, Ordering::Release);
             }),
         );
@@ -929,18 +928,15 @@ mod controlled_wipe_tests {
             .unwrap();
         let (product, port, repository) = product_and_port().await;
         let before = repository.list_keyed_projections().await.unwrap();
-        let (refresh_stop_tx, _refresh_stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
-        let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
+        let (wakeup_tx, _wakeup_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let runtime = MvBackgroundRuntime::new(
-            refresh_stop_tx,
-            std::thread::spawn(move || {
-                release_rx.recv().unwrap();
+            novarocks_mv_application::process_runtime::MvBackgroundStop::default(),
+            tokio::spawn(async move {
+                release_rx.await.unwrap();
             }),
-            maintenance_stop_tx,
             wakeup_tx,
-            std::thread::spawn(|| {}),
+            tokio::spawn(async {}),
         );
         product
             .begin_background_start()
@@ -966,17 +962,14 @@ mod controlled_wipe_tests {
             .unwrap();
         let (product, port, repository) = product_and_port().await;
         let before = repository.list_keyed_projections().await.unwrap();
-        let (refresh_stop_tx, _refresh_stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
-        let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
+        let (wakeup_tx, _wakeup_rx) = tokio::sync::mpsc::channel(1);
         let runtime = MvBackgroundRuntime::new(
-            refresh_stop_tx,
-            std::thread::spawn(|| {
+            novarocks_mv_application::process_runtime::MvBackgroundStop::default(),
+            tokio::spawn(async {
                 panic!("injected MV worker panic");
             }),
-            maintenance_stop_tx,
             wakeup_tx,
-            std::thread::spawn(|| {}),
+            tokio::spawn(async {}),
         );
         product
             .begin_background_start()

@@ -413,6 +413,100 @@ async fn original_open_moves_instance_only_after_real_exit_into_original_target(
 }
 
 #[tokio::test]
+async fn withdrawn_begin_retains_its_original_refusal_after_actual_close() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(temp.path().join("withdrawn-begin.sqlite")).await;
+    let rig = Rig::new(StateStoreBlockingOrigin::Instance(store.attempts.scope()));
+    let execution = rig.context(Instant::now() + Duration::from_secs(5));
+    let mut begin = Box::pin(store.begin_original_read_in(&execution));
+    assert!(
+        begin
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let prepared = rig.prepare_next().await;
+    let cell = prepared.cell.clone();
+    assert_eq!(prepared.request.phase, Phase::BeginRead);
+    prepared.withdraw();
+    let original = lock(&cell.observation)
+        .result
+        .as_ref()
+        .unwrap()
+        .1
+        .as_ref()
+        .unwrap_err()
+        .clone();
+    assert_eq!(cell.original.requested().unwrap().phase, Phase::Close);
+    assert!(!cell.original.is_complete());
+    assert!(cell.original.local_failure().is_none());
+    // Delay the borrower until the same real QB Close has entirely returned.
+    rig.drain().await;
+    assert!(cell.original.is_complete());
+    assert!(matches!(
+        lock(&cell.observation).exit,
+        Some((_, Exit::ActualExited))
+    ));
+    let selected = match begin.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Err(failure)) => failure,
+        _ => panic!("actual Close cannot erase the original unpublished Begin refusal"),
+    };
+    assert_eq!(selected, original);
+    assert_eq!(selected.failure_fact(), original.failure_fact());
+    assert!(cell.original.local_failure().is_none());
+    drop(begin);
+    drop(cell);
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn withdrawn_get_retains_its_original_refusal_after_actual_close() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(temp.path().join("withdrawn-get.sqlite")).await;
+    let rig = Rig::new(StateStoreBlockingOrigin::Instance(store.attempts.scope()));
+    let execution = rig.context(Instant::now() + Duration::from_secs(5));
+    let mut transaction = rig
+        .run(store.begin_original_read_in(&execution))
+        .await
+        .unwrap();
+    let item = key();
+    let mut get = Box::pin(transaction.get_in(&item));
+    assert!(
+        get.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let prepared = rig.prepare_next().await;
+    let cell = prepared.cell.clone();
+    assert_eq!(prepared.request.phase, Phase::Get);
+    prepared.withdraw();
+    let original = lock(&cell.observation)
+        .result
+        .as_ref()
+        .unwrap()
+        .1
+        .as_ref()
+        .unwrap_err()
+        .clone();
+    assert_eq!(cell.original.requested().unwrap().phase, Phase::Close);
+    assert!(!cell.original.is_complete());
+    assert!(cell.original.local_failure().is_none());
+    rig.drain().await;
+    assert!(cell.original.is_complete());
+    let selected = match get.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Err(failure)) => failure,
+        _ => panic!("actual Close cannot erase the original unpublished Get refusal"),
+    };
+    assert_eq!(selected, original);
+    assert_eq!(selected.failure_fact(), original.failure_fact());
+    assert!(cell.original.local_failure().is_none());
+    drop(get);
+    drop(transaction);
+    drop(cell);
+    rig.stop().await;
+}
+
+#[tokio::test]
 async fn marked_never_published_commit_settles_only_after_same_rollback_actual_exit() {
     let temp = tempfile::tempdir().unwrap();
     let store = store(temp.path().join("store.sqlite")).await;

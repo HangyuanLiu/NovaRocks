@@ -243,7 +243,7 @@ fn finish_standard_publication(
             mark_dispatch_possible(attempt)?;
             finish_known_committed(attempt, finalization)
         }
-        Ok(StandardCtasPublishOutcome::CommitUnknown { evidence }) => {
+        Ok(StandardCtasPublishOutcome::CommitUnknown { evidence, .. }) => {
             mark_dispatch_possible(attempt)?;
             let adjudication = attempt.begin_adjudication().map_err(attempt_error)?;
             match engine.adjudicate_standard_ctas_publication(target.handle.as_ref(), evidence) {
@@ -836,6 +836,9 @@ mod tests {
         ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
             self.publishes.fetch_add(1, Ordering::SeqCst);
             Ok(StandardCtasPublishOutcome::CommitUnknown {
+                failure: Box::new(internal_failure(
+                    "original local publication remains unknown",
+                )),
                 evidence: Self::evidence(),
             })
         }

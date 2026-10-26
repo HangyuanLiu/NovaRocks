@@ -148,7 +148,8 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         let namespace = base.namespace.clone();
         let table = base.table.clone();
         let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &table, snapshot_id);
-        overlays.push(QueryLocalTableOverlay::new(
+        overlays.push(QueryLocalTableOverlay::for_catalog(
+            catalog.clone(),
             namespace.clone(),
             table.clone(),
             key,
@@ -522,7 +523,8 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
         let namespace = base.namespace.clone();
         let table = base.table.clone();
         let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &table, snapshot_id);
-        overlays.push(QueryLocalTableOverlay::new(
+        overlays.push(QueryLocalTableOverlay::for_catalog(
+            catalog.clone(),
             namespace.clone(),
             table.clone(),
             key,

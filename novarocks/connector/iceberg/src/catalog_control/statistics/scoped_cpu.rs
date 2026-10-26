@@ -39,6 +39,7 @@ mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
+    Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
     ChangeWindow(scoped_change_window::ChangeWindowBody),
     Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
@@ -119,6 +120,44 @@ impl Drop for BodyLoan<'_> {
     }
 }
 impl IcebergMetadataCpuOriginal {
+    pub(crate) fn compaction_source(
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+        work: crate::catalog_control::metadata_maintenance::observation::CompactionWork,
+    ) -> Arc<Self> {
+        Self::new(descriptor, incarnation, CpuBody::Compaction(work))
+    }
+    pub(crate) fn compaction_received(
+        &self,
+        raw: crate::catalog_control::metadata_maintenance::observation::RawResult,
+    ) {
+        let mut loan = BodyLoan::take(self);
+        let original = loan.body.as_mut().unwrap();
+        let CpuBody::Compaction(work) = &mut original.body else {
+            panic!("same compaction source");
+        };
+        work.receive(raw);
+        original.started = false;
+    }
+    pub(crate) fn compaction_received_result(
+        &self,
+    ) -> Option<Result<novarocks_spi::connector::ConnectorMaxCompactableDataFiles, ConnectorError>>
+    {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::Compaction(work) = &mut loan.body.as_mut().unwrap().body else {
+            panic!("same compaction source");
+        };
+        work.received_result()
+    }
+    pub(crate) fn compaction_next(
+        &self,
+    ) -> crate::catalog_control::metadata_maintenance::observation::Next {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::Compaction(work) = &mut loan.body.as_mut().unwrap().body else {
+            panic!("same compaction source");
+        };
+        work.next()
+    }
     pub(crate) fn cleanup_source(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
         incarnation: novarocks_spi::connector::ProviderBindingEpoch,
@@ -270,6 +309,7 @@ impl IcebergMetadataCpuOriginal {
         assert!(!original.started, "one original Statistics CPU execution");
         original.started = true;
         match &mut original.body {
+            CpuBody::Compaction(work) => work.run(),
             CpuBody::ChangeWindow(body) => body.run(),
             CpuBody::Cleanup(work) => work.run(),
             CpuBody::Read(body) => body.run(),
@@ -599,6 +639,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                         | CpuBody::ChangeWindow(_)
                         | CpuBody::ReadSnapshot(_)
                         | CpuBody::Cleanup(_)
+                        | CpuBody::Compaction(_)
                 ) || matches!(&body.as_ref().unwrap().body,CpuBody::Read(read) if read.phase<=1
                 ),
                 "metadata source cannot dispatch a Statistics product phase"

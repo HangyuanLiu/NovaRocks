@@ -173,38 +173,57 @@ impl QueryServiceError {
     }
 
     /// Keep the selected input and descriptor unchanged while exposing an
-    /// independent publication verdict that forbids retry. Provider and target
-    /// diagnostics remain in the terminal sidecar.
+    /// independent publication verdict. Only Unknown and KnownCommitted forbid
+    /// retry; KnownUncommitted is not, by itself, permission to retry. Provider
+    /// and target diagnostics remain in the terminal sidecar.
     pub fn attach_publication_terminal(mut self, terminal: LakePublicationTerminal) -> Self {
+        self.publication_terminal = Some(terminal);
+        self.render_execution_message();
+        self
+    }
+
+    fn render_execution_message(&mut self) {
         if let QueryServiceErrorBody::Execution {
             user_error,
             message,
             ..
         } = &mut self.body
         {
-            // Always render from the frozen descriptor, so attaching a newer
-            // publication verdict cannot duplicate a previous public suffix.
+            // Both independent knowledge fields render from the same frozen
+            // descriptor. Neither attachment may erase the other one's guard.
             *message = user_error.to_string();
-            let disposition = match terminal.disposition() {
-                LakePublicationDisposition::KnownUncommitted => None,
-                LakePublicationDisposition::CommitUnknown => Some("CommitUnknown"),
-                LakePublicationDisposition::KnownCommitted => Some("KnownCommitted"),
-            };
-            if let Some(disposition) = disposition {
+            if let Some(terminal) = self.publication_terminal.as_ref() {
+                let disposition = match terminal.disposition() {
+                    LakePublicationDisposition::KnownUncommitted => "KnownUncommitted",
+                    LakePublicationDisposition::CommitUnknown => "CommitUnknown",
+                    LakePublicationDisposition::KnownCommitted => "KnownCommitted",
+                };
                 use std::fmt::Write;
                 let header = terminal.header();
                 write!(
                     message,
-                    " (lake publication id={} family={} disposition={} do_not_retry=true; do not retry statement)",
+                    " (lake publication id={} family={} disposition={}",
                     header.publication_id(),
                     header.family().as_str(),
                     disposition,
                 )
                 .expect("writing to a String cannot fail");
+                if terminal.do_not_retry() {
+                    message.push_str(" do_not_retry=true; do not retry statement");
+                }
+                message.push(')');
+            }
+            let label = match self.external_effect_disposition {
+                Some(StatementExternalEffectDisposition::CommitUnknown) => Some("CommitUnknown"),
+                Some(StatementExternalEffectDisposition::KnownCommitted) => Some("KnownCommitted"),
+                Some(StatementExternalEffectDisposition::KnownUncommitted) | None => None,
+            };
+            if let Some(label) = label {
+                use std::fmt::Write;
+                write!(message, " (external effect disposition={label} do_not_retry=true; do not retry statement)")
+                    .expect("writing to a String cannot fail");
             }
         }
-        self.publication_terminal = Some(terminal);
-        self
     }
 
     /// Forward only the original action owner's effect knowledge.
@@ -219,10 +238,17 @@ impl QueryServiceError {
         if self.external_effect_disposition.is_some() {
             return self;
         }
+        self.external_effect_disposition = Some(disposition);
+        if matches!(&self.body, QueryServiceErrorBody::Execution { .. }) {
+            self.render_execution_message();
+            return self;
+        }
+        // Preserve the original Message/User behavior. Their text has no
+        // frozen execution descriptor to render again.
         let message = match &mut self.body {
             QueryServiceErrorBody::Message { message, .. }
-            | QueryServiceErrorBody::User { message, .. }
-            | QueryServiceErrorBody::Execution { message, .. } => message,
+            | QueryServiceErrorBody::User { message, .. } => message,
+            QueryServiceErrorBody::Execution { .. } => unreachable!("handled above"),
         };
         let label = match disposition {
             StatementExternalEffectDisposition::KnownUncommitted => None,
@@ -237,7 +263,6 @@ impl QueryServiceError {
             )
             .expect("writing to a String cannot fail");
         }
-        self.external_effect_disposition = Some(disposition);
         self
     }
 
@@ -291,17 +316,23 @@ impl QueryServiceError {
             .max()
             .unwrap_or(0);
         // UUID display is exactly 36 bytes. The original caller supplies
-        // the publication family; disposition uses the
-        // longest existing label. Target text is not rendered in this suffix.
+        // the publication family. KnownCommitted including its retry guard
+        // is the longest complete suffix; the negative verdict has no guard.
+        // Target text is not rendered in this suffix.
         let suffix = " (lake publication id=".len()
             + 36
             + " family=".len()
             + family.as_str().len()
             + " disposition=KnownCommitted do_not_retry=true; do not retry statement)".len();
+        // Both existing facts may be present on the same selected error. The
+        // cumulative effect has its own complete public guard, independently
+        // of the current publication terminal.
+        let effect_suffix = " (external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)".len();
         let rendered = code
             .checked_add(3)
             .and_then(|n| n.checked_add(detail_bytes))
             .and_then(|n| n.checked_add(suffix))
+            .and_then(|n| n.checked_add(effect_suffix))
             .ok_or(WorkError::ArithmeticOverflow)?;
         // Existing String formatting can double RawVec capacity. Count the
         // old rendering, reset rendering, and one reallocation peak together;
@@ -580,7 +611,7 @@ mod publication_message_tests {
     }
 
     #[test]
-    fn known_uncommitted_keeps_the_complete_canonical_message() {
+    fn known_uncommitted_preserves_primary_and_renders_independent_terminal() {
         let input = selected_input();
         let expected_user_error = input.user_error();
         let expected_message = "[query.execution.unexpected] writer execution failed";
@@ -588,11 +619,103 @@ mod publication_message_tests {
         assert_eq!(selected.message(), expected_message);
         let terminal = publication(LakePublicationDisposition::KnownUncommitted);
         let service = selected.attach_publication_terminal(terminal.clone());
-        assert_eq!(service.message(), expected_message);
+        let expected_public = format!(
+            "{expected_message} (lake publication id={} family=write disposition=KnownUncommitted)",
+            terminal.header().publication_id()
+        );
+        assert_eq!(service.message(), expected_public);
+        assert!(!service.message().contains("do_not_retry"));
+        assert!(!service.message().contains("do not retry statement"));
+        let repeated = service
+            .clone()
+            .attach_publication_terminal(terminal.clone());
+        assert_eq!(repeated.message(), expected_public);
         assert_eq!(service.execution_failure(), Some(&input));
         assert_eq!(service.user_error(), Some(&expected_user_error));
         assert_eq!(service.publication_terminal(), Some(&terminal));
         assert!(!terminal.do_not_retry());
+    }
+
+    #[test]
+    fn stage_noncommit_wire_message_keeps_source_descriptor_and_negative_fact() {
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        for kind in [
+            ConnectorMutationFailureKind::Unavailable,
+            ConnectorMutationFailureKind::PermissionDenied,
+        ] {
+            let original = SharedFailureCause::from_static_detail(
+                ConnectorMutationFailure::new(kind, "private provider diagnostic"),
+                "stage request failed",
+            );
+            let terminal = LakePublicationTerminal::new(
+                LakePublicationMarkerHeader::new(
+                    LakePublicationId::new_v7(),
+                    LakePublicationFamily::Ctas,
+                ),
+                LakePublicationTarget::try_new(
+                    "private-catalog".into(),
+                    "private-namespace".into(),
+                    Some("private-table".into()),
+                    None,
+                )
+                .unwrap(),
+                LakePublicationDisposition::KnownUncommitted,
+                LakePublicationNextAction::RetryStatement,
+                Some(LakePublicationStatementTag::try_new("private-tag".into()).unwrap()),
+            );
+            let selected = QueryServiceError::from_failure_cause(original.clone());
+            let input = selected.execution_failure().unwrap().clone();
+            let primary = selected.user_error().unwrap().clone();
+            let service = selected.attach_publication_terminal(terminal.clone());
+            // These are the exact public message bytes consumed by both MySQL
+            // selected-error writers; no adapter reconstructs a terminal label.
+            let wire_message = service.message().as_bytes().to_vec();
+            let expected = format!(
+                "{} (lake publication id={} family=ctas disposition=KnownUncommitted)",
+                primary,
+                terminal.header().publication_id()
+            );
+            assert_eq!(wire_message.as_slice(), expected.as_bytes());
+            assert_eq!(service.failure_cause(), Some(&original));
+            assert_eq!(
+                service
+                    .failure_cause()
+                    .unwrap()
+                    .downcast_ref::<ConnectorMutationFailure>()
+                    .unwrap()
+                    .kind(),
+                kind
+            );
+            assert_eq!(service.execution_failure(), Some(&input));
+            assert_eq!(input.fact(), original.failure_fact());
+            assert_eq!(service.user_error(), Some(&primary));
+            assert_eq!(
+                input.descriptor().descriptor.code.as_str(),
+                "query.execution.dependency"
+            );
+            assert_eq!(
+                (input.descriptor().errno, input.descriptor().sqlstate),
+                (1105, "HY000")
+            );
+            assert_eq!(service.publication_terminal(), Some(&terminal));
+            assert!(service.external_effect_disposition().is_none());
+            assert!(service.compile_control_error().is_none());
+            assert!(!terminal.do_not_retry());
+            assert!(!service.message().contains("do_not_retry"));
+            assert!(!service.message().contains("do not retry statement"));
+            for private in [
+                "private provider diagnostic",
+                "private-catalog",
+                "private-namespace",
+                "private-table",
+                "private-tag",
+            ] {
+                assert!(!service.message().contains(private));
+            }
+            let repeated = service.attach_publication_terminal(terminal);
+            assert_eq!(repeated.message().as_bytes(), wire_message.as_slice());
+        }
     }
 
     #[test]
@@ -641,6 +764,110 @@ mod publication_message_tests {
             let repeated = service.attach_publication_terminal(terminal);
             assert_eq!(repeated.message(), expected_message);
             assert_eq!(repeated.execution_failure(), Some(&input));
+        }
+    }
+
+    #[test]
+    fn cumulative_effect_and_terminal_survive_both_attachment_orders_and_reattachment() {
+        use novarocks_failure_contract::SharedFailureCause;
+        let source = SharedFailureCause::from_static_detail(
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "private provider diagnostic",
+            ),
+            "selected source failed",
+        );
+        let selected = QueryServiceError::from_failure_cause(source.clone());
+        let input = selected.execution_failure().unwrap().clone();
+        let primary = selected.user_error().unwrap().clone();
+        for (effect, effect_label) in [
+            (
+                StatementExternalEffectDisposition::KnownCommitted,
+                "KnownCommitted",
+            ),
+            (
+                StatementExternalEffectDisposition::CommitUnknown,
+                "CommitUnknown",
+            ),
+        ] {
+            for (knowledge, label) in [
+                (
+                    LakePublicationDisposition::KnownUncommitted,
+                    "KnownUncommitted",
+                ),
+                (LakePublicationDisposition::CommitUnknown, "CommitUnknown"),
+                (LakePublicationDisposition::KnownCommitted, "KnownCommitted"),
+            ] {
+                let terminal = publication(knowledge);
+                let guard = if knowledge.do_not_retry() {
+                    " do_not_retry=true; do not retry statement"
+                } else {
+                    ""
+                };
+                let expected = format!(
+                    "{primary} (lake publication id={} family=write disposition={label}{guard}) (external effect disposition={effect_label} do_not_retry=true; do not retry statement)",
+                    terminal.header().publication_id()
+                );
+                let effect_first = selected
+                    .clone()
+                    .attach_external_effect_disposition(effect)
+                    .attach_publication_terminal(terminal.clone());
+                let terminal_first = selected
+                    .clone()
+                    .attach_publication_terminal(terminal.clone())
+                    .attach_external_effect_disposition(effect);
+                for service in [effect_first, terminal_first] {
+                    assert_eq!(service.message().as_bytes(), expected.as_bytes());
+                    assert_eq!(service.failure_cause(), Some(&source));
+                    assert_eq!(service.execution_failure(), Some(&input));
+                    assert_eq!(service.user_error(), Some(&primary));
+                    assert_eq!(service.publication_terminal(), Some(&terminal));
+                    assert_eq!(service.external_effect_disposition(), Some(effect));
+                    assert_eq!(input.fact(), source.failure_fact());
+                    assert_eq!(
+                        input.descriptor().descriptor.code.as_str(),
+                        "query.execution.dependency"
+                    );
+                    assert_eq!(
+                        (input.descriptor().errno, input.descriptor().sqlstate),
+                        (1105, "HY000")
+                    );
+                    assert_eq!(
+                        service
+                            .message()
+                            .matches("external effect disposition=")
+                            .count(),
+                        1
+                    );
+                    assert_eq!(service.message().matches("lake publication id=").count(), 1);
+                    assert_eq!(
+                        service.message().matches("do_not_retry=true").count(),
+                        1 + usize::from(knowledge.do_not_retry())
+                    );
+                    for private in [
+                        "private provider diagnostic",
+                        "private-catalog",
+                        "private-namespace",
+                        "private-table",
+                        "private-reference",
+                        "private-tag",
+                    ] {
+                        assert!(!service.message().contains(private));
+                    }
+                    // The first cumulative effect is immutable; neither a
+                    // repeated terminal nor a later negative offer erases it.
+                    let repeated = service
+                        .attach_publication_terminal(terminal.clone())
+                        .attach_external_effect_disposition(
+                            StatementExternalEffectDisposition::KnownUncommitted,
+                        );
+                    assert_eq!(repeated.message().as_bytes(), expected.as_bytes());
+                    assert_eq!(repeated.external_effect_disposition(), Some(effect));
+                    assert_eq!(repeated.publication_terminal(), Some(&terminal));
+                    assert_eq!(repeated.failure_cause(), Some(&source));
+                    assert_eq!(repeated.execution_failure(), Some(&input));
+                }
+            }
         }
     }
 

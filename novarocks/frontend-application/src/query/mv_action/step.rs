@@ -47,7 +47,89 @@ use std::{
     task::{Context, Poll},
 };
 
-pub(super) struct MvStepOriginal {
+/// Both step kinds borrow the same command Root and stable retired slots.
+pub(super) enum MvStepOriginal {
+    Refresh(MvRefreshStepOriginal),
+    Control(super::control::MvControlStepOriginal),
+    Create(super::control_create::MvCreateStepOriginal),
+}
+impl MvStepOriginal {
+    pub(super) fn new(
+        input: Arc<CommandInput>,
+        io: Arc<MetadataIoAdmission>,
+        store: &StateStoreOriginalOwner,
+        request: StepRequest,
+        context: ConnectorRequestContext,
+        wake: Arc<MvWake>,
+    ) -> Result<Self, QueryServiceError> {
+        match request {
+            StepRequest::Create { target, statement } => {
+                super::control_create::MvCreateStepOriginal::new(
+                    input, io, store, target, statement, context, wake,
+                )
+                .map(Self::Create)
+            }
+            StepRequest::Control(request) => {
+                super::control::MvControlStepOriginal::new(input, io, store, request, context, wake)
+                    .map(Self::Control)
+            }
+            refresh => MvRefreshStepOriginal::new(input, io, store, refresh, context, wake)
+                .map(Self::Refresh),
+        }
+    }
+    pub(super) fn physical_exit_observed(&self) -> bool {
+        match self {
+            Self::Refresh(step) => step.execution.closed,
+            Self::Control(step) => step.physical_exit_observed(),
+            Self::Create(step) => step.physical_exit_observed(),
+        }
+    }
+    pub(super) fn performed_publication(&self) -> bool {
+        match self {
+            Self::Refresh(step) => step.performed_publication(),
+            Self::Control(step) => step.performed_publication(),
+            Self::Create(step) => step.performed_publication(),
+        }
+    }
+    pub(super) fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+        match self {
+            Self::Refresh(step) => step.external_effect_disposition(),
+            Self::Control(step) => step.external_effect_disposition(),
+            Self::Create(step) => step.external_effect_disposition(),
+        }
+    }
+    pub(super) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
+        match self {
+            Self::Refresh(step) => step.local_health_failure(),
+            Self::Control(step) => step.local_health_failure(),
+            Self::Create(step) => step.local_health_failure(),
+        }
+    }
+    pub(super) fn poll_business(
+        &mut self,
+        store: &StateStoreOriginalOwner,
+        owner: &mut GovernedActionContext<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), MvPhaseFailure>> {
+        match self {
+            Self::Refresh(step) => step.poll_business(store, owner, cx),
+            Self::Control(step) => step.poll_business(store, owner, cx),
+            Self::Create(step) => step.poll_business(store, owner, cx),
+        }
+    }
+    pub(super) fn poll_closed(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        match self {
+            Self::Refresh(step) => step.poll_closed(cx),
+            Self::Control(step) => step.poll_closed(cx),
+            Self::Create(step) => step.poll_closed(cx),
+        }
+    }
+}
+
+pub(super) struct MvRefreshStepOriginal {
     input: Arc<CommandInput>,
     request: Option<StepRequest>,
     attempt: MvRefreshAttemptIdentity,
@@ -93,7 +175,7 @@ struct StepExecution {
     terminal_record_failure: Option<QueryServiceError>,
     closed: bool,
 }
-impl MvStepOriginal {
+impl MvRefreshStepOriginal {
     pub(super) fn new(
         input: Arc<CommandInput>,
         io: Arc<MetadataIoAdmission>,
@@ -886,7 +968,7 @@ fn provider_error(
     }
     failure
 }
-fn product_failure(error: MvProductError) -> MvPhaseFailure {
+pub(super) fn product_failure(error: MvProductError) -> MvPhaseFailure {
     let mut domain =
         crate::mv::domain::application::MvApplicationError::from_refresh_product(&error);
     let service = product_error(error);
@@ -964,6 +1046,75 @@ mod product_failure_tests {
             cause.failure_fact()
         );
         assert_eq!(selected.compile_control_error(), Some(control));
+    }
+
+    #[test]
+    fn product_public_projection_keeps_original_cause_without_exposing_private_detail() {
+        use novarocks_query_application::api::StatementExternalEffectDisposition;
+        // The source owns the private diagnostic; this closed producer authors
+        // the safe detail independently. SafeDetail bounds text, not secrets.
+        let cause = SharedFailureCause::from_static_detail(
+            novarocks_workload_control::WorkError::Capacity(
+                "private original Provider responsibility detail",
+            ),
+            "MV resource capacity is unavailable",
+        );
+        assert_eq!(
+            cause
+                .downcast_ref::<novarocks_workload_control::WorkError>()
+                .expect("same private capacity source")
+                .to_string(),
+            "Work capacity exhausted: private original Provider responsibility detail",
+        );
+        let original_fact = cause.failure_fact();
+        assert_eq!(original_fact.class(), FailureClass::Resource);
+        for (kind, disposition) in [
+            (
+                MvProductErrorKind::CommitUnknown,
+                StatementExternalEffectDisposition::CommitUnknown,
+            ),
+            (
+                MvProductErrorKind::KnownCommittedFinalizeFailed,
+                StatementExternalEffectDisposition::KnownCommitted,
+            ),
+        ] {
+            let phase = product_failure(
+                MvProductError::new(kind, "private original Product detail")
+                    .with_original_failure(cause.clone()),
+            );
+            assert_eq!(phase.service.failure_cause(), Some(&cause));
+            assert_eq!(
+                phase.domain.as_ref().unwrap().original_failure(),
+                Some(&cause),
+            );
+            assert_eq!(
+                phase.service.execution_failure().unwrap().fact(),
+                original_fact
+            );
+            assert_eq!(
+                phase.service.execution_failure().unwrap().detail().as_str(),
+                "MV resource capacity is unavailable",
+            );
+            // Error classification does not mint a publication fact. The Root
+            // independently attaches its observed effect through this public API.
+            assert!(phase.service.external_effect_disposition().is_none());
+            let public = phase
+                .service
+                .attach_external_effect_disposition(disposition);
+            assert_eq!(public.failure_cause(), Some(&cause));
+            assert_eq!(public.execution_failure().unwrap().fact(), original_fact);
+            assert_eq!(public.external_effect_disposition(), Some(disposition));
+            assert!(public.message().contains("do not retry statement"));
+            assert!(
+                public
+                    .message()
+                    .contains("MV resource capacity is unavailable")
+            );
+            assert!(!public.message().contains("private original Provider"));
+            assert!(!public.message().contains("private original Product"));
+            assert!(public.compile_control_error().is_none());
+            assert!(public.publication_terminal().is_none());
+        }
     }
 
     #[test]

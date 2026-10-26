@@ -1392,6 +1392,7 @@ struct OriginalRegistrationChildFixture {
     descriptor: ConnectorInstanceDescriptor,
     epoch: ProviderBindingEpoch,
     cleanup: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    cleanup_outcome: ExternalMutationFinalization,
     calls: std::sync::atomic::AtomicUsize,
     exits: Arc<std::sync::atomic::AtomicUsize>,
     owner: Arc<()>,
@@ -1466,7 +1467,7 @@ impl ConnectorCatalogMutation for OriginalRegistrationChildFixture {
                 effect: ExternalMutationEffect::NoOp,
                 receipt,
                 finalization: ExternalMutationFinalization::Complete,
-                cleanup: ExternalMutationFinalization::Complete,
+                cleanup: self.cleanup_outcome.clone(),
             })
         })
     }
@@ -1485,6 +1486,7 @@ async fn original_registration_needed_does_not_drop_its_child_or_opaque_owner() 
         descriptor: fixture.caps.descriptor.clone(),
         epoch: fixture.caps.epoch,
         cleanup: Mutex::new(Some(cleanup)),
+        cleanup_outcome: ExternalMutationFinalization::Complete,
         calls: AtomicUsize::new(0),
         exits: Arc::clone(&exits),
         owner,
@@ -1561,3 +1563,120 @@ async fn original_registration_needed_does_not_drop_its_child_or_opaque_owner() 
     drop(registration);
     assert!(owner_pin.upgrade().is_none());
 }
+
+#[tokio::test]
+async fn original_registration_physical_exit_keeps_failed_cleanup_and_same_owner() {
+    use super::CurrentProjectionRegistration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fixture = Fixture::new(vec![]);
+    let (finish, cleanup) = tokio::sync::oneshot::channel();
+    let owner = Arc::new(());
+    let owner_pin = Arc::downgrade(&owner);
+    let exits = Arc::new(AtomicUsize::new(0));
+    let cleanup_error = ConnectorError::new(
+        ConnectorErrorKind::Unavailable,
+        "original registration cleanup remains retained",
+    );
+    let provider = Arc::new(OriginalRegistrationChildFixture {
+        descriptor: fixture.caps.descriptor.clone(),
+        epoch: fixture.caps.epoch,
+        cleanup: Mutex::new(Some(cleanup)),
+        cleanup_outcome: ExternalMutationFinalization::Failed(
+            ConnectorMutationFailure::from_connector(cleanup_error.clone()),
+        ),
+        calls: AtomicUsize::new(0),
+        exits: Arc::clone(&exits),
+        owner,
+    });
+    let lease = ConnectorCatalogMutationLease::new(
+        provider.descriptor.clone(),
+        fixture.resolver.binding.control_runtime_id(),
+        provider.epoch,
+        provider.clone(),
+        || {},
+    )
+    .unwrap();
+    let registration = CurrentProjectionRegistration::new();
+    let receiving = Arc::clone(&registration.receiving);
+    let operation_id = ConnectorMutationOperationId::new();
+    let instance = provider.descriptor.instance_id.clone();
+    let future = Box::pin(async move {
+        lease
+            .execute_operation_async_in(
+                operation_id,
+                ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace: ConnectorNamespaceIdentity {
+                        instance_id: instance,
+                        namespace: "unused".into(),
+                    },
+                    policy: DropPolicy::FailIfMissing,
+                },
+                context(),
+                receiving.as_ref(),
+            )
+            .await
+    });
+    {
+        let mut call = registration.call.lock().unwrap();
+        call.call_installed = true;
+        call.future = Some(future);
+    }
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let (disposition, business) = match registration.poll_needed(&mut cx) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("actual source must publish Needed before its tail"),
+    };
+    assert_eq!(disposition, EffectDisposition::KnownCommitted);
+    business.unwrap();
+    assert!(
+        registration
+            .poll_registration_physical_closed(&mut cx)
+            .is_pending()
+    );
+    assert!(registration.poll_registration_closed(&mut cx).is_pending());
+    assert!(!registration.observation().provider_exited());
+    assert_eq!(exits.load(Ordering::SeqCst), 0);
+
+    finish.send(()).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::future::poll_fn(|cx| registration.poll_registration_physical_closed(cx)),
+    )
+    .await
+    .expect("the original Provider child must physically exit without disposing retained cleanup");
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(registration.observation().provider_exited());
+    assert!(registration.local_health_failure().is_none());
+    assert!(registration.poll_registration_closed(&mut cx).is_pending());
+    assert!(
+        registration
+            .poll_registration_physical_closed(&mut cx)
+            .is_ready()
+    );
+    {
+        let observed = registration.observation();
+        assert_eq!(observed.operation_id(), Some(operation_id));
+        assert!(observed.applied_receipt().is_none());
+        assert!(observed.original_owner().is_some());
+        match observed.validated_outcome().unwrap().unwrap() {
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                finalization: ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Failed(failure),
+                ..
+            } => assert_eq!(failure.connector_source(), Some(&cleanup_error)),
+            other => panic!("physical exit changed the original outcome: {other:?}"),
+        }
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    drop(provider);
+    assert!(owner_pin.upgrade().is_some());
+    // This fixture teardown is not a production retirement/disposal verdict.
+    // The full-close oracle above must remain Pending while this owner exists.
+    drop(registration);
+    assert!(owner_pin.upgrade().is_none());
+}
+
+#[path = "admitted_current_tests/retained_root_tests.rs"]
+mod retained_root_tests;

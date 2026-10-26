@@ -813,7 +813,8 @@ fn a_typed_admission_refusal_does_not_skip_staged_target_abort() {
             target: create_command().target,
             staged_operation_id: operation().operation_id,
         };
-        let failure = super::settle_unpublished_stage(operation(), &effects, &staged, primary);
+        let aborted = effects.abort_staged_target(operation(), &staged);
+        let failure = super::settle_stage_abort(primary.into_product_error(), aborted);
         assert_eq!(effects.events(), ["abort"]);
         assert_eq!(failure.kind(), MvProductErrorKind::InvalidRequest);
         assert_eq!(failure.compile_control_error(), None);
@@ -1020,5 +1021,469 @@ async fn a_foreign_refresh_unwind_retains_the_received_fact_and_never_repolls_or
         drop(transition);
         readiness.ensure_no_active_publications().unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn original_operations_and_service_share_the_same_fifo_and_scheduler() {
+    let service = MvKeyedProductService::new(MvSchedulerConfig::new(true, 73, 2, 11, 99));
+    let original = service.original_operations();
+    assert!(Arc::ptr_eq(&original, &service.original_operations()));
+    let target = create_command().target;
+    let held = original
+        .acquire_foreground(target.clone(), MvActivityOwner::Create, || false)
+        .unwrap();
+    let mut waiting = service
+        .request_activity(target.clone(), MvActivityOwner::Drop)
+        .unwrap();
+    assert!(waiting.try_acquire().unwrap().is_none());
+    drop(held);
+    let handed = waiting
+        .try_acquire()
+        .unwrap()
+        .expect("same FIFO release reaches the service borrower");
+    let mut later = original
+        .request_activity(target.clone(), MvActivityOwner::Alter)
+        .unwrap();
+    assert!(later.try_acquire().unwrap().is_none());
+    drop(handed);
+    drop(
+        later
+            .try_acquire()
+            .unwrap()
+            .expect("same FIFO source reaches the original borrower"),
+    );
+
+    let projection = crate::persistence::keyed_documents::StoredKeyedMvProjection {
+        mv_id: 7,
+        facts: crate::persistence::test_support::sample_keyed_projection(target.clone(), Some(11)),
+    };
+    service.with_refresh_scheduler(|scheduler| {
+        scheduler.observe_projection(projection, 1_700_000_061_000)
+    });
+    let ready = original.with_refresh_scheduler(|scheduler| scheduler.take_ready());
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].projection().mv_id, 7);
+    assert_eq!(ready[0].target(), &target);
+    assert!(
+        service
+            .with_refresh_scheduler(|scheduler| scheduler.take_ready())
+            .is_empty(),
+        "there is one scheduler, not a copied queue"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_original_operations_do_not_retain_the_service_or_joined_runtime() {
+    use crate::process_runtime::{MvBackgroundRuntime, MvBackgroundTasks};
+    use std::time::{Duration, Instant};
+
+    let service = Arc::new(service_with_refresh_readiness().await);
+    let weak_service = Arc::downgrade(&service);
+    let original = service.original_operations();
+    let weak_operations = Arc::downgrade(&original);
+    let target = create_command().target;
+    let attempt = original.reserve_refresh_attempt();
+    let publication = original
+        .begin_refresh_publication(&target, &attempt)
+        .unwrap();
+    let readiness = original.keyed_readiness_service().unwrap();
+    assert!(readiness.ensure_no_active_publications().is_err());
+    let activity = original
+        .acquire_foreground(target, MvActivityOwner::Create, || false)
+        .unwrap();
+
+    let refresh_operations = original.clone();
+    let maintenance_operations = original.clone();
+    let (refresh_started, refresh_observed) = tokio::sync::oneshot::channel();
+    let (maintenance_started, maintenance_observed) = tokio::sync::oneshot::channel();
+    let mut refresh_started = Some(refresh_started);
+    let mut maintenance_started = Some(maintenance_started);
+    let runtime = MvBackgroundRuntime::start(
+        &tokio::runtime::Handle::current(),
+        crate::process_runtime::test_health_port(),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        MvBackgroundTasks::new(
+            Box::new(move |_, _| {
+                let original = refresh_operations.clone();
+                let started = refresh_started.take();
+                Box::pin(async move {
+                    assert_eq!(
+                        original.scheduler_tick_interval_ms(),
+                        MvSchedulerConfig::default().tick_interval_ms()
+                    );
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                })
+            }),
+            Box::new(move |_| {
+                let original = maintenance_operations.clone();
+                let started = maintenance_started.take();
+                Box::pin(async move {
+                    assert!(original.keyed_readiness_service().is_some());
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                })
+            }),
+        ),
+    )
+    .unwrap();
+    service
+        .begin_background_start()
+        .unwrap()
+        .install(runtime)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        refresh_observed.await.unwrap();
+        maintenance_observed.await.unwrap();
+    })
+    .await
+    .expect("both original runtime callbacks must actually run");
+    service.begin_stopping();
+    assert!(matches!(
+        original.request_activity(create_command().target, MvActivityOwner::Drop),
+        Err(MvActivityGateError::Stopping)
+    ));
+    service
+        .shutdown_background_workers_until(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    // A successful second start reservation proves the sole installed runtime
+    // was actually joined and retired, while its business source is still held.
+    drop(service.begin_background_start().unwrap());
+    drop(service);
+    assert!(
+        weak_service.upgrade().is_none(),
+        "an original business source cannot retain the runtime wrapper"
+    );
+    assert!(weak_operations.upgrade().is_some());
+    assert!(
+        readiness.ensure_no_active_publications().is_err(),
+        "joining the workers did not end the original publication"
+    );
+    drop(publication);
+    readiness.ensure_no_active_publications().unwrap();
+    drop(activity);
+    drop(original);
+    assert!(weak_operations.upgrade().is_none());
+}
+
+/// These are the original CREATE effects with a real borrowed suspension
+/// before each phase. Expected events come from the existing product contract.
+struct SuspendedCreate<'a> {
+    effects: &'a CreateEffects,
+    yielded: [bool; 5],
+    panic_stage: bool,
+    publish_noop: bool,
+}
+impl SuspendedCreate<'_> {
+    fn yield_once(&mut self, index: usize, cx: &mut Context<'_>) -> bool {
+        if self.yielded[index] {
+            return false;
+        }
+        self.yielded[index] = true;
+        cx.waker().wake_by_ref();
+        true
+    }
+}
+impl crate::ports::MvCreateProgressPort for SuspendedCreate<'_> {
+    fn poll_stage_target(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        command: &MvCommand,
+    ) -> Poll<Result<MvStagedTarget, MvProviderFailure>> {
+        if self.yield_once(0, cx) {
+            return Poll::Pending;
+        }
+        if self.panic_stage {
+            self.effects.record("stage-unwind");
+            panic!("original CREATE stage did not return");
+        }
+        Poll::Ready(self.effects.stage_target(operation, command))
+    }
+    fn poll_publish_staged_target(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> Poll<Result<crate::product::MvCreatePublicationOutcome, MvProviderFailure>> {
+        if self.yield_once(1, cx) {
+            return Poll::Pending;
+        }
+        if self.publish_noop {
+            self.effects.record("publish-noop");
+            Poll::Ready(Ok(crate::product::MvCreatePublicationOutcome::NoOp))
+        } else {
+            Poll::Ready(
+                self.effects
+                    .publish_staged_target(operation, staged)
+                    .map(crate::product::MvCreatePublicationOutcome::Applied),
+            )
+        }
+    }
+    fn poll_abort_staged_target(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> Poll<Result<(), MvProviderFailure>> {
+        if self.yield_once(2, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(self.effects.abort_staged_target(operation, staged))
+    }
+    fn poll_install_created_projection(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        target: &MvCreatedTarget,
+    ) -> Poll<Result<(), MvProviderFailure>> {
+        if self.yield_once(3, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(self.effects.install_created_projection(operation, target))
+    }
+    fn poll_register_target(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        target: &MvCreatedTarget,
+    ) -> Poll<Result<(), MvProviderFailure>> {
+        if self.yield_once(4, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(self.effects.register_target(operation, target))
+    }
+}
+
+#[test]
+fn borrowed_create_wait_drop_keeps_original_product_order_and_single_dispatch() {
+    let product = MvKeyedProductService::default();
+    let effects = CreateEffects::default();
+    let mut execution = SuspendedCreate {
+        effects: &effects,
+        yielded: [false; 5],
+        panic_stage: false,
+        publish_noop: false,
+    };
+    let mut transition = super::MvCreateTransition::new(operation(), create_command());
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    for expected in [
+        vec![],
+        vec!["stage"],
+        vec!["stage", "publish"],
+        vec!["stage", "publish", "install"],
+    ] {
+        let mut waiting = Box::pin(std::future::poll_fn(|cx| {
+            product.poll_create(cx, &mut transition, &mut execution)
+        }));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        drop(waiting);
+        assert_eq!(effects.events(), expected);
+        assert!(transition.result().is_none());
+    }
+    assert!(
+        product
+            .poll_create(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    assert!(matches!(
+        transition.result(),
+        Some(Ok(MvProductResult::Created(_)))
+    ));
+    let expected = vec!["stage", "publish", "install", "register"];
+    assert_eq!(effects.events(), expected);
+    assert!(
+        product
+            .poll_create(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    assert_eq!(effects.events(), expected);
+}
+
+#[test]
+fn create_foreign_stage_unwind_cannot_replay_or_advance_publication() {
+    let product = MvKeyedProductService::default();
+    let effects = CreateEffects::default();
+    let mut execution = SuspendedCreate {
+        effects: &effects,
+        yielded: [true; 5],
+        panic_stage: true,
+        publish_noop: false,
+    };
+    let mut transition = super::MvCreateTransition::new(operation(), create_command());
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        product.poll_create(&mut cx, &mut transition, &mut execution)
+    }));
+    assert!(original.is_err());
+    assert!(transition.result().is_none());
+    assert!(
+        product
+            .poll_create(&mut cx, &mut transition, &mut execution)
+            .is_pending()
+    );
+    assert_eq!(effects.events(), vec!["stage-unwind"]);
+}
+
+struct SuspendedDrop<'a> {
+    effects: &'a CreateEffects,
+    yielded: [bool; 4],
+    guard: Option<EffectOrderDropGuard>,
+}
+impl SuspendedDrop<'_> {
+    fn yield_once(&mut self, index: usize, cx: &mut Context<'_>) -> bool {
+        if self.yielded[index] {
+            return false;
+        }
+        self.yielded[index] = true;
+        cx.waker().wake_by_ref();
+        true
+    }
+}
+impl crate::ports::MvDropProgressPort<EffectOrderDropGuard> for SuspendedDrop<'_> {
+    fn poll_prepare_drop(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> Poll<Result<MvDropReadiness<EffectOrderDropGuard>, MvProviderFailure>> {
+        if self.yield_once(0, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(self.effects.prepare_drop(operation, target, if_exists))
+    }
+    fn poll_drop_target(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> Poll<Result<(), MvProviderFailure>> {
+        if self.yield_once(1, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(self.effects.drop_target(operation, target))
+    }
+    fn poll_delete_after_provider_drop(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        guard: &mut Option<EffectOrderDropGuard>,
+    ) -> Poll<Result<(), MvProviderFailure>> {
+        if self.guard.is_none() {
+            self.guard = guard.take();
+        }
+        if self.yield_once(2, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(
+            self.effects.delete_after_provider_drop(
+                operation,
+                self.guard
+                    .take()
+                    .expect("same DROP guard in original Source"),
+            ),
+        )
+    }
+    fn poll_unregister_target(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> Poll<Result<(), MvProviderFailure>> {
+        if self.yield_once(3, cx) {
+            return Poll::Pending;
+        }
+        Poll::Ready(self.effects.unregister_target(operation, target))
+    }
+}
+#[test]
+fn borrowed_drop_wait_drop_preserves_exact_guard_and_provider_before_projection() {
+    let product = MvKeyedProductService::default();
+    let effects = CreateEffects::default();
+    let mut execution = SuspendedDrop {
+        effects: &effects,
+        yielded: [false; 4],
+        guard: None,
+    };
+    let mut transition = super::MvDropTransition::new(operation(), create_command().target, false);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    for (index, expected) in [
+        vec![],
+        vec!["prepare_drop"],
+        vec!["prepare_drop", "drop"],
+        vec!["prepare_drop", "drop", "delete_projection"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut waiting = Box::pin(std::future::poll_fn(|cx| {
+            product.poll_drop(cx, &mut transition, &mut execution)
+        }));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        drop(waiting);
+        assert_eq!(effects.events(), expected);
+        assert!(transition.result().is_none());
+        if index == 2 {
+            assert!(execution.guard.is_some());
+        }
+    }
+    assert!(
+        product
+            .poll_drop(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    assert!(matches!(
+        transition.result(),
+        Some(Ok(MvProductResult::Dropped))
+    ));
+    assert!(execution.guard.is_none());
+    assert_eq!(
+        effects.events(),
+        vec!["prepare_drop", "drop", "delete_projection", "unregister"]
+    );
+}
+
+#[test]
+fn create_noop_preserves_the_verdict_without_projection_registration_or_abort() {
+    for if_not_exists in [false, true] {
+        let product = MvKeyedProductService::default();
+        let effects = CreateEffects::default();
+        let mut execution = SuspendedCreate {
+            effects: &effects,
+            yielded: [false; 5],
+            panic_stage: false,
+            publish_noop: true,
+        };
+        let mut command = create_command();
+        command.if_not_exists = if_not_exists;
+        let mut transition = super::MvCreateTransition::new(operation(), command);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        while product
+            .poll_create(&mut cx, &mut transition, &mut execution)
+            .is_pending()
+        {}
+        if if_not_exists {
+            assert!(matches!(
+                transition.result(),
+                Some(Ok(MvProductResult::Acknowledged))
+            ));
+        } else {
+            assert!(
+                matches!(transition.result(), Some(Err(error)) if error.kind() == MvProductErrorKind::Corruption)
+            );
+        }
+        assert_eq!(effects.events(), vec!["stage", "publish-noop"]);
+        assert!(
+            product
+                .poll_create(&mut cx, &mut transition, &mut execution)
+                .is_ready()
+        );
+        assert_eq!(effects.events(), vec!["stage", "publish-noop"]);
     }
 }

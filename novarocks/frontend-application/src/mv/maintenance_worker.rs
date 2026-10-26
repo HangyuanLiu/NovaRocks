@@ -121,6 +121,20 @@ pub(crate) enum FrontendMaintenanceSkip {
     },
 }
 
+/// The current frontend deliberately has no production automatic effect
+/// consumer. Keep useful facts observation and its original Disabled report;
+/// no executable attempt, query permit or computation position is minted.
+pub(crate) fn unavailable_automatic_maintenance_admission(
+    config: &MaintenanceCoordinatorConfig,
+) -> MaintenanceAdmission {
+    if config.enabled {
+        tracing::warn!(
+            "automatic MV maintenance is unavailable until every output snapshot preserves its canonical publication and document retention"
+        );
+    }
+    MaintenanceAdmission::Disabled
+}
+
 /// Frontend repository/provider/native adapter for automatic maintenance.
 /// The MV product owns its coordinator, permits, cooldown and backoff state;
 /// this adapter only inventories definitions and invokes durable effects.
@@ -179,12 +193,8 @@ impl FrontendMaintenanceWorker {
 
     pub(crate) fn new(dependencies: FrontendMaintenanceWorkerDependencies) -> Self {
         let mut coordinator_config = dependencies.coordinator_config.clone();
-        if coordinator_config.enabled {
-            tracing::warn!(
-                "automatic MV maintenance is unavailable until every output snapshot preserves its canonical publication and document retention"
-            );
-            coordinator_config.enabled = false;
-        }
+        let _ = unavailable_automatic_maintenance_admission(&coordinator_config);
+        coordinator_config.enabled = false;
         Self {
             runtime: MvMaintenanceRuntime::new(coordinator_config),
             dependencies,

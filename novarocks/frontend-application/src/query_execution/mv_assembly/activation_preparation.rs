@@ -298,7 +298,7 @@ pub(crate) async fn prepare_analysis(
                         (*rewrite.canonical_select_query).clone(),
                     )),
                     ports: input.ports.clone(),
-                    current_catalog: None,
+                    current_catalog: rewrite.current_catalog.clone(),
                     current_database: rewrite.current_database.clone(),
                     context: input.context.clone(),
                     control: control.clone(),
@@ -318,7 +318,7 @@ pub(crate) async fn prepare_analysis(
                 functions: input.kernel.function_catalog().clone(),
                 constant_policy: input.kernel.constant_policy(),
                 control,
-                current_catalog: None,
+                current_catalog: rewrite.current_catalog.clone(),
                 current_database: rewrite.current_database.clone(),
                 settings,
             };

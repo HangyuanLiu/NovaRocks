@@ -37,7 +37,14 @@ Statistics 的现有 Action 入口在 `statistics_jobs/{service,attempt_executor
 CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原 worker；后台沿共享计算 owner
 推进。`query_execution/internal_result_cpu/scoped_statistics.rs` 持封闭 scoped CPU source，
 `query_execution/statistics/preparation.rs` 保留原准备访问，`query_execution/internal_consumer/decoded.rs`
-在 Ready payload 移交前取得原 statement retention。整族 Rewrite/MV 与旧调用面退役仍待完成。
+在 Ready payload 移交前取得原 statement retention。
+
+维护 SQL 的实际 Action 选择位于 `query/maintenance_action.rs`；后台 Rewrite 与 Cleanup 原来源在
+`query_execution/maintenance/{rewrite_job,cleanup_action}.rs`，共享产品算法仍在
+`novarocks/table-maintenance/src/product.rs`。`query/mv_action.rs` 保管同 SQL Root 的多步骤 MV
+编排，数据步骤借共享 Native 计算，控制/publication 仍由相应原 Source 推进。这些接缝不证明全部
+历史调用已切换；旧 coordinator、同步 runner、剩余控制调用与最终模块锚点仍须按实际调用图核对，
+实现状态及最终原生验收保持未完成。
 
 ## 先判定 owner，再选 crate
 
@@ -50,7 +57,7 @@ CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原
 | 领域 | 责任归属 | 可以拥有 | 不可以拥有 |
 | --- | --- | --- | --- |
 | Execution Contract | `novarocks-execution-contract` | 不可变 identity、descriptor、operation、receipt 与纯验证 | registry、重试循环、资源 owner、transport 或执行 kernel |
-| Coordination Contract | `novarocks-coordination-contract`（接线待完成） | FE owner 之间实际共用的身份、时间、消息与中立事实 | Tokio、运行资源、领域载荷、任意 callback 或恢复算法 |
+| Coordination Contract | `novarocks-coordination-contract` | FE owner 之间实际共用的身份、时间、消息与中立事实 | Tokio、运行资源、领域载荷、任意 callback 或恢复算法 |
 | Query Application | `novarocks-query-application` | request-local 观察/准备，各分布式意图的逻辑执行、attempt 恢复、可见性与计算就绪 | 产品业务结果、publication/GC 策略、角色实现、wire codec 或 Server 配置 |
 | Frontend Application | `novarocks-frontend-application` | FE 装配、prepare 前语句监督、Native attempt 驱动、领域就绪证明与 SQL/MySQL 结果接线 | BE Task registry、第二套逻辑执行 policy 或第二份 Provider 提交真相 |
 | Worker | `novarocks-worker` | BE 本地 Task/context 准入、租约、入站围栏、实际停止与收敛 | FE 观察、编译、逻辑恢复政策或产品状态 |
@@ -82,7 +89,8 @@ source 或可回调的重新观察逻辑。
 | Worker 收敛 | Task 的本地状态、实际停止、资源与输出事实 | 宣布逻辑执行的恢复成功，或用协议消息替代本地终态 |
 
 `PreparedLogicalRead` 将冻结描述、静态 template 和解析后的选项以不可拆开的
-move-only carrier 交给 launcher。每次 replacement 只根据冻结 recipe 重新取得本 attempt
+move-only carrier 交给 launcher；内部计算使用 `PreparedLogicalComputation`，固定领域消费者及其
+结果保管留在 Frontend，不进入共享 contract。每次 replacement 只根据冻结 recipe 重新取得本 attempt
 的运行能力，并验证它仍覆盖冻结 binding；它不重新规划，也不改变输出 schema、residual
 predicate 或恢复承诺。无法证明 credential/delegation 覆盖冻结对象时必须 fail closed。
 纯读的 final-plan 路径在首批输出可见前保留 `RestartAttemptBeforeVisibility`；
@@ -140,6 +148,11 @@ producer Future 正常退出；失败、取消或 attempt 替换不能伪造成�
 不把 Client 转换为 Internal。Internal 的计算位置在就绪并满足实际本地退出后归还，
 仍活结果数据继续占同 Root 原预算；Native 远端收尾另由原 owner 保管。结果窗口与 worker
 并非同一资源。
+
+同 Root 的 Internal retention 共用原 `ResultCapacityConfig` 的 `all_objects_bytes`，计算 grant
+使用独立的 `positions`。从 active WorkOwner 借 Root retention 只续接原预算与实际 holder 寿命，
+不取得 Stage/Native/manifest 或 CPU 权限；metadata Source 也不能另建一份同 Root 字节预算。
+实际分配仍须原 byte receipt，保留身份或原 Arc 不等于已支付 buffer；这些配置不证明整进程 RSS 有界。
 
 外层语句/job 同时保存业务是否完成、实际 publication 的累计效果、剩余必要/维护义务和本地
 响应交付事实。seal/NoOp 不产生虚构提交；最后一步未提交不能覆盖前一步已提交或 Unknown。

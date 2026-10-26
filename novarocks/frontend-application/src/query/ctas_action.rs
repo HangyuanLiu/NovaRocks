@@ -37,7 +37,6 @@ use crate::query_execution::{
 };
 use novarocks_query_application::{
     api::StatementNativeHealthFailure,
-    engine_error::EngineErrorCode,
     session_control::{
         GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
         StatementActionValue,
@@ -204,6 +203,7 @@ struct CtasSource {
     target_abort:
         PhaseSlot<Result<novarocks_spi::connector::ConnectorStagedCreateAbortOutcome, CtasFailure>>,
     continuation_error: Option<WorkError>,
+    cleanup_refusal: Option<CtasFailure>,
     target: Option<PreparedStandardCtasTarget>,
     stage_effect: Option<(
         novarocks_spi::connector::ConnectorStagedCreateReceipt,
@@ -227,6 +227,8 @@ struct CtasSource {
     seal_reconciled: bool,
     publish_input: Option<Arc<CatalogInput>>,
     publish: PhaseSlot<Result<StandardCtasPublishOutcome, CtasFailure>>,
+    publication_boundary_received: bool,
+    publication_failure: Option<CtasFailure>,
     adjudication_input: Option<Arc<AdjudicationInput>>,
     adjudication: PhaseSlot<Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure>>,
     adjudication_token: Option<DmlPublicationAdjudication>,
@@ -365,6 +367,7 @@ pub(crate) fn prepare(
             native_launch_attempted: false,
             target_abort: PhaseSlot::default(),
             continuation_error: None,
+            cleanup_refusal: None,
             target: None,
             stage_effect: None,
             write_input: None,
@@ -385,6 +388,8 @@ pub(crate) fn prepare(
             seal_reconciled: false,
             publish_input: None,
             publish: PhaseSlot::default(),
+            publication_boundary_received: false,
+            publication_failure: None,
             adjudication_input: None,
             adjudication: PhaseSlot::default(),
             adjudication_token: None,
@@ -403,6 +408,13 @@ pub(crate) fn prepare(
 
 fn service(error: DmlError) -> QueryServiceError {
     routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err())
+}
+fn terminal_failure(
+    failure: CtasFailure,
+    terminal: novarocks_spi::connector::LakePublicationTerminal,
+    sql: &str,
+) -> QueryServiceError {
+    service(failure.into_governed_dml_error(sql)).attach_publication_terminal(terminal)
 }
 impl CtasSource {
     fn fail(&mut self, error: QueryServiceError) {
@@ -436,6 +448,16 @@ impl CtasSource {
             self.disposition = Some(LakePublicationDisposition::KnownUncommitted);
         }
     }
+    fn receive_publication_boundary(&mut self) -> bool {
+        if !self.publication_boundary_received {
+            if self.attempt.mark_dispatch_possible().is_err() {
+                self.close_failure = Some(self.health.clone());
+                return false;
+            }
+            self.publication_boundary_received = true;
+        }
+        true
+    }
     fn terminal_committed(
         &mut self,
         finalization: ExternalMutationFinalization,
@@ -462,25 +484,24 @@ impl CtasSource {
                     Ok(())
                 }
             }
-            ExternalMutationFinalization::Failed(failure) => Err(service(
-                DmlError::known_committed_finalization_failed(
-                    self.attempt.terminal().unwrap().clone(),
-                    failure.to_string(),
-                )
-                .with_engine_error_code(EngineErrorCode::CommitKnownCommittedFinalizeFailed),
+            ExternalMutationFinalization::Failed(failure) => Err(terminal_failure(
+                mutation_failure(failure),
+                self.attempt.terminal().unwrap().clone(),
+                &self.sql,
             )),
         });
         self.phase = Phase::Close;
     }
-    fn terminal_unknown(&mut self, message: impl Into<String>) {
+    fn terminal_unknown(&mut self, failure: CtasFailure) {
         if self.attempt.terminal_commit_unknown().is_err() {
             self.close_failure = Some(self.health.clone());
             return;
         }
         self.disposition = Some(LakePublicationDisposition::CommitUnknown);
-        self.selected = Some(Err(service(
-            DmlError::executor(message.into())
-                .with_engine_error_code(EngineErrorCode::CommitUnknown),
+        self.selected = Some(Err(terminal_failure(
+            failure,
+            self.attempt.terminal().unwrap().clone(),
+            &self.sql,
         )));
         self.phase = Phase::Close;
     }
@@ -992,19 +1013,39 @@ impl CtasSource {
                         if self.check_cancel(&cancellation) {
                             continue;
                         }
-                        if self.attempt.mark_dispatch_possible().is_err() {
-                            self.close_failure = Some(self.health.clone());
-                            return Poll::Pending;
-                        }
-                        self.disposition = Some(LakePublicationDisposition::CommitUnknown);
                         self.publish.start(publish_original(
                             self.publish_input.as_ref().unwrap().clone(),
                         ));
                     }
-                    if self.publish.poll_settled(cx).is_pending() {
+                    let polled = self.publish.poll_settled(cx);
+                    // Observe the original journal's actual dispatch cut even
+                    // while its necessary finalization child remains Pending.
+                    let observation = self.controls.publication_original.observation();
+                    if observation.dispatch_started() {
+                        if !self.receive_publication_boundary() {
+                            return Poll::Pending;
+                        }
+                        self.disposition = Some(LakePublicationDisposition::CommitUnknown);
+                    }
+                    if polled.is_pending() {
                         return Poll::Pending;
                     }
-                    match self.publish.take() {
+                    let outcome = self.publish.take();
+                    if matches!(
+                        &outcome,
+                        Ok(StandardCtasPublishOutcome::Applied { .. }
+                            | StandardCtasPublishOutcome::NoOp { .. }
+                            | StandardCtasPublishOutcome::CommitUnknown { .. })
+                    ) || (outcome.is_err()
+                        && !self.controls.publication_confirmed_not_dispatched())
+                    {
+                        // A typed positive/Unknown terminal is authoritative
+                        // even for a no-RPC NoOp. Never infer it from absence.
+                        if !self.receive_publication_boundary() {
+                            return Poll::Pending;
+                        }
+                    }
+                    match outcome {
                         Ok(StandardCtasPublishOutcome::Applied { finalization }) => {
                             self.terminal_committed(finalization, true, &cancellation)
                         }
@@ -1023,7 +1064,11 @@ impl CtasSource {
                             }
                             self.failure(failure);
                         }
-                        Ok(StandardCtasPublishOutcome::CommitUnknown { evidence }) => {
+                        Ok(StandardCtasPublishOutcome::CommitUnknown { failure, evidence }) => {
+                            // The one exact Unknown origin remains primary
+                            // throughout its single later observation.
+                            assert!(self.publication_failure.is_none());
+                            self.publication_failure = Some(*failure);
                             match self.attempt.begin_adjudication() {
                                 Ok(token) => self.adjudication_token = Some(token),
                                 Err(_) => {
@@ -1039,13 +1084,24 @@ impl CtasSource {
                             }));
                             self.phase = Phase::Adjudicate;
                         }
-                        Err(error) => self.terminal_unknown(format!(
-                            "CTAS publication outcome is unknown: {}",
-                            error.message
-                        )),
+                        Err(error) if self.controls.publication_confirmed_not_dispatched() => {
+                            if self.attempt.terminal_known_uncommitted().is_err() {
+                                self.close_failure = Some(self.health.clone());
+                                return Poll::Pending;
+                            }
+                            self.disposition = Some(LakePublicationDisposition::KnownUncommitted);
+                            self.failure(error);
+                        }
+                        Err(error) => self.terminal_unknown(error),
                     }
                 }
                 Phase::Adjudicate => {
+                    // The exact late-observation author reads the Provider's
+                    // PublicationUnknown map row. Return that same original
+                    // from its active F before consuming the one observation.
+                    if self.controls.poll_publication_closed(cx).is_pending() {
+                        return Poll::Pending;
+                    }
                     if !self.adjudication.started {
                         self.adjudication.start(adjudicate_original(
                             self.adjudication_input.as_ref().unwrap().clone(),
@@ -1081,28 +1137,20 @@ impl CtasSource {
                             self.disposition = Some(LakePublicationDisposition::KnownCommitted);
                             self.selected = Some(match finalization {
                                 ExternalMutationFinalization::Complete => Ok(()),
-                                ExternalMutationFinalization::Failed(failure) => Err(service(
-                                    DmlError::known_committed_finalization_failed(
+                                ExternalMutationFinalization::Failed(failure) => {
+                                    Err(terminal_failure(
+                                        mutation_failure(failure),
                                         self.attempt.terminal().unwrap().clone(),
-                                        failure.to_string(),
-                                    )
-                                    .with_engine_error_code(
-                                        EngineErrorCode::CommitKnownCommittedFinalizeFailed,
-                                    ),
-                                )),
+                                        &self.sql,
+                                    ))
+                                }
                             });
                             self.phase = Phase::Close;
                         }
                         Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown {
                             failure,
-                        }) => self.finish_unknown_adjudication(format!(
-                            "CTAS publication outcome remains unknown: {}",
-                            failure.message
-                        )),
-                        Err(error) => self.finish_unknown_adjudication(format!(
-                            "CTAS publication adjudication failed: {}",
-                            error.message
-                        )),
+                        }) => self.finish_unknown_adjudication(*failure),
+                        Err(error) => self.finish_unknown_adjudication(error),
                     }
                 }
                 Phase::Close => {
@@ -1163,14 +1211,24 @@ impl CtasSource {
                     if self.close_failure.is_some() {
                         return Poll::Pending;
                     }
-                    let root_owner = owner.execution_owner_slot().as_ref().unwrap();
-                    match self.io.poll_quiescent(root_owner, cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(error)) => {
-                            self.fail(internal_error(error.to_string()));
-                            return Poll::Pending;
+                    // The same installed publication Source retains canonical
+                    // GC. Its actual F/IO exit belongs to the original residual,
+                    // not to the business Needed frontier.
+                    if self
+                        .controls
+                        .publication_original
+                        .original_owner()
+                        .is_none()
+                    {
+                        let root_owner = owner.execution_owner_slot().as_ref().unwrap();
+                        match self.io.poll_quiescent(root_owner, cx) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Err(error)) => {
+                                self.fail(internal_error(error.to_string()));
+                                return Poll::Pending;
+                            }
+                            Poll::Ready(Ok(())) => {}
                         }
-                        Poll::Ready(Ok(())) => {}
                     }
                     drop(self.ready.take());
                     drop(self.source_input.take());
@@ -1178,7 +1236,8 @@ impl CtasSource {
                     drop(self.write_input.take());
                     drop(self.prepared_write.take());
                     drop(self.stage_input.take());
-                    drop(self.publish_input.take());
+                    // Keep the exact target/action/lease until the residual
+                    // observes both physical exit and inventory disposition.
                     drop(self.adjudication_input.take());
                     drop(self.assembly.take());
                     drop(self.terminal_context.take());
@@ -1196,7 +1255,7 @@ impl CtasSource {
             }
         }
     }
-    fn finish_unknown_adjudication(&mut self, message: String) {
+    fn finish_unknown_adjudication(&mut self, later: CtasFailure) {
         if self
             .attempt
             .finish_adjudication(
@@ -1210,8 +1269,11 @@ impl CtasSource {
             return;
         }
         self.disposition = Some(LakePublicationDisposition::CommitUnknown);
-        self.selected = Some(Err(service(
-            DmlError::executor(message).with_engine_error_code(EngineErrorCode::CommitUnknown),
+        let original = self.publication_failure.take().unwrap_or(later);
+        self.selected = Some(Err(terminal_failure(
+            original,
+            self.attempt.terminal().unwrap().clone(),
+            &self.sql,
         )));
         self.phase = Phase::Close;
     }
@@ -1287,6 +1349,30 @@ impl GovernedStatementAction for CtasAction {
     ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
         (|| {
             let source = self.source.as_ref()?;
+            let observation = source.controls.publication_original.observation();
+            if observation.applied_receipt().is_some() {
+                return Some(LakePublicationDisposition::KnownCommitted);
+            }
+            // A signed NoOp is not an externally applied publication, even
+            // though the original CTAS logical terminal uses KnownCommitted.
+            if observation
+                .needed_committed()
+                .is_some_and(|needed| needed.effect == ExternalMutationEffect::NoOp)
+                || matches!(
+                    observation.raw_outcome(),
+                    Some(Ok(
+                        novarocks_spi::connector::ConnectorStagedCreatePublishOutcome::NoOp { .. }
+                    ))
+                )
+            {
+                return None;
+            }
+            if source.controls.publication_confirmed_not_dispatched() {
+                return Some(LakePublicationDisposition::KnownUncommitted);
+            }
+            if observation.dispatch_started() && source.disposition.is_none() {
+                return Some(LakePublicationDisposition::CommitUnknown);
+            }
             if source.publish.started
                 && source.disposition == Some(LakePublicationDisposition::CommitUnknown)
             {
@@ -1364,10 +1450,11 @@ impl GovernedStatementResidual for CtasResidual {
         match source.io.poll_continuing(cx) {
             Ok(ready) => pending |= !ready,
             Err(error) => {
-                source.continuation_error = Some(error);
-                source.close_failure = Some(source.health.clone());
-                source.busy = false;
-                return Poll::Pending;
+                // Ordinary admission/control refusal is not a physical exit
+                // failure. Preserve it while the original Provider F joins.
+                if source.continuation_error.is_none() {
+                    source.continuation_error = Some(error);
+                }
             }
         }
         if let Some(call) = source.seal.as_mut() {
@@ -1383,14 +1470,33 @@ impl GovernedStatementResidual for CtasResidual {
                 pending = true;
             }
         }
-        if !source.target_disposed {
+        // The canonical publisher may have delivered Needed while its GC
+        // child remains active. Finish that exact Source before asking the
+        // Provider Map to settle or release the original target inventory.
+        if source.controls.poll_publication_closed(cx).is_pending() {
+            pending = true;
+        }
+        let mut physical_pending = pending;
+        if !pending && !source.target_disposed {
             if let Some(target) = &source.target {
                 if !source.target_disposal_observed {
-                    source.target_disposal_observed = matches!(
-                        governed_ctas_target_cleanup_responsibility(target.handle.as_ref()),
-                        Ok(ConnectorMetadataCleanupResponsibility::Disposed)
-                    );
-                    if !source.target_disposal_observed {
+                    let may_settle =
+                        match governed_ctas_target_cleanup_responsibility(target.handle.as_ref()) {
+                            Ok(ConnectorMetadataCleanupResponsibility::Disposed) => {
+                                source.target_disposal_observed = true;
+                                false
+                            }
+                            Ok(ConnectorMetadataCleanupResponsibility::Retained) => true,
+                            Err(error) => {
+                                if source.cleanup_refusal.is_none() {
+                                    source.cleanup_refusal = Some(error);
+                                }
+                                false
+                            }
+                        };
+                    if !source.target_disposal_observed
+                        && (may_settle || source.target_cleanup.started)
+                    {
                         if !source.target_cleanup.started {
                             source
                                 .target_cleanup
@@ -1404,6 +1510,8 @@ impl GovernedStatementResidual for CtasResidual {
                                 source.target_cleanup.result,
                                 Some(Ok(ConnectorMetadataCleanupResponsibility::Disposed))
                             );
+                        } else {
+                            physical_pending = true;
                         }
                     }
                 }
@@ -1425,27 +1533,39 @@ impl GovernedStatementResidual for CtasResidual {
                 source.target_disposal_observed = true;
             }
         }
-        if source.target_disposal_observed && !source.target_disposed {
-            match source.io.poll_quiescent_continuing(cx) {
-                Poll::Pending => pending = true,
-                Poll::Ready(Err(error)) => {
-                    source.continuation_error = Some(error);
-                    source.close_failure = Some(source.health.clone());
+        if !physical_pending {
+            // Release actual IO slots even while an Unknown/cleanup inventory
+            // remains retained by this same Root and exact Provider lease.
+            match source.io.poll_actual_quiescent_continuing(cx) {
+                Poll::Pending => {
+                    physical_pending = true;
+                    pending = true;
+                }
+                Poll::Ready(Err(health)) => {
+                    source.close_failure = Some(health);
                     source.busy = false;
                     return Poll::Pending;
                 }
-                Poll::Ready(Ok(())) => {
-                    if let Some(target) = &source.target {
-                        if acknowledge_governed_ctas_target_cleanup(target.handle.as_ref()).is_ok()
-                        {
-                            source.target_disposed = true;
-                        } else {
-                            pending = true;
-                        }
-                    } else {
-                        source.target_disposed = true;
+                Poll::Ready(Ok(observed)) => {
+                    if source.continuation_error.is_none() {
+                        source.continuation_error = observed.into_ordinary_failure();
                     }
                 }
+            }
+        }
+        if source.target_disposal_observed && !source.target_disposed && !physical_pending {
+            if let Some(target) = &source.target {
+                match acknowledge_governed_ctas_target_cleanup(target.handle.as_ref()) {
+                    Ok(()) => source.target_disposed = true,
+                    Err(error) => {
+                        if source.cleanup_refusal.is_none() {
+                            source.cleanup_refusal = Some(error);
+                        }
+                        pending = true;
+                    }
+                }
+            } else {
+                source.target_disposed = true;
             }
         }
         if pending {
@@ -1548,6 +1668,86 @@ pub(crate) fn fixed_source_bytes(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[test]
+    fn original_provider_cause_reaches_actual_statement_terminal_projection() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        use novarocks_type_contract::CompileControlError;
+        // This is a real first-party source, not a synthetic class inferred
+        // from a message or the broad Connector Interrupted kind.
+        let compilation = SharedFailureCause::new(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "CTAS test source".into(),
+            ),
+        );
+        let control = CompileControlError::Source(compilation.clone());
+        let connector = ConnectorError::compile_interruption(control.clone());
+        let original = std::error::Error::source(&connector)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        assert_eq!(original.failure_fact().class(), FailureClass::Unsupported);
+        let failure = mutation_failure(
+            novarocks_spi::connector::ConnectorMutationFailure::from_connector(connector),
+        );
+        for committed in [false, true] {
+            let mut attempt = DmlPublicationAttempt::new(
+                LakePublicationId::new_v7(),
+                LakePublicationFamily::Ctas,
+                LakePublicationTarget::try_new(
+                    "actual-ctas".into(),
+                    "db".into(),
+                    Some("t".into()),
+                    None,
+                )
+                .unwrap(),
+                None,
+            );
+            attempt.mark_dispatch_possible().unwrap();
+            if committed {
+                attempt
+                    .terminal_known_committed(DmlPublicationFinalization::Failed)
+                    .unwrap();
+            } else {
+                let ticket = attempt.begin_adjudication().unwrap();
+                attempt
+                    .finish_adjudication(
+                        ticket,
+                        DmlPublicationAdjudicationOutcome::CommitUnknown,
+                        DmlPublicationFinalization::NotApplicable,
+                    )
+                    .unwrap();
+            }
+            let terminal = attempt.terminal().unwrap().clone();
+            let error = terminal_failure(
+                failure.clone(),
+                terminal.clone(),
+                "CREATE TABLE t AS SELECT 1",
+            );
+            assert_eq!(error.failure_cause(), Some(&original));
+            assert_eq!(
+                error.execution_failure().unwrap().fact(),
+                original.failure_fact()
+            );
+            assert_eq!(
+                error
+                    .failure_cause()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&control)
+            );
+            assert_eq!(error.publication_terminal(), Some(&terminal));
+            assert!(error.message().contains("do_not_retry=true"));
+            assert!(
+                error.compile_control_error().is_none(),
+                "a Connector source is not relabeled as a compile operation"
+            );
+            assert!(
+                error.external_effect_disposition().is_none(),
+                "a terminal projection cannot invent an Applied receipt"
+            );
+        }
+    }
     struct OriginalCatalogFuture {
         polls: Arc<AtomicUsize>,
         drop_panics: bool,

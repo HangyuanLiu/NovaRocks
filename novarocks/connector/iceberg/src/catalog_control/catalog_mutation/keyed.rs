@@ -615,8 +615,7 @@ pub(super) async fn execute_async(
     } else {
         owner_publisher
     };
-    let evidence_policy = inner.evidence_policy();
-    let publisher = journal.observe_prepared(inner);
+    let publisher = journal.observe_catalog_prepared(inner, receiving, &request.context);
     let preparer: Option<Box<dyn Preparer + Send + Sync>> = match &documents.mutation {
         KeyedMutation::Markers(markers) => Some(Box::new(MarkerPreparer(markers.clone()))),
         KeyedMutation::SlotChange(change) => Some(Box::new(SlotChangePreparer {
@@ -683,11 +682,23 @@ pub(super) async fn execute_async(
             return Ok(outcome);
         }
     };
-    // This is the journal's actual positive fact, before necessary metadata I/O.
-    // NoOp never mints an applied-effect proof.
-    if effect == ExternalMutationEffect::Applied {
-        receiving.record_applied_receipt(&receipt)?;
-    }
+    // Actual Applied and its original finite context were received by the
+    // concrete publisher before ready-child Drop. Never recreate that grant.
+    let finalization_context = if effect == ExternalMutationEffect::Applied {
+        receiving
+            .observation()
+            .finalization_context()
+            .cloned()
+            .unwrap_or_else(|| {
+                Err(internal(
+                    "applied keyed publication has no original finalization context",
+                ))
+            })
+    } else {
+        // NoOp may still require the same product projection, under its original
+        // business control; it does not acquire necessary-effect permission.
+        Ok(request.context.clone())
+    };
     provider
         .runtime()
         .control_state()
@@ -697,8 +708,7 @@ pub(super) async fn execute_async(
             let entry = journal
                 .current_entry()
                 .ok_or_else(|| internal("committed keyed publication has no journal entry"))?;
-            let grant = journal.finalization_context(entry, evidence_policy)?;
-            let context = grant.for_io(&request.context)?;
+            let context = finalization_context.clone()?;
             let _finalizing = journal.finalization_activity(entry);
             let physical = provider
                 .runtime()

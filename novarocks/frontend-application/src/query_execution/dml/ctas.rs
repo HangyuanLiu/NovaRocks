@@ -550,6 +550,7 @@ pub enum StandardCtasPublishOutcome {
         cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
+        failure: Box<CtasFailure>,
         evidence: ExternalMutationEvidence,
     },
 }
@@ -1294,19 +1295,32 @@ pub(crate) fn mutation_failure(failure: ConnectorMutationFailure) -> CtasFailure
     CtasFailure {
         kind,
         message: failure.message().to_string(),
-        user_error: None,
+        user_error: Some(CtasUserError::Application(
+            novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                match failure.connector_source() {
+                    Some(original) => connector_original_cause(original.clone()),
+                    None => novarocks_failure_contract::SharedFailureCause::new(failure),
+                },
+            ),
+        )),
     }
 }
 
+fn connector_original_cause(
+    error: novarocks_spi::connector::ConnectorError,
+) -> novarocks_failure_contract::SharedFailureCause {
+    use novarocks_failure_contract::SharedFailureCause;
+    if let Some(original) = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+    {
+        return original.clone();
+    }
+    SharedFailureCause::new(error)
+}
 fn connector_failure(error: novarocks_spi::connector::ConnectorError) -> CtasFailure {
     use novarocks_spi::connector::ConnectorErrorKind;
-    if error.kind() == ConnectorErrorKind::Interrupted {
-        return CtasFailure::control(novarocks_type_contract::CompileControlError::Source(
-            novarocks_failure_contract::SharedFailureCause::new(error),
-        ));
-    }
     let kind = match error.kind() {
-        ConnectorErrorKind::Interrupted => unreachable!("caller interruption returned above"),
+        ConnectorErrorKind::Interrupted => CtasFailureKind::Internal,
         ConnectorErrorKind::InvalidRequest => CtasFailureKind::InvalidRequest,
         ConnectorErrorKind::NotFound => CtasFailureKind::NotFound,
         ConnectorErrorKind::Unsupported => CtasFailureKind::Unsupported,
@@ -1321,7 +1335,11 @@ fn connector_failure(error: novarocks_spi::connector::ConnectorError) -> CtasFai
     CtasFailure {
         kind,
         message: error.to_string(),
-        user_error: None,
+        user_error: Some(CtasUserError::Application(
+            novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                connector_original_cause(error),
+            ),
+        )),
     }
 }
 
@@ -2171,8 +2189,11 @@ impl CtasEngine for DmlExecutionKernel {
                     cleanup,
                 })
             }
-            ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
-                Ok(StandardCtasPublishOutcome::CommitUnknown { evidence })
+            ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence } => {
+                Ok(StandardCtasPublishOutcome::CommitUnknown {
+                    failure: Box::new(mutation_failure(failure)),
+                    evidence,
+                })
             }
         }
     }
@@ -2879,30 +2900,56 @@ impl DmlExecutionKernel {
                 "CTAS catalog action is not a standard publish action",
             ));
         };
+        // This is the once-call guard, not evidence of external dispatch.
         action.begin_dispatch()?;
-        match target
+        let execution = match target
             .lease
-            .publish_async(request.as_ref().clone(), &receiving.publication)
-            .await
-            .map_err(connector_failure)?
+            .begin_publish_original(request.as_ref().clone(), &receiving.publication_original)
         {
-            ConnectorStagedCreatePublishOutcome::Applied { finalization, .. } => {
-                Ok(StandardCtasPublishOutcome::Applied { finalization })
+            Ok(execution) => execution,
+            Err(error) => {
+                // This exact factory is pure validation/construction, with no
+                // F or dispatch. Do not infer this fact from an empty observer.
+                receiving
+                    .publication_factory_refused
+                    .store(true, Ordering::Release);
+                return Err(connector_failure(error));
             }
-            ConnectorStagedCreatePublishOutcome::NoOp { finalization, .. } => {
-                Ok(StandardCtasPublishOutcome::NoOp { finalization })
-            }
-            ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup }
-            | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup } => {
-                Ok(StandardCtasPublishOutcome::KnownUncommitted {
-                    failure: Box::new(mutation_failure(failure)),
-                    cleanup,
-                })
-            }
-            ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
-                Ok(StandardCtasPublishOutcome::CommitUnknown { evidence })
-            }
+        };
+        {
+            let mut slot = receiving
+                .publication_execution
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(slot.is_none(), "one original CTAS publication execution");
+            *slot = Some(execution);
         }
+        std::future::poll_fn(|cx| {
+            let result = receiving.poll_publication_result(cx);
+            // Cache the exact original finite Context, never a new grant. The
+            // previous Context is destroyed after releasing its storage lock.
+            if !receiving
+                .publication_context_received
+                .load(Ordering::Acquire)
+            {
+                if let Some(Ok(context)) = receiving
+                    .publication_original
+                    .observation()
+                    .finalization_context()
+                {
+                    let previous = {
+                        let mut slot = target.context.lock().unwrap_or_else(|p| p.into_inner());
+                        std::mem::replace(&mut *slot, context)
+                    };
+                    receiving
+                        .publication_context_received
+                        .store(true, Ordering::Release);
+                    drop(previous);
+                }
+            }
+            result
+        })
+        .await
     }
 
     pub(crate) async fn adjudicate_governed_ctas_publication_async(
@@ -3560,6 +3607,12 @@ mod typed_compile_source_tests {
 }
 
 pub(crate) struct GovernedCtasControlReceiving {
+    pub(crate) publication_original:
+        novarocks_spi::connector::ConnectorStagedCreatePublicationReceiving,
+    publication_execution:
+        Mutex<Option<novarocks_spi::connector::ConnectorStagedCreatePublication>>,
+    publication_context_received: AtomicBool,
+    publication_factory_refused: AtomicBool,
     pub(crate) stage: Mutex<
         Option<
             Result<ConnectorStagedCreatePrepareOutcome, novarocks_spi::connector::ConnectorError>,
@@ -3611,9 +3664,143 @@ pub(crate) struct GovernedCtasControlReceiving {
         >,
     >,
 }
+// The caller Source owns this facade at all times; no F becomes its sole
+// owner and no Provider poll/Drop runs while the receiving mutex is held.
+struct CtasPublicationLoan<'a> {
+    slot: &'a Mutex<Option<novarocks_spi::connector::ConnectorStagedCreatePublication>>,
+    execution: Option<novarocks_spi::connector::ConnectorStagedCreatePublication>,
+}
+impl<'a> CtasPublicationLoan<'a> {
+    fn take(
+        slot: &'a Mutex<Option<novarocks_spi::connector::ConnectorStagedCreatePublication>>,
+    ) -> Self {
+        let execution = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+        assert!(execution.is_some(), "one CTAS publication borrower");
+        Self { slot, execution }
+    }
+}
+impl Drop for CtasPublicationLoan<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(slot.is_none(), "same CTAS publication returns once");
+        *slot = self.execution.take();
+    }
+}
+fn map_governed_ctas_publish_outcome(
+    outcome: ConnectorStagedCreatePublishOutcome,
+) -> StandardCtasPublishOutcome {
+    match outcome {
+        ConnectorStagedCreatePublishOutcome::Applied { finalization, .. } => {
+            StandardCtasPublishOutcome::Applied { finalization }
+        }
+        ConnectorStagedCreatePublishOutcome::NoOp { finalization, .. } => {
+            StandardCtasPublishOutcome::NoOp { finalization }
+        }
+        ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup }
+        | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup } => {
+            StandardCtasPublishOutcome::KnownUncommitted {
+                failure: Box::new(mutation_failure(failure)),
+                cleanup,
+            }
+        }
+        ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence } => {
+            StandardCtasPublishOutcome::CommitUnknown {
+                failure: Box::new(mutation_failure(failure)),
+                evidence,
+            }
+        }
+    }
+}
 impl GovernedCtasControlReceiving {
+    pub(crate) fn publication_confirmed_not_dispatched(&self) -> bool {
+        self.publication_factory_refused.load(Ordering::Acquire)
+            || self
+                .publication_original
+                .observation()
+                .confirmed_not_dispatched()
+    }
+    fn receive_publication_raw(&self) {
+        if let Some(raw) = self.publication_original.observation().raw_outcome() {
+            let mut slot = self.publication.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(raw);
+            }
+            // Any unneeded cloned carrier is dropped outside the storage lock.
+        }
+    }
+    fn poll_publication_result(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<StandardCtasPublishOutcome, CtasFailure>> {
+        let result = {
+            let mut loan = CtasPublicationLoan::take(&self.publication_execution);
+            loan.execution
+                .as_mut()
+                .expect("installed CTAS publication")
+                .poll_result(cx)
+        };
+        self.receive_publication_raw();
+        // A real refusal remains a refusal even if an earlier positive fact
+        // exists; the Action's read-only effect observation retains that fact.
+        if let std::task::Poll::Ready(Err(error)) = result {
+            if self
+                .publication_original
+                .observation()
+                .applied_receipt()
+                .is_some()
+            {
+                // A later reception/validation refusal cannot downgrade the
+                // same original journal's actual positive publication.
+                return std::task::Poll::Ready(Ok(StandardCtasPublishOutcome::Applied {
+                    finalization: ExternalMutationFinalization::Failed(
+                        ConnectorMutationFailure::from_connector(error),
+                    ),
+                }));
+            }
+            return std::task::Poll::Ready(Err(connector_failure(error)));
+        }
+        if let Some(needed) = self.publication_original.observation().needed_committed() {
+            return std::task::Poll::Ready(Ok(match needed.effect {
+                novarocks_spi::connector::ExternalMutationEffect::Applied => {
+                    StandardCtasPublishOutcome::Applied {
+                        finalization: needed.finalization,
+                    }
+                }
+                novarocks_spi::connector::ExternalMutationEffect::NoOp => {
+                    StandardCtasPublishOutcome::NoOp {
+                        finalization: needed.finalization,
+                    }
+                }
+            }));
+        }
+        result.map(|raw| {
+            raw.map(map_governed_ctas_publish_outcome)
+                .map_err(connector_failure)
+        })
+    }
+    pub(crate) fn poll_publication_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.publication_original.original_owner().is_none() {
+            return std::task::Poll::Ready(());
+        }
+        let result = {
+            let mut loan = CtasPublicationLoan::take(&self.publication_execution);
+            loan.execution
+                .as_mut()
+                .expect("installed CTAS publication")
+                .poll_closed(cx)
+        };
+        self.receive_publication_raw();
+        result
+    }
     pub(crate) fn new() -> Arc<Self> {
         let source = Arc::new(Self {
+            publication_original: Default::default(),
+            publication_execution: Mutex::new(None),
+            publication_context_received: AtomicBool::new(false),
+            publication_factory_refused: AtomicBool::new(false),
             stage: Mutex::new(None),
             publication: Mutex::new(None),
             adjudication: Mutex::new(None),
@@ -3735,6 +3922,11 @@ impl PreparedGovernedCtasWrite {
 impl CtasFailure {
     pub(crate) fn into_governed_dml_error(self, source: &str) -> crate::dml::error::DmlError {
         use crate::dml::error::DmlError;
+        // Application owns its original Source as well as the frozen fact.
+        // Extracting only execution_failure here would erase that sidecar.
+        if let Some(original) = self.application_error() {
+            return DmlError::from_application(original.clone());
+        }
         if let Some(input) = self.execution_failure() {
             return DmlError::from_execution(input)
                 .with_compile_control(self.compile_control_error());
@@ -4104,5 +4296,94 @@ mod governed_adjudication_observation_tests {
             Disposition::CommitUnknown
         );
         assert_eq!(evidence.operation_id(), request.operation_id);
+    }
+}
+
+#[cfg(test)]
+mod governed_original_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+
+    #[test]
+    fn ordinary_connector_unsupported_retains_its_actual_source_and_fact() {
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "actual provider refusal",
+        );
+        let fact = original.failure_fact();
+        let failure = connector_failure(original.clone());
+        assert_eq!(failure.kind, CtasFailureKind::Unsupported);
+        let dml = failure.into_governed_dml_error("CREATE TABLE t AS SELECT 1");
+        let application = dml.application_error().expect("same application channel");
+        assert_eq!(application.execution_failure().unwrap().fact(), fact);
+        assert_eq!(
+            application
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
+        );
+        assert_eq!(fact.class(), FailureClass::Unsupported);
+        assert!(application.compile_control_error().is_none());
+    }
+
+    #[test]
+    fn unknown_publication_keeps_original_failure_through_actual_outcome_mapping() {
+        use novarocks_spi::connector::{
+            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
+            ConnectorProviderId, ProviderBindingEpoch,
+        };
+        let source = SharedFailureCause::new(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "original publication source".into(),
+            ),
+        );
+        let connector = novarocks_spi::connector::ConnectorError::from_domain_static(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            source,
+            "original catalog source",
+        );
+        let expected = std::error::Error::source(&connector)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let evidence = ExternalMutationEvidence::try_new(
+            2,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("ctas-original").unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([3; 16]),
+            ConnectorMutationOperationId::new(),
+            "staged-create-publish",
+            bytes::Bytes::from_static(b"opaque"),
+        )
+        .unwrap();
+        let mapped =
+            map_governed_ctas_publish_outcome(ConnectorStagedCreatePublishOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::from_connector(connector),
+                evidence: evidence.clone(),
+            });
+        let StandardCtasPublishOutcome::CommitUnknown {
+            failure,
+            evidence: received,
+        } = mapped
+        else {
+            panic!("exact Unknown required")
+        };
+        assert_eq!(received, evidence);
+        let dml = failure.into_governed_dml_error("CREATE TABLE t AS SELECT 1");
+        let application = dml.application_error().unwrap();
+        assert_eq!(application.failure_cause(), Some(&expected));
+        assert_eq!(
+            application.execution_failure().unwrap().fact(),
+            expected.failure_fact()
+        );
+        assert_eq!(
+            expected.failure_fact().class(),
+            FailureClass::Unsupported,
+            "the original domain fact remains authoritative despite a broad Unavailable wrapper"
+        );
     }
 }

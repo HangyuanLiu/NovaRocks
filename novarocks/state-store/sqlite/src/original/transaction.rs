@@ -69,7 +69,7 @@ struct TxnBody {
     attempt: Option<WriteAttempt>,
     evidence: Option<Arc<SqliteCommitEvidence>>,
     command: Option<Command>,
-    output: Option<(Request, Result<Output, StateStoreError>)>,
+    output: Option<(Request, Result<Output, Failure>)>,
     commit: Option<CommitOutcome>,
     dispatch: Option<DispatchGuard>,
     marked: bool,
@@ -189,6 +189,23 @@ impl TxnOriginal {
     fn after_exit(&self, request: Request, exit: Exit) -> Result<Option<Phase>, Failure> {
         let mut loan = BodyLoan::take(&self.core.body)?;
         let b = loan.value.as_mut().unwrap();
+        // An unpublished business call never ran its output constructor. Keep
+        // its exact received refusal before queueing Close clears the current
+        // phase failure; the borrower may not poll until after Close exits.
+        if matches!(
+            request.phase,
+            Phase::BeginRead
+                | Phase::BeginWrite
+                | Phase::Get
+                | Phase::Range
+                | Phase::Put
+                | Phase::Delete
+        ) && b.output.is_none()
+        {
+            if let Some(failure) = self.core.physical_failure() {
+                b.output = Some((request, Err(failure)));
+            }
+        }
         if request.phase == Phase::Commit && exit == Exit::NeverPublishedReturned {
             b.withdrawn_commit = true;
             // This is not a worker liveness proof. The exact withdrawn call
@@ -441,7 +458,7 @@ impl TxnOriginal {
                     }
                     Command::Commit => unreachable!("commit has its registered phase"),
                 };
-                b.output = Some((request, result));
+                b.output = Some((request, result.map_err(failure)));
             }
         }
     }
@@ -473,7 +490,7 @@ impl TxnOriginal {
             if let Some(b) = body.as_mut() {
                 if b.output.as_ref().is_some_and(|(r, _)| *r == request) {
                     let (_, result) = b.output.take().unwrap();
-                    return Poll::Ready(result.map_err(failure));
+                    return Poll::Ready(result);
                 }
             }
             match progress {
@@ -852,7 +869,7 @@ async fn wait_begin(original: &Arc<TxnOriginal>) -> Result<(), Failure> {
                 .is_some_and(|(r, _)| matches!(r.phase, Phase::BeginRead | Phase::BeginWrite))
             {
                 let (_, value) = body.output.take().unwrap();
-                return Poll::Ready(value.map(|_| ()).map_err(failure));
+                return Poll::Ready(value.map(|_| ()));
             }
         }
         match progress {

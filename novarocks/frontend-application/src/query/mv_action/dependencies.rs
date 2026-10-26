@@ -81,6 +81,16 @@ impl DependencyPreparation {
             handed_off: false,
         };
         match &result.input.request {
+            MvCommandRequest::Create { target, statement } => {
+                result.steps = Some(vec![StepRequest::Create {
+                    target: target.clone(),
+                    statement: statement.clone(),
+                }]);
+            }
+            MvCommandRequest::Control(request) => {
+                // One metadata command, not a refresh dependency traversal.
+                result.steps = Some(vec![StepRequest::Control(request.clone())]);
+            }
             MvCommandRequest::Repartition {
                 statement,
                 target,

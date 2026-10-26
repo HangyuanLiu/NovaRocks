@@ -4786,3 +4786,35 @@ async fn async_keyed_legacy_refusal_retains_the_actual_codec_source_and_fact() {
     assert_eq!(failure.clone(), failure);
     assert!(state.liveness().is_open());
 }
+
+#[tokio::test]
+async fn async_keyed_drop_preserves_the_original_pending_observation_and_exact_guard() {
+    use std::future::Future;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *caps.async_gate.lock().unwrap() = Some(gate);
+    let mut original =
+        Box::pin(entrance.observe_keyed_drop_async(&lease, request.clone(), Default::default()));
+    let mut borrowed = Box::pin(std::future::poll_fn(|cx| original.as_mut().poll(cx)));
+    assert!(futures::poll!(borrowed.as_mut()).is_pending());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 0);
+    drop(borrowed);
+    assert_eq!(caps.async_exits.load(SeqCst), 0);
+    release.send(()).unwrap();
+    let (first, _) = original.await.unwrap();
+    assert_eq!(first.target(), &target);
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 1);
+    let management = entrance
+        .acquire_async(first.request(), std::future::pending::<()>())
+        .await
+        .unwrap();
+    let (second, _) = entrance
+        .observe_keyed_drop_async(&lease, request, Default::default())
+        .await
+        .unwrap();
+    assert!(first.matches(&second));
+    drop(management);
+}

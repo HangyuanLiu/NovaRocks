@@ -43,6 +43,12 @@ code-anchors:
   - "novarocks/frontend-application/src/query_execution/internal_consumer/decoded.rs (Statistics Ready transfers original statement retention before payload)"
   - "novarocks/statistics-application/src/job_service.rs (same installed job, serial worker notification and original admission)"
   - "novarocks/frontend-application/src/query_execution/maintenance/io_admission.rs (original Root payload, ordinary refusal and actual quiescence observation)"
+  - "novarocks/frontend-application/src/query/maintenance_action.rs (SQL maintenance selects the original Rewrite, Cleanup or metadata Action)"
+  - "novarocks/frontend-application/src/query_execution/maintenance/rewrite_job.rs (original job Root, Provider sources and Native computation)"
+  - "novarocks/frontend-application/src/query_execution/maintenance/cleanup_action.rs (same Cleanup source, publication facts and actual close)"
+  - "novarocks/table-maintenance/src/runtime.rs (installed original exit observations and safe history retirement)"
+  - "novarocks/table-maintenance/src/gc_observation.rs (same maturity algorithm with an explicit original execution context)"
+  - "novarocks/frontend-application/src/query/mv_action.rs (registered multi-step MV action; migration anchor)"
   - "novarocks/frontend-application/src/dml/runner.rs (legacy synchronous runner still present; retirement pending)"
   - "novarocks/frontend-application/src/query_execution/write_session.rs (provider session and retained access; migration anchor)"
   - "novarocks/frontend-application/src/query_execution/write_session/publication_call.rs (original Provider Future, needed-ready receiving and actual exit; migration anchor)"
@@ -50,6 +56,8 @@ code-anchors:
   - "novarocks/query-application/src/api/result.rs (statement result projection; migration anchor)"
   - "novarocks/spi/src/connector/write_stack/writer.rs (writer seal and deletion authority; migration anchor)"
   - "novarocks/connector/iceberg/src/commit/operation.rs (operation-owned artifacts and actual I/O exit; migration anchor)"
+  - "novarocks/connector/iceberg/src/commit/attempt/observation/dispatch.rs (original journal dispatch frontier)"
+  - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance/async_original.rs (original publication fact and cause survive later receipt CPU refusal)"
   - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (scan reclamation admission; migration anchor)"
   - "novarocks/query-application/src/session_control/statement_action.rs (stable SQL Action custody, borrowed context and actual exit)"
   - "novarocks/query-application/src/session_control/background_source.rs (original background Root and residual custody)"
@@ -71,9 +79,11 @@ code-anchors:
 
 本条记录已接受的目标契约；代码切换与原生验证尚待完成。上列锚点是已有迁移入口，集成时须核对最终模块和承重注释，不能用本条的 active 状态证明实现或测试通过。
 
-当前源码已有普通 Read、Internal 写入与 Statistics 的 governed Action 接缝。Statistics 的前台 capture 保留原请求与 CPU/Provider source，capture 实际关闭后才把同一 query permit 交给 job 的稳定接收格，再通知原串行 worker；不是先持一个许可等待第二个许可。后台计算沿同一逻辑执行 owner，统计 Ready 在移走 payload 前续接原 statement retention，计算退出与后续 publication/清理分别观察。
+当前源码已有普通 Read、Internal 写入、Statistics、Rewrite/Cleanup 与多步骤 MV 的 governed Action 接缝。Statistics 的前台 capture 保留原请求与 CPU/Provider source，capture 实际关闭后才把同一 query permit 交给 job 的稳定接收格，再通知原串行 worker；不是先持一个许可等待第二个许可。后台计算沿同一逻辑执行 owner，统计 Ready 在移走 payload 前续接原 statement retention，计算退出与后续 publication/清理分别观察。
 
-这些是实际源码接缝，不是各语句族的完整验收结论。整族 Rewrite、MV 与旧 `coordinator/**`、同步 runner 的调用面迁移和删旧仍未完成；本条保持 implementation pending，不能据新入口存在或局部检查宣称原生验收完成。
+维护 SQL 的 Action 选择原 Rewrite、Cleanup 或 metadata Source；OPTIMIZE 后台 job 沿原 runtime 的稳定接收格保管 Root、Provider/CPU 来源和真实退出观察。GC first-observation 使用显式执行 context 的 StateStore 路径，记录仍只是可重建的成熟度事实，不授予删除权。
+
+这些是当前源码接缝，不是各语句族的完整验收结论。旧 `coordinator/**`、同步 runner 与部分控制调用面仍须逐项核对并完成迁移、删旧；本条保持 implementation pending。最终调用图、旧路径退役、目标二进制及原生验证完成之前，不能据新入口存在或局部检查宣称全族迁移完成。
 
 | 责任 | 唯一 owner | 不拥有的权力 |
 |---|---|---|
@@ -137,6 +147,10 @@ Internal 计算在 typed 就绪交接且本地计算实际不再使用后归还�
 | 已授权且已可能派发 | 不假设请求可撤回；只观察、裁定同一 publication，不盲目重派 |
 | 已知已提交 | 保留已发生效果，推进必要 finalize；晚到取消不能改写为普通中断 |
 
+调用 finish、进入 Provider Future 或取得 CPU/来源能力都不是可能派发的证据。Iceberg 的实际边界由原 journal 的派发状态及 `first_dispatch_ms` 报告；FE 消费原事实，不提前替 Provider 标记。CTAS 的 stage 与最终 catalog publish 分别保留各自事实，不能由其中一段推断另一段已派发或已提交。
+
+原 journal 已有 Applied/Rejected/Unknown 或必要 finalization 结论时，先把同一事实与原 typed cause 接入稳定接收格，再进行可能拒绝的 receipt 解码、结果投影或通知。后继 CPU/通知失败保留其自身原因，不能把已知 publication 改写成 Unknown，也不能抹掉较早的失败。业务结果、raw health 与真实退出仍分别观察。
+
 派发后观察、裁定与必要 finalize 使用独立、有限的结算预算和授权，不能复用已取消的开始新工作检查。预算耗尽保留 Unknown、原证据和残余责任；不会把超时改成未提交，也不会借结算再开始新的业务提交。迟于取消到达远端的已授权请求不自动违规，判断依据是授权与前沿的顺序。
 
 ### 4. 语句结果贯穿成功与失败路径
@@ -180,6 +194,8 @@ Provider 的必要业务事实与安全 GC 使用两个本地端口。`Connector
 
 NeededReady、原 Future 的真实 poll/Drop 退出和精确库存 Disposed 是不同证明。poll/Drop 或通知 panic 后，已存事实仍可观察，但不能据此重入动作或归还未证实退出的责任。Observed 只记录原清理作者的实际结论，包括有证据的无清理义务与失败，不以等待结束代替；正常已提交且精确库存已处置时可释放该责任，历史清理诊断不反推仍有对象，业务 receipt 也不反推库存已处置。
 
+历史记录裁剪必须消费原 Source 的实际退出观察；Source 的业务 terminal、NeededReady 或 job 的 FINISHED/FAILED 都不是裁剪尚存责任的许可。观察回收沿原调度器公平推进，不为结束历史记录而另建清理执行器或丢弃原 observer。
+
 operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用的对象。Unknown 对象不得删除；未接收完整产物与 publication Unknown 是不同未决事实，都不能由本地 release 推导全量回收。具名子责任转交可使该子责任退出，接收方仍承担未决义务。
 
 扫描型 orphan、owned-ref 成熟回收和无表锚 CTAS 根扫描共用 Provider 安全准入，SQL 手动入口与自动入口没有例外。证明必须覆盖真实 writer/潜在外部效果上界或有效 fencing、时钟/列举前提、并发发布、Unknown，以及所声称故障范围下的可恢复保护。只有真实外部效果受限时，safe_gc_age 的时长不等式才有意义。
@@ -198,6 +214,8 @@ operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用
 | Native 排队 bytes/items、在途调用与每 BE 部署窗口 | 原 transport 与 attempt owner；W 不超过该准确 BE descriptor 公布的准备位置 P | 沿已有公平 waiter/唤醒背压；控制回报与完成回收保持可推进，不另收通用逻辑配额 |
 | Client/Internal 计算位置及结果数据 | 原 window/阶段与真实数据 holder；位置交接和数据字节分开 | 独立工作可释放的资源可等待；本语句自持不足不能等待自己 |
 | publication、未接收产物与 residual | 副作用前已登记的稳定 Source、原 journal、精确对象和访问能力 | 责任不因状态变化消失；实际资源承压交原 owner，不把 Unknown 自动计成一个活动执行槽 |
+
+当前内部结果的实际字节 author 与计算位置分开：同 Root 的 retention alias 共用 `ResultCapacityConfig` 中 Internal 的 `all_objects_bytes` 预算，真实 Internal computation grant 使用独立的 `positions`。从原 active Root owner 借到 retention 只延续原预算和 holder 寿命，不取得计算位置、Native/manifest 绑定或 CPU 派发能力；同 Root 的 metadata 准备与后续领域消费者也不能重建另一份字节预算。Client 继续使用其原 window，不以 Internal 配置替换或重复收费。这些配置不等于整进程内存/RSS 上界。
 
 网络控制 I/O 直接沿 SPI/Provider async Future 推进；纯字段与验证保持纯作者，规划 CPU 和实际形成/解码交给已认证的封闭 CPU source。真正阻塞的 SDK/JVM/本地操作使用原有界执行器，不在外层包整段同步 block_on，不新建并行池。执行器普通 Full 是可取消背压，不伪装成业务 Resource failure。排队、物理 reservation 与来源验证前后接同原输入，不能重复派发或丢失被拒接输入。检查锁跨 await、同池工作自等及控制回报重入业务队列等实际循环；不靠增加默认线程数规避错误。
 

@@ -41,6 +41,12 @@ pub(crate) fn resolve_create_mv_dependencies_with_readiness(
     resolved_refs: &[ResolvedTableRef],
     created_at_ms: i64,
 ) -> Result<ResolvedCreateMvDependencies, String> {
+    resolve_create_mv_dependencies(resolved_refs, created_at_ms)
+}
+pub(crate) fn resolve_create_mv_dependencies(
+    resolved_refs: &[ResolvedTableRef],
+    created_at_ms: i64,
+) -> Result<ResolvedCreateMvDependencies, String> {
     let mut base_refs = Vec::new();
     let mut dependencies = Vec::new();
     for table_ref in resolved_refs {
@@ -151,23 +157,64 @@ pub(crate) fn validate_no_create_cycle_with_readiness(
         .map(|loaded| &loaded.projection)
         .collect::<Vec<_>>();
     for loaded in &projections {
-        let target = stored_keyed_definition_dependency_ref(&loaded.projection);
         let dependencies = readiness
             .list_ready_dependencies_by_downstream(loaded)
             .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?;
-        let dependencies = classify_ready_dependency_occurrences(dependencies, &inventory)?
-            .into_iter()
-            .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
-            .map(|dep| dep.upstream)
-            .collect::<Vec<_>>();
-        edges.push((target, dependencies));
+        edges.push(create_cycle_edge(loaded, dependencies, &inventory)?);
     }
+    finish_create_cycle(new_target, new_dependencies, &edges)
+}
+
+pub(crate) fn validate_no_create_cycle_from_facts(
+    new_target: &MvDependencyObjectRef,
+    new_dependencies: &[CreateMvDependencyRequest],
+    projections: Vec<
+        novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+    >,
+    observed_dependencies: Vec<Vec<StoredMvDependency>>,
+) -> Result<(), String> {
+    assert_eq!(
+        projections.len(),
+        observed_dependencies.len(),
+        "one dependency set per original projection"
+    );
+    let inventory = projections
+        .iter()
+        .map(|loaded| &loaded.projection)
+        .collect::<Vec<_>>();
+    let edges = projections
+        .iter()
+        .zip(observed_dependencies)
+        .map(|(loaded, dependencies)| create_cycle_edge(loaded, dependencies, &inventory))
+        .collect::<Result<Vec<_>, _>>()?;
+    finish_create_cycle(new_target, new_dependencies, &edges)
+}
+fn create_cycle_edge(
+    loaded: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+    dependencies: Vec<StoredMvDependency>,
+    inventory: &[&StoredKeyedMvProjection],
+) -> Result<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>), String> {
+    let dependencies = classify_ready_dependency_occurrences(dependencies, inventory)?
+        .into_iter()
+        .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
+        .map(|dep| dep.upstream)
+        .collect::<Vec<_>>();
+    Ok((
+        stored_keyed_definition_dependency_ref(&loaded.projection),
+        dependencies,
+    ))
+}
+fn finish_create_cycle(
+    new_target: &MvDependencyObjectRef,
+    new_dependencies: &[CreateMvDependencyRequest],
+    edges: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
+) -> Result<(), String> {
     let new_upstreams = new_dependencies
         .iter()
         .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
         .map(|dep| dep.upstream.clone())
         .collect::<Vec<_>>();
-    validate_no_cycle_for_edges(new_target, &new_upstreams, &edges)
+    validate_no_cycle_for_edges(new_target, &new_upstreams, edges)
 }
 
 /// Classify each exact source occurrence against the caller's one ready

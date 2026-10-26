@@ -18,6 +18,7 @@
 //! One journal owns each request's dispatch fact, evidence and finalization.
 
 mod dispatch;
+pub(crate) use dispatch::{PendingPublicationFinalization, PreparedObservedPublisher};
 #[cfg(test)]
 mod lifecycle_contract_tests;
 
@@ -554,7 +555,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .and_then(|key| state.entries.get(key))
             .map(|entry| entry.checked.clone())
     }
-    pub(super) fn bind_preparation(&self, preparation: ConnectorRequestContext) -> Result<()> {
+    pub(crate) fn bind_preparation(&self, preparation: ConnectorRequestContext) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -629,6 +630,18 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     /// Copy-only observation of the original dispatch evidence. This borrows
     /// neither a receipt nor a cloned Checked graph and grants no retirement,
     /// finalization or I/O authority. None means no dispatch conclusion exists.
+    pub(crate) fn catalog_dispatch_started(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .current
+            .get(&self.frontier)
+            .and_then(|id| state.entries.get(id))
+            .is_some_and(|entry| entry.checked.descriptor.first_dispatch_ms.is_some())
+    }
+    /// Copy-only conclusion; an in-flight actual dispatch remains None.
     pub(crate) fn catalog_dispatch_fact(&self) -> Option<(LakePublicationDisposition, bool)> {
         let state = self
             .state
@@ -2790,6 +2803,105 @@ mod tests {
         let descriptor = journal.descriptor().unwrap();
         assert_eq!(descriptor.key, key);
         assert!(descriptor.first_dispatch_ms.is_none());
+    }
+    #[tokio::test]
+    async fn actual_dispatch_start_is_distinct_from_claim_and_pending_finalization() {
+        use crate::catalog::publication::{CatalogEvidencePolicy, EvidenceContext};
+        use crate::catalog::publication_dispatch::{
+            DispatchCompletion, FinalizationWork, PreparedCatalogDispatch, PreparedPublication,
+        };
+        use std::task::{Context, Poll, Waker};
+        struct Mutation {
+            journal: PublicationJournal<String>,
+            issued: Arc<AtomicUsize>,
+            dispatch: tokio::sync::oneshot::Receiver<()>,
+            finalize: tokio::sync::oneshot::Receiver<()>,
+        }
+        struct Finalize(tokio::sync::oneshot::Receiver<()>);
+        #[async_trait]
+        impl FinalizationWork for Finalize {
+            async fn run(self: Box<Self>, _: EvidenceContext) -> ExternalMutationFinalization {
+                self.0.await.unwrap();
+                ExternalMutationFinalization::Complete
+            }
+        }
+        #[async_trait]
+        impl PreparedCatalogDispatch for Mutation {
+            async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+                assert!(
+                    self.journal.catalog_dispatch_started(),
+                    "actual dispatch author marked first"
+                );
+                self.issued.fetch_add(1, Ordering::SeqCst);
+                self.dispatch.await.unwrap();
+                DispatchCompletion {
+                    evidence: DispatchEvidence::Applied {
+                        proof: CommitProof::applied(None),
+                    },
+                    finalization: Some(Box::new(Finalize(self.finalize))),
+                }
+            }
+        }
+        let (journal, preparation) = catalog_journal();
+        assert!(!journal.catalog_dispatch_started());
+        // The old claim/Dispatching state is earlier than physical publication.
+        let (other, context) = catalog_journal();
+        let _entry = other
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&context, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        assert!(!other.catalog_dispatch_started());
+        let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+        let (finalize_tx, finalize_rx) = tokio::sync::oneshot::channel();
+        let issued = Arc::new(AtomicUsize::new(0));
+        let actual = Mutation {
+            journal: journal.clone(),
+            issued: issued.clone(),
+            dispatch: dispatch_rx,
+            finalize: finalize_rx,
+        };
+        let policy = CatalogEvidencePolicy::default();
+        let mut original = Box::pin(journal.publish_once_to_finalization(
+            preparation,
+            policy,
+            |_, _, _| async move {
+                Ok(PreparedPublication::Mutation {
+                    binding: None,
+                    dispatch: Box::new(actual),
+                })
+            },
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(std::future::Future::poll(original.as_mut(), &mut cx).is_pending());
+        assert!(journal.catalog_dispatch_started());
+        assert!(
+            journal.catalog_dispatch_fact().is_none(),
+            "no conclusion while request is pending"
+        );
+        assert_eq!(issued.load(Ordering::SeqCst), 1);
+        assert!(journal.claim_dispatch().is_err());
+        dispatch_tx.send(()).unwrap();
+        let pending = original.await.unwrap();
+        assert_eq!(
+            journal.catalog_dispatch_fact(),
+            Some((LakePublicationDisposition::KnownCommitted, true))
+        );
+        let mut finish = Box::pin(pending.finish(policy));
+        assert!(matches!(
+            std::future::Future::poll(finish.as_mut(), &mut cx),
+            Poll::Pending
+        ));
+        assert_eq!(
+            journal.catalog_dispatch_fact(),
+            Some((LakePublicationDisposition::KnownCommitted, true)),
+            "necessary finalization never erases Applied"
+        );
+        finalize_tx.send(()).unwrap();
+        finish.await.unwrap();
+        assert!(journal.catalog_dispatch_started());
+        assert_eq!(issued.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
     async fn retained_positive_frontier_does_not_invent_a_cleanup_report() {

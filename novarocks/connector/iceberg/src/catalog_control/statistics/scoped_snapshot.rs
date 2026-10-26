@@ -346,6 +346,20 @@ pub(crate) async fn drive_read_snapshot(
         original.started = false;
     }
 }
+/// One actual cause record plus the caller's coexisting ConnectorError message
+/// clones. SharedFailureCause aliases never clone the original SDK error graph.
+pub(crate) fn raw_read_failure_backing_bytes(
+    message_clones: usize,
+) -> Result<usize, ConnectorError> {
+    let base =
+        ConnectorError::static_domain_backing_bytes::<SnapshotRawFailure>(SNAPSHOT_RAW_DETAIL)
+            .map_err(|_| internal("snapshot error layout overflow"))?;
+    novarocks_failure_contract::BoundedDetail::truncating_backing_len(SNAPSHOT_RAW_DETAIL)
+        .checked_mul(message_clones)
+        .and_then(|extra| base.checked_add(extra))
+        .ok_or_else(|| internal("snapshot error layout overflow"))
+}
+
 pub(super) fn reader_backing_bytes() -> Result<usize, ConnectorError> {
     use novarocks_type_contract::owned_resources::layout::arc_layout;
     fn bytes<A, B, C, D, E, F, G>(_: fn(A, B, C, D, E, F) -> G) -> usize {
@@ -354,9 +368,7 @@ pub(super) fn reader_backing_bytes() -> Result<usize, ConnectorError> {
     let gate = arc_layout(std::alloc::Layout::new::<SnapshotIoGate>())
         .map_err(|_| internal("snapshot gate layout overflow"))?
         .size();
-    let error =
-        ConnectorError::static_domain_backing_bytes::<SnapshotRawFailure>(SNAPSHOT_RAW_DETAIL)
-            .map_err(|_| internal("snapshot error layout overflow"))?;
+    let error = raw_read_failure_backing_bytes(0)?;
     bytes(crate::read_snapshot::make_scoped_read_snapshot)
         .checked_add(gate)
         .and_then(|n| n.checked_add(error))

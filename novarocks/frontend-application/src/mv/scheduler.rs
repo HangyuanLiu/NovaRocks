@@ -100,16 +100,73 @@ pub(crate) fn poll(
     })
 }
 
-pub(crate) fn mark_started(product: &MvKeyedProductService, mv_id: i64) -> bool {
+/// The same policy snapshots are borrowed only for pure transitions. No
+/// StateStore, Provider, future poll or foreign destructor runs under its lock.
+pub(crate) async fn poll_async(
+    product: &novarocks_mv_application::service::MvProductOperations,
+    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
+    ports: &crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    factory: &crate::mv::domain::staged_create::CurrentProjectionMetadataCpu,
+    capture: &std::sync::Arc<crate::mv::domain::staged_create::CurrentMetadataCapture>,
+    now_ms: i64,
+) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
+    if !product.with_refresh_scheduler(|scheduler| scheduler.enabled()) {
+        return Ok(Vec::new());
+    }
+    for projection in readiness.list_ready_projections().await? {
+        let observation = product.with_refresh_scheduler(|scheduler| {
+            scheduler.observe_projection(projection.projection, now_ms)
+        });
+        let Some(observation) = observation else {
+            continue;
+        };
+        let current = super::background_engine::current_source_inputs_in(
+            ports,
+            observation.occurrences(),
+            context,
+            factory,
+            capture,
+        )
+        .await;
+        match current {
+            Ok(inputs) => product.with_refresh_scheduler(|scheduler| {
+                scheduler.resolve_current_inputs(observation, inputs, now_ms)
+            }),
+            Err(error) => {
+                let disposition = ScheduledRefreshDisposition::from_background_error(error);
+                product.with_refresh_scheduler(|scheduler| {
+                    scheduler.record_observation_failure(&observation, disposition, now_ms)
+                });
+            }
+        }
+    }
+    Ok(product
+        .with_refresh_scheduler(|scheduler| scheduler.take_ready())
+        .into_iter()
+        .map(|product| ScheduledRefreshRequest {
+            target: sql_target(product.target()),
+            product,
+        })
+        .collect())
+}
+
+pub(crate) fn mark_started(
+    product: &novarocks_mv_application::service::MvProductOperations,
+    mv_id: i64,
+) -> bool {
     product.with_refresh_scheduler(|scheduler| scheduler.mark_started(mv_id))
 }
 
-pub(crate) fn requeue(product: &MvKeyedProductService, request: ScheduledRefreshRequest) {
+pub(crate) fn requeue(
+    product: &novarocks_mv_application::service::MvProductOperations,
+    request: ScheduledRefreshRequest,
+) {
     product.with_refresh_scheduler(|scheduler| scheduler.requeue(request.product));
 }
 
 pub(crate) fn complete(
-    product: &MvKeyedProductService,
+    product: &novarocks_mv_application::service::MvProductOperations,
     request: &ScheduledRefreshRequest,
     disposition: ScheduledRefreshDisposition,
     now_ms: i64,

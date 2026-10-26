@@ -51,6 +51,8 @@ use crate::iceberg::{TableCreation, TableUpdate};
 
 #[path = "staged_create/publication.rs"]
 mod publication;
+#[path = "staged_create/scoped_publication.rs"]
+mod scoped_publication;
 use crate::loaded_table::IcebergRestVendedS3LeaseRefresher;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -587,6 +589,11 @@ pub struct IcebergStagedCreateAdapter {
 #[derive(Clone)]
 enum OperationState {
     Preparing,
+    /// The exact original Source owns the aggregate; this original registry
+    /// slot stays occupied until that Source installs its terminal state.
+    Publishing {
+        handle_digest: [u8; 32],
+    },
     StageAppliedUnusable {
         _stage_publication: StagePublication,
     },
@@ -791,6 +798,13 @@ impl IcebergStagedCreateAdapter {
                     ));
                 }
                 Ok(Responsibility::Disposed)
+            }
+            Some(OperationState::Publishing { handle_digest })
+                if handle_digest != &handle.digest() =>
+            {
+                Err(invalid(
+                    "Iceberg active staged publication handle digest mismatch",
+                ))
             }
             Some(
                 OperationState::PublishedRetained(prepared)
@@ -2064,6 +2078,17 @@ async fn adjudicate_publication_entry(
 }
 
 impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
+    fn begin_publish_original(
+        &self,
+        request: ConnectorStagedCreatePublishRequest,
+        observation: novarocks_spi::connector::ConnectorStagedCreatePublicationRecorder,
+    ) -> Result<
+        Arc<dyn novarocks_spi::connector::ConnectorStagedCreatePublicationSource>,
+        ConnectorError,
+    > {
+        scoped_publication::begin(self.clone(), request, observation)
+    }
+
     fn acknowledge_cleanup_disposed(
         &self,
         handle: &ConnectorStagedTableHandle,
@@ -4278,6 +4303,9 @@ mod tests {
                 handle_digest: [0; 32],
             },
             OperationState::Preparing,
+            OperationState::Publishing {
+                handle_digest: [4; 32],
+            },
         ];
         for state in closed {
             let label = format!("{:?}", std::mem::discriminant(&state));

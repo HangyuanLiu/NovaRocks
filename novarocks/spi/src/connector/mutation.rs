@@ -1433,6 +1433,7 @@ struct CatalogMutationReceivingState {
     needed_committed: Option<ConnectorCatalogMutationNeededCommitted>,
     needed_validation: Option<Result<(), ConnectorError>>,
     original_owner: Option<ConnectorProcessLocalPayload>,
+    finalization_context: Option<Result<ConnectorRequestContext, ConnectorError>>,
     dispatched: bool,
     provider_exited: bool,
 }
@@ -1500,6 +1501,11 @@ impl ConnectorCatalogMutationObservation<'_> {
     /// Provider operation/journal custody remains after the child F exits.
     pub fn original_owner(&self) -> Option<&ConnectorProcessLocalPayload> {
         self.state.original_owner.as_ref()
+    }
+    /// The original journal's finite necessary phase, not an effect or exit proof.
+    /// A failed grant remains a failure and never grants continuation authority.
+    pub fn finalization_context(&self) -> Option<&Result<ConnectorRequestContext, ConnectorError>> {
+        self.state.finalization_context.as_ref()
     }
     pub fn dispatched(&self) -> bool {
         self.state.dispatched
@@ -1775,6 +1781,52 @@ impl ConnectorCatalogMutationReceiving {
             finalization: finalization.clone(),
         });
         state.needed_validation = Some(Ok(()));
+        Ok(())
+    }
+    /// Receive the SAME original journal's necessary finalization context once.
+    /// Requires the separately received actual Applied receipt for this exact
+    /// operation. It does not prove necessary readiness, cleanup, or actual exit.
+    pub fn record_finalization_context(
+        &self,
+        receipt: &ConnectorCatalogMutationReceipt,
+        context: Result<ConnectorRequestContext, ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = state.request.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog mutation original request is not installed",
+            )
+        })?;
+        validate_catalog_mutation_receipt(
+            &request.descriptor,
+            request.target.incarnation,
+            request.operation_id,
+            request.operation_kind,
+            receipt,
+        )?;
+        if !state.dispatched || state.original_owner.is_none() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog mutation finalization context requires its original Provider owner",
+            ));
+        }
+        if state.applied_receipt.as_ref() != Some(receipt) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog mutation finalization context requires its same actual Applied receipt",
+            ));
+        }
+        if state.finalization_context.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog mutation original finalization context is already installed",
+            ));
+        }
+        state.finalization_context = Some(context);
         Ok(())
     }
     /// Retain this original operation's Provider owner before its actual work.
@@ -2791,24 +2843,39 @@ mod tests {
         }
         let mut capability = async_capability();
         capability.final_noop = true;
-        capability.gate.open();
         let capability = Arc::new(capability);
         let lease = async_lease(&capability);
         let receiving = ConnectorCatalogMutationReceiving::new();
-        let mut original = Box::pin(lease.execute_async_in(async_request(&lease), &receiving));
+        let request = async_request(&lease);
+        let original_context = request.context.clone();
+        let key = request.target.clone();
+        let mut original = Box::pin(lease.execute_async_in(request, &receiving));
+        assert!(poll_async(original.as_mut()).is_pending());
+        receiving
+            .retain_original_owner(ConnectorProcessLocalPayload::new(key, capability.clone()))
+            .unwrap();
+        capability.gate.open();
         assert!(matches!(
             poll_async(original.as_mut()),
             std::task::Poll::Ready(Ok(()))
         ));
         let observed = receiving.observation();
         assert!(observed.applied_receipt().is_none());
-        assert!(matches!(
-            observed.validated_outcome(),
-            Some(Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::NoOp,
-                ..
-            }))
-        ));
+        let Some(Ok(ExternalMutationOutcome::KnownCommitted {
+            effect, receipt, ..
+        })) = observed.validated_outcome()
+        else {
+            panic!("the actual NoOp remains a successful outcome");
+        };
+        assert_eq!(*effect, ExternalMutationEffect::NoOp);
+        let receipt = receipt.clone();
+        drop(observed);
+        assert!(
+            receiving
+                .record_finalization_context(&receipt, Ok(original_context))
+                .is_err()
+        );
+        assert!(receiving.observation().finalization_context().is_none());
     }
 
     #[test]
@@ -2947,5 +3014,100 @@ mod tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 3);
         assert!(!dropped_under_lock.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn async_catalog_finalization_context_is_same_original_once_and_keeps_refusal() {
+        use super::*;
+        for refuse in [false, true] {
+            let capability = Arc::new(async_capability());
+            let lease = async_lease(&capability);
+            let request = async_request(&lease);
+            let receipt = ConnectorCatalogMutationReceipt::try_new(
+                lease.descriptor().clone(),
+                request.target.incarnation,
+                request.operation_id,
+                request.operation.kind(),
+                None,
+            )
+            .unwrap();
+            let original_context = request.context.clone();
+            let deadline = original_context.deadline();
+            let marker = original_context.request_scope_extension_or_insert_with(|| 193_u64);
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            let key = request.target.clone();
+            let mut original = Box::pin(lease.execute_async_in(request, &receiving));
+            assert!(poll_async(original.as_mut()).is_pending());
+            receiving
+                .retain_original_owner(ConnectorProcessLocalPayload::new(key, Arc::new(())))
+                .unwrap();
+            let foreign = ConnectorCatalogMutationReceipt::try_new(
+                lease.descriptor().clone(),
+                lease.provider_incarnation,
+                ConnectorMutationOperationId::new(),
+                receipt.operation_kind(),
+                None,
+            )
+            .unwrap();
+            assert!(
+                receiving
+                    .record_finalization_context(&foreign, Ok(original_context.clone()))
+                    .is_err()
+            );
+            assert!(receiving.observation().finalization_context().is_none());
+            assert!(
+                receiving
+                    .record_finalization_context(&receipt, Ok(original_context.clone()))
+                    .is_err()
+            );
+            assert!(receiving.observation().finalization_context().is_none());
+            receiving.record_applied_receipt(&receipt).unwrap();
+            let refusal = ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "original finite phase refused",
+            );
+            let context = if refuse {
+                Err(refusal.clone())
+            } else {
+                Ok(original_context.clone())
+            };
+            receiving
+                .record_finalization_context(&receipt, context)
+                .unwrap();
+            assert!(
+                receiving
+                    .record_finalization_context(&receipt, Ok(original_context))
+                    .is_err()
+            );
+            {
+                let observed = receiving.observation();
+                assert!(!observed.provider_exited());
+                assert!(
+                    observed.applied_receipt() == Some(&receipt),
+                    "the original Applied fact precedes its continuation context"
+                );
+                assert!(observed.needed_committed().is_none());
+                match observed.finalization_context().unwrap() {
+                    Ok(context) => {
+                        assert!(!refuse);
+                        assert_eq!(context.deadline(), deadline);
+                        let same = context.request_scope_extension_or_insert_with::<u64>(|| {
+                            panic!("same original context")
+                        });
+                        assert!(Arc::ptr_eq(&same, &marker));
+                    }
+                    Err(error) => {
+                        assert!(refuse);
+                        assert_eq!(error, &refusal);
+                    }
+                }
+            }
+            capability.gate.open();
+            assert!(matches!(
+                poll_async(original.as_mut()),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert!(receiving.observation().provider_exited());
+        }
     }
 }

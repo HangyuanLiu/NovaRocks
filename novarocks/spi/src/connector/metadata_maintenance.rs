@@ -638,6 +638,49 @@ impl ConnectorMaxCompactableDataFiles {
     }
 }
 
+/// The original read-only scalar Source. A returned scalar is not an exit
+/// receipt. A caller retains this Source through both the result and actual
+/// close, including after a borrowed waiter is cancelled.
+pub trait ConnectorMaxCompactableDataFilesSource: Send + Sync {
+    fn poll_result(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorMaxCompactableDataFiles, ConnectorError>>;
+    /// Only Ok proves actual I/O and CPU/footer exit. Ordinary refusal belongs
+    /// to poll_result; an unproven exit must never be converted to Ok.
+    fn poll_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ConnectorError>>;
+    fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Strong original custody, installed by the caller before the first poll.
+/// This is an observation, not a mutation, receipt or publication journal.
+pub struct ConnectorMaxCompactableDataFilesExecution {
+    source: Arc<dyn ConnectorMaxCompactableDataFilesSource>,
+}
+impl ConnectorMaxCompactableDataFilesExecution {
+    pub fn from_source(source: Arc<dyn ConnectorMaxCompactableDataFilesSource>) -> Self {
+        Self { source }
+    }
+    pub fn poll_result(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorMaxCompactableDataFiles, ConnectorError>> {
+        self.source.poll_result(cx)
+    }
+    pub fn poll_closed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ConnectorError>> {
+        self.source.poll_closed(cx)
+    }
+    pub fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        self.source.local_failure()
+    }
+}
+
 pub type ConnectorMetadataMaintenanceOutcome =
     ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>;
 pub type ConnectorMetadataMaintenanceFuture<'a, T> =
@@ -748,6 +791,17 @@ pub trait ConnectorMetadataMaintenance: Send + Sync {
     /// This call is explicitly expensive: answering it requires the provider to
     /// enumerate the table's live manifests. It is reserved for background
     /// maintenance policy and must never be placed on a SQL planning path.
+    fn begin_read_max_compactable_data_files(
+        &self,
+        _request: ConnectorMaxCompactableDataFilesRequest,
+        _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> Result<ConnectorMaxCompactableDataFilesExecution, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector has no original compactable-file observation source",
+        ))
+    }
+
     fn read_max_compactable_data_files(
         &self,
         request: ConnectorMaxCompactableDataFilesRequest,
@@ -887,6 +941,20 @@ impl ConnectorMetadataMaintenanceLease {
     /// observation needs the provider's own runtime and file access, but it
     /// deliberately validates nothing beyond exact handle ownership: there is
     /// no plan, no operation id and no outcome to reconcile.
+    pub fn begin_read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+        cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> Result<ConnectorMaxCompactableDataFilesExecution, ConnectorError> {
+        if request.table.owner() != &self.provider_binding_key.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "metadata maintenance observation table does not match lease",
+            ));
+        }
+        self.maintenance
+            .begin_read_max_compactable_data_files(request, cpu)
+    }
     pub async fn read_max_compactable_data_files(
         &self,
         request: ConnectorMaxCompactableDataFilesRequest,

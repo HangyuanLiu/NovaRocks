@@ -234,6 +234,44 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_process_health_blocks_ready_and_triggers_running_host_observation() {
+    #[derive(Debug)]
+    struct OriginalCause;
+    impl std::fmt::Display for OriginalCause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original process source failed")
+        }
+    }
+    impl std::error::Error for OriginalCause {}
+    let mut host = open_host(Some(state_store_input())).await.unwrap();
+    host.install_statement_control_for_test();
+    host.mark_ready().unwrap();
+    let healthy = !host.workload_progress_has_failed();
+    let cause = Arc::new(OriginalCause);
+    let original = Arc::downgrade(&cause);
+    host.execution_runtime_owner
+        .logical_execution_client
+        .report_process_failure(
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "original MV background source failed",
+                cause,
+            ),
+        );
+    let still_running = !host.execution_runtime_owner.supervisor.service_has_exited();
+    // These are the real readiness and running Server-loop predicates.
+    let failed = host.workload_progress_has_failed();
+    let refused = host.execution_runtime_owner.mark_ready().is_err();
+    let retained = original.upgrade().is_some();
+    let result = host
+        .shutdown_until(std::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    host.abandon_for_process_exit();
+    drop(host);
+    assert!(healthy && still_running && failed && refused && retained);
+    assert!(result.is_err(), "health cannot become a healthy shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_drain() {
     use novarocks_workload_control::{WorkClass, WorkRequest};
     let mut host = open_host(Some(state_store_input())).await.unwrap();

@@ -918,4 +918,4 @@ mod provider_close_tests {
 }
 
 #[cfg(test)]
-mod error_residual_tests;
+pub(crate) mod error_residual_tests;

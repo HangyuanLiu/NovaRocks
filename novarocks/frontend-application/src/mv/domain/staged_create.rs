@@ -52,9 +52,12 @@ use novarocks_spi::connector::{
     ConnectorTableIdentity, ConnectorTableObjectId, CreatePolicy, LakePublicationId,
 };
 
+#[path = "staged_create/create_original.rs"]
+pub(crate) mod create_original;
+
 #[path = "staged_create/current_metadata_cpu.rs"]
 mod current_metadata_cpu;
-pub(crate) use current_metadata_cpu::CurrentProjectionMetadataCpu;
+pub(crate) use current_metadata_cpu::{CurrentMetadataCapture, CurrentProjectionMetadataCpu};
 
 /// How a staged publish ended, in the product's own vocabulary.
 ///
@@ -1284,15 +1287,12 @@ impl CurrentProjectionRegistration {
             }
         }
     }
-    /// Original capture and registration children, never the whole Current/StateStore phase.
-    /// Unknown and failed cleanup keep their exact original owner retained.
-    pub(crate) fn poll_registration_closed(
+    /// Observe only actual capture / registration Future and Provider footer exit.
+    /// This grants no logical inventory disposal or release of the original owner.
+    pub(crate) fn poll_registration_physical_closed(
         &self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
-        use novarocks_spi::connector::{
-            ExternalMutationFinalization as F, ExternalMutationOutcome as O,
-        };
         use std::task::Poll;
         let _ = self.poll_progress(cx);
         if self.capture.poll_closed(cx).is_pending() {
@@ -1315,6 +1315,23 @@ impl CurrentProjectionRegistration {
         }
         if !observation.provider_exited() || self.receiving.foreign_exit_unproven() {
             return Poll::Pending;
+        }
+        Poll::Ready(())
+    }
+    /// Full retirement additionally requires the original logical cleanup fact.
+    /// Unknown and failed cleanup retain this same receiving and Provider owner.
+    pub(crate) fn poll_registration_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use novarocks_spi::connector::{
+            ExternalMutationFinalization as F, ExternalMutationOutcome as O,
+        };
+        use std::task::Poll;
+        std::task::ready!(self.poll_registration_physical_closed(cx));
+        let observation = self.receiving.observation();
+        if !observation.dispatched() {
+            return Poll::Ready(());
         }
         match observation.validated_outcome() {
             Some(Ok(O::KnownCommitted {

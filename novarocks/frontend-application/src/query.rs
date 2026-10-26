@@ -122,6 +122,7 @@ pub(crate) mod insert_action;
 mod maintenance_action;
 pub(crate) mod mutation_action;
 pub(crate) mod mv_action;
+pub(crate) mod mv_read_action;
 pub(crate) mod read_action;
 mod statement_action;
 pub(crate) mod statement_computation;
@@ -1253,6 +1254,14 @@ fn product_command_error(error: CommandError) -> RoutedExecutionError {
         };
     }
     let control = error.compile_control_error();
+    if let Some(original) = error.user_error() {
+        let mut service =
+            QueryServiceError::from_user_error(original.clone()).with_compile_control(control);
+        if let Some(disposition) = disposition {
+            service = service.attach_external_effect_disposition(disposition);
+        }
+        return RoutedExecutionError::Application(service);
+    }
     let input = error.execution_failure().cloned().or_else(|| {
         // An original Source is already owner-selected, unlike a local caller
         // control fallback. Keep that existing projector and its same fact.
@@ -2480,11 +2489,16 @@ impl FrontendQuerySession {
             }
         }
         if let ParsedStatement::MaterializedView(mv) = &parsed_statement {
-            use novarocks_parser::ast::{MaterializedViewAlterAction, MaterializedViewStatement};
-            if matches!(mv, MaterializedViewStatement::Refresh(_))
-                || matches!(mv, MaterializedViewStatement::Alter(alter)
-                    if matches!(&alter.action, MaterializedViewAlterAction::Repartition(_)))
-            {
+            use novarocks_parser::ast::MaterializedViewStatement;
+            if matches!(
+                mv,
+                MaterializedViewStatement::Refresh(_)
+                    | MaterializedViewStatement::Show(_)
+                    | MaterializedViewStatement::ExplainRefresh(_)
+                    | MaterializedViewStatement::Create(_)
+                    | MaterializedViewStatement::Drop(_)
+                    | MaterializedViewStatement::Alter(_)
+            ) {
                 let action = match self
                     .service
                     .command_executor
@@ -4563,11 +4577,22 @@ mod tests {
         assert_eq!(service.execution_failure(), Some(&input));
         assert_eq!(service.publication_terminal(), Some(&terminal));
         assert_eq!(service.compile_control_error(), Some(control));
+        let descriptor_message = "[query.execution.unexpected] Unexpected failure (reason 4:10)";
+        assert_eq!(service.user_error(), Some(&input.user_error()));
+        assert_eq!(
+            service.user_error().unwrap().to_string(),
+            descriptor_message
+        );
         assert_eq!(
             service.message(),
-            "[query.execution.unexpected] Unexpected failure (reason 4:10)"
+            format!(
+                "{descriptor_message} (lake publication id={} family=write disposition=KnownUncommitted)",
+                terminal.header().publication_id(),
+            ),
         );
-        assert_eq!(service.user_error().unwrap().to_string(), service.message());
+        assert!(!terminal.do_not_retry());
+        assert!(!service.message().contains("do_not_retry"));
+        assert!(service.external_effect_disposition().is_none());
         assert!(!service.message().contains("private"));
         assert!(!service.message().contains("Executor:"));
         let delayed = selected_execution_or_worker_fallback(
@@ -6376,5 +6401,34 @@ mod mv_command_original_route_tests {
         drop(request);
         drop(root.business);
         root.owner.complete_after_terminal_cancel_settled();
+    }
+}
+
+#[cfg(test)]
+mod product_user_error_projection_tests {
+    use super::*;
+    #[test]
+    fn original_product_descriptor_keeps_its_code_and_independent_effect() {
+        let novarocks_sql::compiler::SqlCompileError::Analyze(analyze) =
+            novarocks_sql::compiler::SqlCompileError::from(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(
+                    novarocks_functions::FunctionOverloadId::try_new(
+                        "fixture/product/missing-pure-v1",
+                    )
+                    .unwrap(),
+                ),
+            )
+        else {
+            panic!("the actual analyzer authors the descriptor")
+        };
+        let original = analyze.to_user_error(None);
+        for effect in [None, Some(novarocks_query_application::api::StatementExternalEffectDisposition::KnownCommitted)] {
+            let command = CommandError::from_user_error(original.clone())
+                .with_external_effect_disposition(effect);
+            let selected = routed_execution_service_error(product_command_error(command));
+            assert_eq!(selected.user_error(), Some(&original));
+            assert_eq!(selected.external_effect_disposition(), effect);
+            assert!(selected.compile_control_error().is_none());
+        }
     }
 }

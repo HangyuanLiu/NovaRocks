@@ -20,7 +20,7 @@
 
 use super::{async_original::MvRefreshPreparationOriginal, io_gate::MvRefreshPreparationIo};
 use crate::query_execution::{
-    internal_result_cpu::{InternalResultCpu, MvRefreshCpuJob, MvRefreshCpuTurn},
+    internal_result_cpu::{InternalResultCpu, MvCpuJob, MvRefreshCpuTurn},
     mv_assembly::activation_cpu::MvWriteActivationOriginal,
 };
 use crate::task_execution::status_intake::StatusIntakeWake;
@@ -85,7 +85,7 @@ pub(crate) struct MvRefreshTurnCustody {
     runtime: tokio::runtime::Handle,
     wake: Arc<dyn StatusIntakeWake>,
     original: Option<Original>,
-    job: Option<MvRefreshCpuJob>,
+    job: Option<MvCpuJob>,
     marker: Option<Result<(), ExecutionFailureInput>>,
     failure: Option<MvTurnFailure>,
     waiting_io: bool,

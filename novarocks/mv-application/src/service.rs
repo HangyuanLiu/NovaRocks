@@ -41,12 +41,24 @@ use crate::readiness::{MvDropReadiness, MvKeyedReadinessService, MvRuntimePublic
 use crate::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
 
+mod create_progress;
+mod drop_progress;
+pub use create_progress::MvCreateTransition;
+pub use drop_progress::MvDropTransition;
+
 /// The one process-local MV owner for activity admission and background-worker
 /// lifecycle. Hosts may inject effect callbacks, but cannot own a parallel
 /// gate, shutdown state, or worker supervisor.
 pub struct MvKeyedProductService {
-    activity_gate: MvActivityGate,
+    operations: Arc<MvProductOperations>,
     background: MvBackgroundRuntimeOwner,
+}
+
+/// The same process-local business state borrowed by original Actions and
+/// background Sources. It has no reference back to the background lifecycle.
+/// Keeping an active operation alive must not keep its worker owner alive.
+pub struct MvProductOperations {
+    activity_gate: MvActivityGate,
     scheduler_config: MvSchedulerConfig,
     scheduler: Mutex<MvRefreshScheduler>,
     readiness: Option<MvKeyedReadinessService>,
@@ -112,8 +124,30 @@ impl MvKeyedProductService {
     /// source revisions, retry ledger and terminal transitions remain here.
     pub fn new(scheduler_config: MvSchedulerConfig) -> Self {
         Self {
-            activity_gate: MvActivityGate::default(),
+            operations: Arc::new(MvProductOperations::new(scheduler_config)),
             background: MvBackgroundRuntimeOwner::default(),
+        }
+    }
+
+    /// Retain the original business state without retaining the worker owner.
+    /// This is the same gate, scheduler and publication state, not a snapshot.
+    pub fn original_operations(&self) -> Arc<MvProductOperations> {
+        Arc::clone(&self.operations)
+    }
+}
+
+impl std::ops::Deref for MvKeyedProductService {
+    type Target = MvProductOperations;
+
+    fn deref(&self) -> &Self::Target {
+        self.operations.as_ref()
+    }
+}
+
+impl MvProductOperations {
+    fn new(scheduler_config: MvSchedulerConfig) -> Self {
+        Self {
+            activity_gate: MvActivityGate::default(),
             scheduler: Mutex::new(MvRefreshScheduler::new(scheduler_config.clone())),
             scheduler_config,
             readiness: None,
@@ -287,49 +321,7 @@ impl MvKeyedProductService {
         provider: &dyn MvCreateProviderPort,
         catalog_registration: &dyn MvCreateCatalogRegistrationPort,
     ) -> Result<MvProductResult, MvProductError> {
-        let command = MvCommand::Create(create);
-        let target = match &command {
-            MvCommand::Create(create) => create.target.clone(),
-            MvCommand::Drop { .. } | MvCommand::Refresh { .. } | MvCommand::Show { .. } => {
-                unreachable!("CREATE product path constructed a non-CREATE command")
-            }
-        };
-        // Staging has no catalog-visible effect, so a failure here ends the
-        // statement with nothing to compensate.
-        let staged = provider
-            .stage_target(operation, &command)
-            .map_err(MvProviderFailure::into_product_error)?;
-        if staged.target != target {
-            return Err(MvProductError::new(
-                MvProductErrorKind::InvalidRequest,
-                "MV CREATE provider staged a different target than the command named",
-            ));
-        }
-        // The one atomic point: the target and its canonical documents become
-        // visible together.
-        let created = match provider.publish_staged_target(operation, &staged) {
-            Ok(created) => created,
-            Err(primary) => {
-                return Err(settle_unpublished_stage(
-                    operation, provider, &staged, primary,
-                ));
-            }
-        };
-        if created.target != target {
-            return Err(MvProductError::new(
-                MvProductErrorKind::Corruption,
-                "MV CREATE publish reported a different target than it staged",
-            ));
-        }
-        // Everything below is post-commit. The create is done and must not be
-        // undone by a finalization failure.
-        provider
-            .install_created_projection(operation, &created)
-            .map_err(known_committed_finalize_failure)?;
-        catalog_registration
-            .register_target(operation, &created)
-            .map_err(known_committed_finalize_failure)?;
-        Ok(MvProductResult::Created(created))
+        create_progress::create_immediate(self, operation, create, provider, catalog_registration)
     }
 
     /// Execute the product-owned DROP state machine. The projection port
@@ -344,24 +336,15 @@ impl MvKeyedProductService {
         provider: &dyn MvDropProviderPort,
         catalog_registration: &dyn MvDropCatalogRegistrationPort,
     ) -> Result<MvProductResult, MvProductError> {
-        match projection
-            .prepare_drop(operation, &target, if_exists)
-            .map_err(MvProviderFailure::into_product_error)?
-        {
-            MvDropReadiness::AlreadyAbsent => Ok(MvProductResult::Acknowledged),
-            MvDropReadiness::ReadyToDrop(guard) => {
-                provider
-                    .drop_target(operation, &target)
-                    .map_err(MvProviderFailure::into_product_error)?;
-                projection
-                    .delete_after_provider_drop(operation, guard)
-                    .map_err(known_committed_finalize_failure)?;
-                catalog_registration
-                    .unregister_target(operation, &target)
-                    .map_err(known_committed_finalize_failure)?;
-                Ok(MvProductResult::Dropped)
-            }
-        }
+        drop_progress::drop_immediate(
+            self,
+            operation,
+            target,
+            if_exists,
+            projection,
+            provider,
+            catalog_registration,
+        )
     }
 
     pub fn acquire_foreground(
@@ -397,7 +380,9 @@ impl MvKeyedProductService {
     ) -> Result<MvActivityTicket, crate::activity::MvActivityGateError> {
         self.activity_gate.request(target, owner)
     }
+}
 
+impl MvKeyedProductService {
     pub fn begin_background_start(
         &self,
     ) -> Result<MvBackgroundRuntimeStart<'_>, MvBackgroundRuntimeLifecycleError> {
@@ -405,7 +390,7 @@ impl MvKeyedProductService {
     }
 
     pub fn begin_stopping(&self) {
-        self.activity_gate.begin_stopping();
+        self.operations.activity_gate.begin_stopping();
     }
 
     pub async fn shutdown_background_workers_until(&self, deadline: Instant) -> Result<(), String> {
@@ -424,23 +409,12 @@ impl MvKeyedProductService {
 /// the objects of a create that actually succeeded, and re-running it could
 /// publish a second time. That case stays unsettled for the management owner
 /// to adjudicate against the provider.
-fn settle_unpublished_stage(
-    operation: MvOperationContext,
-    provider: &dyn MvCreateProviderPort,
-    staged: &MvStagedTarget,
-    primary: MvProviderFailure,
+fn settle_stage_abort(
+    primary: MvProductError,
+    abort: Result<(), MvProviderFailure>,
 ) -> MvProductError {
-    let primary = primary.into_product_error();
-    if matches!(
-        primary.kind(),
-        MvProductErrorKind::CommitUnknown | MvProductErrorKind::KnownCommittedFinalizeFailed
-    ) {
-        return primary;
-    }
-    match provider.abort_staged_target(operation, staged) {
+    match abort {
         Ok(()) => primary,
-        // A failed abort is a second failure; preserve its complete diagnostic
-        // instead of replacing it with the original pure admission cause.
         Err(abort) => {
             let mut failure = MvProductError::new(
                 primary.kind(),
@@ -513,18 +487,23 @@ impl MvKeyedProductService {
         management: Arc<crate::management::ManagementEntrance>,
         policy: crate::management::RemoteEffectPolicy,
     ) -> Self {
-        let mut service = Self::new(config);
-        service.readiness = Some(MvKeyedReadinessService::new(repository, runtime));
-        service.continuation = Some(Arc::new(
+        let mut operations = MvProductOperations::new(config);
+        operations.readiness = Some(MvKeyedReadinessService::new(repository, runtime));
+        operations.continuation = Some(Arc::new(
             crate::management::ManagementContinuationService::new(
                 management.as_ref().clone(),
                 policy,
             ),
         ));
-        service.management = Some(management);
-        service
+        operations.management = Some(management);
+        Self {
+            operations: Arc::new(operations),
+            background: MvBackgroundRuntimeOwner::default(),
+        }
     }
+}
 
+impl MvProductOperations {
     pub fn keyed_readiness_service(&self) -> Option<crate::readiness::MvKeyedReadinessService> {
         self.readiness.clone()
     }

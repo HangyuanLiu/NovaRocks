@@ -455,12 +455,14 @@ pub(crate) enum MvWriteActivationRequest {
     },
     Finish(MvWriteFinishInput),
     PreparePublication(MvWritePreparePublicationInput),
+    Create(super::create_publication::CreatePublicationInput),
 }
 pub(crate) enum MvWriteActivationOutput {
     Analyzed(MvWriteAnalysis),
     ProviderNeeds(MvWriteProviderNeeds),
     Static(PreparedMvNativeWriteParts),
     PublicationPrepared,
+    Create(super::create_publication::CreatePublicationOutput),
 }
 struct Body {
     request: MvWriteActivationRequest,
@@ -531,6 +533,9 @@ impl MvWriteActivationOriginal {
             MvWriteActivationRequest::PreparePublication(input) => input
                 .prepare()
                 .map(|()| MvWriteActivationOutput::PublicationPrepared),
+            MvWriteActivationRequest::Create(input) => {
+                input.run().map(MvWriteActivationOutput::Create)
+            }
         };
         body.result = Some(result);
         drop(loan);

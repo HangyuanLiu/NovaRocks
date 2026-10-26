@@ -66,6 +66,8 @@ pub(crate) struct MvRefreshDependencyGraphInput {
     pub(crate) requested: novarocks_mv_application::dependency::MvDependencyObjectRef,
 }
 pub(crate) enum MvRefreshPreparationOutput {
+    Create(Arc<crate::mv::domain::iceberg_refresh::IcebergMvCreatePlan>),
+    Explain(Vec<String>),
     DependencySteps(Vec<crate::mv::domain::dependency::refresh::MvRefreshDependencyStep>),
     Catalog(MvCatalogCaptureOutput),
     Refresh(super::pure_reader::MvRefreshPrepared),
@@ -165,6 +167,44 @@ impl MvRefreshPreparationOriginal {
                     super::pure_reader::prepare_refresh(input, &reader_io)
                         .await
                         .map(MvRefreshPreparationOutput::Refresh)
+                })),
+                result: None,
+                received: false,
+            })),
+            poisoned: AtomicBool::new(false),
+            io,
+        })
+    }
+    pub(crate) fn for_create(
+        input: super::super::create_preparation::MvCreatePreparationInput,
+        io: Arc<MvRefreshPreparationIo>,
+    ) -> Arc<Self> {
+        let reader_io = Arc::clone(&io);
+        Arc::new(Self {
+            body: Mutex::new(Some(Body {
+                reader: Some(Box::pin(async move {
+                    super::super::create_preparation::prepare_create(input, &reader_io)
+                        .await
+                        .map(MvRefreshPreparationOutput::Create)
+                })),
+                result: None,
+                received: false,
+            })),
+            poisoned: AtomicBool::new(false),
+            io,
+        })
+    }
+    pub(crate) fn for_explain(
+        input: super::super::refresh_explain::MvExplainPreparationInput,
+        io: Arc<MvRefreshPreparationIo>,
+    ) -> Arc<Self> {
+        let reader_io = Arc::clone(&io);
+        Arc::new(Self {
+            body: Mutex::new(Some(Body {
+                reader: Some(Box::pin(async move {
+                    super::super::refresh_explain::explain_original(input, &reader_io)
+                        .await
+                        .map(MvRefreshPreparationOutput::Explain)
                 })),
                 result: None,
                 received: false,

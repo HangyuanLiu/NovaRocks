@@ -246,7 +246,7 @@ async fn prepare_refresh_inner(
     })
 }
 
-async fn frozen_refresh_aggregate_analysis(
+pub(crate) async fn frozen_refresh_aggregate_analysis(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
     projection: &StoredKeyedMvProjection,

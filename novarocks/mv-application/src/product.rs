@@ -187,6 +187,14 @@ pub struct MvCreatedTarget {
     pub object_id: ConnectorTableObjectId,
 }
 
+/// The Provider's exact CREATE publication verdict. A NoOp creates no target
+/// identity and grants no authority to install a Current projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvCreatePublicationOutcome {
+    Applied(MvCreatedTarget),
+    NoOp,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MvProductResult {
     Acknowledged,

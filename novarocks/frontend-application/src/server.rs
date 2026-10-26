@@ -1360,8 +1360,8 @@ async fn wait_for_frontend_listener_failure(
     host: &FrontendApplicationHost,
 ) -> String {
     loop {
-        if host.workload_progress_has_exited() {
-            return "frontend governed role service terminated unexpectedly".to_string();
+        if host.workload_progress_has_failed() {
+            return "frontend governed role service failed or exited unexpectedly".to_string();
         }
         match report_server.poll_failure() {
             Ok(Some(error)) => return format!("frontend report listener failed: {error}"),

@@ -1350,8 +1350,7 @@ pub fn compile_imv_refresh_explain_lines(
         control,
         level,
     } = context;
-    let mut query = *canonical_query;
-    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let query = *canonical_query;
     let request = imv_refresh_explain_request(
         query,
         &imv_rewrite,

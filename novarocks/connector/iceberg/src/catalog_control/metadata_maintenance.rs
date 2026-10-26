@@ -64,6 +64,9 @@ use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::RewriteManifes
 use crate::metadata::IcebergTablePayload;
 use crate::metadata_context::IcebergMetadataContext;
 
+#[path = "metadata_maintenance/observation.rs"]
+pub(crate) mod observation;
+
 const PAYLOAD_VERSION: u16 = 2;
 const MARKER_VERSION: u16 = 2;
 const MARKER_PROPERTY: &str = "novarocks.connector.maintenance.v2";
@@ -763,6 +766,7 @@ pub fn metadata_maintenance_io_geometry()
         .checked_add(std::mem::size_of::<MetadataExecutionInput>())
         .and_then(|n| n.checked_add(metadata_execution_future_bytes(make_metadata_execution)))
         .and_then(|n| n.checked_add(execution::fixed_backing_bytes()))
+        .and_then(|n| n.checked_add(observation::fixed_backing_bytes()?))
         .and_then(|n| n.checked_add(IcebergCommitOperation::fixed_backing_bytes().ok()?))
         .and_then(|n| {
             n.checked_add(
@@ -909,6 +913,22 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         active.insert(row.operation, Arc::clone(&row));
         drop(active);
         Ok(ConnectorMetadataMaintenanceExecution::from_source(row))
+    }
+
+    fn begin_read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> Result<novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution, ConnectorError>
+    {
+        if request.table.owner() != &self.key.instance_id {
+            return Err(invalid("compaction observation has a foreign table owner"));
+        }
+        Ok(
+            novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution::from_source(
+                observation::ObservationSource::new(Arc::clone(&self.engine), request, cpu),
+            ),
+        )
     }
 
     fn read_max_compactable_data_files(
@@ -2151,6 +2171,157 @@ mod tests {
             || {},
         )
         .expect("real metadata and maintenance adapter share the exact generation")
+    }
+
+    struct ObservationCpu {
+        descriptor: ConnectorInstanceDescriptor,
+        epoch: novarocks_spi::connector::ProviderBindingEpoch,
+        calls: std::sync::atomic::AtomicUsize,
+        first_receipt: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        footer: Mutex<tokio::sync::oneshot::Receiver<()>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+    // Component-only CPU executor: runs the real private phase. The independent
+    // footer verifies Source custody, not the FA Work/physical CPU admission.
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for ObservationCpu {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            use std::sync::atomic::Ordering;
+            let source = input.as_ref().expect("original phase");
+            assert_eq!(source.descriptor(), &self.descriptor);
+            assert_eq!(source.incarnation(), self.epoch);
+            assert_eq!(
+                source.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            input.take().unwrap().run_original_phase();
+            Ok(())
+        }
+        fn poll_finished(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            let mut receipt = self.first_receipt.lock().unwrap();
+            if let Some(receiving) = receipt.as_mut() {
+                std::task::ready!(Pin::new(receiving).poll(cx))
+                    .expect("original first CPU receipt released");
+                *receipt = None;
+            }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            use std::sync::atomic::Ordering;
+            if self.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            std::task::ready!(Pin::new(&mut *self.footer.lock().unwrap()).poll(cx))
+                .expect("original footer released");
+            self.closed.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+
+    #[test]
+    fn original_compaction_scalar_retains_real_manifest_source_until_footer() {
+        use std::sync::atomic::Ordering;
+        let (executor, _warehouse, adapter, key) = adapter();
+        let table = create_local_table(&executor, &adapter);
+        for file in ["a", "b", "c"] {
+            append_local_file(&executor, &adapter, table.identifier(), file);
+        }
+        let root = std::path::PathBuf::from(
+            novarocks_fs::FsLocation::parse(table.metadata().location())
+                .unwrap()
+                .path(),
+        );
+        let before = inventory_without_private_artifacts(&root);
+        let request = ConnectorMaxCompactableDataFilesRequest::try_new(
+            local_planning_request(&key, false)
+                .operation()
+                .table()
+                .clone(),
+            context(),
+        )
+        .unwrap();
+        let (release_first, first_receipt) = tokio::sync::oneshot::channel();
+        let (release, footer) = tokio::sync::oneshot::channel();
+        let cpu = Arc::new(ObservationCpu {
+            descriptor: adapter.descriptor.clone(),
+            epoch: key.incarnation,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            first_receipt: Mutex::new(Some(first_receipt)),
+            footer: Mutex::new(footer),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let lease = real_maintenance_lease(adapter);
+        executor.block_on(async {
+            let mut original = lease
+                .begin_read_max_compactable_data_files(request, cpu.clone())
+                .unwrap();
+            // Cancelling a borrowed wait does not drop its original Source.
+            let mut borrowed = Box::pin(std::future::poll_fn(|cx| original.poll_result(cx)));
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(borrowed.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(cpu.calls.load(Ordering::SeqCst), 1);
+            drop(borrowed);
+            release_first.send(()).unwrap();
+            let scalar = std::future::poll_fn(|cx| original.poll_result(cx))
+                .await
+                .unwrap();
+            assert_eq!(scalar.value(), Some(3));
+            assert!(
+                cpu.calls.load(Ordering::SeqCst) > 2,
+                "real table/list/manifest CPU phases"
+            );
+            assert!(original.poll_closed(&mut cx).is_pending());
+            assert!(original.local_failure().is_none());
+            let calls = cpu.calls.load(Ordering::SeqCst);
+            assert_eq!(
+                std::future::poll_fn(|cx| original.poll_result(cx))
+                    .await
+                    .unwrap(),
+                scalar
+            );
+            assert_eq!(
+                cpu.calls.load(Ordering::SeqCst),
+                calls,
+                "observation is not replayed"
+            );
+            release.send(()).unwrap();
+            std::future::poll_fn(|cx| original.poll_closed(cx))
+                .await
+                .unwrap();
+            assert!(cpu.closed.load(Ordering::SeqCst));
+            let foreign = ConnectorMaxCompactableDataFilesRequest::try_new(
+                ConnectorTableHandle::try_new(
+                    ConnectorInstanceId::parse("foreign-observation").unwrap(),
+                    Bytes::from_static(b"not decoded"),
+                )
+                .unwrap(),
+                context(),
+            )
+            .unwrap();
+            assert_eq!(
+                lease
+                    .begin_read_max_compactable_data_files(foreign, cpu.clone())
+                    .err()
+                    .unwrap()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+            assert_eq!(cpu.calls.load(Ordering::SeqCst), calls);
+        });
+        assert_eq!(
+            inventory_without_private_artifacts(&root),
+            before,
+            "read-only observation"
+        );
     }
 
     fn competing_adapter(
