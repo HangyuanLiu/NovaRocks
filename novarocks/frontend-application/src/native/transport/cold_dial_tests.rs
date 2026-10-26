@@ -492,16 +492,16 @@ async fn actual_cold_handoff_bootstraps_endpoint_h2_and_reuses_exact_ready_gener
         let original = acquired
             .as_ref()
             .ok_or("original published channel missing")?;
-        if original.slot != identity.slot {
+        if original.slot() != &identity.slot {
             return Err("Endpoint publication changed the original selected slot".into());
         }
         let cached = runtime
-            .cached_channel(&original.slot)
+            .cached_channel(original.slot())
             .ok_or("same published cache row missing")?;
         if !original.same_generation_for_test(&cached) {
             return Err("Endpoint publication changed original generation".into());
         }
-        let mut channel = original.channel.clone();
+        let mut channel = original.channel().clone();
         let request = http::Request::builder()
             .method("POST")
             .uri("/cold.dial.Probe/Ping")

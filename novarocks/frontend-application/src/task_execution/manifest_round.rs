@@ -41,7 +41,7 @@ use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::QueryTaskExecution;
 use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
-use super::round::{AcknowledgementObserver, TaskRound, TurnPump};
+use super::round::{AcknowledgementObserver, TaskRound};
 use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
@@ -327,17 +327,6 @@ impl ManifestAssembledRound {
     /// projection; this owner never constructs a second actor port.
     pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
         self.round.install_abort_effect_intake(intake);
-    }
-
-    /// Installs one manifest-validated RF, credential, or split-source pump.
-    pub(crate) fn install_pump(&mut self, pump: Box<dyn TurnPump>) {
-        self.round.add_pump(pump);
-    }
-
-    /// Completes C3's runtime-resource attachment. A round cannot turn before
-    /// this explicit declaration, including when the exact pump set is empty.
-    pub(crate) fn seal_runtime_owners(&mut self) {
-        self.round.seal_pumps();
     }
 
     /// Transfer only this attempt's original receiver to its fixed FA consumer.

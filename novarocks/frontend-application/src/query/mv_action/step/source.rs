@@ -745,26 +745,26 @@ impl Body {
         {
             // Dependency steps must not consume the requested target's one
             // scheduler claim. The activity lease is already in this Body.
-            if requested == &self.preparation_input.request.target {
-                if let Some(controls) = self.input.services.controls.as_ref() {
-                    match controls
-                        .scheduler_async(requested, &self.cancellation)
-                        .await
-                    {
-                        Ok(true) => {
-                            return Err(domain_error(MvApplicationError::new(
-                                MvApplicationErrorKind::ShutdownCancelled,
-                                "MV scheduler barrier was cancelled",
-                            )));
-                        }
-                        Err(error) => {
-                            return Err(domain_error(MvApplicationError::new(
-                                MvApplicationErrorKind::Unavailable,
-                                error,
-                            )));
-                        }
-                        Ok(false) => {}
+            if requested == &self.preparation_input.request.target
+                && let Some(controls) = self.input.services.controls.as_ref()
+            {
+                match controls
+                    .scheduler_async(requested, &self.cancellation)
+                    .await
+                {
+                    Ok(true) => {
+                        return Err(domain_error(MvApplicationError::new(
+                            MvApplicationErrorKind::ShutdownCancelled,
+                            "MV scheduler barrier was cancelled",
+                        )));
                     }
+                    Err(error) => {
+                        return Err(domain_error(MvApplicationError::new(
+                            MvApplicationErrorKind::Unavailable,
+                            error,
+                        )));
+                    }
+                    Ok(false) => {}
                 }
             }
         }
@@ -999,24 +999,24 @@ impl Body {
             return Err(phase_service("MV original precommit was already started"));
         }
         #[cfg(novarocks_dev_controls)]
-        if self.kind == Some(StepPreparedKind::Data) {
-            if let Some(controls) = &self.input.services.controls {
-                let target = self.product_target.as_ref().unwrap();
-                controls
-                    .recovery_async(
-                        target.catalog().unwrap(),
-                        target.namespace(),
-                        target.name(),
-                        "data-prepared",
-                    )
-                    .await
-                    .map_err(|error| {
-                        domain_error(MvApplicationError::new(
-                            MvApplicationErrorKind::Engine,
-                            error,
-                        ))
-                    })?;
-            }
+        if self.kind == Some(StepPreparedKind::Data)
+            && let Some(controls) = &self.input.services.controls
+        {
+            let target = self.product_target.as_ref().unwrap();
+            controls
+                .recovery_async(
+                    target.catalog().unwrap(),
+                    target.namespace(),
+                    target.name(),
+                    "data-prepared",
+                )
+                .await
+                .map_err(|error| {
+                    domain_error(MvApplicationError::new(
+                        MvApplicationErrorKind::Engine,
+                        error,
+                    ))
+                })?;
         }
         // Install its original receiver before any dependency recheck can suspend.
         self.precommit = Some(self.turn(&source.io));

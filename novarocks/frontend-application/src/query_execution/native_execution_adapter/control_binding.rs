@@ -261,6 +261,7 @@ impl NativeControlBinding {
     }
 }
 
+#[cfg(test)]
 pub(super) fn metadata_layouts() -> [std::alloc::Layout; 2] {
     [
         std::alloc::Layout::new::<NativeControlBinding>(),

@@ -924,14 +924,13 @@ impl CtasSource {
                 Phase::Bind => {
                     // Only the lease-validated ACTUAL seal can authorize this
                     // pure bind and consume the retained terminal resolver.
-                    if self.seal_needed.is_none() {
-                        if let Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
+                    if self.seal_needed.is_none()
+                        && let Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
                             needed,
                             ..
                         })) = self.seal_outcome.as_ref()
-                        {
-                            self.seal_needed = Some(Arc::clone(needed));
-                        }
+                    {
+                        self.seal_needed = Some(Arc::clone(needed));
                     }
                     let Some(needed) = self.seal_needed.as_ref().map(Arc::clone) else {
                         if matches!(
@@ -939,17 +938,15 @@ impl CtasSource {
                             Some(Ok(
                                 ConnectorWritePublicationCompletion::CommitUnknown { .. }
                             ))
-                        ) {
-                            if let Err(error) =
-                                self.prepared_write.as_ref().unwrap().mark_write_unknown()
-                            {
-                                self.close_failure =
-                                    Some(StatementNativeHealthFailure::actual_exit_unproven(
-                                        "CTAS unknown write responsibility transition failed",
-                                        Arc::new(error),
-                                    ));
-                                return Poll::Pending;
-                            }
+                        ) && let Err(error) =
+                            self.prepared_write.as_ref().unwrap().mark_write_unknown()
+                        {
+                            self.close_failure =
+                                Some(StatementNativeHealthFailure::actual_exit_unproven(
+                                    "CTAS unknown write responsibility transition failed",
+                                    Arc::new(error),
+                                ));
+                            return Poll::Pending;
                         }
                         self.fail(internal_error(
                             "CTAS staged write sealing did not prove a publishable write",
@@ -1175,7 +1172,7 @@ impl CtasSource {
                     }
                     if !self.native_launch_attempted
                         && !self.publish.started
-                        && self.target.is_some()
+                        && let Some(target) = self.target.as_ref()
                         && self.unlaunched_session_disposed()
                     {
                         if let Some(health) = self.subordinate_health() {
@@ -1195,7 +1192,7 @@ impl CtasSource {
                             }
                             self.target_abort
                                 .start(abort_governed_unlaunched_ctas_target(
-                                    self.target.as_ref().unwrap().handle.clone(),
+                                    target.handle.clone(),
                                     self.controls.clone(),
                                 ));
                         }
@@ -1375,20 +1372,19 @@ impl GovernedStatementAction for CtasAction {
             if source.publish.started
                 && source.disposition == Some(LakePublicationDisposition::CommitUnknown)
             {
-                if source.adjudication.started {
-                    if let Some(raw) = source
+                if source.adjudication.started
+                    && let Some(raw) = source
                         .controls
                         .adjudication
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .as_ref()
-                    {
-                        return Some(observed_governed_ctas_adjudication(
-                            source.publish_input.as_ref()?.action.as_ref(),
-                            &source.adjudication_input.as_ref()?.evidence,
-                            raw,
-                        ));
-                    }
+                {
+                    return Some(observed_governed_ctas_adjudication(
+                        source.publish_input.as_ref()?.action.as_ref(),
+                        &source.adjudication_input.as_ref()?.evidence,
+                        raw,
+                    ));
                 }
                 if let Some(raw) = source
                     .controls
@@ -1464,10 +1460,10 @@ impl GovernedStatementResidual for CtasResidual {
                 return Poll::Pending;
             }
         }
-        if let Some(tail) = source.tail.as_mut() {
-            if tail.poll_exit(cx).is_pending() {
-                pending = true;
-            }
+        if let Some(tail) = source.tail.as_mut()
+            && tail.poll_exit(cx).is_pending()
+        {
+            pending = true;
         }
         // The canonical publisher may have delivered Needed while its GC
         // child remains active. Finish that exact Source before asking the

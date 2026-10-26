@@ -121,7 +121,7 @@ pub enum DataMutationDispatchState {
 /// Application view after one execute or one explicit reconciliation.
 #[derive(Clone, Debug)]
 pub enum ResolvedDataMutation {
-    KnownCommitted(CompletedDataMutation),
+    KnownCommitted(Box<CompletedDataMutation>),
     KnownUncommitted {
         failure: KnownUncommittedDataMutation,
         cleanup: ExternalMutationFinalization,
@@ -166,7 +166,7 @@ pub fn execute_data_mutation(
                         .to_string(),
                 )
             } else {
-                Ok(completed)
+                Ok(*completed)
             }
         }
         ResolvedDataMutation::KnownUncommitted { failure, cleanup } => Err(
@@ -438,12 +438,12 @@ fn resolve_terminal_outcome(
                 tracing::warn!(%error, "committed data mutation retains incomplete cleanup");
             }
             let generic_finalization = cache_finalizer.invalidate_generic_table(table);
-            ResolvedDataMutation::KnownCommitted(CompletedDataMutation {
+            ResolvedDataMutation::KnownCommitted(Box::new(CompletedDataMutation {
                 effect,
                 receipt,
                 finalization: merge_finalization(finalization, generic_finalization),
                 cleanup,
-            })
+            }))
         }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedDataMutation::KnownUncommitted {

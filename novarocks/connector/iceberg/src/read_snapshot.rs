@@ -335,32 +335,6 @@ pub(crate) async fn build_cow_read_files_at_with_original_scope(
     observe_read_files::<FrozenCowDataFileProjection>(table, domain, None, Some(capture)).await
 }
 
-/// Same checked capture, with the exact complete delete observation retained
-/// before the original index consumes it. Rewrite must account for unattached
-/// live deletes as well as each data file's applicable load view.
-pub(crate) async fn build_rewrite_read_files_with_original_scope(
-    table: &Table,
-    snapshot_id: i64,
-    capture: &CaptureScope<'_>,
-    all_deletes: &mut Vec<Arc<crate::delete_semantics::DeleteFact>>,
-) -> Result<Vec<IcebergReadFile>, ReadFailure> {
-    capture.active()?;
-    let metadata = table.metadata();
-    let snapshot = metadata
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
-    let schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
-    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
-    observe_read_files_with_delete_receiving::<FrozenCowDataFileProjection>(
-        table,
-        domain,
-        None,
-        Some(capture),
-        Some(all_deletes),
-    )
-    .await
-}
-
 pub(crate) async fn make_scoped_read_snapshot(
     table: Table,
     snapshot_id: i64,

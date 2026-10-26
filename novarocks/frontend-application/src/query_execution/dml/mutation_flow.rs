@@ -387,10 +387,6 @@ fn bind_change_stream_routes(
     Ok((routes, statistics_targets))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Finalization pairs the same signed session with its actual read facts and execution context."
-)]
 fn finish_change_stream_write(
     state: &DmlExecutionKernel,
     completion: novarocks_sql::planning::dml::DmlChangeStreamCompletion,
@@ -881,10 +877,6 @@ pub(super) fn resolve_update_target(
     Ok((target, target_ref))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Pure mutation admission keeps the exact target, generation, original context and identity distinct."
-)]
 fn finish_update_mutation_preparation(
     stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
@@ -1028,10 +1020,6 @@ pub(super) fn resolve_merge_target(
     Ok((target, target_ref))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Pure mutation admission keeps the exact target, generation, original context and identity distinct."
-)]
 fn finish_merge_mutation_preparation(
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
@@ -2611,7 +2599,7 @@ fn finish_cow_match_plan(
             novarocks_query_application::api::QueryExecutionKind::Read,
             &candidate,
         )?;
-    check_cow_root_output_types(output.fields(), &declaration, completion_control)
+    check_cow_root_output_types(output.fields(), declaration, completion_control)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,

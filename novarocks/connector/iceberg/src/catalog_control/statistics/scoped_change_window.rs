@@ -154,7 +154,7 @@ impl IcebergMetadataCpuOriginal {
         Self::new(
             provider.descriptor().clone(),
             provider.incarnation(),
-            CpuBody::ChangeWindow(ChangeWindowBody {
+            CpuBody::ChangeWindow(Box::new(ChangeWindowBody {
                 provider,
                 table,
                 request,
@@ -170,7 +170,7 @@ impl IcebergMetadataCpuOriginal {
                 endpoints: [None, None],
                 result: None,
                 original,
-            }),
+            })),
         )
     }
     fn poll_change_window_table(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {

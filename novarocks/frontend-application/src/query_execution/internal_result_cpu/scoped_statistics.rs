@@ -26,6 +26,10 @@ use crate::query_execution::statistics::preparation::{
 
 // One actual Box pointee in the original retirement packet. No open closure,
 // Any input or caller-selected factory enters the finite worker.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The original retirement already owns this closed input in one Box; keeping variants inline preserves its same-box loan without a second allocation."
+)]
 pub(super) enum ClosedCreatorInput {
     Read(super::super::provider_read_facts::ProviderReadCreatorInput),
     MvRefresh(scoped_mv_refresh::MvRefreshCpuTurn),

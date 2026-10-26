@@ -19,15 +19,12 @@
 
 use std::fmt;
 
-use uuid::Uuid;
-
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
 use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,12 +253,6 @@ pub struct MvCreateStatement {
     pub primary_key: Option<Vec<String>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct MvRequestContext<'a> {
-    pub current_catalog: Option<&'a str>,
-    pub current_database: &'a str,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvApplicationErrorKind {
     InvalidRequest,
@@ -445,94 +436,6 @@ impl std::error::Error for MvApplicationError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvCreateProviderErrorKind {
-    InvalidRequest,
-    Analysis,
-    TargetOperation,
-    /// The effect is proven not to have happened.
-    KnownUncommitted,
-    /// The effect may or may not have happened. It must not be compensated and
-    /// must not be retried under the same identity.
-    CommitUnknown,
-    KnownCommittedFinalizeFailed,
-    DescriptorSync,
-    CatalogRegistration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvCreateProviderError {
-    kind: MvCreateProviderErrorKind,
-    message: String,
-    compile_control: Option<novarocks_type_contract::CompileControlError>,
-    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
-}
-
-impl MvCreateProviderError {
-    pub fn new(kind: MvCreateProviderErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            compile_control: None,
-            unavailable_implementation: None,
-        }
-    }
-
-    pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
-        let failure = MvApplicationError::from_compile(error);
-        let mut result = Self::new(MvCreateProviderErrorKind::Analysis, failure.message());
-        result.compile_control = failure.compile_control_error();
-        result.unavailable_implementation = failure.unavailable_implementation().cloned();
-        result
-    }
-    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control.clone()
-    }
-
-    pub fn unavailable_implementation(
-        &self,
-    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
-        self.unavailable_implementation.as_ref()
-    }
-
-    pub fn kind(&self) -> MvCreateProviderErrorKind {
-        self.kind
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for MvCreateProviderError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message())
-    }
-}
-
-impl std::error::Error for MvCreateProviderError {}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PrepareMvCreateRequest<'a> {
-    pub statement: &'a MvCreateStatement,
-    pub context: MvRequestContext<'a>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedMvCreate {
-    pub target: MvTarget,
-    pub projection_seed: MvCreateProjectionSeed,
-}
-
-impl PreparedMvCreate {
-    pub fn new(target: MvTarget, projection_seed: MvCreateProjectionSeed) -> Self {
-        Self {
-            target,
-            projection_seed,
-        }
-    }
-}
-
 /// CREATE-only facts used to assemble canonical lake documents. This is not a
 /// StateStore command: durable projection is constructed only from a later
 /// exact lake observation.
@@ -541,57 +444,6 @@ pub struct MvCreateProjectionSeed {
     pub definition: CreateMvDefinitionRequest,
     pub refresh: InitialMvRefreshConfiguration,
     pub dependencies: Vec<CreateMvDependencyRequest>,
-}
-
-/// One staged, catalog-invisible CREATE target and the provider operation it
-/// belongs to. Publish and abort must name the same operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StagedMvTarget {
-    pub target: MvTarget,
-    pub staged_operation_id: Uuid,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreatedMvTarget {
-    pub target: MvTarget,
-    pub object_id: novarocks_spi::connector::ConnectorTableObjectId,
-}
-
-pub trait MvCreateProviderAdapter: Send + Sync {
-    fn prepare_create(
-        &self,
-        request: PrepareMvCreateRequest<'_>,
-    ) -> Result<PreparedMvCreate, MvCreateProviderError>;
-
-    /// Stage the target invisibly and freeze the provider's field bindings.
-    fn stage_target(
-        &self,
-        plan: &PreparedMvCreate,
-        operation_id: Uuid,
-    ) -> Result<StagedMvTarget, MvCreateProviderError>;
-
-    /// Publish the staged target with its canonical D/L/C in one commit.
-    fn publish_staged_target(
-        &self,
-        plan: &PreparedMvCreate,
-        staged: &StagedMvTarget,
-    ) -> Result<CreatedMvTarget, MvCreateProviderError>;
-
-    /// Discard a stage proven never to have been published.
-    fn abort_staged_target(
-        &self,
-        plan: &PreparedMvCreate,
-        staged: &StagedMvTarget,
-    ) -> Result<(), MvCreateProviderError>;
-
-    /// Install the Current projection from a fresh observation.
-    fn install_created_projection(
-        &self,
-        target: &CreatedMvTarget,
-        operation_id: Uuid,
-    ) -> Result<(), MvCreateProviderError>;
-
-    fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
 }
 
 #[cfg(test)]
@@ -612,25 +464,18 @@ mod compile_error_tests {
         let expected = analyze.to_string();
         let expected_analyze = analyze.clone();
         let application = MvApplicationError::from_compile(compile.clone());
-        let provider = MvCreateProviderError::from_compile(compile);
         assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
-        assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
         assert_eq!(
             application.unavailable_implementation(),
             Some(&expected_analyze)
         );
-        assert_eq!(
-            provider.unavailable_implementation(),
-            Some(&expected_analyze)
+        assert_eq!(application.message(), expected);
+        assert!(
+            !application
+                .message()
+                .starts_with("[sql.analyze.unavailable_implementation] ")
         );
-        for (message, control) in [
-            (application.message(), application.compile_control_error()),
-            (provider.message(), provider.compile_control_error()),
-        ] {
-            assert_eq!(message, expected);
-            assert!(!message.starts_with("[sql.analyze.unavailable_implementation] "));
-            assert_eq!(control, None);
-        }
+        assert_eq!(application.compile_control_error(), None);
     }
 
     #[test]
@@ -644,33 +489,27 @@ mod compile_error_tests {
             let fact = source.failure_fact();
             let compile = SqlCompileError::CompilationSource(source.clone());
             let application = MvApplicationError::from_compile(compile.clone());
-            let provider = MvCreateProviderError::from_compile(compile);
             assert_eq!(application.original_failure(), Some(&source));
             assert_eq!(
                 std::error::Error::source(&application)
                     .and_then(|cause| cause.downcast_ref::<SharedFailureCause>()),
                 Some(&source),
             );
-            for control in [
-                application.compile_control_error(),
-                provider.compile_control_error(),
-            ] {
-                let Some(CompileControlError::Source(carried)) = control else {
-                    panic!("keep the original compile source");
-                };
-                assert_eq!(
-                    carried, source,
-                    "SharedFailureCause equality is Arc identity"
-                );
-                assert_eq!(carried.failure_fact(), fact);
-                assert!(
-                    carried
-                        .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
-                        .is_some()
-                );
-            }
+            let Some(CompileControlError::Source(carried)) = application.compile_control_error()
+            else {
+                panic!("keep the original compile source");
+            };
+            assert_eq!(
+                carried, source,
+                "SharedFailureCause equality is Arc identity"
+            );
+            assert_eq!(carried.failure_fact(), fact);
+            assert!(
+                carried
+                    .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                    .is_some()
+            );
             assert_eq!(application.unavailable_implementation(), None);
-            assert_eq!(provider.unavailable_implementation(), None);
         }
     }
 
@@ -683,14 +522,10 @@ mod compile_error_tests {
         ] {
             let expected = compile.to_string();
             let application = MvApplicationError::from_compile(compile.clone());
-            let provider = MvCreateProviderError::from_compile(compile);
             assert_eq!(application.message(), expected);
             assert_eq!(application.original_failure(), None);
-            assert_eq!(provider.message(), expected);
             assert_eq!(application.compile_control_error(), None);
             assert_eq!(application.unavailable_implementation(), None);
-            assert_eq!(provider.unavailable_implementation(), None);
-            assert_eq!(provider.compile_control_error(), None);
         }
     }
 
@@ -707,16 +542,11 @@ mod compile_error_tests {
             ] {
                 let expected = compile.to_string();
                 let application = MvApplicationError::from_compile(compile.clone());
-                let provider = MvCreateProviderError::from_compile(compile);
                 assert_eq!(application.message(), expected);
                 assert_eq!(application.original_failure(), None);
-                assert_eq!(provider.message(), expected);
                 assert_eq!(application.compile_control_error(), Some(control.clone()));
-                assert_eq!(provider.compile_control_error(), Some(control.clone()));
                 assert_eq!(application.unavailable_implementation(), None);
-                assert_eq!(provider.unavailable_implementation(), None);
                 assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
-                assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
             }
         }
     }

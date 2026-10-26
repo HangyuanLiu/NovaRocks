@@ -30,7 +30,6 @@ use novarocks_spi::connector::{
 
 type DmlError = crate::dml::error::DmlExecutionError;
 type Target = crate::catalog_application::resolver::TargetBackend;
-type LayoutError = novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 
 /// Pure provider-signed preparation of the exact admitted UPDATE or MERGE.
 /// COW has not begun a write; its matching computation must run first.
@@ -109,14 +108,7 @@ pub(crate) async fn prepare_mutation_facts_async(
     .map_err(Into::into)
 }
 
-fn arc_layout<T>() -> Result<std::alloc::Layout, LayoutError> {
-    novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<T>())
-}
-
 impl PreparedMutationFacts {
-    pub(crate) fn source_layout() -> Result<std::alloc::Layout, LayoutError> {
-        arc_layout::<Self>()
-    }
     pub(crate) fn target(&self) -> &Target {
         match self {
             Self::Update(p) => &p.target,
@@ -370,9 +362,6 @@ pub(crate) struct PreparedMorMutationWrite {
     bindings: Arc<QueryTableBindingStore>,
 }
 impl PreparedMorMutationWrite {
-    pub(crate) fn source_layout() -> Result<std::alloc::Layout, LayoutError> {
-        arc_layout::<Self>()
-    }
     pub(crate) fn write_session(&self) -> Arc<ConnectorWriteSession> {
         Arc::clone(&self.session)
     }
@@ -513,9 +502,6 @@ pub(crate) struct PreparedCowSelection {
     bindings: Arc<QueryTableBindingStore>,
 }
 impl PreparedCowSelection {
-    pub(crate) fn source_layout() -> Result<std::alloc::Layout, LayoutError> {
-        arc_layout::<Self>()
-    }
     pub(crate) async fn compile_async(
         &self,
         provider: &FrontendCompletionCustody,
@@ -601,9 +587,6 @@ pub(crate) struct PreparedCowMatchAssembly {
     seed: crate::query_execution::internal_consumer::decoded::CowMatchComputationSeed,
 }
 impl PreparedCowMatchAssembly {
-    pub(crate) fn source_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Self>()
-    }
     pub(crate) fn prepare_computation(
         self,
         initial: crate::query_execution::logical_execution::InitialComputationReservation,
@@ -636,9 +619,6 @@ pub(crate) struct PreparedCowMutationWrite {
     write: CowUpdateDistributedWrite,
 }
 impl PreparedCowMutationWrite {
-    pub(crate) fn source_layout() -> Result<std::alloc::Layout, LayoutError> {
-        arc_layout::<Self>()
-    }
     pub(crate) fn target_count(&self) -> usize {
         self.write.targets.len()
     }

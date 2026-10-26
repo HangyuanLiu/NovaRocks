@@ -25,8 +25,8 @@ use crate::activity::{
     MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
 use crate::ports::{
-    MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
-    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvRefreshExecutionPort,
+    MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure,
+    MvRefreshExecutionPort,
 };
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
@@ -322,29 +322,6 @@ impl MvProductOperations {
         catalog_registration: &dyn MvCreateCatalogRegistrationPort,
     ) -> Result<MvProductResult, MvProductError> {
         create_progress::create_immediate(self, operation, create, provider, catalog_registration)
-    }
-
-    /// Execute the product-owned DROP state machine. The projection port
-    /// supplies only exact durable facts; provider and catalog ports carry the
-    /// outer effects without owning their order or terminal interpretation.
-    pub fn drop<G>(
-        &self,
-        operation: MvOperationContext,
-        target: MvTarget,
-        if_exists: bool,
-        projection: &dyn MvDropProjectionPort<G>,
-        provider: &dyn MvDropProviderPort,
-        catalog_registration: &dyn MvDropCatalogRegistrationPort,
-    ) -> Result<MvProductResult, MvProductError> {
-        drop_progress::drop_immediate(
-            self,
-            operation,
-            target,
-            if_exists,
-            projection,
-            provider,
-            catalog_registration,
-        )
     }
 
     pub fn acquire_foreground(

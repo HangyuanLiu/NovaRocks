@@ -476,7 +476,7 @@ async fn progress_wait_prioritizes_ready_control_work() {
 }
 
 #[test]
-fn invalid_and_excessive_configuration_is_rejected() {
+fn configuration_rejects_invalid_bounds_without_an_extra_queue_limit() {
     let mut invalid = config();
     invalid.root_limit = 0;
     assert!(matches!(
@@ -486,9 +486,13 @@ fn invalid_and_excessive_configuration_is_rejected() {
     let mut invalid = config();
     invalid.scope_records_limit = 7;
     assert!(invalid.validate().is_err());
-    let mut invalid = config();
-    invalid.waiting_limit = usize::MAX;
-    assert!(invalid.validate().is_err());
+    // Entries are allocated as they arrive; this configured queue limit does
+    // not imply preallocation or another policy ceiling.
+    for waiting_limit in [1_000_001, usize::MAX] {
+        let mut configured = config();
+        configured.waiting_limit = waiting_limit;
+        assert_eq!(configured.validate(), Ok(()));
+    }
     let mut invalid = config();
     invalid.waiting_bytes = u64::MAX;
     assert!(invalid.validate().is_err());

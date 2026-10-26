@@ -265,23 +265,6 @@ impl FrontendProviderReadFacts {
         source.control_binding.after_source_exit();
         Ok(())
     }
-    /// Pure known first-party header facts. Self already includes the private
-    /// body; its inline fields are not counted again as separate allocations.
-    pub(crate) fn known_source_layouts() -> Result<
-        [std::alloc::Layout; 4],
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    > {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        Ok([
-            arc_layout(std::alloc::Layout::new::<Self>())?,
-            arc_layout(std::alloc::Layout::new::<ProviderCreatorWake>())?,
-            novarocks_workload_control::joint_admission::JointProposalSlotWait::metadata_layouts()
-                .1,
-            // The child constructor keeps its own original fixed wait field;
-            // charge that named F backing as well as the binding wait above.
-            ConnectorBlockingIoAdmission::wait_backing_layout(),
-        ])
-    }
     #[cfg(test)]
     pub(crate) async fn fixture_worker_failure_is<T: std::any::Any>(&self) -> bool {
         self.source
@@ -989,9 +972,6 @@ impl ProviderReadCreatorInput {
         *target = self.result.take();
         Ok(())
     }
-    pub(crate) fn known_input_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Self>()
-    }
 }
 
 fn finish_prepared_read_borrowed(
@@ -1059,42 +1039,6 @@ fn finish_prepared_read_borrowed(
         opened,
         rejected_access,
     )
-}
-
-/// Legacy synchronous family author, retained only until every direct caller
-/// moves its physical observation before its pure preparation phase. The new
-/// async table path never invokes this as fallback.
-pub(crate) fn freeze_one_read(
-    need: &ProviderReadNeed,
-    control: &ConnectorControlHost,
-    bindings: &QueryTableBindingStore,
-    session: &ConnectorSession,
-    context: &ConnectorRequestContext,
-    deposits: &ReadAccessDeposit<FrozenProviderRead>,
-) -> Result<ProviderReadFact, String> {
-    freeze_one_read_typed(need, control, bindings, session, context, deposits)
-        .map_err(|error| error.to_string())
-}
-
-fn freeze_one_read_typed(
-    need: &ProviderReadNeed,
-    control: &ConnectorControlHost,
-    bindings: &QueryTableBindingStore,
-    session: &ConnectorSession,
-    context: &ConnectorRequestContext,
-    deposits: &ReadAccessDeposit<FrozenProviderRead>,
-) -> Result<ProviderReadFact, ProviderReadError> {
-    let opening = prepare_read_opening(need, control, bindings, context)?;
-    let metadata = opening.request_control.metadata();
-    let opened = open_relation(
-        metadata.as_ref(),
-        session,
-        &opening.table,
-        need.relation(),
-        &opening.admitted,
-        &opening.name,
-    )?;
-    finish_read_from_opened(need, session, context, deposits, &opening, opened, None)
 }
 
 fn finish_read_from_opened(

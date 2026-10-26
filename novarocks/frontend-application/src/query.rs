@@ -81,8 +81,8 @@ use novarocks_query_application::session_control::{
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::session_outcome::{
     cancellation_error, cancellation_requires_statement_fence, governed_cancellation_error,
-    governed_execution_error, governed_query_deadline, governed_query_execution_error,
-    governed_statement_begin_error, scalar_query_error,
+    governed_query_deadline, governed_query_execution_error, governed_statement_begin_error,
+    scalar_query_error,
 };
 use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
@@ -127,10 +127,6 @@ mod statement_action;
 pub(crate) mod statement_computation;
 pub(crate) mod statement_publication;
 pub(crate) mod write_action;
-pub(crate) use explain_action::{
-    ExplainStatementGeometry, statement_action_geometry as explain_statement_geometry,
-};
-pub(crate) use maintenance_action::fixed_source_bytes as metadata_statement_fixed_source_bytes;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -887,11 +883,6 @@ impl SpecializedStatementRoute for TypedCommandRoute {
 
 enum RoutedExecutionError {
     Application(QueryServiceError),
-    FailureCause {
-        cause: novarocks_failure_contract::SharedFailureCause,
-        external_effect_disposition:
-            Option<novarocks_query_application::api::StatementExternalEffectDisposition>,
-    },
     Execution {
         input: Box<novarocks_query_application::execution_error::ExecutionFailureInput>,
         terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
@@ -1013,17 +1004,6 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
 fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceError {
     match error {
         RoutedExecutionError::Application(error) => error,
-        RoutedExecutionError::FailureCause {
-            cause,
-            external_effect_disposition,
-        } => {
-            let service = QueryServiceError::from_failure_cause(cause);
-            if let Some(disposition) = external_effect_disposition {
-                service.attach_external_effect_disposition(disposition)
-            } else {
-                service
-            }
-        }
         RoutedExecutionError::Execution {
             input,
             terminal,
@@ -1075,9 +1055,7 @@ fn selected_execution_or_worker_fallback(
 ) -> QueryServiceError {
     match result {
         Err(
-            error @ (RoutedExecutionError::Application(_)
-            | RoutedExecutionError::Execution { .. }
-            | RoutedExecutionError::FailureCause { .. }),
+            error @ (RoutedExecutionError::Application(_) | RoutedExecutionError::Execution { .. }),
         ) => routed_execution_service_error(error),
         Err(RoutedExecutionError::ExternalEffect {
             disposition,
@@ -1214,10 +1192,14 @@ pub(crate) fn product_command_service_error(error: CommandError) -> QueryService
 fn product_command_error(error: CommandError) -> RoutedExecutionError {
     let disposition = error.external_effect_disposition();
     if let Some(cause) = error.failure_cause() {
-        return RoutedExecutionError::FailureCause {
-            cause: cause.clone(),
-            external_effect_disposition: disposition,
-        };
+        // A selected cause and compiler control are independent facts. Keep
+        // both in the complete service error across routing and late fallback.
+        let mut service = QueryServiceError::from_failure_cause(cause.clone())
+            .with_compile_control(error.compile_control_error());
+        if let Some(disposition) = disposition {
+            service = service.attach_external_effect_disposition(disposition);
+        }
+        return RoutedExecutionError::Application(service);
     }
     let control = error.compile_control_error();
     if let Some(original) = error.user_error() {
@@ -2086,7 +2068,7 @@ impl FrontendQuerySession {
             governed_query_deadline(&state)?
         };
         let token = self.token()?;
-        let mut statement = self
+        let statement = self
             .service
             .query_control
             .begin_queued_governed_query_statement_with_result(
@@ -3611,7 +3593,6 @@ mod tests {
     }
 
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::{array::StringArray, datatypes::DataType};
     use novarocks_query_application::api::{BackendTopologySnapshot, ResultField};
@@ -3620,7 +3601,6 @@ mod tests {
     use novarocks_query_application::test_support::{
         ResultStreamTestProducer, TestResultDeliveryDisposition,
     };
-    use novarocks_types::schema::ColumnDef;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
     use novarocks_workload_control::{
         CancellationReason as WorkCancellationReason, ResourceConfig,
@@ -5476,23 +5456,31 @@ mod maintenance_failure_cause_tests {
             StatementExternalEffectDisposition::CommitUnknown,
             StatementExternalEffectDisposition::KnownCommitted,
         ] {
-            let command = CommandError::from_failure_cause(cause.clone())
-                .with_external_effect_disposition(Some(disposition));
-            let service = selected_execution_or_worker_fallback(
-                Err(product_command_error(command)),
-                internal_error("late observer failure"),
-            );
-            assert_eq!(service.failure_cause(), Some(&cause));
-            assert_eq!(service.execution_failure().unwrap().fact(), fact);
-            assert_eq!(service.external_effect_disposition(), Some(disposition));
-            assert!(service.publication_terminal().is_none());
-            assert!(service.compile_control_error().is_none());
-            assert!(!service.message().contains("maintenance publication"));
-            assert!(!service.message().contains("lake publication"));
-            assert_eq!(
-                service.message().contains("do not retry statement"),
-                disposition.do_not_retry()
-            );
+            for control in [
+                None,
+                Some(CompileControlError::Cancelled),
+                Some(CompileControlError::DeadlineExceeded),
+                Some(CompileControlError::ResourceExhausted),
+            ] {
+                let command = CommandError::from_failure_cause(cause.clone())
+                    .with_compile_control(control.clone())
+                    .with_external_effect_disposition(Some(disposition));
+                let service = selected_execution_or_worker_fallback(
+                    Err(product_command_error(command)),
+                    internal_error("late observer failure"),
+                );
+                assert_eq!(service.failure_cause(), Some(&cause));
+                assert_eq!(service.execution_failure().unwrap().fact(), fact);
+                assert_eq!(service.external_effect_disposition(), Some(disposition));
+                assert!(service.publication_terminal().is_none());
+                assert_eq!(service.compile_control_error(), control);
+                assert!(!service.message().contains("maintenance publication"));
+                assert!(!service.message().contains("lake publication"));
+                assert_eq!(
+                    service.message().contains("do not retry statement"),
+                    disposition.do_not_retry()
+                );
+            }
         }
     }
 

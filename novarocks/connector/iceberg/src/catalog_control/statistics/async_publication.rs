@@ -45,6 +45,10 @@ pub(super) struct StatisticsPublicationSource {
     publisher: Arc<dyn Publisher>,
     journal: PublicationJournal<StatisticsReceipt>,
     policy: RetryPolicy,
+    progress: Box<StatisticsPublicationProgress>,
+}
+
+struct StatisticsPublicationProgress {
     started: bool,
     ready: Option<StatisticsPublicationReady>,
     close: Option<StatisticsPublicationClose>,
@@ -180,24 +184,26 @@ impl StatisticsPublicationSource {
             publisher,
             journal,
             policy,
-            started: false,
-            ready: None,
-            close: None,
+            progress: Box::new(StatisticsPublicationProgress {
+                started: false,
+                ready: None,
+                close: None,
+            }),
         }
     }
 
     pub(super) async fn finish(&mut self) -> Result<StatisticsPublicationReady, ConnectorError> {
-        if let Some(ready) = &self.ready {
+        if let Some(ready) = &self.progress.ready {
             return Ok(ready.clone());
         }
-        if self.started {
+        if self.progress.started {
             return Err(invalid(
                 "Statistics publication already started; observe/close its original journal",
             ));
         }
         // This original source, not the local future, records the single start.
         // Dropping a borrowing future cannot permit another publication run.
-        self.started = true;
+        self.progress.started = true;
         let report = attempt::run_to_committed_frontier(
             &self.operation,
             &self.intent,
@@ -221,7 +227,7 @@ impl StatisticsPublicationSource {
                 StatisticsPublicationReady::Settled(outcome)
             }
         };
-        self.ready = Some(ready.clone());
+        self.progress.ready = Some(ready.clone());
         Ok(ready)
     }
 
@@ -230,16 +236,21 @@ impl StatisticsPublicationSource {
         current: &ConnectorRequestContext,
     ) -> Result<StatisticsPublicationClose, ConnectorError> {
         same_original_io(self.operation.request_context(), current)?;
-        if let Some(StatisticsPublicationClose::RetainedUnknown { .. }) = &self.close {
-            return Ok(self.close.as_ref().expect("observed close").clone());
+        if let Some(StatisticsPublicationClose::RetainedUnknown { .. }) = &self.progress.close {
+            return Ok(self
+                .progress
+                .close
+                .as_ref()
+                .expect("observed close")
+                .clone());
         }
         if self.journal.cleanup_inventory_is_disposed()
-            && let Some(close) = &self.close
+            && let Some(close) = &self.progress.close
         {
             return Ok(close.clone());
         }
         let mut uncommitted_disposed = false;
-        let outcome = match &self.ready {
+        let outcome = match &self.progress.ready {
             Some(StatisticsPublicationReady::Committed { .. })
             | Some(StatisticsPublicationReady::Settled(
                 ExternalMutationOutcome::KnownCommitted { .. },
@@ -293,7 +304,7 @@ impl StatisticsPublicationSource {
                 // borrow is possible. The original journal decides whether it
                 // never dispatched, committed, or retained Unknown. This is
                 // recovery observation only, never another publication run.
-                self.started = true;
+                self.progress.started = true;
                 self.journal
                     .recover_bridge_in(
                         &self.operation,
@@ -323,10 +334,10 @@ impl StatisticsPublicationSource {
                 }
             }
         };
-        self.close = Some(close.clone());
+        self.progress.close = Some(close.clone());
         // Closing an unlaunched/interrupted source also closes the start gate.
-        if self.ready.is_none() {
-            self.ready = Some(match &close {
+        if self.progress.ready.is_none() {
+            self.progress.ready = Some(match &close {
                 StatisticsPublicationClose::Observed { outcome, .. } => {
                     StatisticsPublicationReady::Settled(outcome.clone())
                 }
@@ -351,7 +362,8 @@ pub(super) fn geometry(
     let arc = std::mem::size_of::<[usize; 2]>();
     let io = OperationLimits::default().io_requests as usize;
     let headers = std::mem::size_of::<IcebergStatisticsCollectionSession>()
-        .checked_add(ConnectorStatisticsLease::session_backing_bytes())
+        .checked_add(std::mem::size_of::<StatisticsPublicationProgress>())
+        .and_then(|n| n.checked_add(ConnectorStatisticsLease::session_backing_bytes()))
         .and_then(|n| n.checked_add(std::mem::size_of::<StatisticsDraftPreparer>() + arc))
         .and_then(|n| n.checked_add(std::mem::size_of::<CatalogPublisher>() + arc))
         .and_then(|n| {

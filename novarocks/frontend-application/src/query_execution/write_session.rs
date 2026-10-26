@@ -189,27 +189,6 @@ struct AccumulatedWriteSet {
 }
 
 impl ConnectorWriteSession {
-    /// Fixed allocations of the original receiving session. Variable target,
-    /// schema and artifact payloads retain their separate original invoices.
-    pub(crate) fn fixed_receiving_layouts() -> Result<
-        [std::alloc::Layout; 4],
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    > {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        use std::alloc::Layout;
-        Ok([
-            arc_layout(Layout::new::<Self>())?,
-            arc_layout(Layout::new::<ReceivedWriteInput>())?,
-            arc_layout(Layout::new::<()>())?,
-            arc_layout(Layout::new::<
-                std::collections::BTreeSet<(
-                    WriteTargetOrdinal,
-                    novarocks_spi::connector::StatisticsArtifactIdentity,
-                )>,
-            >())?,
-        ])
-    }
-
     /// Admit the write and freeze its recipes. On return either a session
     /// exists and nothing external has happened yet, or an error was raised and
     /// nothing was started.

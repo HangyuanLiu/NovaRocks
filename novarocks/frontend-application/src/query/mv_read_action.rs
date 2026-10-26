@@ -523,16 +523,16 @@ impl State {
             })
     }
     fn progress(&mut self, cx: &mut Context<'_>) {
-        if let Some(store) = &self.store {
-            if let Err(error) = store.poll_progress(cx) {
-                self.refusal
-                    .get_or_insert_with(|| QueryServiceError::from_failure_cause(error));
-            }
+        if let Some(store) = &self.store
+            && let Err(error) = store.poll_progress(cx)
+        {
+            self.refusal
+                .get_or_insert_with(|| QueryServiceError::from_failure_cause(error));
         }
-        if let Some(io) = &self.io {
-            if let Err(error) = io.poll_continuing(cx) {
-                self.ordinary_io.get_or_insert(error);
-            }
+        if let Some(io) = &self.io
+            && let Err(error) = io.poll_continuing(cx)
+        {
+            self.ordinary_io.get_or_insert(error);
         }
     }
     fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -908,15 +908,14 @@ impl State {
         if let Some(store) = self.store.as_mut() {
             std::task::ready!(store.poll_closed(cx)).map_err(store_health)?;
         }
-        if let Some(io) = &self.io {
-            if io
+        if let Some(io) = &self.io
+            && io
                 .withdraw_unstarted_in()
                 .map_err(|error| health(Arc::new(error)))?
                 .is_none()
-            {
-                let _ = io.poll_continuing(cx);
-                std::task::ready!(io.poll_actual_quiescent_continuing(cx))?;
-            }
+        {
+            let _ = io.poll_continuing(cx);
+            std::task::ready!(io.poll_actual_quiescent_continuing(cx))?;
         }
         self.closed = true;
         Poll::Ready(Ok(()))

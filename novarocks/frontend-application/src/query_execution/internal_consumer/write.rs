@@ -200,7 +200,7 @@ pub(crate) struct ReadyWriteComputation {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) accepted: AcceptedWriteSegment,
     pub(crate) session: Arc<ConnectorWriteSession>,
-    pub(crate) credentials: Arc<AttemptCredentialStorage>,
+    pub(crate) _credentials: Arc<AttemptCredentialStorage>,
     // The actual statement/result holder retains the initial weak entry point.
     _initial: Arc<InitialComputationCredentials>,
 }
@@ -217,7 +217,7 @@ impl WriteComputationOutput {
             ready: token,
             accepted: staged.accepted,
             session: Arc::clone(&self.holder.session),
-            credentials: staged.credentials,
+            _credentials: staged.credentials,
             _initial: Arc::clone(&self.holder.initial),
         })
     }

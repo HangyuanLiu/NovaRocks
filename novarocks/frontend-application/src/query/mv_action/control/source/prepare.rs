@@ -74,8 +74,8 @@ impl ControlSource {
                 }
                 _ => {
                     return Err(invalid(format!(
-                        "materialized view does not exist: {}",
-                        format!("{:?}", self.target)
+                        "materialized view does not exist: {:?}",
+                        self.target
                     )));
                 }
             }

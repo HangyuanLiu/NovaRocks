@@ -28,7 +28,7 @@ use crate::query_execution::{
     internal_consumer::write::ReadyWriteComputation,
     logical_execution::InitialComputationReservation,
     maintenance::io_admission::MetadataIoAdmission,
-    write_session::{ConnectorWriteSession, WriteBeginReceiving, WritePublicationCall},
+    write_session::{ConnectorWriteSession, WriteBeginReceiving},
 };
 use novarocks_query_application::{
     api::StatementNativeHealthFailure,
@@ -329,14 +329,14 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
                 )),
             }
         }
-        if self.prepared.is_some()
+        if let Some(prepared) = self.prepared.as_ref()
             && self.assembly.is_none()
             && self.compilation.is_none()
             && !self.provider_closed
             && self.selected.is_none()
         {
             self.compilation = Some(Box::pin(P::compile(
-                Arc::clone(self.prepared.as_ref().unwrap()),
+                Arc::clone(prepared),
                 Arc::clone(&self.provider),
                 self.query_options.clone(),
             )));
@@ -403,10 +403,11 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
         }
         // Only this original session's Call crosses the publication frontier.
         // Its business result and later physical retirement remain separate.
-        if self.publication.as_ref().unwrap().call.is_none() && self.selected.is_none() {
-            if let Some(reason) = cancellation.reason() {
-                self.fail(cancellation_error(reason));
-            }
+        if self.publication.as_ref().unwrap().call.is_none()
+            && self.selected.is_none()
+            && let Some(reason) = cancellation.reason()
+        {
+            self.fail(cancellation_error(reason));
         }
         let session = self.session();
         let abort = self.selected.is_some();
@@ -664,13 +665,13 @@ impl GovernedStatementResidual for WriteCleanupResidual {
                 return Poll::Ready(Err(health));
             }
         }
-        if let Some(tail) = self.native_tail.as_mut() {
-            if tail.poll_exit(cx).is_pending() {
-                if let Some(health) = tail.local_health_failure() {
-                    return Poll::Ready(Err(health));
-                }
-                pending = true;
+        if let Some(tail) = self.native_tail.as_mut()
+            && tail.poll_exit(cx).is_pending()
+        {
+            if let Some(health) = tail.local_health_failure() {
+                return Poll::Ready(Err(health));
             }
+            pending = true;
         }
         if pending {
             return Poll::Pending;

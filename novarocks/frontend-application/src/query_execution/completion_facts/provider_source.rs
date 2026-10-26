@@ -200,36 +200,6 @@ impl FrontendCompletionCustody {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).joined = true;
         Ok(())
     }
-    pub(crate) fn known_layouts() -> Result<
-        [std::alloc::Layout; 10],
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    > {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        let provider = FrontendProviderReadFacts::known_source_layouts()?;
-        // Same pinned target model as the original QA Source author. The
-        // mutex pointee is additional to the inline Mutex stored in Self.
-        let mutex_backing = if cfg!(all(target_os = "macos", target_pointer_width = "64")) {
-            std::alloc::Layout::new::<(isize, [u8; 56])>()
-        } else if cfg!(target_os = "linux") {
-            std::alloc::Layout::new::<()>()
-        } else {
-            return Err(
-                novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
-            );
-        };
-        Ok([
-            arc_layout(std::alloc::Layout::new::<Self>())?,
-            arc_layout(std::alloc::Layout::new::<Facts>())?,
-            provider[0],
-            provider[1],
-            provider[2],
-            provider[3],
-            arc_layout(std::alloc::Layout::new::<FrontendCatalogFacts>())?,
-            arc_layout(std::alloc::Layout::new::<FrontendStatisticsFacts>())?,
-            arc_layout(std::alloc::Layout::new::<FrontendMaterializedViewFacts>())?,
-            mutex_backing,
-        ])
-    }
     #[cfg(test)]
     pub(crate) fn install_provider_for_test(&self, provider: Arc<FrontendProviderReadFacts>) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());

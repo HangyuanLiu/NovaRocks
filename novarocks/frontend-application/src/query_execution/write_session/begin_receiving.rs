@@ -303,24 +303,6 @@ impl WriteBeginReceiving {
             .load(Ordering::Acquire)
             .then(|| self.health.clone())
     }
-    pub(crate) fn known_layouts() -> Result<
-        [std::alloc::Layout; 2],
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    > {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        Ok([
-            arc_layout(std::alloc::Layout::new::<Self>())?,
-            arc_layout(std::alloc::Layout::new::<BeginExitUnproven>())?,
-        ])
-    }
-    /// COW uses the same fixed receiving allocation, including its inline
-    /// move-only checked plan/cause slots. No second error holder is allocated.
-    pub(crate) fn known_cow_layouts() -> Result<
-        [std::alloc::Layout; 2],
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    > {
-        Self::known_layouts()
-    }
     #[cfg(test)]
     pub(super) fn retains_cow_error(&self) -> bool {
         self.cow_plan

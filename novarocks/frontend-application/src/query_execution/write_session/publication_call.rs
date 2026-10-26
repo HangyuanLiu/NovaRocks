@@ -635,32 +635,6 @@ impl WritePublicationCall {
         self.drop_completed = false;
         Ok(())
     }
-
-    /// Exact requested layouts of this author only. This is not admission,
-    /// payment, an SDK heap estimate, or a platform mutex backing claim.
-    pub(crate) fn known_layouts() -> Result<
-        [std::alloc::Layout; 11],
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    > {
-        use novarocks_type_contract::owned_resources::layout::arc_layout;
-        fn returned<A, F>(_: fn(A) -> F) -> std::alloc::Layout {
-            std::alloc::Layout::new::<F>()
-        }
-        let [needed, ready] = ConnectorWriteNeededReadyReceiving::known_layouts()?;
-        Ok([
-            std::alloc::Layout::new::<Self>(),
-            needed,
-            ready,
-            arc_layout(std::alloc::Layout::new::<PublicationInput>())?,
-            arc_layout(std::alloc::Layout::new::<ReconciliationInput>())?,
-            arc_layout(std::alloc::Layout::new::<PublicationExitUnproven>())?,
-            arc_layout(std::alloc::Layout::new::<CallReceiving>())?,
-            arc_layout(std::alloc::Layout::new::<AbortInput>())?,
-            returned(abort_future),
-            returned(finish_future),
-            returned(reconcile_future),
-        ])
-    }
 }
 
 async fn finish_future(

@@ -17,7 +17,6 @@
 
 //! EXPLAIN runs in the original registered statement, not a second Work role.
 
-use super::statement_action::StatementReadyReceiver;
 use super::*;
 use crate::query::compiler::{PreparedAsyncExplain, PreparedAsyncProfile};
 use crate::query_execution::logical_execution::OriginalComputationStart;
@@ -397,30 +396,6 @@ impl FrontendQuerySession {
         });
         self.execute_observed_statement_action(statement, action)
             .await
-    }
-}
-
-/// Pure layout facts from the same concrete factories used above. Variable
-/// AST/plan/SQL/provider backing and the shared statement source are separate.
-pub(crate) struct ExplainStatementGeometry {
-    pub(crate) action: std::alloc::Layout,
-    pub(crate) preparation: std::alloc::Layout,
-    pub(crate) diagnostics: std::alloc::Layout,
-    pub(crate) receiver: std::alloc::Layout,
-    pub(crate) provider_custody: [std::alloc::Layout; 10],
-}
-pub(crate) fn statement_action_geometry() -> ExplainStatementGeometry {
-    fn future_layout<I, F: Future>(_: impl Fn(I) -> F) -> std::alloc::Layout {
-        std::alloc::Layout::new::<F>()
-    }
-    ExplainStatementGeometry {
-        action: std::alloc::Layout::new::<ExplainStatementAction>(),
-        preparation: future_layout(make_explain_preparation),
-        diagnostics: future_layout(make_profile_diagnostics),
-        receiver: std::alloc::Layout::new::<StatementReadyReceiver>(),
-        provider_custody:
-            crate::query_execution::completion_facts::FrontendCompletionCustody::known_layouts()
-                .expect("supported fixed completion Source layouts"),
     }
 }
 

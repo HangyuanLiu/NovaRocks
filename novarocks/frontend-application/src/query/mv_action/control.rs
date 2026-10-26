@@ -154,15 +154,15 @@ impl MvControlStepOriginal {
         mut result: Result<(), MvPhaseFailure>,
     ) -> Poll<Result<(), MvPhaseFailure>> {
         if let Some(source) = &self.source {
-            if let Err(error) = source.finish_management() {
-                if result.is_ok() {
-                    result = Err(super::step::product_failure(error.into_product_error()));
-                }
+            if let Err(error) = source.finish_management()
+                && result.is_ok()
+            {
+                result = Err(super::step::product_failure(error.into_product_error()));
             }
-            if result.is_ok() {
-                if let Some(error) = source.finalization_failure() {
-                    result = Err(super::step::product_failure(error.into_product_error()));
-                }
+            if result.is_ok()
+                && let Some(error) = source.finalization_failure()
+            {
+                result = Err(super::step::product_failure(error.into_product_error()));
             }
             source.release_activity();
         }

@@ -147,13 +147,6 @@ pub enum RefreshErrorKind {
     PreCommitFailed,
 }
 
-#[cfg(test)]
-impl RefreshErrorKind {
-    pub fn should_rollback_after_commit(self) -> bool {
-        matches!(self, Self::UserError | Self::PreCommitFailed)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshError {
     pub kind: RefreshErrorKind,

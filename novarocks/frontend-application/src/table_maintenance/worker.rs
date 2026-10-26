@@ -678,47 +678,7 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
     }
 }
 
-#[cfg(test)]
-mod rewrite_compile_projection_tests {
-    use super::*;
-    #[test]
-    fn rewrite_preparation_keeps_original_source_and_control_without_text_guessing() {
-        use novarocks_sql::compiler::SqlCompileError;
-        use novarocks_type_contract::CompileControlError;
-        let source = novarocks_failure_contract::SharedFailureCause::new(
-            novarocks_local_compiler::FragmentCompileError::Unsupported {
-                node: None,
-                feature: "provider relation other than a table",
-            },
-        );
-        let error = rewrite_compile_terminal(SqlCompileError::CompilationSource(source.clone()));
-        assert_eq!(
-            error.compile_control,
-            Some(CompileControlError::Source(source.clone()))
-        );
-        assert_eq!(error.execution_failure, None);
-        let plain = rewrite_compile_terminal(SqlCompileError::Compilation(source.to_string()));
-        assert_eq!(plain.compile_control, None);
-        for (compile, expected) in [
-            (SqlCompileError::Cancelled, CompileControlError::Cancelled),
-            (
-                SqlCompileError::DeadlineExceeded,
-                CompileControlError::DeadlineExceeded,
-            ),
-            (
-                SqlCompileError::ResourceExhausted,
-                CompileControlError::ResourceExhausted,
-            ),
-        ] {
-            assert_eq!(
-                rewrite_compile_terminal(compile).compile_control,
-                Some(expected)
-            );
-        }
-    }
-}
-
-async fn original_job_run_original_job<'a>(
+async fn original_job_run_original_job(
     this: Box<FrontendOptimizeJobExecution>,
     jobs: Arc<novarocks_table_maintenance::OptimizeProcessRuntime>,
     originals: OptimizeJobOriginals,
@@ -727,8 +687,8 @@ async fn original_job_run_original_job<'a>(
     crate::query_execution::maintenance::rewrite_job::mount_original(this, jobs, originals, job)
         .await
 }
-async fn original_job_original_effect<'a>(
-    this: &'a FrontendOptimizeJobExecution,
+async fn original_job_original_effect(
+    this: &FrontendOptimizeJobExecution,
 ) -> Option<novarocks_coordination_contract::ExecutionEffect> {
     crate::query_execution::maintenance::rewrite_job::actual_original_effect(this.mounted.as_ref()?)
         .await
@@ -802,4 +762,44 @@ async fn original_job_execute_automatic<'a>(
             effect_id,
         )
         .await
+}
+
+#[cfg(test)]
+mod rewrite_compile_projection_tests {
+    use super::*;
+    #[test]
+    fn rewrite_preparation_keeps_original_source_and_control_without_text_guessing() {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        let source = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_local_compiler::FragmentCompileError::Unsupported {
+                node: None,
+                feature: "provider relation other than a table",
+            },
+        );
+        let error = rewrite_compile_terminal(SqlCompileError::CompilationSource(source.clone()));
+        assert_eq!(
+            error.compile_control,
+            Some(CompileControlError::Source(source.clone()))
+        );
+        assert_eq!(error.execution_failure, None);
+        let plain = rewrite_compile_terminal(SqlCompileError::Compilation(source.to_string()));
+        assert_eq!(plain.compile_control, None);
+        for (compile, expected) in [
+            (SqlCompileError::Cancelled, CompileControlError::Cancelled),
+            (
+                SqlCompileError::DeadlineExceeded,
+                CompileControlError::DeadlineExceeded,
+            ),
+            (
+                SqlCompileError::ResourceExhausted,
+                CompileControlError::ResourceExhausted,
+            ),
+        ] {
+            assert_eq!(
+                rewrite_compile_terminal(compile).compile_control,
+                Some(expected)
+            );
+        }
+    }
 }

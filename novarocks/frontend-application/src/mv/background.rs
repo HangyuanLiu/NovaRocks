@@ -20,50 +20,6 @@
 use std::sync::Arc;
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
-use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefresh;
-use novarocks_mv_application::maintenance::{MvBackgroundEngineError, MvMaintenanceFacts};
-use novarocks_mv_application::product::MvRefreshAttemptIdentity;
-use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-use novarocks_table_maintenance::MaintenanceTarget;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvRefreshStep {
-    pub(crate) mv_id: i64,
-    pub(crate) target: MvTarget,
-}
-
-/// Side-effect-free discovery and preparation capability consumed by
-/// frontend-owned MV background workers.
-#[async_trait::async_trait]
-pub(crate) trait MvBackgroundEngine: Send + Sync {
-    fn resolve_refresh_steps(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Vec<MvRefreshStep>, MvBackgroundEngineError>;
-
-    fn prepare_refresh_step(
-        &self,
-        step: &MvRefreshStep,
-        attempt: MvRefreshAttemptIdentity,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<PreparedMvRefresh, MvBackgroundEngineError>;
-
-    fn current_source_inputs(
-        &self,
-        occurrences: &[novarocks_mv_application::persistence::codec::RelationOccurrence],
-    ) -> Result<
-        Vec<novarocks_mv_application::persistence::codec::PublicationInput>,
-        MvBackgroundEngineError,
-    >;
-
-    async fn maintenance_facts(
-        &self,
-        pending: &mut Option<crate::mv::domain::maintenance::stats::MaintenanceFactsState>,
-        target: &MaintenanceTarget,
-    ) -> Result<MvMaintenanceFacts, MvBackgroundEngineError>;
-}
-
 /// Bound only after Core has restored catalogs, performed MV recovery, bound
 /// providers and started table-maintenance recovery. The frontend starts and
 /// owns worker threads after it receives this value.
@@ -71,6 +27,5 @@ pub(crate) trait MvBackgroundEngine: Send + Sync {
 pub(crate) struct MvBackgroundBindings {
     pub(crate) ports: crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
     pub(crate) execution: crate::query::mv_action::MvExecutionServices,
-    pub(crate) engine: Arc<dyn MvBackgroundEngine>,
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 }

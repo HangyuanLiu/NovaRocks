@@ -18,7 +18,7 @@
 use crate::mv::domain::dependency::graph::topological_upstream_order_for_edges;
 use crate::mv::domain::dependency_resolver::classify_ready_dependency_occurrences;
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::readiness::{MvReadinessExecution, MvReadinessPort};
+use crate::mv::domain::readiness::MvReadinessExecution;
 use novarocks_mv_application::dependency::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -88,58 +88,6 @@ pub(crate) fn refresh_step_for_dependency_object(
         },
         storage_engine,
     })
-}
-
-/// Resolves the required upstream MV refresh order from accelerator dependency
-/// edges. The caller owns refresh admission; Core returns only domain steps.
-pub(crate) fn build_upstream_refresh_steps_with_readiness(
-    readiness: &MvReadinessPort,
-    requested: &MvDependencyObjectRef,
-) -> Result<Vec<MvRefreshDependencyStep>, String> {
-    let projections = readiness
-        .list_ready_projections()
-        .map_err(|e| format!("load MV projections for refresh graph failed: {e}"))?;
-
-    let inventory = projections
-        .iter()
-        .map(|loaded| &loaded.projection)
-        .collect::<Vec<_>>();
-    let mut edges = Vec::new();
-    for loaded in &projections {
-        let dependencies = readiness
-            .list_ready_dependencies_by_downstream(loaded)
-            .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?;
-        edges.push(refresh_edge_for_projection(
-            loaded,
-            dependencies,
-            &inventory,
-        )?);
-    }
-    refresh_steps_for_edges(requested, &edges)
-}
-
-/// Read the dependency graph through the caller's selected original requests.
-/// The outer statement retains and progresses its StateStore owner around polls.
-pub(crate) async fn build_upstream_refresh_steps_with_readiness_async(
-    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
-    requested: &MvDependencyObjectRef,
-) -> Result<Vec<MvRefreshDependencyStep>, novarocks_mv_application::repository::MvRepositoryError> {
-    use novarocks_mv_application::repository::{MvRepositoryError, MvRepositoryErrorKind};
-    let invalid = |message| MvRepositoryError::new(MvRepositoryErrorKind::InvalidRequest, message);
-    let projections = readiness.list_ready_projections().await?;
-    let inventory = projections
-        .iter()
-        .map(|loaded| &loaded.projection)
-        .collect::<Vec<_>>();
-    let mut edges = Vec::new();
-    for loaded in &projections {
-        let dependencies = readiness
-            .list_ready_dependencies_by_downstream(loaded)
-            .await?;
-        edges
-            .push(refresh_edge_for_projection(loaded, dependencies, &inventory).map_err(&invalid)?);
-    }
-    refresh_steps_for_edges(requested, &edges).map_err(invalid)
 }
 
 /// Raw observations returned by the named I/O gate. Classification and graph

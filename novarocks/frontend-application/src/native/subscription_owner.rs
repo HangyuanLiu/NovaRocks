@@ -639,22 +639,6 @@ impl NativeSubscriptionPort {
         Ok(state.records.len())
     }
 
-    pub(crate) fn capacity_sources(
-        &self,
-    ) -> Result<(usize, usize), novarocks_workload_control::WorkError> {
-        let records = self
-            .core
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .records
-            .len();
-        Ok((
-            records,
-            NativeSubscriptionOwner::resident_storage_bytes(records)?,
-        ))
-    }
-
     /// Reserve only this original finite header and parent facts. The one
     /// original service queues/polls the child outside Core and caller locks.
     /// No SDK request, watch, state or future is constructed by this operation.

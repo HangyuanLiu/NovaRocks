@@ -446,7 +446,7 @@ impl MvCommandOriginal {
                 self.input
                     .state_store
                     .for_root(self.root.clone())
-                    .map_err(|cause| QueryServiceError::from_failure_cause(cause))?,
+                    .map_err(QueryServiceError::from_failure_cause)?,
             );
         }
         match self.io.as_ref().unwrap().poll_progress(work, cx) {
@@ -585,22 +585,22 @@ impl MvCommandOriginal {
         }
     }
     fn poll_original_progress(&mut self, cx: &mut Context<'_>) {
-        if let Some(io) = &self.io {
-            if let Err(error) = io.poll_continuing(cx) {
-                // Admission refusal is not a physical-exit verdict. The
-                // same admitted child and its raw outcome remain retained.
-                self.progress_refusal.get_or_insert(error);
-            }
+        if let Some(io) = &self.io
+            && let Err(error) = io.poll_continuing(cx)
+        {
+            // Admission refusal is not a physical-exit verdict. The
+            // same admitted child and its raw outcome remain retained.
+            self.progress_refusal.get_or_insert(error);
         }
-        if let Some(store) = &self.store {
-            if let Err(cause) = store.poll_progress(cx) {
-                self.health.get_or_insert_with(|| {
-                    StatementNativeHealthFailure::actual_exit_unproven(
-                        "MV original StateStore progress is unproven",
-                        Arc::new(cause),
-                    )
-                });
-            }
+        if let Some(store) = &self.store
+            && let Err(cause) = store.poll_progress(cx)
+        {
+            self.health.get_or_insert_with(|| {
+                StatementNativeHealthFailure::actual_exit_unproven(
+                    "MV original StateStore progress is unproven",
+                    Arc::new(cause),
+                )
+            });
         }
     }
     fn poll_retirement(
@@ -652,20 +652,20 @@ impl MvCommandOriginal {
         if pending && !physical_closed {
             return Poll::Pending;
         }
-        if !self.initialized {
-            if let Some(io) = &self.io {
-                match io.withdraw_unstarted_in() {
-                    Ok(Some(_actual_withdrawal)) => {
-                        self.io = None;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
-                            "MV unstarted original withdrawal is unproven",
-                            Arc::new(error),
-                        ));
-                        return Poll::Pending;
-                    }
+        if !self.initialized
+            && let Some(io) = &self.io
+        {
+            match io.withdraw_unstarted_in() {
+                Ok(Some(_actual_withdrawal)) => {
+                    self.io = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                        "MV unstarted original withdrawal is unproven",
+                        Arc::new(error),
+                    ));
+                    return Poll::Pending;
                 }
             }
         }

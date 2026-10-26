@@ -362,28 +362,6 @@ impl MvReadinessPort {
         )
     }
 
-    /// Synchronous bridge to the product-owned DROP durable preflight.
-    pub(crate) fn prepare_drop(
-        &self,
-        target: &MvTarget,
-        if_exists: bool,
-    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
-        self.block_on(
-            self.service
-                .prepare_drop(&canonical_mv_target(target), if_exists),
-        )
-    }
-
-    /// Synchronous bridge to the product-owned post-provider-delete CAS.
-    pub(crate) fn delete_after_provider_drop(
-        &self,
-        operation_id: Uuid,
-        guard: MvKeyedProjectionDeleteGuard,
-    ) -> Result<MvKeyedProjectionInstallOutcome, String> {
-        self.block_on(self.service.delete_after_provider_drop(operation_id, guard))
-            .map_err(|error| error.to_string())
-    }
-
     /// Reject the test/harness-only whole-family Accelerator wipe while this
     /// FE owns any publication. A wipe has no distributed coordination role;
     /// the runner immediately restarts this FE after the wipe succeeds.

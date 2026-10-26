@@ -163,7 +163,7 @@ impl Drop for ScanOwnerLoan {
     }
 }
 struct Retained {
-    owner: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    _owner: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
     cpu: Arc<dyn ProviderMetadataCpuPort>,
 }
 pub(crate) struct MvRefreshPreparationIo {
@@ -774,7 +774,7 @@ impl MvRefreshPreparationIo {
             .as_mut()
             .expect("original MV retained custody is not loaned")
             .push(Retained {
-                owner: received.owner,
+                _owner: received.owner,
                 cpu: received.cpu,
             });
         let scan = result.map_err(provider_error)?;
@@ -961,7 +961,7 @@ impl MvRefreshPreparationIo {
             }
         }
         drop(retained);
-        self.registration.poll_progress(cx);
+        let _ = self.registration.poll_progress(cx);
         if self.registration.poll_registration_closed(cx).is_pending() {
             return Poll::Pending;
         }
@@ -1020,7 +1020,7 @@ mod repository_original_cause_tests {
         };
         let target =
             novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "orders");
-        let error = repository
+        let error = match repository
             .in_requests(&requests)
             .find_keyed_by_target(
                 &target,
@@ -1028,8 +1028,13 @@ mod repository_original_cause_tests {
                 ),
             )
             .await
-            .err()
-            .expect("the actual request refusal must reach the repository boundary");
+        {
+            Err(error) => error,
+            Ok(payload) => {
+                drop(payload);
+                panic!("the actual request refusal must reach the repository boundary");
+            }
+        };
         assert_eq!(requests.reads.load(Ordering::SeqCst), 1);
         assert_eq!(error.original_failure(), Some(&cause));
         let projected = repository_error(error);

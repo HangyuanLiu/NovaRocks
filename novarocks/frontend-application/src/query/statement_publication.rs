@@ -231,11 +231,12 @@ impl StatementPublication {
         if call.poll_retirement(cx).is_pending() {
             return Poll::Pending;
         }
-        if self.outcome.is_none() && call.outcome().is_some() {
-            if let Err(error) = call.take_outcome_in(&mut self.outcome) {
-                self.poison(error);
-                return Poll::Pending;
-            }
+        if self.outcome.is_none()
+            && call.outcome().is_some()
+            && let Err(error) = call.take_outcome_in(&mut self.outcome)
+        {
+            self.poison(error);
+            return Poll::Pending;
         }
         Poll::Ready(())
     }

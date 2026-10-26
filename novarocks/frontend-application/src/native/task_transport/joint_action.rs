@@ -550,7 +550,7 @@ impl NativeTaskOperationSink {
         }
         let call = match handoff.take().expect("original Native local handoff") {
             NativeDialHandoff::Ready(acquired) => {
-                let call = match acquired.channel.select_local_call().try_reserve(cx) {
+                let call = match acquired.channel().select_local_call().try_reserve(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => {
                         return Poll::Ready(Err(NativeAdmissionFailure::Unsent(error.to_string())));

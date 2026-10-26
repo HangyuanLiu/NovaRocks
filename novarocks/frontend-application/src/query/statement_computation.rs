@@ -182,7 +182,6 @@ impl StatementStageAdmission {
         }
         if self.compute.is_none() {
             if self.owner_admission.is_none() && self.owner_ready.is_none() {
-                let io = io;
                 let source = io
                     .root_stage_source(self.owner.as_ref().unwrap())
                     .map_err(|e| internal_error(e.to_string()))?;

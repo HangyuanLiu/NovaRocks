@@ -195,16 +195,5 @@ impl NativeSourceCohortAdmission {
     }
 }
 
-pub(super) fn metadata_layouts() -> [std::alloc::Layout; 3] {
-    [
-        std::alloc::Layout::new::<NativeSourceCohortAdmission>(),
-        JointProposalSlotWait::metadata_layouts().1,
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            Mutex<Option<SourceCohort>>,
-        >())
-        .expect("actual Source cohort Arc layout"),
-    ]
-}
-
 #[cfg(test)]
 pub(crate) mod tests;

@@ -1063,20 +1063,6 @@ impl TaskRound {
         self.execution.begin_terminal_cleanup();
     }
 
-    /// Return the caller's observation leases to the same original Native
-    /// process records. Their original futures, child work and actual joins
-    /// remain with the process owner; this is not an IO-exited receipt.
-    pub(crate) fn return_native_observation_custody(&mut self) {
-        self.begin_terminal_cleanup();
-        for &context in self.execution.graph().contexts() {
-            if let Some(subscriber) = &self.covered_subscriber {
-                subscriber.stop(context);
-            } else {
-                self.legacy_subscriber().stop(context);
-            }
-        }
-    }
-
     fn drive_actor_abort_effect(&mut self) -> Result<usize, TaskExecutionError> {
         let Some(intake) = self.abort_effect_intake.as_mut() else {
             return Ok(0);

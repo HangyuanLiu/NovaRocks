@@ -57,13 +57,15 @@ impl novarocks_failure_contract::FailureProjection for RewriteRetentionFailure {
 
 type OriginalFuture =
     Pin<Box<dyn Future<Output = Result<ConnectorWriteSessionPlan, ConnectorError>> + Send>>;
+struct ObserveRequest {
+    namespace: String,
+    table: String,
+    context: ConnectorRequestContext,
+}
+
 enum IoState {
     Idle,
-    Observe {
-        namespace: String,
-        table: String,
-        context: ConnectorRequestContext,
-    },
+    Observe(Box<ObserveRequest>),
     Observed(Result<crate::loaded_table::IcebergPhysicalTable, String>),
     Snapshot {
         table: crate::iceberg::table::Table,
@@ -124,14 +126,14 @@ impl RewriteBeginIo {
             let body = loan.body.as_mut().unwrap();
             match &body.state {
                 IoState::Idle => {
-                    body.state = IoState::Observe {
+                    body.state = IoState::Observe(Box::new(ObserveRequest {
                         namespace: namespace.to_owned(),
                         table: table.to_owned(),
                         context: context.clone(),
-                    };
+                    }));
                     Poll::Pending
                 }
-                IoState::Observe { .. } => Poll::Pending,
+                IoState::Observe(_) => Poll::Pending,
                 IoState::Observed(_) => {
                     let IoState::Observed(value) =
                         std::mem::replace(&mut body.state, IoState::Idle)
@@ -191,11 +193,12 @@ impl RewriteBeginIo {
         let mut loan = IoLoan::take(self);
         let body = loan.body.as_mut().unwrap();
         match &mut body.state {
-            IoState::Observe {
-                namespace,
-                table,
-                context,
-            } => {
+            IoState::Observe(request) => {
+                let ObserveRequest {
+                    namespace,
+                    table,
+                    context,
+                } = request.as_mut();
                 let value = self
                     .control
                     .runtime

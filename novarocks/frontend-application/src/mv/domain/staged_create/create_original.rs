@@ -1406,3 +1406,568 @@ mod original_call_tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod original_stage_tests {
+    use super::*;
+    use crate::mv::domain::test_admission::{AdmittingManagement, catalog_properties};
+    use crate::query_execution::{
+        internal_consumer::domain_cpu::root_action_tests::{bind, root_control},
+        internal_result_cpu::InternalResultCpuOwner,
+        mv_assembly::refresh_preparation::io_gate::{
+            MvRefreshPreparationIo, MvRefreshPreparationServices,
+        },
+    };
+    use crate::task_execution::status_intake::StatusIntakeWake;
+    use bytes::Bytes;
+    use novarocks_mv_application::management::{
+        DeploymentOwner, MvManagementPhase, ProcessIncarnation,
+    };
+    use novarocks_spi::connector::*;
+    use novarocks_state_store_api::{
+        StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreReadExecution,
+    };
+    use novarocks_workload_control::{
+        WorkClass, WorkRequest, WorkloadControl,
+        joint_admission::{JointProgress, JointProgressDriver},
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::AtomicUsize,
+        time::{Duration, Instant},
+    };
+
+    struct NoRepositoryIo;
+    impl StateStoreReadExecution for NoRepositoryIo {
+        fn read_transaction_context(
+            &self,
+        ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+            panic!("CREATE staging does not perform a repository read");
+        }
+    }
+    impl StateStoreExecutionRequests for NoRepositoryIo {
+        fn write_operation_context(
+            &self,
+        ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+            panic!("CREATE staging does not perform a repository write");
+        }
+    }
+    #[derive(Default)]
+    struct Wake(futures::task::AtomicWaker);
+    impl std::fmt::Debug for Wake {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CreateStageWake")
+        }
+    }
+    impl StatusIntakeWake for Wake {
+        fn wake(&self) {
+            self.0.wake();
+        }
+    }
+    async fn with_driver<F: Future>(
+        control: &WorkloadControl,
+        driver: &mut JointProgressDriver,
+        future: F,
+    ) -> F::Output {
+        tokio::pin!(future);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match driver.step() {
+                    JointProgress::More => tokio::task::yield_now().await,
+                    JointProgress::Idle(revision) => tokio::select! {
+                        biased;
+                        result = &mut future => return result,
+                        _ = control.wait_progress(revision) => {},
+                    },
+                }
+            }
+        })
+        .await
+        .expect("original CREATE stage/component watchdog")
+    }
+
+    struct RefusingStage {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        entrance: Arc<ManagementEntrance>,
+        mode: u8,
+        prepares: Arc<AtomicUsize>,
+    }
+    impl ConnectorStagedCreate for RefusingStage {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+        fn prepare_async(
+            &self,
+            request: ConnectorStagedCreatePrepareRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.prepares.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    self.entrance.management_phase(&request.table),
+                    MvManagementPhase::AwaitingCreateBinding
+                );
+                let failure = ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    "injected stage failure",
+                );
+                match self.mode {
+                    0 => Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+                        receipt: ConnectorStagedCreateReceipt::try_new(
+                            request.owner,
+                            request.operation_id,
+                            ConnectorStagedCreateReceiptPhase::Prepared,
+                            ExternalMutationEffect::Applied,
+                            Bytes::new(),
+                        )
+                        .unwrap(),
+                        finalization: ExternalMutationFinalization::Failed(failure),
+                    }),
+                    1 => Err(ConnectorError::new(
+                        ConnectorErrorKind::Unavailable,
+                        "injected provider dispatch failure",
+                    )),
+                    2 => Ok(ConnectorStagedCreatePrepareOutcome::Conflict { failure }),
+                    3 => Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure }),
+                    _ => unreachable!(),
+                }
+            })
+        }
+        fn prepare(
+            &self,
+            _: ConnectorStagedCreatePrepareRequest,
+        ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
+            panic!("original CREATE must use prepare_async");
+        }
+        fn plan_write(
+            &self,
+            _: ConnectorStagedWritePlanningRequest,
+        ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorError> {
+            panic!("failed stage cannot plan writes");
+        }
+        fn bind_write(
+            &self,
+            _: ConnectorStagedTableHandle,
+            _: ConnectorStagedWriteProof,
+        ) -> Result<(), ConnectorError> {
+            panic!("failed stage cannot bind writes");
+        }
+        fn publish(
+            &self,
+            _: ConnectorStagedCreatePublishRequest,
+        ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
+            panic!("failed stage cannot publish");
+        }
+        fn abort(
+            &self,
+            _: ConnectorStagedCreateAbortRequest,
+        ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError> {
+            panic!("failed stage cannot abort");
+        }
+        fn adjudicate_publication(
+            &self,
+            _: ConnectorStagedCreatePublicationAdjudicationRequest,
+        ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
+            panic!("failed stage is not final publication");
+        }
+    }
+
+    fn plan(
+        context: &ConnectorRequestContext,
+    ) -> (Arc<IcebergMvCreatePlan>, Arc<MvCreateProjectionSeed>) {
+        use crate::mv::domain::{
+            application::{MvCreateRefreshPolicy, MvCreateStatement},
+            iceberg_refresh::{
+                finish_mv_create_preparation, prepare_mv_create_properties,
+                prepare_mv_create_shape, prepare_mv_create_target,
+            },
+        };
+        use novarocks_sql::compiler::{
+            CatalogRelationFact, SqlCapturedCatalogPreparation, SqlCompileControl,
+        };
+        use novarocks_sql::planning::catalog::{
+            ConnectorReadTableFacts, materialize_connector_read_table,
+        };
+        let sql = "SELECT id, count(*) AS n FROM iceberg.db.orders GROUP BY id";
+        let query = crate::mv::domain::refresh::definition::parse_mv_select_query(sql).unwrap();
+        let statement = MvCreateStatement {
+            name_parts: vec!["new_mv".into()],
+            if_not_exists: false,
+            partition_by: None,
+            distribution: None,
+            refresh_policy: MvCreateRefreshPolicy::Manual,
+            select_sql: sql.into(),
+            select_query: query.clone(),
+            properties: Vec::new(),
+            primary_key: None,
+        };
+        let control = SqlCompileControl::unbounded();
+        let preparation = SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            Some("iceberg"),
+            "db",
+            control.clone(),
+        )
+        .unwrap();
+        let [need] = preparation.needs() else {
+            panic!("one exact original relation");
+        };
+        let mut bindings = novarocks_sql::binding::SqlTableBindingAllocator::new_unique().unwrap();
+        let table = materialize_connector_read_table(ConnectorReadTableFacts {
+            catalog: "iceberg".into(),
+            namespace: "db".into(),
+            table: "orders".into(),
+            columns: vec![
+                novarocks_types::schema::ColumnDef::from_value_type(
+                    "id".into(),
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                    None,
+                )
+                .unwrap(),
+            ],
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
+            ])),
+            binding: bindings.allocate().unwrap(),
+            selector: ConnectorReadSelector::Current,
+            planning_facts: ConnectorTablePlanningFacts::empty(),
+        })
+        .unwrap();
+        let fact = CatalogRelationFact::resolved(need, table.into_resolved_table()).unwrap();
+        let captured = preparation.capture(&[fact]).unwrap();
+        let analysis =
+            crate::mv::domain::analysis_adapter::analyze_mv_select_with_captured_catalog(
+                Some("iceberg"),
+                &captured,
+                "db",
+                &query,
+                novarocks_sql::compiler::builtin_sql_function_catalog(),
+                crate::application::test_constant_policy(),
+                control.clone(),
+            )
+            .unwrap();
+        let target = prepare_mv_create_target(Some("iceberg"), "db", &statement).unwrap();
+        let shape = prepare_mv_create_shape(target, &statement, query, analysis, &control).unwrap();
+        let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
+        let object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
+        let observation = crate::mv::domain::storage_observation::schema_validation_from_spi(
+            MvSchemaValidationObservation::try_new(
+                ConnectorTableIdentity {
+                    instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("orders"),
+                },
+                object_id,
+                ConnectorCommittedVersion::try_new(
+                    Bytes::from_static(b"orders-metadata"),
+                    Some(11),
+                )
+                .unwrap(),
+                Bytes::from_static(b"schema-1"),
+                Bytes::from_static(b"spec-0"),
+                true,
+                true,
+                vec![(
+                    0,
+                    MvObservedSourceField::try_new(
+                        Bytes::from_static(b"id-1"),
+                        "id".into(),
+                        "long".into(),
+                        true,
+                    )
+                    .unwrap(),
+                )],
+                Vec::new(),
+                context,
+            )
+            .unwrap(),
+            context,
+        )
+        .unwrap();
+        // These are pure captured declaration facts, not Provider authority.
+        // The test stops at stage refusal and never manufactures a handle or a
+        // document-management admission. Both admissions come from real leases.
+        let plan = finish_mv_create_preparation(
+            shape, &statement, property, persistence,
+            vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation {
+                occurrence_id: 0, provider_object_id: Bytes::from_static(b"orders-object"),
+                provider_schema_version: Bytes::from_static(b"schema-1"), fields: Vec::new(),
+            }],
+            novarocks_mv_application::persistence::codec::keyed::BindingDocument {
+                data_versions: vec![novarocks_mv_application::persistence::codec::keyed::DataVersionFormat {
+                    provider: "iceberg".into(), name: "fixture/stage-data-version".into(),
+                    version: 1, max_value_bytes: 8,
+                }],
+            },
+            BTreeMap::from([("iceberg.db.orders".into(), observation)]),
+        ).unwrap();
+        let seed = Arc::new(
+            plan.projection_seed(&statement, Some("iceberg"), "db")
+                .unwrap(),
+        );
+        (plan, seed)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_non_negative_stage_failure_retains_the_unbound_create_responsibility() {
+        for mode in 0..4 {
+            let mut cpu = InternalResultCpuOwner::try_new_for_test().unwrap();
+            let (control, _, mut driver) = root_control(&mut cpu);
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Management))
+                .unwrap();
+            let scope = root.owner.scope();
+            bind(&scope, &mut driver);
+            let io = MetadataIoAdmission::for_original_source(&root.owner, Vec::new()).unwrap();
+            with_driver(
+                &control,
+                &mut driver,
+                poll_fn(|cx| {
+                    if io.poll_progress(&root.owner, cx).unwrap() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await;
+            let capacity = io.root_capacity().unwrap();
+            let window = capacity.try_window_alias().unwrap();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(5),
+                ConnectorStopOwner::new().view(),
+                4096,
+                65536,
+            )
+            .unwrap()
+            .with_io_admission(io.clone());
+            let (plan, seed) = plan(&context);
+            let instance_id = ConnectorInstanceId::parse("iceberg").unwrap();
+            let base = novarocks_catalog_application::test_support::test_control_binding_for(
+                instance_id.clone(),
+                8,
+            );
+            let descriptor = base.descriptor().clone();
+            let incarnation = base.incarnation();
+            let entrance = Arc::new(ManagementEntrance::new(
+                DeploymentOwner::parse("deployment-test").unwrap(),
+                ProcessIncarnation::parse("process-test").unwrap(),
+            ));
+            let prepares = Arc::new(AtomicUsize::new(0));
+            let stage = Arc::new(RefusingStage {
+                descriptor: descriptor.clone(),
+                incarnation,
+                entrance: entrance.clone(),
+                mode,
+                prepares: prepares.clone(),
+            });
+            let documents = ConnectorDocumentStorageBinding::try_new(
+                descriptor.clone(),
+                incarnation,
+                None,
+                Some(Arc::new(AdmittingManagement {
+                    descriptor: descriptor.clone(),
+                    incarnation,
+                })),
+            )
+            .unwrap();
+            let binding = ConnectorControlBinding::try_new_with_all_capabilities_and_staged_create(
+                descriptor,
+                incarnation,
+                base.metadata().clone(),
+                base.planning().clone(),
+                base.execution_distribution().clone(),
+                None,
+                None,
+                None,
+                Some(stage),
+                None,
+                None,
+            )
+            .unwrap()
+            .with_catalog_properties(catalog_properties(&instance_id))
+            .unwrap()
+            .try_with_document_storage(Some(documents))
+            .unwrap();
+            let planning = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+            let catalog = planning.binding().catalog_handle().unwrap().clone();
+            let table = ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("new_mv"),
+            };
+            let operation_id = uuid::Uuid::now_v7();
+            let intent = CreateIntent::try_new(
+                catalog.clone(),
+                table.clone(),
+                EffectIdentity::from_bytes(*operation_id.as_bytes()),
+            )
+            .unwrap();
+            let (_, repository) = crate::mv::domain::test_admission::keyed_product().await;
+            let readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
+                novarocks_mv_application::readiness::MvKeyedReadinessService::new(
+                    repository,
+                    Arc::default(),
+                ),
+                tokio::runtime::Handle::current(),
+                entrance.clone(),
+            ));
+            let ports = IcebergMvCorePorts::new(
+                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                None,
+                Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
+                readiness,
+                Arc::new(UnavailableMvStorageObservationPort),
+                crate::application::test_constant_policy(),
+            )
+            .with_management_entrance(entrance.clone());
+            let wake = Arc::new(Wake::default());
+            let cancellation = QueryCancellationView::governed(scope.cancellation().unwrap(), None);
+            let requests = Arc::new(NoRepositoryIo);
+            let gate = Arc::new(MvRefreshPreparationIo::new(
+                MvRefreshPreparationServices {
+                    cpu: cpu.runtime(),
+                    scope: scope.clone(),
+                    window: window.clone(),
+                    cancellation: cancellation.clone(),
+                    runtime: tokio::runtime::Handle::current(),
+                    wake: wake.clone(),
+                    requests: requests.clone(),
+                },
+                io.original_result_scope(&context).unwrap(),
+            ));
+            let turn = MvRefreshTurnCustody::new(
+                gate.clone(),
+                cpu.runtime(),
+                scope.clone(),
+                window.clone(),
+                cancellation.clone(),
+                tokio::runtime::Handle::current(),
+                wake.clone(),
+            );
+            let source = CreateOriginal::new(CreateOriginalInput {
+                plan,
+                seed,
+                ports,
+                planning,
+                operation_id,
+                context,
+                cancellation,
+                io: io.clone(),
+                cpu: turn,
+                requests,
+            })
+            .unwrap();
+            source.prepare().await;
+            let mut prepared = None;
+            source.take_phase_result_in(&mut prepared).unwrap();
+            assert!(prepared.unwrap().is_ok());
+            let mut phase = source.stage();
+            with_driver(
+                &control,
+                &mut driver,
+                poll_fn(|cx| {
+                    wake.0.register(cx.waker());
+                    Pin::new(&mut phase).poll(cx)
+                }),
+            )
+            .await;
+            drop(phase);
+            let mut result = None;
+            source.take_phase_result_in(&mut result).unwrap();
+            assert!(result.unwrap().is_err());
+            assert_eq!(prepares.load(Ordering::SeqCst), 1);
+            let replacement = CreateIntent::try_new(
+                catalog,
+                table.clone(),
+                EffectIdentity::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .unwrap();
+            let next = || {
+                entrance.acquire(
+                    ManagementRequest::for_create_intent(
+                        replacement.clone(),
+                        EffectScope::CATALOG_COMMIT,
+                    ),
+                    || false,
+                )
+            };
+            if mode < 2 {
+                assert_eq!(
+                    entrance.management_phase(&table),
+                    MvManagementPhase::AwaitingCreateBinding
+                );
+                assert!(entrance.begin_unbound_create_observation(&intent).is_ok());
+            } else {
+                assert_eq!(
+                    entrance.management_phase(&table),
+                    MvManagementPhase::NotObserved
+                );
+                assert!(entrance.begin_unbound_create_observation(&intent).is_err());
+            }
+            // Actual CPU/MIO exit is observable independently of the retained
+            // unbound responsibility. Unknown is not a full-close proof.
+            with_driver(
+                &control,
+                &mut driver,
+                poll_fn(|cx| {
+                    wake.0.register(cx.waker());
+                    let _ = source.poll_closed(cx);
+                    if source.physical_exit_observed() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await;
+            assert!(source.local_health_failure().is_none());
+            drop(source);
+            // Disposal releases the original activity lease after physical exit.
+            // Unbound CREATE responsibility remains in the management entrance.
+            if mode < 2 {
+                assert_eq!(
+                    entrance.management_phase(&table),
+                    MvManagementPhase::AwaitingCreateBinding
+                );
+                assert_eq!(
+                    next().err().unwrap(),
+                    ManagementAdmissionError::EffectUnsettled
+                );
+            } else {
+                assert_eq!(
+                    entrance.management_phase(&table),
+                    MvManagementPhase::NotObserved
+                );
+                assert!(next().is_ok());
+            }
+            drop(gate);
+            drop(window);
+            drop(capacity);
+            drop(io);
+            drop(scope);
+            root.owner.complete();
+            root.business.release();
+            drop(driver);
+            drop(control);
+            cpu.shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+    }
+}

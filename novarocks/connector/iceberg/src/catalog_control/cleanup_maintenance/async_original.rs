@@ -817,7 +817,7 @@ enum CpuInput {
     },
     Plan {
         adapter: IcebergCleanupMaintenanceAdapter,
-        request: ConnectorCleanupPlanningRequest,
+        request: Box<ConnectorCleanupPlanningRequest>,
         target: IcebergTablePayload,
         table: Physical,
         original: ConnectorOriginalResultScope,
@@ -866,7 +866,7 @@ enum CpuInput {
 }
 pub(in crate::catalog_control) enum CpuOutput {
     Admitted,
-    Request(ConnectorCleanupPlanningRequest, IcebergTablePayload),
+    Request(Box<ConnectorCleanupPlanningRequest>, IcebergTablePayload),
     Payload(PlanPayload),
     Public(Output),
     Records(Arc<[ManifestRecord]>),
@@ -931,7 +931,7 @@ impl CpuWork {
                 };
                 let target = serde_json::from_slice(request.operation().table().payload())
                     .map_err(|_| invalid("invalid cleanup physical table payload"))?;
-                Ok(CpuOutput::Request(request, target))
+                Ok(CpuOutput::Request(Box::new(request), target))
             }
             CpuInput::Payload { adapter, plan } => {
                 plan.validate()?;

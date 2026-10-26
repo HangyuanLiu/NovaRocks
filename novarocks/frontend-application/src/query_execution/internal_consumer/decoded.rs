@@ -196,14 +196,14 @@ pub(crate) struct ReadyCowComputation {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) binding: QueryResultCapacityBinding,
     pub(crate) selection: ConnectorRowMutationSelection,
-    pub(crate) credentials: Option<Arc<AttemptCredentialStorage>>,
+    pub(crate) _credentials: Option<Arc<AttemptCredentialStorage>>,
     _initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
 }
 pub(crate) struct ReadyStatisticsComputation {
     pub(crate) ready: ComputationReadyToken,
-    pub(crate) binding: QueryResultCapacityBinding,
+    pub(crate) _binding: QueryResultCapacityBinding,
     pub(crate) artifacts: Vec<StatisticsArtifactDraft>,
-    pub(crate) credentials: Option<Arc<AttemptCredentialStorage>>,
+    pub(crate) _credentials: Option<Arc<AttemptCredentialStorage>>,
 }
 
 impl CowComputationOutput {
@@ -231,7 +231,7 @@ impl CowComputationOutput {
                 )
             })?,
             selection,
-            credentials: staged._credentials,
+            _credentials: staged._credentials,
             _initial: Arc::clone(&self.initial),
         })
     }
@@ -269,9 +269,9 @@ impl StatisticsComputationOutput {
         });
         Ok(ReadyStatisticsComputation {
             ready: token,
-            binding,
+            _binding: binding,
             artifacts,
-            credentials: staged._credentials,
+            _credentials: staged._credentials,
         })
     }
     pub(crate) fn cpu_custody(&self) -> Arc<DomainCpuCustody> {

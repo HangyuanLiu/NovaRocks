@@ -2549,11 +2549,11 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     attempt: ManifestAssembledRound,
     completion: ManifestAttemptCompletion,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
-    prepared: Option<TaskExecutionPreparedQuery>,
-    credential_storage:
+    _prepared: Option<TaskExecutionPreparedQuery>,
+    _credential_storage:
         Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
-    split_assignment: Option<SplitAssignmentRoundGuard>,
-    abort_route: Option<LogicalAbortRoute>,
+    _split_assignment: Option<SplitAssignmentRoundGuard>,
+    _abort_route: Option<LogicalAbortRoute>,
     handoff: Option<AttemptHandoffProducer>,
     _profile_observer:
         Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
@@ -2592,10 +2592,10 @@ impl FrontendTaskProtocolActiveBehavior {
             attempt: round,
             completion,
             rows,
-            prepared,
-            credential_storage,
-            split_assignment,
-            abort_route,
+            _prepared: prepared,
+            _credential_storage: credential_storage,
+            _split_assignment: split_assignment,
+            _abort_route: abort_route,
             handoff,
             _profile_observer: profile_observer,
             lifecycle_diagnostics,
@@ -4544,53 +4544,6 @@ mod tests {
         assert_eq!(active_drops.load(Ordering::SeqCst), 1);
         assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
     }
-}
-
-/// Pure pointee layout of the actual first-party preparation author. Shared
-/// runtime infrastructure and per-attempt payload remain their original owners.
-pub(crate) fn native_preparation_owner_layout() -> std::alloc::Layout {
-    std::alloc::Layout::new::<FrontendNativeAttemptPreparationPort<ProductionDormantAttemptFactory>>(
-    )
-}
-
-/// Pure layout of the actual dormant owner pointee, including its one stable
-/// activation result. Dynamic backing and original service owners are separate.
-pub(crate) fn native_dormant_owner_layout() -> std::alloc::Layout {
-    std::alloc::Layout::new::<
-        SnapshotBoundDormantAttemptOwner<
-            FrontendTaskProtocolDormantBehavior<RegisteredManifestAttemptProjection>,
-        >,
-    >()
-}
-
-/// Pure layout of the concrete active owner transferred to the original QA
-/// custody slot. It is a storage fact, not an execution or capacity grant.
-pub(crate) fn native_active_owner_layout() -> std::alloc::Layout {
-    std::alloc::Layout::new::<
-        SnapshotBoundActiveAttemptOwner<
-            ManifestBoundNativeAttemptInputs,
-            FrontendTaskProtocolActiveBehavior,
-        >,
-    >()
-}
-
-/// New original binding state plus its one named paid-Q wait pointee.
-/// Existing Native owner storage is not recursively re-quoted here.
-pub(crate) fn native_control_binding_layouts() -> [std::alloc::Layout; 7] {
-    let [state, wait_future] = control_binding::metadata_layouts();
-    let [source_state, source_wait, source_arc] = source_cohort::metadata_layouts();
-    // The original preparation port's Factory Option and the actual dormant
-    // owner both embed this state. Moving the value does not shrink the first
-    // allocation. Only the dormant author polls/allocates the one wait F.
-    [
-        state,
-        state,
-        wait_future,
-        source_state,
-        source_state,
-        source_wait,
-        source_arc,
-    ]
 }
 
 #[cfg(test)]

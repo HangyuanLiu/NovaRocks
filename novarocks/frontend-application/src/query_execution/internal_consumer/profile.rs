@@ -98,7 +98,7 @@ struct StagedProfile {
     end: RootResultEnd,
     provenance: AttemptProtocolProvenance,
     observer: Option<ProfileDiagnosticObserver>,
-    credentials: Option<Arc<AttemptCredentialStorage>>,
+    _credentials: Option<Arc<AttemptCredentialStorage>>,
 }
 
 enum ReceivingState {
@@ -239,8 +239,9 @@ impl ReadyProfileComputation {
 
     /// Keep the same attempt credential table through diagnostic observation.
     /// Native retains its own original custody independently until actual exit.
+    #[cfg(all(test, novarocks_dev_controls))]
     pub(crate) fn original_credentials(&self) -> Option<&Arc<AttemptCredentialStorage>> {
-        self.payload.credentials.as_ref()
+        self.payload._credentials.as_ref()
     }
 
     pub(crate) fn current_diagnostics(
@@ -440,7 +441,7 @@ impl InternalComputationConsumer for ProfileComputationConsumer {
                 end: original_end,
                 provenance,
                 observer,
-                credentials,
+                _credentials: credentials,
             })?;
             // Receiving custody is now stable outside this future. The actor
             // remains the sole selected-outcome author, across replacement.

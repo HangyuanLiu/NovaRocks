@@ -637,7 +637,7 @@ impl MetadataIoAdmission {
         }
         // Preserve the exact positive incarnation. Profile/layout numbers
         // are responsibility facts, never a qualification of actual capacity.
-        payload.root_domain_source(&body.root, JointLane::Foreground)?;
+        drop(payload.root_domain_source(&body.root, JointLane::Foreground)?);
         body.provider_owned_floor = payload.capacity_bytes().map_err(|_| WorkError::Released)?;
         body.bound.push(SharedDependency::LocalHost);
         body.full = Some(body.bound.clone().into());

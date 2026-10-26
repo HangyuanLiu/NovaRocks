@@ -588,7 +588,7 @@ async fn run_case(case: Case) {
                 assert_eq!(ready.artifacts.len(), 1);
                 assert_eq!(ready.artifacts[0].body().as_ref(), b"original artifact");
                 assert!(Arc::ptr_eq(
-                    ready.credentials.as_ref().unwrap(),
+                    ready._credentials.as_ref().unwrap(),
                     &attempt.native_credentials
                 ));
                 artifact_body = Some(ready.artifacts[0].body().clone());
@@ -710,16 +710,16 @@ async fn run_case(case: Case) {
                 .as_ref()
                 .expect("original Ready output remains live");
             assert_eq!(ready.artifacts[0].body().as_ref(), b"original artifact");
-            assert!(ready.binding.is_root_backed_internal());
+            assert!(ready._binding.is_root_backed_internal());
             assert!(
                 ready
-                    .binding
+                    ._binding
                     .window_alias()
                     .is_for_scope(&typed.root.owner.scope())
             );
             assert!(
                 ready
-                    .binding
+                    ._binding
                     .window_alias()
                     .internal_manifest_binding()
                     .unwrap()

@@ -40,10 +40,10 @@ mod scoped_read;
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
-    ChangeWindow(scoped_change_window::ChangeWindowBody),
+    ChangeWindow(Box<scoped_change_window::ChangeWindowBody>),
     Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
-    Read(scoped_read::ReadBody),
+    Read(Box<scoped_read::ReadBody>),
     MetadataBinding {
         provider: IcebergMetadata,
         facts: crate::metadata::IcebergPreparedTableFacts,
@@ -660,8 +660,14 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
     let reader = scoped_snapshot::reader_backing_bytes()?
         .max(IcebergMetadata::statistics_read_preparation_bytes()?);
     let error = scoped_read::error_backing_bytes()?;
+    // One actual parent Source keeps its owned body through every phase.
+    // Read and change-window bodies are mutually exclusive; the nested
+    // snapshot Source owns neither parent packet.
+    let parent_body = std::mem::size_of::<scoped_read::ReadBody>()
+        .max(std::mem::size_of::<scoped_change_window::ChangeWindowBody>());
     header
         .checked_mul(2)
+        .and_then(|n| n.checked_add(parent_body))
         .and_then(|n| n.checked_add(reader))
         .and_then(|n| n.checked_add(error))
         .ok_or_else(|| internal("metadata source layout overflow"))

@@ -1026,16 +1026,8 @@ pub(crate) fn mv_background_bindings(
     )
     .with_management_entrance(ports.management_entrance);
     crate::mv::background::MvBackgroundBindings {
-        ports: iceberg_ports.clone(),
+        ports: iceberg_ports,
         execution,
-        engine: Arc::new(
-            crate::mv::background_engine::FrontendMvBackgroundEngine::new_with_ports(
-                iceberg_ports,
-                ports.connector_control,
-                ports.readiness,
-                ports.storage_observation,
-            ),
-        ),
         table_maintenance_engine,
     }
 }

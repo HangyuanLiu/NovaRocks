@@ -24,9 +24,8 @@ use super::{MvKeyedProductService, MvRefreshTransition};
 use crate::activity::{CanonicalMvTarget, MvActivityGateError, MvActivityOwner};
 use crate::persistence::definition::CreateMvDefinitionRequest;
 use crate::ports::{
-    MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
-    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvProviderFailureKind,
-    MvRefreshProgressPort,
+    MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure,
+    MvProviderFailureKind, MvRefreshProgressPort,
 };
 use crate::process_runtime::ProcessRuntime;
 use crate::product::{
@@ -151,28 +150,6 @@ impl MvCreateCatalogRegistrationPort for CreateEffects {
         _target: &MvCreatedTarget,
     ) -> Result<(), MvProviderFailure> {
         self.record("register");
-        Ok(())
-    }
-}
-
-impl MvDropProviderPort for CreateEffects {
-    fn drop_target(
-        &self,
-        _operation: MvOperationContext,
-        _target: &MvTarget,
-    ) -> Result<(), MvProviderFailure> {
-        self.record("drop");
-        Ok(())
-    }
-}
-
-impl MvDropCatalogRegistrationPort for CreateEffects {
-    fn unregister_target(
-        &self,
-        _operation: MvOperationContext,
-        _target: &MvTarget,
-    ) -> Result<(), MvProviderFailure> {
-        self.record("unregister");
         Ok(())
     }
 }
@@ -384,32 +361,6 @@ async fn service_with_refresh_readiness() -> MvKeyedProductService {
 // Product effect-order tests use the port's generic witness, never forge
 // a native readiness/CAS guard. Real keyed guards are tested by readiness.
 struct EffectOrderDropGuard(MvTarget);
-
-impl MvDropProjectionPort<EffectOrderDropGuard> for CreateEffects {
-    fn prepare_drop(
-        &self,
-        _operation: MvOperationContext,
-        target: &MvTarget,
-        _if_exists: bool,
-    ) -> Result<MvDropReadiness<EffectOrderDropGuard>, MvProviderFailure> {
-        self.record("prepare_drop");
-        Ok(if self.drop_absent {
-            MvDropReadiness::AlreadyAbsent
-        } else {
-            MvDropReadiness::ReadyToDrop(EffectOrderDropGuard(target.clone()))
-        })
-    }
-
-    fn delete_after_provider_drop(
-        &self,
-        _operation: MvOperationContext,
-        guard: EffectOrderDropGuard,
-    ) -> Result<(), MvProviderFailure> {
-        assert_eq!(guard.0, create_command().target);
-        self.record("delete_projection");
-        Ok(())
-    }
-}
 
 fn create_command() -> MvCreateCommand {
     MvCreateCommand {
@@ -729,8 +680,22 @@ fn drop_orders_provider_projection_and_catalog_effects() {
     let effects = CreateEffects::default();
     let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
 
-    let result = service
-        .drop(operation(), target, false, &effects, &effects, &effects)
+    let mut transition = super::MvDropTransition::new(operation(), target, false);
+    let mut execution = SuspendedDrop {
+        effects: &effects,
+        yielded: [true; 4],
+        guard: None,
+    };
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(
+        service
+            .poll_drop(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    let result = transition
+        .result()
+        .expect("DROP transition completed")
+        .as_ref()
         .expect("drop succeeds");
 
     assert!(matches!(result, MvProductResult::Dropped));
@@ -749,8 +714,22 @@ fn drop_if_exists_absence_emits_no_external_effect() {
     };
     let target = MvTarget::from_parts(Some("iceberg"), "db", "missing_mv");
 
-    let result = service
-        .drop(operation(), target, true, &effects, &effects, &effects)
+    let mut transition = super::MvDropTransition::new(operation(), target, true);
+    let mut execution = SuspendedDrop {
+        effects: &effects,
+        yielded: [true; 4],
+        guard: None,
+    };
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(
+        service
+            .poll_drop(&mut cx, &mut transition, &mut execution)
+            .is_ready()
+    );
+    let result = transition
+        .result()
+        .expect("DROP transition completed")
+        .as_ref()
         .expect("missing IF EXISTS target is acknowledged");
 
     assert!(matches!(result, MvProductResult::Acknowledged));
@@ -1347,30 +1326,36 @@ impl crate::ports::MvDropProgressPort<EffectOrderDropGuard> for SuspendedDrop<'_
     fn poll_prepare_drop(
         &mut self,
         cx: &mut Context<'_>,
-        operation: MvOperationContext,
+        _operation: MvOperationContext,
         target: &MvTarget,
-        if_exists: bool,
+        _if_exists: bool,
     ) -> Poll<Result<MvDropReadiness<EffectOrderDropGuard>, MvProviderFailure>> {
         if self.yield_once(0, cx) {
             return Poll::Pending;
         }
-        Poll::Ready(self.effects.prepare_drop(operation, target, if_exists))
+        self.effects.record("prepare_drop");
+        Poll::Ready(Ok(if self.effects.drop_absent {
+            MvDropReadiness::AlreadyAbsent
+        } else {
+            MvDropReadiness::ReadyToDrop(EffectOrderDropGuard(target.clone()))
+        }))
     }
     fn poll_drop_target(
         &mut self,
         cx: &mut Context<'_>,
-        operation: MvOperationContext,
-        target: &MvTarget,
+        _operation: MvOperationContext,
+        _target: &MvTarget,
     ) -> Poll<Result<(), MvProviderFailure>> {
         if self.yield_once(1, cx) {
             return Poll::Pending;
         }
-        Poll::Ready(self.effects.drop_target(operation, target))
+        self.effects.record("drop");
+        Poll::Ready(Ok(()))
     }
     fn poll_delete_after_provider_drop(
         &mut self,
         cx: &mut Context<'_>,
-        operation: MvOperationContext,
+        _operation: MvOperationContext,
         guard: &mut Option<EffectOrderDropGuard>,
     ) -> Poll<Result<(), MvProviderFailure>> {
         if self.guard.is_none() {
@@ -1379,25 +1364,25 @@ impl crate::ports::MvDropProgressPort<EffectOrderDropGuard> for SuspendedDrop<'_
         if self.yield_once(2, cx) {
             return Poll::Pending;
         }
-        Poll::Ready(
-            self.effects.delete_after_provider_drop(
-                operation,
-                self.guard
-                    .take()
-                    .expect("same DROP guard in original Source"),
-            ),
-        )
+        let guard = self
+            .guard
+            .take()
+            .expect("same DROP guard in original Source");
+        assert_eq!(guard.0, create_command().target);
+        self.effects.record("delete_projection");
+        Poll::Ready(Ok(()))
     }
     fn poll_unregister_target(
         &mut self,
         cx: &mut Context<'_>,
-        operation: MvOperationContext,
-        target: &MvTarget,
+        _operation: MvOperationContext,
+        _target: &MvTarget,
     ) -> Poll<Result<(), MvProviderFailure>> {
         if self.yield_once(3, cx) {
             return Poll::Pending;
         }
-        Poll::Ready(self.effects.unregister_target(operation, target))
+        self.effects.record("unregister");
+        Poll::Ready(Ok(()))
     }
 }
 #[test]

@@ -319,7 +319,7 @@ async fn run_case(fail_writer: bool) {
             assert!(!ready.accepted.is_empty());
             assert!(ready.accepted.belongs_to(&session));
             assert!(Arc::ptr_eq(&ready.session, &session));
-            assert!(Arc::ptr_eq(&ready.credentials, &native_storage));
+            assert!(Arc::ptr_eq(&ready._credentials, &native_storage));
             assert_eq!(session.accumulated_row_count().unwrap(), 3);
             assert!(output.take_ready(token).is_err());
             assert_eq!(

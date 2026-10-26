@@ -66,14 +66,14 @@ impl StatementComputationAssembly for PreparedDistributedRewriteCohort {
 /// consumer already appended its payload to the same session. There is no
 /// conversion into legacy ConnectorWriteSessionCompletion/accumulate.
 pub(crate) struct ReadyRewriteCohort {
-    original: ReadyWriteComputation,
+    _original: ReadyWriteComputation,
 }
 impl ReadyRewriteCohort {
     pub(crate) fn row_count(&self) -> u64 {
-        self.original.accepted.row_count()
+        self._original.accepted.row_count()
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.original.accepted.is_empty()
+        self._original.accepted.is_empty()
     }
     pub(crate) fn layout() -> Layout {
         Layout::new::<Self>()
@@ -274,10 +274,9 @@ impl RewriteCohortComputation {
         {
             return Err(self.computation.retained_health());
         }
-        *ready = self
-            .ready
-            .take()
-            .map(|original| ReadyRewriteCohort { original });
+        *ready = self.ready.take().map(|original| ReadyRewriteCohort {
+            _original: original,
+        });
         *tail = self.native_tail.take();
         self.handed_off = true;
         Ok(())

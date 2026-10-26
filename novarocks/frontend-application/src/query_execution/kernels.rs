@@ -98,10 +98,6 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "This kernel constructor binds distinct query, connector, and execution owners; a second configuration aggregate would duplicate the validated kernel contract."
-    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -460,10 +456,6 @@ pub(crate) struct MaintenanceRewriteRuntime {
 }
 
 impl MaintenanceExecutionKernel {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "This kernel constructor binds distinct query, connector, and execution owners; a second configuration aggregate would duplicate the validated kernel contract."
-    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

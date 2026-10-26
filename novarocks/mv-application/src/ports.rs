@@ -24,7 +24,7 @@ use crate::product::{
     MvProductErrorKind, MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
-use crate::readiness::{MvDropReadiness, MvKeyedProjectionDeleteGuard};
+use crate::readiness::MvDropReadiness;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProviderFailureKind {
@@ -239,15 +239,6 @@ pub trait MvCreateProgressPort: Send {
     ) -> std::task::Poll<Result<(), MvProviderFailure>>;
 }
 
-/// Provider effect required by the product-owned DROP transition.
-pub trait MvDropProviderPort: Send + Sync {
-    fn drop_target(
-        &self,
-        operation: MvOperationContext,
-        target: &MvTarget,
-    ) -> Result<(), MvProviderFailure>;
-}
-
 /// Product admission is expressed as a one-operation capability, never as a
 /// workload controller or a process-global lookup.
 pub trait MvWorkScopePort: Send + Sync {
@@ -266,33 +257,6 @@ pub trait MvCreateCatalogRegistrationPort: Send + Sync {
         &self,
         operation: MvOperationContext,
         target: &MvCreatedTarget,
-    ) -> Result<(), MvProviderFailure>;
-}
-
-/// Catalog-registration effect required by DROP after exact projection deletion.
-pub trait MvDropCatalogRegistrationPort: Send + Sync {
-    fn unregister_target(
-        &self,
-        operation: MvOperationContext,
-        target: &MvTarget,
-    ) -> Result<(), MvProviderFailure>;
-}
-
-/// The product-owned durable side of DROP. An outer adapter may bridge sync
-/// execution, but cannot reinterpret missing-target policy, dependency safety,
-/// or the exact post-provider-delete CAS.
-pub trait MvDropProjectionPort<G = MvKeyedProjectionDeleteGuard>: Send + Sync {
-    fn prepare_drop(
-        &self,
-        operation: MvOperationContext,
-        target: &MvTarget,
-        if_exists: bool,
-    ) -> Result<MvDropReadiness<G>, MvProviderFailure>;
-
-    fn delete_after_provider_drop(
-        &self,
-        operation: MvOperationContext,
-        guard: G,
     ) -> Result<(), MvProviderFailure>;
 }
 

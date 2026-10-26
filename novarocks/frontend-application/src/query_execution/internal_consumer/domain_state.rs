@@ -20,9 +20,8 @@
 use std::sync::Arc;
 
 use crate::query_execution::{
-    row_mutation::CowMatchRootConsumer,
-    statistics::StatisticsRootResultDecoder,
-    write_result::{DecodedPreparedWriteSet, RootWriteResultDecoder},
+    row_mutation::CowMatchRootConsumer, statistics::StatisticsRootResultDecoder,
+    write_result::RootWriteResultDecoder,
 };
 use novarocks_execution_contract::root_result::RootResultEnd;
 use novarocks_query_application::api::{RetainedRootReply, RootReplyView};
@@ -100,7 +99,6 @@ impl InternalDomainFailure {
 
 pub(crate) enum InternalDomainState {
     Statistics(StatisticsRootResultDecoder),
-    Write(RootWriteResultDecoder),
     WriteComputation {
         decoder: RootWriteResultDecoder,
         decode: crate::query_execution::write_session::WriteComputationDecode,
@@ -110,7 +108,6 @@ pub(crate) enum InternalDomainState {
 
 pub(crate) enum InternalDomainCompletion {
     Statistics(StatisticsRootResultDecoder),
-    Write(DecodedPreparedWriteSet),
     WriteDecoded(crate::query_execution::write_session::SessionDecodedWriteSegment),
     Cow(ConnectorRowMutationSelection),
 }
@@ -131,18 +128,21 @@ pub(crate) enum InternalDomainSlot {
     WriteAccepted(crate::query_execution::write_session::AcceptedWriteSegment),
 }
 impl InternalDomainSlot {
+    #[cfg(test)]
     pub(crate) fn receipt(&self) -> Option<u64> {
         match self {
             Self::Collecting { receipt, .. } => *receipt,
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn end(&self) -> Option<RootResultEnd> {
         match self {
             Self::Eof { end, .. } => Some(*end),
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn statistics_finished(&self) -> bool {
         matches!(self, Self::StatisticsFinished(_))
     }
@@ -160,8 +160,7 @@ impl InternalDomainSlot {
             InternalDomainState::Statistics(decoder) => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
-            InternalDomainState::Write(decoder)
-            | InternalDomainState::WriteComputation { decoder, .. } => decoder
+            InternalDomainState::WriteComputation { decoder, .. } => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
             InternalDomainState::Cow(consumer) => consumer
@@ -195,11 +194,6 @@ impl InternalDomainSlot {
                 decoder.observe_root_eof()?;
                 let prepared = decode.interpret(decoder.finish()?)?;
                 InternalDomainCompletion::WriteDecoded(prepared)
-            }
-            InternalDomainState::Write(mut decoder) => {
-                decoder.check_relay_end(end.output_rows)?;
-                decoder.observe_root_eof()?;
-                InternalDomainCompletion::Write(decoder.finish()?)
             }
             InternalDomainState::Cow(consumer) => {
                 consumer.check_end(end.output_rows)?;
@@ -238,15 +232,6 @@ impl InternalDomainSlot {
         match self {
             Self::WriteAccepted(accepted) => Ok(accepted),
             _ => Err("write domain has no original accepted segment".into()),
-        }
-    }
-    pub(crate) fn into_write(self) -> Result<DecodedPreparedWriteSet, String> {
-        match self {
-            Self::Eof {
-                completion: InternalDomainCompletion::Write(prepared),
-                ..
-            } => Ok(prepared),
-            _ => Err("write lost its CPU-validated prepared set".into()),
         }
     }
     pub(crate) fn into_cow(self) -> Result<ConnectorRowMutationSelection, String> {

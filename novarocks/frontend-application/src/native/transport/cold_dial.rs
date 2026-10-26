@@ -31,26 +31,18 @@ use super::super::data_runtime::NativeDialReservation;
 
 pub(in crate::native) enum NativeChannelSource {
     Ready(CachedNativeChannel),
-    Cold(SelectedNativeDial),
+    Cold(Box<SelectedNativeDial>),
 }
 
 pub(in crate::native) struct SelectedNativeDial {
     reservation: NativeDialReservation,
-    packet: Box<ColdDialPacket>,
-}
-
-/// One owned cold preparation, allocated once before the first network poll.
-/// Reservation only installs the original physical positions in this packet;
-/// the source, handoff and call move the same allocation without cloning it.
-struct ColdDialPacket {
-    dial: Option<FrontendDialReservation>,
     connector: Option<NativeEndpointConnector>,
     endpoint: tonic::transport::Endpoint,
 }
 
 pub(in crate::native) enum NativeDialHandoff {
     Ready(CachedNativeChannel),
-    Reserved(ReservedNativeDial),
+    Reserved(Box<ReservedNativeDial>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,7 +55,9 @@ pub(in crate::native) enum NativeDialAttempt {
 /// Physical/connector fields precede the original lane/cache custody, so an
 /// unused handoff drops original physical positions before releasing its lane.
 pub(in crate::native) struct ReservedNativeDial {
-    packet: Box<ColdDialPacket>,
+    dial: Option<FrontendDialReservation>,
+    connector: Option<NativeEndpointConnector>,
+    endpoint: tonic::transport::Endpoint,
     _lane: OwnedMutexGuard<()>,
     reservation: Option<NativeDialReservation>,
 }
@@ -108,14 +102,11 @@ impl Client {
             })?,
         )
         .timeout(Duration::from_secs(600));
-        Ok(NativeChannelSource::Cold(SelectedNativeDial {
+        Ok(NativeChannelSource::Cold(Box::new(SelectedNativeDial {
             reservation,
-            packet: Box::new(ColdDialPacket {
-                dial: None,
-                connector: Some(connector),
-                endpoint,
-            }),
-        }))
+            connector: Some(connector),
+            endpoint,
+        })))
     }
 }
 
@@ -198,15 +189,21 @@ impl NativeChannelSource {
                     drop(source.take());
                     return Ok(NativeDialAttempt::Installed);
                 }
-                let Some(Self::Cold(mut selected)) = source.take() else {
+                let Some(Self::Cold(selected)) = source.take() else {
                     unreachable!("the borrowed source variant cannot change");
                 };
-                selected.packet.dial = Some(dial);
-                *target = Some(NativeDialHandoff::Reserved(ReservedNativeDial {
-                    packet: selected.packet,
+                let SelectedNativeDial {
+                    reservation,
+                    connector,
+                    endpoint,
+                } = *selected;
+                *target = Some(NativeDialHandoff::Reserved(Box::new(ReservedNativeDial {
+                    dial: Some(dial),
+                    connector,
+                    endpoint,
                     _lane: lane_position,
-                    reservation: Some(selected.reservation),
-                }));
+                    reservation: Some(reservation),
+                })));
                 Ok(NativeDialAttempt::Installed)
             }
         }
@@ -219,7 +216,7 @@ impl ReservedNativeDial {
     /// cancellation/cleanup; its Drop does not prove a spawned driver exit.
     /// The target is filled before releasing the original lane guard (wake).
     pub(in crate::native) async fn connect_in(
-        mut self,
+        mut self: Box<Self>,
         target: &mut Option<CachedNativeChannel>,
     ) -> Result<(), ChannelAcquisitionError> {
         if target.is_some() {
@@ -244,21 +241,14 @@ impl ReservedNativeDial {
         let lane = reservation.lane();
         let admission = reservation.data_runtime().transport_admission().clone();
         let connector = self
-            .packet
             .dial
             .take()
             .expect("original dial retained")
-            .into_connector(
-                self.packet
-                    .connector
-                    .take()
-                    .expect("original connector retained"),
-            );
+            .into_connector(self.connector.take().expect("original connector retained"));
         // Endpoint consumes the nonClone service without reacquiring its first
         // physical/handshake positions. H2 setup runs with the original lane
         // guard and the caller's same stage still held.
         let created = self
-            .packet
             .endpoint
             .connect_with_connector(connector)
             .await

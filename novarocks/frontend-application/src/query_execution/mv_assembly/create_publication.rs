@@ -125,13 +125,7 @@ impl CreatePublicationInput {
                         context: context.clone(),
                     })
                     .map_err(provider)?;
-                let fields = plan.staged_write_fields(handle).map_err(|error| {
-                    MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, error.message())
-                        .with_compile_control(error.compile_control_error())
-                        .with_unavailable_implementation(
-                            error.unavailable_implementation().cloned(),
-                        )
-                })?;
+                let fields = plan.staged_write_fields(handle)?;
                 Ok(CreatePublicationOutput::Publication {
                     begin: ConnectorWriteBeginRequest {
                         table: Arc::from(format!(

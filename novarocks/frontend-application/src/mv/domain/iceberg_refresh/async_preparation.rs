@@ -1465,3 +1465,313 @@ pub(crate) async fn validate_target_snapshot_original(
     )
     .map_err(Into::into)
 }
+
+#[cfg(test)]
+mod partition_planning_tests {
+    use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
+    use crate::query_execution::{
+        internal_result_cpu::InternalResultCpuOwner,
+        maintenance::io_admission::MetadataIoAdmission,
+        mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationServices,
+    };
+    use crate::task_execution::status_intake::StatusIntakeWake;
+    use mv_schema::{MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract};
+    use novarocks_query_application::{
+        cancellation::QueryCancellationView, cpu::QueryBlockingExecutorConfig,
+    };
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorRequestContext, ConnectorStopOwner,
+    };
+    use novarocks_state_store_api::{
+        StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreExecutionRequests,
+        StateStoreReadExecution,
+    };
+    use novarocks_workload_control::{
+        ControlStorageConfig, ResultCapacityConfig, WorkClass, WorkRequest, WorkloadConfig,
+        WorkloadControl,
+        joint_admission::{JointProgress, ResponsibilityConfig},
+    };
+    use std::{
+        future::{Future, poll_fn},
+        num::NonZeroUsize,
+        task::Poll,
+        time::{Duration, Instant},
+    };
+
+    struct NoRepositoryIo;
+    impl StateStoreReadExecution for NoRepositoryIo {
+        fn read_transaction_context(
+            &self,
+        ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+            panic!("unchanged bases must not request repository I/O")
+        }
+    }
+    impl StateStoreExecutionRequests for NoRepositoryIo {
+        fn write_operation_context(
+            &self,
+        ) -> Result<StateStoreExecutionContext, StateStoreExecutionFailure> {
+            panic!("unchanged bases must not request a repository write")
+        }
+    }
+    #[derive(Debug)]
+    struct Wake;
+    impl StatusIntakeWake for Wake {
+        fn wake(&self) {}
+    }
+
+    async fn with_driver<F: Future>(
+        control: &WorkloadControl,
+        driver: &mut novarocks_workload_control::joint_admission::JointProgressDriver,
+        future: F,
+    ) -> F::Output {
+        tokio::pin!(future);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match driver.step() {
+                    JointProgress::More => tokio::task::yield_now().await,
+                    JointProgress::Idle(revision) => tokio::select! {
+                        biased;
+                        result = &mut future => return result,
+                        _ = control.wait_progress(revision) => {},
+                    },
+                }
+            }
+        })
+        .await
+        .expect("unchanged-base component cleanup watchdog")
+    }
+
+    fn base_ref(table: &str) -> TableIdentity {
+        TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: table.to_string(),
+        }
+    }
+
+    /// The MV target's partitioning is the provider's own typed observation,
+    /// carried by the exact target binding. The retired schema contract used to
+    /// keep a second copy; it is gone.
+    fn identity_partition() -> MvPartitionContract {
+        MvPartitionContract {
+            target_spec_id: 7,
+            fields: vec![MvPartitionFieldContract {
+                partition_field_id: 100,
+                partition_field_name: "id".to_string(),
+                source_target_field_id: 10,
+                source_column_name: "id".to_string(),
+                transform: MvPartitionTransformContract::Identity,
+            }],
+        }
+    }
+
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
+            mv_id: 1,
+            facts: ProjectionFixture::new(
+                novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
+                Some(11),
+            )
+            .build()
+            .expect("fixture projection"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plan_multi_base_affected_partitions_unchanged_bases_return_empty_known_set() {
+        let projection = projection();
+        let partition = identity_partition();
+        let base_refs = vec![
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(0),
+                table: base_ref("left"),
+            },
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(1),
+                table: base_ref("right"),
+            },
+        ];
+        let previous_snapshots = BTreeMap::from([
+            (SqlMvRelationOccurrenceId::new(0), 11_i64),
+            (SqlMvRelationOccurrenceId::new(1), 22_i64),
+        ]);
+        let current_snapshots = BTreeMap::from([
+            (SqlMvRelationOccurrenceId::new(0), Some(11_i64)),
+            (SqlMvRelationOccurrenceId::new(1), Some(22_i64)),
+        ]);
+
+        let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: 8,
+            business_limit: 8,
+            query_concurrency_limit: 8,
+            scope_records_limit: 8,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let (_, mut driver) = control
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
+            .unwrap();
+        control
+            .configure_control_storage(ControlStorageConfig::new(8, &[]))
+            .unwrap();
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        let mut cpu = InternalResultCpuOwner::try_new(
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            &mut control,
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let io = MetadataIoAdmission::for_original_source(&root.owner, Vec::new()).unwrap();
+        with_driver(
+            &control,
+            &mut driver,
+            poll_fn(|cx| {
+                if io.poll_progress(&root.owner, cx).unwrap() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await;
+        let capacity = io.root_capacity().unwrap();
+        let window = capacity.try_window_alias().unwrap();
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            4096,
+            64 * 1024,
+        )
+        .unwrap()
+        .with_io_admission(io.clone());
+        let cancellation = QueryCancellationView::governed(scope.cancellation().unwrap(), None);
+        let gate = Arc::new(MvRefreshPreparationIo::new(
+            MvRefreshPreparationServices {
+                cpu: cpu.runtime(),
+                scope: scope.clone(),
+                window: window.clone(),
+                cancellation,
+                runtime: tokio::runtime::Handle::current(),
+                wake: Arc::new(Wake),
+                requests: Arc::new(NoRepositoryIo),
+            },
+            io.original_result_scope(&context).unwrap(),
+        ));
+        let source_revision = projection.facts.source_revision();
+        let instance = source_revision.target.instance_id.clone();
+        let binding = novarocks_catalog_application::test_support::test_control_binding_for(
+            instance.clone(),
+            8,
+        )
+        .with_catalog_properties(crate::mv::domain::test_admission::catalog_properties(
+            &instance,
+        ))
+        .unwrap();
+        let host = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+        host.register(binding).unwrap();
+        let planning = host.acquire_current(&instance).unwrap();
+        let (_product, repository) = crate::mv::domain::test_admission::keyed_product().await;
+        let entrance = crate::mv::domain::test_admission::management_entrance();
+        let readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
+            novarocks_mv_application::readiness::MvKeyedReadinessService::new(
+                repository,
+                Arc::default(),
+            ),
+            tokio::runtime::Handle::current(),
+            entrance.clone(),
+        ));
+        let ports = IcebergMvCorePorts::new(
+            Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+            None,
+            host.clone(),
+            readiness,
+            Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            crate::application::test_constant_policy(),
+        )
+        .with_management_entrance(entrance);
+        // Unchanged occurrences must not resolve a predecessor or read target metadata.
+        let baseline = RefreshStateBaseline::SnapshotBacked {
+            previous_sources: Vec::new(),
+            target_snapshot_id: projection.facts.publication_snapshot(),
+            target_table_uuid: "unchanged-partition-target".to_string(),
+            definition_fingerprint: mv_definition_fingerprint(
+                &projection.facts.definition().query.effective_sql,
+            ),
+        };
+        let planned = {
+            let mut future = std::pin::pin!(plan_multi_base_affected_partitions_original(
+                &gate,
+                &ports,
+                &baseline,
+                &context,
+                &projection,
+                &partition,
+                RefreshMode::Incremental,
+                &base_refs,
+                &previous_snapshots,
+                &current_snapshots,
+                "UNION ALL MV affected partition planning",
+            ));
+            // Exactly one poll: a requested change window cannot be serviced here.
+            poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+        };
+        // Preserve the no-call observation before close may withdraw an unstarted request.
+        let requested_change_window = gate.has_request();
+        with_driver(&control, &mut driver, poll_fn(|cx| gate.poll_closed(cx)))
+            .await
+            .unwrap();
+        drop(gate);
+        drop(ports);
+        drop(planning);
+        drop(host);
+        drop(context);
+        let _ = with_driver(
+            &control,
+            &mut driver,
+            poll_fn(|cx| io.poll_actual_quiescent_continuing(cx)),
+        )
+        .await
+        .unwrap();
+        drop(window);
+        drop(capacity);
+        drop(io);
+        drop(scope);
+        root.owner.complete();
+        root.business.release();
+        drop(driver);
+        drop(control);
+        cpu.shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            !requested_change_window,
+            "unchanged bases should not require change-window admission"
+        );
+        let Poll::Ready(planned) = planned else {
+            panic!("unchanged bases should finish without requesting change-window admission");
+        };
+
+        assert_eq!(
+            planned,
+            crate::mv::domain::model::AffectedTargetPartitions::known(std::iter::empty::<
+                crate::mv::domain::model::MvPartitionKey,
+            >(),)
+        );
+    }
+}

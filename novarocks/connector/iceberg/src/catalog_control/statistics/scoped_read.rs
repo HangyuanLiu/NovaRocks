@@ -208,7 +208,7 @@ impl IcebergMetadataCpuOriginal {
         Self::new(
             provider.descriptor().clone(),
             provider.incarnation(),
-            CpuBody::Read(ReadBody {
+            CpuBody::Read(Box::new(ReadBody {
                 provider: Some(provider),
                 request: Some(request),
                 original,
@@ -223,7 +223,7 @@ impl IcebergMetadataCpuOriginal {
                 snapshot_id: None,
                 retiring: false,
                 closed: false,
-            }),
+            })),
         )
     }
     async fn read_original(

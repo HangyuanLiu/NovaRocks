@@ -191,10 +191,10 @@ impl ReadNativeTail {
         }
     }
     fn poll_state_store(&mut self, cx: &mut Context<'_>) {
-        if let Some(source) = self.state_store.as_ref() {
-            if let Err(cause) = source.poll_progress(cx) {
-                self.retain_state_store_health(cause);
-            }
+        if let Some(source) = self.state_store.as_ref()
+            && let Err(cause) = source.poll_progress(cx)
+        {
+            self.retain_state_store_health(cause);
         }
     }
     fn state_store_quiescent(&mut self, cx: &mut Context<'_>) -> bool {
@@ -444,12 +444,12 @@ impl ReadStatementAction {
                 }
             }
         }
-        if self.error.is_none() {
-            if let Some(error) = tail.io.original().and_then(|io| io.failure()) {
-                self.error = Some(QueryServiceError::from_failure_cause(
-                    novarocks_failure_contract::SharedFailureCause::new(error),
-                ));
-            }
+        if self.error.is_none()
+            && let Some(error) = tail.io.original().and_then(|io| io.failure())
+        {
+            self.error = Some(QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            ));
         }
         if self.error.is_none() && self.local.is_some() {
             match tail.poll_business_exit(cx) {
@@ -550,15 +550,15 @@ impl ReadStatementAction {
                 drop(self.preparation.take());
                 self.completed_preparation = true;
             }
-            if !self.completed_preparation {
-                if let Some(future) = self.preparation.as_mut() {
-                    match future.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(result) => self.prepared = Some(result),
-                    }
-                    self.completed_preparation = true;
-                    drop(self.preparation.take());
+            if !self.completed_preparation
+                && let Some(future) = self.preparation.as_mut()
+            {
+                match future.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => self.prepared = Some(result),
                 }
+                self.completed_preparation = true;
+                drop(self.preparation.take());
             }
             match poll_provider_close(
                 &mut self.provider_close,
@@ -774,13 +774,13 @@ impl FrontendQuerySession {
             .execute_observed_statement_action(statement, Box::new(action))
             .await?;
         #[cfg(novarocks_dev_controls)]
-        if let StatementResult::StreamingQuery(stream) = &result {
-            if let Some(control) = &self.service.result_handoff {
-                control
-                    .before_protocol(handoff_statement, handoff_target, stream.failure_view())
-                    .await
-                    .map_err(internal_error)?;
-            }
+        if let StatementResult::StreamingQuery(stream) = &result
+            && let Some(control) = &self.service.result_handoff
+        {
+            control
+                .before_protocol(handoff_statement, handoff_target, stream.failure_view())
+                .await
+                .map_err(internal_error)?;
         }
         Ok(result)
     }

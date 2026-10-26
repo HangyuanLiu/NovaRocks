@@ -84,8 +84,6 @@ type OriginalFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(crate) struct OriginalInputLayouts {
     pub(crate) future: std::alloc::Layout,
     pub(crate) input: std::alloc::Layout,
-    pub(crate) reservations: std::alloc::Layout,
-    pub(crate) task_inline: std::alloc::Layout,
 }
 pub(crate) fn original_input_layouts<F: Future<Output = ()>>()
 -> Result<OriginalInputLayouts, novarocks_workload_control::WorkError> {
@@ -96,59 +94,6 @@ pub(crate) fn original_input_layouts<F: Future<Output = ()>>()
         future: Layout::new::<F>(),
         input: arc_layout(Layout::new::<OriginalInput>())
             .map_err(|_| WorkError::ArithmeticOverflow)?,
-        reservations: arc_layout(Layout::new::<ReservationBacking>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        task_inline: Layout::new::<OriginalTask>(),
-    })
-}
-
-/// The actual fixed Apply inventory, including canonical reply headers which
-/// can outlive action/IO. Dynamic reply cells and payload remain per action.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ApplySourceGeometry {
-    pub(crate) records: usize,
-    pub(crate) record_array: std::alloc::Layout,
-    pub(crate) core: std::alloc::Layout,
-    pub(crate) canonical_header: std::alloc::Layout,
-    pub(crate) canonical_headers: usize,
-    pub(crate) owner: std::alloc::Layout,
-}
-impl ApplySourceGeometry {
-    pub(crate) fn resident_bytes(self) -> Result<usize, novarocks_workload_control::WorkError> {
-        use novarocks_workload_control::WorkError;
-        self.canonical_headers
-            .checked_mul(self.canonical_header.size())
-            .and_then(|bytes| bytes.checked_add(self.record_array.size()))
-            .and_then(|bytes| bytes.checked_add(self.core.size()))
-            .and_then(|bytes| bytes.checked_add(self.owner.size()))
-            .ok_or(WorkError::ArithmeticOverflow)
-    }
-}
-/// Shared by installation inventory observation and frontend composition.
-/// These are requested Rust backing layouts, not a Tokio task or platform
-/// synchronization implementation estimate. No source is constructed here.
-pub(crate) fn apply_source_geometry(
-    records: usize,
-) -> Result<ApplySourceGeometry, novarocks_workload_control::WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    use novarocks_workload_control::WorkError;
-    use std::alloc::Layout;
-    if records == 0 {
-        return Err(WorkError::Capacity("Native Apply records"));
-    }
-    Ok(ApplySourceGeometry {
-        records,
-        record_array: Layout::array::<Option<OriginalRecord>>(records)
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        core: arc_layout(Layout::new::<Core>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        canonical_header: arc_layout(Layout::new::<ReservationBacking>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        // One retiring header can still be leaving the serial reaper after
-        // its original row has become available to its successor.
-        canonical_headers: records
-            .checked_add(1)
-            .ok_or(WorkError::ArithmeticOverflow)?,
-        owner: Layout::new::<ApplySendOwner>(),
     })
 }
 
@@ -552,22 +497,6 @@ impl ApplySendPort {
             return Err(novarocks_workload_control::WorkError::Closed);
         }
         Ok(state.records.len())
-    }
-
-    /// Original fixed record/Core/owner payloads only, not independent input,
-    /// task, reservation or arbitrary failure pointees.
-    pub(crate) fn capacity_sources(
-        &self,
-    ) -> Result<(usize, usize), novarocks_workload_control::WorkError> {
-        let records = self
-            .core
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .records
-            .len();
-        let geometry = apply_source_geometry(records)?;
-        Ok((geometry.records, geometry.resident_bytes()?))
     }
 
     /// Refuse a closed role before starting a paid proposal. This does not

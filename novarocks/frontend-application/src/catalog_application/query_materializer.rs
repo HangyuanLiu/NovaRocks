@@ -696,7 +696,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
 /// value is built or completed; its exact lease is used by the named I/O gate.
 pub(crate) enum OriginalCatalogLookup {
     Fact(novarocks_sql::compiler::CatalogRelationFact),
-    Metadata(OriginalCatalogMetadataLookup),
+    Metadata(Box<OriginalCatalogMetadataLookup>),
 }
 pub(crate) struct OriginalCatalogMetadataLookup {
     need: novarocks_sql::compiler::CatalogRelationNeed,
@@ -847,7 +847,7 @@ impl CatalogServiceMaterializer<'_> {
                 None,
             ),
         };
-        Ok(OriginalCatalogLookup::Metadata(
+        Ok(OriginalCatalogLookup::Metadata(Box::new(
             OriginalCatalogMetadataLookup {
                 need: need.clone(),
                 key,
@@ -859,7 +859,7 @@ impl CatalogServiceMaterializer<'_> {
                 snapshot,
                 metadata_kind,
             },
-        ))
+        )))
     }
 
     /// Consume that exact observation on the CPU. The original projection and
@@ -867,7 +867,7 @@ impl CatalogServiceMaterializer<'_> {
     /// their real cause alongside the same memoized failure.
     pub(crate) fn finish_original_catalog_lookup(
         &self,
-        lookup: OriginalCatalogMetadataLookup,
+        lookup: Box<OriginalCatalogMetadataLookup>,
         observed: Result<
             novarocks_spi::connector::ConnectorTableMetadata,
             novarocks_spi::connector::ConnectorError,
@@ -877,6 +877,7 @@ impl CatalogServiceMaterializer<'_> {
         crate::mv::domain::application::MvApplicationError,
     > {
         use crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error;
+        let lookup = *lookup;
         let relation = lookup.need.relation();
         let materialization = match observed {
             Ok(metadata) => crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(

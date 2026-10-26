@@ -102,12 +102,6 @@ impl ConnectorBlockingIoResponsibility {
 }
 
 impl ConnectorBlockingIoAdmission {
-    /// Inline state is paid by its original Source header. The named waiting
-    /// future is the only additional allocation, with one fixed position.
-    pub(crate) fn wait_backing_layout() -> std::alloc::Layout {
-        JointProposalSlotWait::metadata_layouts().1
-    }
-
     fn poll_individual_request(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WorkError>> {
         if self.request.is_some() || self.receipt.is_some() {
             return Poll::Ready(Ok(()));

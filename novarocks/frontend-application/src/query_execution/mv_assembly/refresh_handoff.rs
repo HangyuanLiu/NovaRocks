@@ -26,8 +26,6 @@ use super::refresh_artifact::{
 use novarocks_mv_application::publication::MvRefreshPublicationIntent;
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 
-use crate::mv::domain::lifecycle::RefreshError;
-
 /// Application request supplied to the side-effect-free SQL preparation port.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshPreparationRequest {
@@ -188,16 +186,6 @@ pub struct PreparedMvRefresh {
     pub observed_binding: ConnectorProviderBindingKey,
     pub finalize: MvRefreshFinalizeFacts,
     pub work: PreparedMvRefreshWork,
-}
-
-/// SQL preparation port consumed by the frontend lifecycle owner. Its request
-/// and output are application envelopes around immutable SQL values, never a
-/// way for SQL to acquire lifecycle or connector authority itself.
-pub trait MvRefreshPreparationService: Send + Sync {
-    fn prepare_step(
-        &self,
-        request: MvRefreshPreparationRequest,
-    ) -> Result<PreparedMvRefresh, RefreshError>;
 }
 
 #[cfg(test)]

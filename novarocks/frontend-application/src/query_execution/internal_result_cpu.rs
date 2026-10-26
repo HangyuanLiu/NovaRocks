@@ -1938,7 +1938,6 @@ fn make_closed_legacy_forwarder(
 }
 
 #[cfg(test)]
-
 fn make_forwarder<I, O, F>(
     executor: QueryBlockingExecutor,
     input: InternalResultValue<I>,

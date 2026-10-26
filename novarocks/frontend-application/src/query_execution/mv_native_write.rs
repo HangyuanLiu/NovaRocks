@@ -24,10 +24,7 @@
 //! rest of query assembly.
 
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteReceipt,
-};
+use novarocks_spi::connector::ConnectorWriteReceipt;
 
 use novarocks_mv_application::publication::{MvRefreshCommittedFacts, MvRefreshPublicationIntent};
 
@@ -192,21 +189,6 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         intent: MvRefreshPublicationIntent,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String>;
-
-    /// Install the Current projection of a target this refresh just published.
-    ///
-    /// The publication committed P in the same snapshot as its rows, so the
-    /// projection is read back from that one committed document set rather
-    /// than assembled from the facts the frontend happened to hold. The caller
-    /// supplies the committed carrier snapshot it already proved.
-    fn install_published_projection(
-        &self,
-        planning_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
-        expected_snapshot_id: i64,
-        operation_id: uuid::Uuid,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<(), String>;
 }
 
 #[cfg(test)]

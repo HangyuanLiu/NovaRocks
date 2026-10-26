@@ -954,66 +954,21 @@ mod tests {
 
 #[cfg(test)]
 mod refresh_refusal_projection_tests {
-    use super::{mv_command_error, mv_compile_error};
+    use super::mv_application_command_error;
     use crate::mv::domain::application::MvApplicationErrorKind;
-    use crate::mv::domain::lifecycle::RefreshError;
-    use crate::mv::service::prepare_refresh_step;
-    use crate::query_execution::mv_assembly::refresh_handoff::{
-        MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
-    };
+    use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
     use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
-    use novarocks_mv_application::service::MvKeyedProductService;
     use novarocks_query_application::api::CommandErrorKind;
     use novarocks_sql::{
         analyze_error::{AnalyzeError, AnalyzeErrorKind},
         compiler::SqlCompileError,
-        planning::mv::{MvRefreshStatement, SqlMvTarget},
     };
     use novarocks_type_contract::CompileControlError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct RefusingPreparation {
-        expected: MvRefreshPreparationRequest,
-        error: SqlCompileError,
-        calls: AtomicUsize,
-    }
-
-    impl MvRefreshPreparationService for RefusingPreparation {
-        fn prepare_step(
-            &self,
-            request: MvRefreshPreparationRequest,
-        ) -> Result<PreparedMvRefresh, RefreshError> {
-            assert_eq!(request, self.expected);
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(RefreshError::from(self.error.clone()))
-        }
-    }
 
     fn prepare_failure(
         error: SqlCompileError,
     ) -> crate::mv::domain::application::MvApplicationError {
-        let request = MvRefreshPreparationRequest {
-            statement: MvRefreshStatement {
-                name_parts: vec!["db".into(), "mv".into()],
-                full: true,
-            },
-            target: SqlMvTarget {
-                catalog: Some("iceberg".into()),
-                database: "db".into(),
-                name: "mv".into(),
-            },
-            attempt: MvKeyedProductService::default().reserve_refresh_attempt(),
-        };
-        let preparation = RefusingPreparation {
-            expected: request.clone(),
-            error,
-            calls: AtomicUsize::new(0),
-        };
-        let failure = match prepare_refresh_step(&preparation, request) {
-            Ok(_) => panic!("the preparation port must refuse before execution"),
-            Err(failure) => failure,
-        };
-        assert_eq!(preparation.calls.load(Ordering::SeqCst), 1);
+        let failure = PreparationError::from(error).0;
         assert_eq!(failure.kind(), MvApplicationErrorKind::InvalidRequest);
         failure
     }
@@ -1028,17 +983,16 @@ mod refresh_refusal_projection_tests {
         };
         let expected_user = expected.to_user_error(None).to_string();
         let failure = prepare_failure(compile.clone());
-        let projected = mv_compile_error(failure);
-        let SqlCompileError::Analyze(analyze) = &projected else {
-            panic!("command reconstruction must keep the typed analysis cause");
-        };
+        let analyze = failure
+            .unavailable_implementation()
+            .expect("preparation must keep the typed analysis cause");
         assert_eq!(analyze, expected);
         assert_eq!(analyze.kind(), AnalyzeErrorKind::UnavailableImplementation);
         assert_eq!(
             analyze.code().as_str(),
             "sql.analyze.unavailable_implementation"
         );
-        let user = mv_command_error(projected);
+        let user = mv_application_command_error(failure);
         assert_eq!(user.kind(), CommandErrorKind::Failed);
         assert_eq!(user.compile_control_error(), None);
         assert_eq!(user.to_string(), expected_user);
@@ -1055,19 +1009,20 @@ mod refresh_refusal_projection_tests {
             let fact = source.failure_fact();
             let failure = prepare_failure(SqlCompileError::CompilationSource(source.clone()));
             assert_eq!(failure.unavailable_implementation(), None);
-            let SqlCompileError::CompilationSource(carried) = mv_compile_error(failure) else {
-                panic!("command reconstruction must retain the compile source");
-            };
-            assert_eq!(carried, source);
-            assert_eq!(carried.failure_fact(), fact);
-            let user = mv_command_error(SqlCompileError::CompilationSource(carried));
-            let Some(CompileControlError::Source(carried)) = user.compile_control_error() else {
-                panic!("the final command must retain the same source");
-            };
-            assert_eq!(user.kind(), CommandErrorKind::Failed);
-            assert_eq!(carried, source);
-            assert_eq!(carried.failure_fact(), fact);
-            assert_eq!(user.to_string(), source.to_string());
+            assert_eq!(failure.original_failure(), Some(&source));
+            let actual = mv_application_command_error(failure.clone());
+            assert_eq!(actual.kind(), CommandErrorKind::Failed);
+            assert_eq!(actual.failure_cause(), Some(&source));
+            assert_eq!(actual.failure_cause().unwrap().failure_fact(), fact);
+            assert_eq!(actual.execution_failure().unwrap().fact(), fact);
+            assert_eq!(
+                actual.compile_control_error(),
+                Some(CompileControlError::Source(source.clone()))
+            );
+            assert_eq!(
+                actual.to_string(),
+                actual.execution_failure().unwrap().user_error().to_string()
+            );
         }
     }
 
@@ -1080,11 +1035,10 @@ mod refresh_refusal_projection_tests {
         ] {
             let failure = prepare_failure(compile);
             assert_eq!(failure.unavailable_implementation(), None);
-            let projected = mv_compile_error(failure);
-            assert!(
-                matches!(&projected, SqlCompileError::Compilation(actual) if actual == message)
-            );
-            let user = mv_command_error(projected);
+            let user = mv_application_command_error(failure);
+            assert_eq!(user.failure_cause(), None);
+            assert_eq!(user.execution_failure(), None);
+            assert_eq!(user.user_error(), None);
             assert_eq!(user.kind(), CommandErrorKind::Failed);
             assert_eq!(user.compile_control_error(), None);
             assert_eq!(user.to_string(), message);
@@ -1092,7 +1046,7 @@ mod refresh_refusal_projection_tests {
     }
 
     #[test]
-    fn refresh_prepare_step_control_keeps_command_cause_and_rollback_policy() {
+    fn refresh_prepare_step_control_keeps_command_cause_and_priority() {
         for control in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
@@ -1102,14 +1056,10 @@ mod refresh_refusal_projection_tests {
                 SqlCompileError::from(control.clone()),
                 SqlCompileError::Analyze(AnalyzeError::control(control.clone())),
             ] {
-                let refresh = RefreshError::from(compile.clone());
-                assert!(refresh.kind.should_rollback_after_commit());
-                assert_eq!(refresh.compile_control_error(), Some(control.clone()));
-                assert_eq!(refresh.unavailable_implementation(), None);
                 let failure = prepare_failure(compile);
                 assert_eq!(failure.compile_control_error(), Some(control.clone()));
                 assert_eq!(failure.unavailable_implementation(), None);
-                let user = mv_command_error(mv_compile_error(failure));
+                let user = mv_application_command_error(failure);
                 assert_eq!(user.compile_control_error(), Some(control.clone()));
                 assert_eq!(user.to_string(), control.to_string());
                 assert_eq!(
@@ -1126,7 +1076,7 @@ mod refresh_refusal_projection_tests {
             ));
             let failure = prepare_failure(missing).with_compile_control(Some(control.clone()));
             assert!(failure.unavailable_implementation().is_some());
-            let user = mv_command_error(mv_compile_error(failure));
+            let user = mv_application_command_error(failure);
             assert_eq!(user.compile_control_error(), Some(control.clone()));
             assert_eq!(user.to_string(), control.to_string());
         }

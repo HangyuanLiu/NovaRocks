@@ -18,7 +18,7 @@
 //! Governed UPDATE/MERGE stages over the original signed mutation authors.
 
 use super::statement_computation::{
-    self, StatementComputation, StatementComputationAssembly, StatementComputationOutput,
+    StatementComputation, StatementComputationAssembly, StatementComputationOutput,
     StatementNativeTail,
 };
 use super::statement_publication::StatementPublication;
@@ -41,7 +41,7 @@ use crate::query_execution::{
     },
     logical_execution::{InitialComputationReservation, PreparedLogicalComputation},
     maintenance::io_admission::MetadataIoAdmission,
-    write_session::{ConnectorWriteSession, WriteBeginReceiving, WritePublicationCall},
+    write_session::{ConnectorWriteSession, WriteBeginReceiving},
 };
 use novarocks_query_application::{
     admitted_query_context::{QueryExecutionContext, QueryResultCapacityBinding},
@@ -177,8 +177,7 @@ async fn prepare_phase(
         )
         .await
         .map(Arc::new)
-        .map(PhaseValue::Facts)
-        .map_err(Into::into),
+        .map(PhaseValue::Facts),
         PhaseRequest::Mor(facts) => facts
             .prepare_mor_write_async(&input.kernel, Arc::clone(&input.receiving))
             .await
@@ -392,10 +391,9 @@ impl MutationAction {
             && self.close.is_none()
             && self.phase != Phase::Publication
             && self.phase != Phase::Done
+            && let Some(reason) = cancellation.reason()
         {
-            if let Some(reason) = cancellation.reason() {
-                self.fail(cancellation_error(reason));
-            }
+            self.fail(cancellation_error(reason));
         }
         if self.selected.is_some()
             && self.preparation.future.is_none()
@@ -419,11 +417,10 @@ impl MutationAction {
                     self.phase,
                     Phase::Admit | Phase::NextWriter | Phase::CloseIo
                 )
+                && let Some(reason) = cancellation.reason()
             {
-                if let Some(reason) = cancellation.reason() {
-                    self.fail(cancellation_error(reason));
-                    self.phase = Phase::Publication;
-                }
+                self.fail(cancellation_error(reason));
+                self.phase = Phase::Publication;
             }
             match self.phase {
                 Phase::Admit => {
@@ -595,16 +592,16 @@ impl MutationAction {
                     self.phase = Phase::LocalExit;
                 }
                 Phase::LocalExit => {
-                    if self.selection_execution.is_none() {
-                        if let Some(MutationReady::Selection(ready)) = self.ready.as_ref() {
-                            self.selection_execution = Some(
-                                self.original
-                                    .request
-                                    .execution()
-                                    .for_statement_retention(ready.binding.clone())
-                                    .map_err(|e| internal_error(e.to_string()))?,
-                            );
-                        }
+                    if self.selection_execution.is_none()
+                        && let Some(MutationReady::Selection(ready)) = self.ready.as_ref()
+                    {
+                        self.selection_execution = Some(
+                            self.original
+                                .request
+                                .execution()
+                                .for_statement_retention(ready.binding.clone())
+                                .map_err(|e| internal_error(e.to_string()))?,
+                        );
                     }
                     match self.computation.as_mut().unwrap().poll_ready_local_exit(cx) {
                         Poll::Pending => return Poll::Pending,
@@ -751,10 +748,10 @@ impl MutationAction {
                 Phase::Publication => {
                     // No new effect begins after cancellation. Existing Calls
                     // settle once; an Applied verdict survives late cancellation.
-                    if self.publication.as_ref().unwrap().call.is_none() {
-                        if let Some(reason) = cancellation.reason() {
-                            self.fail(cancellation_error(reason));
-                        }
+                    if self.publication.as_ref().unwrap().call.is_none()
+                        && let Some(reason) = cancellation.reason()
+                    {
+                        self.fail(cancellation_error(reason));
                     }
                     if let Some(computation) = self.computation.as_mut() {
                         match computation.poll_refused_exit(cx) {
@@ -883,12 +880,12 @@ impl GovernedStatementAction for MutationAction {
         }
         self.busy = true;
         let mut result = self.poll_inner(owner, cx);
-        if self.phase != Phase::Done {
-            if let Poll::Ready(Err(error)) = result {
-                self.fail(error);
-                self.phase = Phase::Publication;
-                result = self.poll_inner(owner, cx);
-            }
+        if self.phase != Phase::Done
+            && let Poll::Ready(Err(error)) = result
+        {
+            self.fail(error);
+            self.phase = Phase::Publication;
+            result = self.poll_inner(owner, cx);
         }
         self.busy = false;
         result
@@ -1198,68 +1195,6 @@ pub(crate) fn prepare(
         busy: false,
         health: health(),
     }))
-}
-fn phase_future_size<F: Future>(_: fn(Arc<OriginalInput>, PhaseRequest) -> F) -> usize {
-    std::mem::size_of::<F>()
-}
-fn close_future_size<F: Future>(_: fn(Arc<FrontendCompletionCustody>) -> F) -> usize {
-    std::mem::size_of::<F>()
-}
-pub(crate) fn fixed_source_bytes(
-    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
-    k: usize,
-) -> Result<u64, WorkError> {
-    use novarocks_type_contract::owned_resources::layout::arc_layout;
-    let mut bytes = Layout::new::<MutationAction>()
-        .size()
-        .checked_add(Layout::new::<MutationResidual>().size())
-        .and_then(|n| n.checked_add(phase_future_size(prepare_phase)))
-        .and_then(|n| n.checked_add(close_future_size(close_provider)))
-        .and_then(|n| n.checked_add(statement_computation::heap_source_bytes().ok()?))
-        .and_then(|n| n.checked_add(StatementNativeTail::retained_heap_bytes().ok()?))
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    let layouts = [
-        arc_layout(Layout::new::<OriginalInput>()).map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<Mutex<Option<Arc<ConnectorWriteSession>>>>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        arc_layout(Layout::new::<MutationExitUnproven>())
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-        PreparedMutationFacts::source_layout().map_err(|_| WorkError::ArithmeticOverflow)?,
-        PreparedMorMutationWrite::source_layout().map_err(|_| WorkError::ArithmeticOverflow)?,
-        PreparedCowSelection::source_layout().map_err(|_| WorkError::ArithmeticOverflow)?,
-        PreparedCowMutationWrite::source_layout().map_err(|_| WorkError::ArithmeticOverflow)?,
-    ];
-    for layout in layouts {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    for layout in ConnectorWriteSession::fixed_receiving_layouts()
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .into_iter()
-        .chain(
-            FrontendCompletionCustody::known_layouts()
-                .map_err(|_| WorkError::ArithmeticOverflow)?,
-        )
-        .chain(WriteBeginReceiving::known_cow_layouts().map_err(|_| WorkError::ArithmeticOverflow)?)
-        .chain(
-            WritePublicationCall::known_layouts()
-                .map_err(|_| WorkError::ArithmeticOverflow)?
-                .into_iter()
-                .skip(1),
-        )
-    {
-        bytes = bytes
-            .checked_add(layout.size())
-            .ok_or(WorkError::ArithmeticOverflow)?;
-    }
-    u64::try_from(bytes)
-        .map_err(|_| WorkError::ArithmeticOverflow)?
-        .checked_add(MetadataIoAdmission::fixed_backing_bytes(
-            geometry.max_concurrent_io().get(),
-            k,
-        )?)
-        .ok_or(WorkError::ArithmeticOverflow)
 }
 
 #[cfg(test)]

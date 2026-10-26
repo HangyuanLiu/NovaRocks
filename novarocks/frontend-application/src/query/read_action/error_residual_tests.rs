@@ -511,7 +511,6 @@ async fn read_error_hands_same_idle_original_to_residual_only_after_actual_foote
     assert_eq!(source.results.load(Ordering::Acquire), 2);
     assert_eq!(source.exits.load(Ordering::Acquire), 2);
     drop((context, source, provider));
-    drop(owner);
     // The test's observer retains the cancellation cell after Work exits.
     // Release it before requiring the original fixed storage to fully drain.
     drop(cancellation);

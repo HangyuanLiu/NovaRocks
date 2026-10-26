@@ -43,22 +43,40 @@ pub(super) struct NativeChannelSlot {
 /// not identify the cache entry that supplied an older request.
 #[derive(Clone)]
 pub(super) struct CachedNativeChannel {
-    pub(super) channel: NativeLaneChannel,
-    pub(super) slot: NativeChannelSlot,
+    original: Arc<CachedNativeChannelBody>,
+}
+
+/// One immutable publication template, shared by the cache and escaped identities.
+/// Actual calls clone the channel to obtain their own poll/readiness state.
+struct CachedNativeChannelBody {
+    channel: NativeLaneChannel,
+    slot: NativeChannelSlot,
     generation: Arc<DialGeneration>,
 }
 
 impl CachedNativeChannel {
+    pub(super) fn channel(&self) -> &NativeLaneChannel {
+        &self.original.channel
+    }
+
+    pub(super) fn slot(&self) -> &NativeChannelSlot {
+        &self.original.slot
+    }
+
+    fn generation(&self) -> &Arc<DialGeneration> {
+        &self.original.generation
+    }
+
     pub(super) fn is_retired(&self) -> bool {
-        self.generation.retired.load(Ordering::Acquire)
+        self.generation().retired.load(Ordering::Acquire)
     }
 
     /// Read-only component identity; grants no selection or dial authority.
     #[cfg(test)]
     pub(super) fn same_generation_for_test(&self, other: &Self) -> bool {
-        self.slot == other.slot
-            && Arc::ptr_eq(&self.generation, &other.generation)
-            && !self.generation.retired.load(Ordering::Acquire)
+        self.slot() == other.slot()
+            && Arc::ptr_eq(self.generation(), other.generation())
+            && !self.generation().retired.load(Ordering::Acquire)
     }
 }
 
@@ -68,14 +86,14 @@ struct DialGeneration {
 
 enum NativeChannelCacheRow {
     Dialing(Arc<DialGeneration>),
-    Ready(Box<CachedNativeChannel>),
+    Ready(CachedNativeChannel),
 }
 
 impl NativeChannelCacheRow {
     fn generation(&self) -> &Arc<DialGeneration> {
         match self {
             Self::Dialing(generation) => generation,
-            Self::Ready(channel) => &channel.generation,
+            Self::Ready(channel) => channel.generation(),
         }
     }
 }
@@ -208,7 +226,7 @@ impl NativeDialReservation {
         }
         match channels.row(&self.slot) {
             Some(NativeChannelCacheRow::Ready(channel))
-                if Arc::ptr_eq(&channel.generation, &self.generation) =>
+                if Arc::ptr_eq(channel.generation(), &self.generation) =>
             {
                 Ok(Some(CachedNativeChannel::clone(channel)))
             }
@@ -238,15 +256,23 @@ impl NativeDialReservation {
             return Err("Native channel generation retired before publication".to_owned());
         }
         let acquired = CachedNativeChannel {
-            channel,
-            slot: self.slot.clone(),
-            generation: Arc::clone(&self.generation),
+            original: Arc::new(CachedNativeChannelBody {
+                // Preserve the cache's original fresh-clone state. The shared
+                // template is never polled through a mutable reference.
+                channel: channel.clone(),
+                slot: self.slot.clone(),
+                generation: Arc::clone(&self.generation),
+            }),
         };
         *channels
             .row_mut(&self.slot)
             .expect("exact dialing row exists") =
-            Some(NativeChannelCacheRow::Ready(Box::new(acquired.clone())));
+            Some(NativeChannelCacheRow::Ready(acquired.clone()));
         self.published = true;
+        // The original fresh input can retire only after the same cache guard.
+        // Escaped/cache aliases retain the one immutable publication template.
+        drop(channels);
+        drop(channel);
         Ok(acquired)
     }
 }
@@ -732,14 +758,14 @@ impl FrontendDataRuntime {
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        let Some(row) = channels.row_mut(&acquired.slot) else {
+        let Some(row) = channels.row_mut(acquired.slot()) else {
             return false;
         };
-        if !matches!(row, Some(NativeChannelCacheRow::Ready(current)) if Arc::ptr_eq(&current.generation, &acquired.generation))
+        if !matches!(row, Some(NativeChannelCacheRow::Ready(current)) if Arc::ptr_eq(current.generation(), acquired.generation()))
         {
             return false;
         }
-        acquired.generation.retired.store(true, Ordering::Release);
+        acquired.generation().retired.store(true, Ordering::Release);
         *row = None;
         true
     }
@@ -1069,7 +1095,7 @@ mod tests {
         let (late, _updates) = tonic::transport::Channel::balance_channel::<String>(1);
         let rejected = original_dial.publish(lane_channel(late)).is_err();
         let retired_ready = escaped
-            .generation
+            .generation()
             .retired
             .load(std::sync::atomic::Ordering::Acquire);
         let retired_follower = follower.is_retired() && follower.ready_channel().is_err();
@@ -1100,8 +1126,8 @@ mod tests {
             tonic::transport::Channel::balance_channel::<String>(1);
         let current = replacement.publish(lane_channel(current_channel)).unwrap();
         assert!(Arc::ptr_eq(
-            &runtime.cached_channel(&key).unwrap().generation,
-            &current.generation
+            runtime.cached_channel(&key).unwrap().generation(),
+            current.generation()
         ));
         let mut other = key.clone();
         other.key.peer = novarocks_types::BackendProcessId::new_v7();

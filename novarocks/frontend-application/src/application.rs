@@ -16,7 +16,9 @@
 // under the License.
 
 use std::fmt;
-use std::num::{NonZeroU32, NonZeroUsize};
+#[cfg(test)]
+use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -28,8 +30,10 @@ use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalRes
 use crate::task_protocol_config::CoordinationBudgets;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::QueryExecutionClient;
+#[cfg(test)]
+use novarocks_query_application::coordination::LogicalExecutionRowsConfig;
 use novarocks_query_application::coordination::{
-    LogicalExecutionRowsConfig, LogicalExecutionSupervisor, LogicalExecutionSupervisorConfig,
+    LogicalExecutionSupervisor, LogicalExecutionSupervisorConfig,
     LogicalExecutionSupervisorShutdownError,
 };
 use novarocks_query_application::cpu::{
@@ -88,12 +92,18 @@ const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_QUERY_CPU_IDLE_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_QUERY_BLOCKING_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+#[cfg(test)]
 const DEFAULT_RESULT_DELIVERY_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+#[cfg(test)]
 const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
+#[cfg(test)]
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+#[cfg(test)]
 const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
+#[cfg(test)]
 const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 #[cfg(test)]
@@ -2822,7 +2832,7 @@ mod tests {
     use novarocks_state_store_runtime::{
         StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
     };
-    use novarocks_workload_control::{WorkClass, WorkRequest, WorkloadConfig};
+    use novarocks_workload_control::{WorkClass, WorkRequest};
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,

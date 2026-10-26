@@ -792,7 +792,14 @@ fn provider_failure(error: &CreatePhaseFailure) -> MvProviderFailure {
         Some(MvApplicationErrorKind::BindingInvalidated) => MvProviderFailureKind::TargetReplaced,
         _ => MvProviderFailureKind::KnownUncommitted,
     };
-    let mut failure = MvProviderFailure::new(kind, error.service.message())
+    // Product carries domain diagnostics, not an already rendered SQL code.
+    // The final typed command/service boundaries own public projection.
+    let message = error
+        .domain
+        .as_ref()
+        .map(MvApplicationError::message)
+        .unwrap_or_else(|| error.service.message());
+    let mut failure = MvProviderFailure::new(kind, message)
         .with_compile_control(error.service.compile_control_error())
         .with_unavailable_implementation(
             error
@@ -817,20 +824,20 @@ fn select_product_result(
                 .as_ref()
                 .filter(|_| error.kind() != MvProductErrorKind::Corruption)
             {
-                if matches!(
-                    error.kind(),
-                    MvProductErrorKind::CommitUnknown
-                        | MvProductErrorKind::KnownCommittedFinalizeFailed
-                ) {
-                    if let Some(cause) = primary.service.failure_cause() {
-                        domain = domain.with_original_failure(cause.clone());
-                    }
+                if let Some(cause) = primary.service.failure_cause() {
+                    domain = domain.with_original_failure(cause.clone());
+                }
+                if primary.domain.is_some() {
+                    // Product owns the settled aggregate, including cleanup
+                    // diagnostics and whether a pure refusal still applies.
+                    Err(domain_failure(domain))
+                } else {
+                    // A raw execution selection retains its exact input/site;
+                    // the Product's settled domain remains a separate fact.
                     Err(MvPhaseFailure {
                         service: primary.service.clone(),
                         domain: Some(domain),
                     })
-                } else {
-                    Err(primary.clone())
                 }
             } else {
                 if domain.original_failure().is_none() {
@@ -1021,5 +1028,446 @@ mod tests {
         );
         assert_eq!(selected_cause.failure_fact(), product.failure_fact());
         assert_eq!(port.events, ["stage", "publish"]);
+    }
+}
+
+#[cfg(test)]
+mod create_contract_tests {
+    use super::*;
+    use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+    use novarocks_sql::compiler::SqlCompileError;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn create_preanalysis_control_survives_provider_product_and_frontend_bridges() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let failure =
+                CreatePhaseFailure::from(MvApplicationError::from_compile(control.clone().into()));
+            assert_eq!(
+                failure.service.compile_control_error(),
+                Some(control.clone())
+            );
+            assert_eq!(
+                failure.domain.as_ref().unwrap().compile_control_error(),
+                Some(control.clone())
+            );
+            let product = provider_failure(&failure).into_product_error();
+            let selected = select_product_result(&Err(product), &None).unwrap_err();
+            assert_eq!(
+                selected.service.compile_control_error(),
+                Some(control.clone())
+            );
+            assert_eq!(
+                selected.domain.as_ref().unwrap().compile_control_error(),
+                Some(control)
+            );
+        }
+    }
+
+    #[test]
+    fn create_analysis_refusal_survives_provider_product_and_frontend_bridges() {
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/create/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(expected) = &compile else {
+            panic!("missing pure implementation must be typed analysis");
+        };
+        let failure = CreatePhaseFailure::from(MvApplicationError::from_compile(compile.clone()));
+        assert_eq!(
+            failure
+                .domain
+                .as_ref()
+                .unwrap()
+                .unavailable_implementation(),
+            Some(expected)
+        );
+        let product = provider_failure(&failure).into_product_error();
+        let selected = select_product_result(&Err(product), &None).unwrap_err();
+        assert_eq!(
+            selected
+                .domain
+                .as_ref()
+                .unwrap()
+                .unavailable_implementation(),
+            Some(expected)
+        );
+        assert_eq!(selected.service.compile_control_error(), None);
+    }
+
+    /// Product ordering fixture, using the current phase projection and result
+    /// selection. It grants no Provider, Root, or publication capability.
+    struct Effects {
+        finalize: bool,
+        abort_fails: bool,
+        compile: SqlCompileError,
+        primary: Option<MvPhaseFailure>,
+        events: Vec<&'static str>,
+    }
+    impl Effects {
+        fn refusal(&mut self) -> MvProviderFailure {
+            let failure =
+                CreatePhaseFailure::from(MvApplicationError::from_compile(self.compile.clone()));
+            self.primary
+                .get_or_insert_with(|| phase_failure(failure.clone()));
+            provider_failure(&failure)
+        }
+    }
+    impl MvCreateProgressPort for Effects {
+        fn poll_stage_target(
+            &mut self,
+            _: &mut Context<'_>,
+            operation: MvOperationContext,
+            command: &MvCommand,
+        ) -> Poll<Result<MvStagedTarget, MvProviderFailure>> {
+            self.events.push("stage");
+            let MvCommand::Create(create) = command else {
+                panic!("the actual CREATE owner must pass its CREATE command");
+            };
+            Poll::Ready(Ok(MvStagedTarget {
+                target: create.target.clone(),
+                staged_operation_id: operation.operation_id,
+            }))
+        }
+        fn poll_publish_staged_target(
+            &mut self,
+            _: &mut Context<'_>,
+            _: MvOperationContext,
+            staged: &MvStagedTarget,
+        ) -> Poll<Result<MvCreatePublicationOutcome, MvProviderFailure>> {
+            self.events.push("publish");
+            if !self.finalize {
+                return Poll::Ready(Err(self.refusal()));
+            }
+            Poll::Ready(Ok(MvCreatePublicationOutcome::Applied(MvCreatedTarget {
+                target: staged.target.clone(),
+                object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                    bytes::Bytes::from_static(b"mv-object"),
+                )
+                .unwrap(),
+            })))
+        }
+        fn poll_abort_staged_target(
+            &mut self,
+            _: &mut Context<'_>,
+            _: MvOperationContext,
+            _: &MvStagedTarget,
+        ) -> Poll<Result<(), MvProviderFailure>> {
+            self.events.push("abort");
+            Poll::Ready(if self.abort_fails {
+                Err(MvProviderFailure::new(
+                    MvProviderFailureKind::Unavailable,
+                    "abort failed",
+                ))
+            } else {
+                Ok(())
+            })
+        }
+        fn poll_install_created_projection(
+            &mut self,
+            _: &mut Context<'_>,
+            _: MvOperationContext,
+            _: &MvCreatedTarget,
+        ) -> Poll<Result<(), MvProviderFailure>> {
+            self.events.push("install");
+            Poll::Ready(Err(self.refusal()))
+        }
+        fn poll_register_target(
+            &mut self,
+            _: &mut Context<'_>,
+            _: MvOperationContext,
+            _: &MvCreatedTarget,
+        ) -> Poll<Result<(), MvProviderFailure>> {
+            panic!("failed projection must not register a target");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_create_cleanup_and_committed_failures_do_not_publish_pure_refusal_code() {
+        use novarocks_mv_application::{
+            persistence::definition::CreateMvDefinitionRequest,
+            repository::InitialMvRefreshConfiguration,
+        };
+        use novarocks_query_application::persisted_query_definition::{
+            PersistedQueryDefinition, PersistedQueryDialect,
+        };
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/create/final-command/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(analyze) = &compile else {
+            panic!("the binding owner must provide typed analysis");
+        };
+        let diagnostic = analyze.to_string();
+        let public = analyze.to_user_error(None).to_string();
+        let (service, _) = crate::mv::domain::test_admission::keyed_product().await;
+        let operations = service.original_operations();
+        for (finalize, abort_fails) in [(false, false), (false, true), (true, false)] {
+            let mut effects = Effects {
+                finalize,
+                abort_fails,
+                compile: compile.clone(),
+                primary: None,
+                events: Vec::new(),
+            };
+            let create = MvCreateCommand {
+                target: MvTarget::from_parts(Some("iceberg"), "db", "mv"),
+                if_not_exists: false,
+                definition: CreateMvDefinitionRequest {
+                    query_definition: PersistedQueryDefinition::new(
+                        "SELECT 1",
+                        PersistedQueryDialect::StarRocks,
+                        "iceberg",
+                        "db",
+                    )
+                    .unwrap(),
+                    base_table_refs: Vec::new(),
+                    primary_key_columns: Vec::new(),
+                    storage_engine: "iceberg".into(),
+                    target_catalog: Some("iceberg".into()),
+                    target_namespace: Some("db".into()),
+                    target_table: Some("mv".into()),
+                    created_at_ms: 1,
+                },
+                refresh: InitialMvRefreshConfiguration::default(),
+                dependencies: Vec::new(),
+            };
+            let mut transition = MvCreateTransition::new(
+                MvOperationContext {
+                    operation_id: uuid::Uuid::now_v7(),
+                },
+                create,
+            );
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                operations
+                    .poll_create(&mut cx, &mut transition, &mut effects)
+                    .is_ready()
+            );
+            let failure = transition.result().unwrap().as_ref().unwrap_err();
+            assert_eq!(
+                effects.events,
+                if finalize {
+                    vec!["stage", "publish", "install"]
+                } else {
+                    vec!["stage", "publish", "abort"]
+                }
+            );
+            assert_eq!(
+                failure.kind(),
+                if finalize {
+                    MvProductErrorKind::KnownCommittedFinalizeFailed
+                } else {
+                    MvProductErrorKind::InvalidRequest
+                }
+            );
+            assert_eq!(
+                failure.unavailable_implementation().is_some(),
+                !finalize && !abort_fails
+            );
+            let selected = select_product_result(transition.result().unwrap(), &effects.primary)
+                .expect_err("the current CREATE selection must preserve the real product result");
+            let completion = super::super::MvCommandCompletionReceiving::default();
+            completion.receive_selected_failure(&Err(selected.clone()));
+            let domain = completion.observed_failure().unwrap();
+            assert!(completion.observed().is_none());
+            if finalize {
+                assert_eq!(
+                    domain.kind(),
+                    MvApplicationErrorKind::KnownCommittedFinalizeFailed
+                );
+            }
+            let command = crate::mv::command::project_product_failure_for_test(domain.clone());
+            assert_eq!(
+                selected.service.message(),
+                crate::query::product_command_service_error(command.clone()).message()
+            );
+            assert_eq!(selected.service.compile_control_error(), None);
+            if finalize {
+                assert_eq!(
+                    selected.service.external_effect_disposition(),
+                    Some(StatementExternalEffectDisposition::KnownCommitted)
+                );
+            }
+            assert_eq!(command.compile_control_error(), None);
+            assert_eq!(
+                command.kind(),
+                novarocks_query_application::api::CommandErrorKind::Failed
+            );
+            if finalize || abort_fails {
+                assert!(
+                    !command
+                        .to_string()
+                        .starts_with("[sql.analyze.unavailable_implementation] ")
+                );
+                assert_eq!(
+                    command.to_string(),
+                    if abort_fails {
+                        format!("{diagnostic}; staged target abort failed: abort failed")
+                    } else {
+                        diagnostic.clone()
+                    }
+                );
+            } else {
+                assert_eq!(command.to_string(), public);
+            }
+        }
+    }
+
+    fn aggregate_command() -> MvCreateCommand {
+        use novarocks_mv_application::{
+            persistence::definition::CreateMvDefinitionRequest,
+            repository::InitialMvRefreshConfiguration,
+        };
+        use novarocks_query_application::persisted_query_definition::{
+            PersistedQueryDefinition, PersistedQueryDialect,
+        };
+        MvCreateCommand {
+            target: MvTarget::from_parts(Some("iceberg"), "db", "mv"),
+            if_not_exists: false,
+            definition: CreateMvDefinitionRequest {
+                query_definition: PersistedQueryDefinition::new(
+                    "SELECT 1",
+                    PersistedQueryDialect::StarRocks,
+                    "iceberg",
+                    "db",
+                )
+                .unwrap(),
+                base_table_refs: Vec::new(),
+                primary_key_columns: Vec::new(),
+                storage_engine: "iceberg".into(),
+                target_catalog: Some("iceberg".into()),
+                target_namespace: Some("db".into()),
+                target_table: Some("mv".into()),
+                created_at_ms: 1,
+            },
+            refresh: InitialMvRefreshConfiguration::default(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settled_create_aggregate_keeps_the_same_primary_cause_and_public_projection() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "private original CREATE compiler source",
+        ));
+        let (service, _) = crate::mv::domain::test_admission::keyed_product().await;
+        let operations = service.original_operations();
+        for (finalize, abort_fails) in [(false, true), (true, false)] {
+            let mut effects = Effects {
+                finalize,
+                abort_fails,
+                compile: SqlCompileError::CompilationSource(cause.clone()),
+                primary: None,
+                events: Vec::new(),
+            };
+            let mut transition = MvCreateTransition::new(
+                MvOperationContext {
+                    operation_id: uuid::Uuid::now_v7(),
+                },
+                aggregate_command(),
+            );
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                operations
+                    .poll_create(&mut cx, &mut transition, &mut effects)
+                    .is_ready()
+            );
+            let selected =
+                select_product_result(transition.result().unwrap(), &effects.primary).unwrap_err();
+            let completion = super::super::MvCommandCompletionReceiving::default();
+            completion.receive_selected_failure(&Err(selected.clone()));
+            let observed = completion.observed_failure().unwrap();
+            assert_eq!(observed.original_failure(), Some(&cause));
+            assert_eq!(selected.service.failure_cause(), Some(&cause));
+            assert_eq!(
+                selected.service.failure_cause().unwrap().failure_fact(),
+                cause.failure_fact()
+            );
+            assert_eq!(
+                selected.service.execution_failure(),
+                effects
+                    .primary
+                    .as_ref()
+                    .unwrap()
+                    .service
+                    .execution_failure()
+            );
+            assert_eq!(
+                observed.message(),
+                transition.result().unwrap().as_ref().unwrap_err().message()
+            );
+            assert_eq!(
+                observed.kind(),
+                if finalize {
+                    MvApplicationErrorKind::KnownCommittedFinalizeFailed
+                } else {
+                    MvApplicationErrorKind::InvalidRequest
+                }
+            );
+            let command = crate::mv::command::project_product_failure_for_test(observed.clone());
+            assert_eq!(command.failure_cause(), Some(&cause));
+            assert_eq!(
+                selected.service.message(),
+                crate::query::product_command_service_error(command.clone()).message()
+            );
+            assert_eq!(
+                selected.service.compile_control_error(),
+                effects
+                    .primary
+                    .as_ref()
+                    .unwrap()
+                    .service
+                    .compile_control_error()
+            );
+            if finalize {
+                assert_eq!(
+                    selected.service.external_effect_disposition(),
+                    Some(StatementExternalEffectDisposition::KnownCommitted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settled_product_domain_does_not_replace_the_raw_execution_input() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original CPU capacity fact",
+        ));
+        let input = ExecutionFailureInput::new(
+            cause.failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating("selected original CPU detail"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let raw = QueryServiceError::from_execution_failure(input.clone());
+        let primary = MvPhaseFailure {
+            service: raw.clone(),
+            domain: None,
+        };
+        // This is a Product result-selection fixture, not a Root, Provider or
+        // lifecycle author. Its typed settled aggregate grants no new effect.
+        let product = MvProductError::new(
+            MvProductErrorKind::ProviderKnownUncommitted,
+            "original CPU refusal; staged target abort failed: abort failed",
+        );
+        let selected = select_product_result(&Err(product.clone()), &Some(primary)).unwrap_err();
+        assert_eq!(selected.service, raw);
+        assert_eq!(selected.service.execution_failure(), Some(&input));
+        assert_eq!(selected.service.failure_cause(), None);
+        let completion = super::super::MvCommandCompletionReceiving::default();
+        completion.receive_selected_failure(&Err(selected));
+        let observed = completion.observed_failure().unwrap();
+        assert_eq!(observed.kind(), MvApplicationErrorKind::Engine);
+        assert_eq!(observed.message(), product.message());
+        assert_eq!(observed.original_failure(), None);
+        assert_eq!(observed.unavailable_implementation(), None);
+        assert!(completion.observed().is_none());
     }
 }

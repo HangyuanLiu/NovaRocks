@@ -193,10 +193,10 @@ impl MvNativePhase {
     /// Observe only the tail already detached by actual computation Ready.
     /// A still-running computation keeps its normal business polling owner.
     pub(super) fn poll_ready_tail(&mut self, cx: &mut Context<'_>) {
-        if let Some(tail) = self.tail.as_mut() {
-            if let Poll::Ready(Err(health)) = tail.poll_exit(cx) {
-                self.health.get_or_insert(health);
-            }
+        if let Some(tail) = self.tail.as_mut()
+            && let Poll::Ready(Err(health)) = tail.poll_exit(cx)
+        {
+            self.health.get_or_insert(health);
         }
     }
     /// Selection never asserts remote actual exit. The same step/residual

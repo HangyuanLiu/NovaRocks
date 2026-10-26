@@ -285,44 +285,44 @@ impl MvRefreshStepOriginal {
         &mut self,
         mut result: Result<(), MvPhaseFailure>,
     ) -> Poll<Result<(), MvPhaseFailure>> {
-        if let Some(publication) = &mut self.execution.publication {
-            if publication.disposition().is_some() {
-                if let Err(error) = &result {
-                    if publication.committed() && publication.local_finalization.is_none() {
-                        // The original typed primary remains in result. This
-                        // sidecar records only the necessary-finalization verdict.
-                        publication.local_finalization = Some(Err(error.service.to_string()));
-                    }
-                }
-                if let Err(error) = publication.freeze_terminal() {
-                    if result.is_ok() {
-                        result = Err(error.into());
-                    }
-                }
-                // A Provider NoOp is not proof that this MV's declared P was
-                // published. Keep its canonical raw fact, without rendering a
-                // false MV KnownCommitted/do-not-retry marker to the client.
-                if publication.received_committed_effect()
-                    != Some(novarocks_spi::connector::ExternalMutationEffect::NoOp)
-                {
-                    if let Some(terminal) = publication.attempt.terminal() {
-                        result = result.map_err(|mut failure| {
-                            failure.service = failure
-                                .service
-                                .attach_publication_terminal(terminal.clone());
-                            failure
-                        });
-                    }
-                }
+        if let Some(publication) = &mut self.execution.publication
+            && publication.disposition().is_some()
+        {
+            if let Err(error) = &result
+                && publication.committed()
+                && publication.local_finalization.is_none()
+            {
+                // The original typed primary remains in result. This
+                // sidecar records only the necessary-finalization verdict.
+                publication.local_finalization = Some(Err(error.service.to_string()));
+            }
+            if let Err(error) = publication.freeze_terminal()
+                && result.is_ok()
+            {
+                result = Err(error.into());
+            }
+            // A Provider NoOp is not proof that this MV's declared P was
+            // published. Keep its canonical raw fact, without rendering a
+            // false MV KnownCommitted/do-not-retry marker to the client.
+            if publication.received_committed_effect()
+                != Some(novarocks_spi::connector::ExternalMutationEffect::NoOp)
+                && let Some(terminal) = publication.attempt.terminal()
+            {
+                result = result.map_err(|mut failure| {
+                    failure.service = failure
+                        .service
+                        .attach_publication_terminal(terminal.clone());
+                    failure
+                });
             }
         }
         if let Some(source) = &self.execution.source {
             // The logical per-target activity ends here. Its independent GC,
             // actual Native receipt and unknown publication stay in this Source.
-            if let Err(error) = source.release_business_activity() {
-                if result.is_ok() {
-                    result = Err(error.into());
-                }
+            if let Err(error) = source.release_business_activity()
+                && result.is_ok()
+            {
+                result = Err(error.into());
             }
         }
         self.selected = Some(result.clone());
@@ -437,10 +437,10 @@ impl StepExecution {
     fn poll_live_tails(&mut self, cx: &mut Context<'_>) {
         // A received business fact permits necessary Current work while its
         // original Call continues cleanup. Neither tail can gate that work.
-        if let Some(publication) = self.publication.as_mut() {
-            if publication.committed_needed().is_some() {
-                let _ = publication.poll_retirement(cx);
-            }
+        if let Some(publication) = self.publication.as_mut()
+            && publication.committed_needed().is_some()
+        {
+            let _ = publication.poll_retirement(cx);
         }
         if let Some(native) = self.native.as_mut() {
             native.poll_ready_tail(cx);
@@ -494,10 +494,10 @@ impl StepExecution {
     }
     fn reject_execution(&mut self, error: impl Into<MvPhaseFailure>) {
         let error = error.into();
-        if let Some(source) = &self.source {
-            if let Ok(context) = source.publication_context() {
-                self.call_context = Some(context);
-            }
+        if let Some(source) = &self.source
+            && let Ok(context) = source.publication_context()
+        {
+            self.call_context = Some(context);
         }
         self.fail(error.clone());
         self.published = Some(Err(provider_error(
@@ -535,58 +535,58 @@ impl StepExecution {
         };
         // Failed Native work must actually exit before revoking/cleaning its
         // write session. The UI-selected failure is not a writer-close proof.
-        if self.failure.is_some() && native_closed {
-            if let Some(source) = &self.source {
-                if let Some(session) = source.session().map_err(|_| self.retained_health.clone())? {
-                    if self.publication.is_none() {
-                        // The identity is created from the same original target
-                        // before any provider call; no target is reconstructed.
-                        if let Some((target, attempt)) = source
-                            .refresh_identity()
-                            .map_err(|_| self.retained_health.clone())?
-                        {
-                            self.publication = Some(
-                                new_publication(&target, &attempt)
-                                    .map_err(|_| self.retained_health.clone())?,
-                            );
-                        }
-                    }
-                    if let Some(publication) = &mut self.publication {
-                        if self.call_context.is_none() {
-                            self.call_context = Some(
-                                source
-                                    .publication_context()
-                                    .map_err(|_| self.retained_health.clone())?,
-                            );
-                        }
-                        if publication
-                            .poll_settle(
-                                Some(&session),
-                                self.call_context.as_ref().unwrap(),
-                                true,
-                                cx,
-                            )
-                            .is_pending()
-                        {
-                            pending = true;
-                        }
-                        pending |= publication.poll_retirement(cx).is_pending();
-                    }
+        if self.failure.is_some()
+            && native_closed
+            && let Some(source) = &self.source
+            && let Some(session) = source.session().map_err(|_| self.retained_health.clone())?
+        {
+            if self.publication.is_none() {
+                // The identity is created from the same original target
+                // before any provider call; no target is reconstructed.
+                if let Some((target, attempt)) = source
+                    .refresh_identity()
+                    .map_err(|_| self.retained_health.clone())?
+                {
+                    self.publication = Some(
+                        new_publication(&target, &attempt)
+                            .map_err(|_| self.retained_health.clone())?,
+                    );
                 }
             }
-        }
-        if self.future.is_some() {
-            if self.poll_phase(cx).is_pending() {
-                pending = true;
-            }
-        }
-        if !pending && !self.closing_started && self.future.is_none() {
-            if let Some(source) = &self.source {
-                self.future = Some(source.close());
-                self.closing_started = true;
-                if self.poll_phase(cx).is_pending() {
+            if let Some(publication) = &mut self.publication {
+                if self.call_context.is_none() {
+                    self.call_context = Some(
+                        source
+                            .publication_context()
+                            .map_err(|_| self.retained_health.clone())?,
+                    );
+                }
+                if publication
+                    .poll_settle(
+                        Some(&session),
+                        self.call_context.as_ref().unwrap(),
+                        true,
+                        cx,
+                    )
+                    .is_pending()
+                {
                     pending = true;
                 }
+                pending |= publication.poll_retirement(cx).is_pending();
+            }
+        }
+        if self.future.is_some() && self.poll_phase(cx).is_pending() {
+            pending = true;
+        }
+        if !pending
+            && !self.closing_started
+            && self.future.is_none()
+            && let Some(source) = &self.source
+        {
+            self.future = Some(source.close());
+            self.closing_started = true;
+            if self.poll_phase(cx).is_pending() {
+                pending = true;
             }
         }
         if let Some(source) = &self.source {
@@ -974,10 +974,10 @@ pub(super) fn product_failure(error: MvProductError) -> MvPhaseFailure {
     let service = product_error(error);
     // A plain Product failure has an actual typed author at the service
     // boundary. Reuse that same cause rather than capturing it a second time.
-    if domain.original_failure().is_none() {
-        if let Some(cause) = service.failure_cause() {
-            domain = domain.with_original_failure(cause.clone());
-        }
+    if domain.original_failure().is_none()
+        && let Some(cause) = service.failure_cause()
+    {
+        domain = domain.with_original_failure(cause.clone());
     }
     MvPhaseFailure {
         service,

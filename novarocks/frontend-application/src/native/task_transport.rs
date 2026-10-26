@@ -1663,7 +1663,7 @@ async fn send_operations_in(
             // No async wait holds an admitted Joint vector for another local
             // physical position. Refusal proves no Apply was dispatched.
             let call = std::future::poll_fn(|cx| {
-                Poll::Ready(acquired.channel.select_local_call().try_reserve(cx))
+                Poll::Ready(acquired.channel().select_local_call().try_reserve(cx))
             })
             .await;
             let call = match call {

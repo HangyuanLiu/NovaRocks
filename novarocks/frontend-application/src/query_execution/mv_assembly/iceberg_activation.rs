@@ -24,8 +24,7 @@
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorWriteInputRequest,
-    ConnectorWriteLease,
+    ConnectorRequestContext, ConnectorWriteInputRequest, ConnectorWriteLease,
 };
 
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
@@ -101,50 +100,6 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String> {
         MvRefreshCommittedFacts::from_write_receipt(intent, receipt)
-    }
-
-    fn install_published_projection(
-        &self,
-        planning_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
-        expected_snapshot_id: i64,
-        operation_id: uuid::Uuid,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<(), String> {
-        if planning_lease.binding().descriptor().instance_id != table.instance_id {
-            return Err(
-                "MV publication observation table belongs to a different connector generation"
-                    .to_string(),
-            );
-        }
-        let catalog = planning_lease
-            .binding()
-            .catalog_handle()
-            .map_err(|error| format!("bind MV publication catalog generation: {error}"))?
-            .clone();
-        let target = novarocks_mv_application::product::MvTarget::try_new(
-            Some(table.instance_id.as_str().to_string()),
-            table.namespace.to_string(),
-            table.table.to_string(),
-        )
-        .map_err(|error| format!("name the published MV target: {error}"))?;
-        crate::mv::domain::staged_create::install_published_current_projection(
-            self.ports
-                .management_entrance()
-                .map_err(|error| error.to_string())?
-                .as_ref(),
-            self.ports.readiness().as_ref(),
-            self.ports.connector_control(),
-            catalog,
-            target,
-            operation_id,
-            crate::mv::domain::staged_create::PublishedOutput {
-                snapshot_id: expected_snapshot_id,
-            },
-            // The publication already happened; observe under a scope that
-            // cannot be mistaken for part of the same effect.
-            connector_context.clone().after_external_effect(),
-        )
     }
 }
 
