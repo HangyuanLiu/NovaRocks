@@ -1323,18 +1323,6 @@ impl MetadataIoAdmission {
         ExistingMetadataObligation::capture(self, root, context)
     }
 
-    #[cfg(test)]
-    pub(crate) fn settlement_result_scope(
-        self: &Arc<Self>,
-        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        obligation: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorOriginalResultScope,
-        novarocks_spi::connector::OriginalResultCheckError,
-    > {
-        super::rewrite_capture::borrow_positive_settlement_capture(self, binding, obligation)
-    }
-
     pub(crate) fn check_existing_metadata_obligation(
         &self,
         root: &WorkScope,
@@ -1995,7 +1983,7 @@ mod original_governor_tests {
     }
 
     #[test]
-    fn metadata_settlement_capture_requires_the_same_positive_source_and_preserves_its_control() {
+    fn metadata_obligation_token_requires_the_same_positive_source_and_preserves_its_control() {
         use novarocks_failure_contract::FailureProjection;
         use novarocks_spi::connector::{
             ConnectorOperationControl, ConnectorRequestContext, ConnectorStopOwner,
@@ -2032,7 +2020,9 @@ mod original_governor_tests {
             Err(WorkError::NotReady)
         ));
         assert!(
-            source.settlement_result_scope(&binding, &context).is_err(),
+            source
+                .existing_metadata_obligation(binding.scope(), &context)
+                .is_err(),
             "positive bytes alone do not assert a publication obligation"
         );
         source.publication_obligation_started();
@@ -2040,8 +2030,8 @@ mod original_governor_tests {
             ConnectorRequestContext::try_new(context.deadline(), business_stop.view(), 1024, 4096)
                 .unwrap();
         assert!(matches!(
-            source.check_existing_metadata_obligation_context(binding.scope(), &foreign_context),
-            Err(WorkError::Conflict)
+            source.existing_metadata_obligation(binding.scope(), &foreign_context),
+            Err(error) if matches!(error.downcast_ref::<WorkError>(), Some(WorkError::Conflict))
         ));
         let ordinary =
             super::super::rewrite_capture::borrow_positive_capture(&source, &context).unwrap();
@@ -2057,9 +2047,9 @@ mod original_governor_tests {
             "no new result alias is minted after business cancellation"
         );
         let settlement = source
-            .settlement_result_scope(&binding, &obligation)
+            .existing_metadata_obligation(binding.scope(), &obligation)
             .unwrap();
-        assert!(settlement.check_active().is_ok());
+        assert!(settlement.check_active(binding.scope()).is_ok());
         assert!(
             source
                 .check_existing_metadata_obligation(binding.scope())
@@ -2067,10 +2057,13 @@ mod original_governor_tests {
         );
         obligation_stop.request_stop();
         assert!(obligation.check_active().is_err());
-        let refused = settlement.check_active().unwrap_err();
+        let refused = settlement.check_active(binding.scope()).unwrap_err();
         assert_eq!(
-            refused.class(),
-            novarocks_spi::connector::OriginalResultCheckClass::Control
+            refused
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .expect("the original obligation control cause")
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Cancelled
         );
         assert_eq!(
             refused.failure_fact(),

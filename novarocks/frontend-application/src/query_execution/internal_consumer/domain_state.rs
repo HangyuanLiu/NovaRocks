@@ -341,21 +341,17 @@ mod tests {
         >,
     ) -> Result<InternalResultValue<InternalDomainSlot>, InternalDomainFailure> {
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(result) = job.try_take() {
-                    let result = result
-                        .expect("real CPU completion")
-                        .try_transform(|slot, _| slot);
-                    // The result alone is not the stable original job's exit.
-                    // Retire its original packet only after the real forwarder
-                    // joins, before asserting complete capacity reclamation.
-                    job.join_closed()
-                        .await
-                        .expect("actual original CPU job exit");
-                    break result;
-                }
-                tokio::task::yield_now().await;
-            }
+            let result = std::future::poll_fn(|cx| job.poll_take(cx))
+                .await
+                .expect("real CPU completion")
+                .try_transform(|slot, _| slot);
+            // The result alone is not the stable original job's exit.
+            // Retire its original packet only after the real forwarder
+            // joins, before asserting complete capacity reclamation.
+            job.join_closed()
+                .await
+                .expect("actual original CPU job exit");
+            result
         })
         .await
         .expect("domain CPU watchdog")

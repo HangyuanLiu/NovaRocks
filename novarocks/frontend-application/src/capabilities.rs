@@ -790,24 +790,8 @@ pub fn background_maintenance_attempt(
     topology: BackendTopologyService,
     max_attempt_duration: std::time::Duration,
     runtime: &tokio::runtime::Handle,
-    capacity: Option<
-        &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    >,
 ) -> Result<BackgroundMaintenanceAttempt, String> {
-    if let Some(capacity) = capacity {
-        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-            capacity.scope(),
-            &capacity.window_alias(),
-        )?;
-    }
-    original_maintenance_context(
-        role,
-        topology,
-        max_attempt_duration,
-        runtime,
-        capacity,
-        capacity.map(|c| c.root_scope()),
-    )
+    original_maintenance_context(role, topology, max_attempt_duration, runtime, None, None)
 }
 
 /// Bind only original Root control/deadline. MIO and the computation source

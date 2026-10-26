@@ -259,11 +259,9 @@ fn internal_description_with_recovery(
 pub(crate) fn original_credentials(execution: QueryExecutionId) -> Arc<AttemptCredentialStorage> {
     let collector = AttemptCredentialLeaseCollector::new(execution);
     offer_original_credentials(collector.as_ref());
-    collector
-        .drain_credential_leases()
-        .unwrap()
-        .into_attempt_storage_resolver()
-        .expect("original vended table")
+    let leases = collector.drain_credential_leases().unwrap();
+    assert!(!leases.leases().is_empty(), "original vended table");
+    leases.into_storage()
 }
 
 pub(crate) fn offer_original_credentials(sink: &dyn ConnectorVendedCredentialLeaseSink) {

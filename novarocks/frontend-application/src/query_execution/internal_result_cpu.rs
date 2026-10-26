@@ -637,18 +637,6 @@ impl<T: Send + 'static> InternalResultCpuJob<T> {
         self.completion.try_recv().ok()
     }
 
-    pub(crate) fn poll_closed(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Arc<dyn std::error::Error + Send + Sync>>> {
-        self.begin_close();
-        let result = self.poll_forwarder_closed(cx);
-        if matches!(result, std::task::Poll::Ready(Ok(()))) {
-            drop(self.take_retired_outcome());
-        }
-        result
-    }
-
     /// Observe the original join without destroying delivery output. A stable
     /// caller closes delivery separately and retires its result outside locks.
     pub(crate) fn poll_forwarder_closed(
@@ -730,37 +718,14 @@ impl<T: Send + 'static> InternalResultCpuJob<T> {
     pub(crate) async fn join_closed(
         &mut self,
     ) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
-        std::future::poll_fn(|cx| self.poll_closed(cx).map(|_| ())).await;
+        self.begin_close();
+        match std::future::poll_fn(|cx| self.poll_forwarder_closed(cx)).await {
+            Ok(()) => drop(self.take_retired_outcome()),
+            Err(original) => return Err(original),
+        }
         match self.health_failure() {
             Some(original) => Err(original),
             None => Ok(()),
-        }
-    }
-
-    pub(crate) fn try_take(
-        &mut self,
-    ) -> Option<Result<InternalResultValue<T>, ExecutionFailureInput>> {
-        if self.closing || self.claimed {
-            return None;
-        }
-        match self.completion.try_recv() {
-            Ok(mut value) => {
-                self.claimed = true;
-                // The original result has returned. For a joint action this
-                // does not prove physical exit: the same forwarder still waits
-                // for poll_actual_exit before serial reuse or Ready.
-                if let Ok(value) = &mut value {
-                    value.activity.take();
-                }
-                Some(value)
-            }
-            Err(oneshot::error::TryRecvError::Empty) => None,
-            Err(oneshot::error::TryRecvError::Closed) => {
-                self.claimed = true;
-                Some(Err(cpu_execution_failure(
-                    "internal result CPU forwarder exited without its outcome",
-                )))
-            }
         }
     }
 
@@ -2062,14 +2027,10 @@ mod tests {
     async fn take<T: Send + 'static>(
         job: &mut InternalResultCpuJob<T>,
     ) -> Result<InternalResultValue<T>, ExecutionFailureInput> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(value) = job.try_take() {
-                    break value;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| job.poll_take(cx)),
+        )
         .await
         .expect("CPU outcome watchdog")
     }
@@ -3162,19 +3123,15 @@ mod actual_close_tests {
         } else {
             cancellation.request(cancel.expect("explicit control reason"));
             tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if let Some(result) = job.try_take() {
-                        break result.err();
-                    }
-                    tokio::task::yield_now().await;
-                }
+                std::future::poll_fn(|cx| job.poll_take(cx)).await.err()
             })
             .await
         };
         job.begin_close();
-        let still_joining =
-            std::future::poll_fn(|cx| std::task::Poll::Ready(job.poll_closed(cx).is_pending()))
-                .await;
+        let still_joining = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(job.poll_forwarder_closed(cx).is_pending())
+        })
+        .await;
         let mut first_waiter = Box::pin(binding.result_activities_exited());
         let mut surviving_waiter = Box::pin(binding.result_activities_exited());
         let waiting = std::future::poll_fn(|cx| {

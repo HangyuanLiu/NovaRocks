@@ -215,26 +215,6 @@ impl DmlPublicationAttempt {
         }
     }
 
-    /// Maps an outer failure by the frozen dispatch boundary without inspecting
-    /// an error string. A caller uses it when no typed provider outcome exists.
-    pub(crate) fn terminal_after_outer_failure(
-        &mut self,
-    ) -> Result<&LakePublicationTerminal, DmlPublicationAttemptError> {
-        match self.phase {
-            DmlPublicationPhase::PreDispatch => self.assign_terminal(
-                LakePublicationDisposition::KnownUncommitted,
-                DmlPublicationFinalization::NotApplicable,
-            ),
-            DmlPublicationPhase::DispatchPossible => self.assign_terminal(
-                LakePublicationDisposition::CommitUnknown,
-                DmlPublicationFinalization::NotApplicable,
-            ),
-            DmlPublicationPhase::Terminal => {
-                Err(DmlPublicationAttemptError::TerminalAlreadyAssigned)
-            }
-        }
-    }
-
     pub(crate) fn terminal_pre_dispatch_uncommitted(
         &mut self,
     ) -> Result<&LakePublicationTerminal, DmlPublicationAttemptError> {
@@ -430,7 +410,7 @@ mod tests {
             Err(DmlPublicationAttemptError::InvalidPreDispatchTerminal)
         ));
         let terminal = attempt
-            .terminal_after_outer_failure()
+            .terminal_commit_unknown()
             .expect("possible-dispatch terminal");
 
         assert_eq!(
@@ -565,10 +545,10 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_or_deadline_before_and_after_dispatch_use_the_same_phase_mapping() {
+    fn explicit_terminals_preserve_before_and_after_dispatch_uncertainty() {
         let mut before_dispatch = attempt();
         let before = before_dispatch
-            .terminal_after_outer_failure()
+            .terminal_pre_dispatch_uncommitted()
             .expect("before dispatch");
 
         let mut after_dispatch = attempt();
@@ -576,7 +556,7 @@ mod tests {
             .mark_dispatch_possible()
             .expect("mark dispatch possible");
         let after = after_dispatch
-            .terminal_after_outer_failure()
+            .terminal_commit_unknown()
             .expect("after dispatch");
 
         assert_eq!(

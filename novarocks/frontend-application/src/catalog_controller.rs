@@ -135,7 +135,7 @@ pub struct FrontendCatalogController {
     /// rather than a notification because it holds state — a stop published
     /// before the worker starts waiting is still seen.
     stop: watch::Sender<bool>,
-    /// The identity `bootstrap` observed, handed once to the worker.
+    /// The identity `bootstrap_in` observed, handed once to the worker.
     bootstrap_identity: Mutex<Option<StoreIdentity>>,
     /// Monotonic control generation. A freshness expiry supersedes it, which
     /// is what makes an abandoned scan's late completion inert rather than
@@ -215,28 +215,6 @@ impl FrontendCatalogController {
                 "catalog bootstrap identity lock is poisoned",
             )
         })? = Some(identity);
-        Ok(())
-    }
-
-    /// Performs the first complete authoritative reread.
-    ///
-    /// There is no watermark to capture. A reconcile reads the attachment
-    /// family itself, so the only thing startup has to establish is that one
-    /// complete snapshot was applied; failing here fails frontend bootstrap,
-    /// which is the point — a frontend that never enumerated desired state
-    /// must not start serving a guess at it.
-    pub async fn bootstrap(&self) -> Result<(), String> {
-        let identity = self
-            .store
-            .identity()
-            .await
-            .map_err(|error| error.to_string())?;
-        self.reconcile().await?;
-        *self
-            .bootstrap_identity
-            .lock()
-            .map_err(|_| "catalog controller bootstrap state lock is poisoned".to_string())? =
-            Some(identity);
         Ok(())
     }
 
@@ -586,6 +564,86 @@ mod tests {
     use novarocks_catalog_application::ConnectorControlHost;
     use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
 
+    /// Retains the selected Host's real startup-read owner while its borrower runs.
+    /// The physical worker is joined after the original inventory closes, even
+    /// when the caller's outer watchdog cancelled only that borrower.
+    pub(super) struct OriginalBootstrapFixture {
+        original: crate::state_store::execution::StateStoreOriginalOwner,
+        workers: novarocks_query_application::cpu::QueryBlockingExecutorOwner,
+        transaction_deadline: Duration,
+    }
+    impl OriginalBootstrapFixture {
+        pub(super) fn new(host: &novarocks_state_store_runtime::StateStoreHost) -> Self {
+            use novarocks_query_application::cpu::{
+                QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+            };
+            let (vocabulary, instance) = host
+                .original_blocking_sources()
+                .expect("the selected pure provider supports original reads");
+            let workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ))
+            .expect("original bootstrap worker");
+            let original = crate::state_store::execution::StateStoreOriginalOwner::bootstrap_read(
+                &workers.executor(),
+                vocabulary,
+                instance,
+                host.run_policy(),
+            )
+            .expect("the selected instance's original bootstrap owner");
+            Self {
+                original,
+                workers,
+                transaction_deadline: host.state_store().unwrap().limits().transaction_deadline,
+            }
+        }
+
+        pub(super) async fn drive(
+            &self,
+            controller: &FrontendCatalogController,
+        ) -> Result<(), CatalogApplicationError> {
+            use std::future::Future;
+            let execution = self
+                .original
+                .read_execution(self.transaction_deadline)
+                .expect("the original read execution");
+            let mut bootstrap = std::pin::pin!(controller.bootstrap_in(&execution));
+            std::future::poll_fn(|cx| {
+                self.original
+                    .poll_progress(cx)
+                    .unwrap_or_else(|cause| panic!("original bootstrap progress failed: {cause}"));
+                let result = bootstrap.as_mut().poll(cx);
+                self.original
+                    .poll_progress(cx)
+                    .unwrap_or_else(|cause| panic!("original bootstrap progress failed: {cause}"));
+                result
+            })
+            .await
+        }
+
+        pub(super) async fn close(mut self) {
+            std::future::poll_fn(|cx| self.original.poll_closed(cx))
+                .await
+                .unwrap_or_else(|cause| panic!("original bootstrap did not close: {cause}"));
+            drop(self.original);
+            self.workers
+                .shutdown_until(StdInstant::now() + Duration::from_secs(5))
+                .await
+                .expect("the same original bootstrap worker exits");
+        }
+    }
+
+    pub(super) async fn bootstrap_original(
+        controller: &FrontendCatalogController,
+        host: &novarocks_state_store_runtime::StateStoreHost,
+    ) -> Result<(), CatalogApplicationError> {
+        let fixture = OriginalBootstrapFixture::new(host);
+        let result = fixture.drive(controller).await;
+        fixture.close().await;
+        result
+    }
+
     /// Mints a distinct control generation per materialization, like a real
     /// provider role factory: reusing an incarnation would trip the retired-generation guard
     /// on a same-name recreate. It also counts materializations, so a test can
@@ -661,6 +719,23 @@ mod tests {
             self.inner.begin_read().await
         }
 
+        async fn begin_original_read_in(
+            &self,
+            execution: &novarocks_state_store_api::StateStoreExecutionContext,
+        ) -> Result<
+            Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+            novarocks_state_store_api::StateStoreExecutionFailure,
+        > {
+            if !self.reads_available.load(Ordering::Acquire) {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected catalog admission read failure",
+                )
+                .into_original_failure());
+            }
+            self.inner.begin_original_read_in(execution).await
+        }
+
         async fn begin_write(
             &self,
             attempt: WriteAttempt,
@@ -691,6 +766,21 @@ mod tests {
                 let _permit = self.gate.acquire().await.expect("stall gate");
             }
             self.inner.begin_read().await
+        }
+
+        async fn begin_original_read_in(
+            &self,
+            execution: &novarocks_state_store_api::StateStoreExecutionContext,
+        ) -> Result<
+            Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+            novarocks_state_store_api::StateStoreExecutionFailure,
+        > {
+            if self.stalled.load(Ordering::Acquire) {
+                // Parks here for as long as the test holds the permit. The scan
+                // is not failing and not cancelled; it simply has not returned.
+                let _permit = self.gate.acquire().await.expect("stall gate");
+            }
+            self.inner.begin_original_read_in(execution).await
         }
 
         async fn begin_write(
@@ -1447,8 +1537,7 @@ mod tests {
         )
         .expect("controller");
 
-        controller
-            .bootstrap()
+        bootstrap_original(&controller, &host)
             .await
             .expect("one provider failure does not fail the full bootstrap");
         assert!(matches!(
@@ -1502,7 +1591,9 @@ mod tests {
             CatalogProjectionConfig::default(),
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         toggle_store.reads_available.store(false, Ordering::Release);
         assert!(
             repository
@@ -1564,7 +1655,9 @@ mod tests {
                 config.clone(),
             )
             .expect("controller");
-            controller.bootstrap().await.expect("bootstrap");
+            bootstrap_original(&controller, &host)
+                .await
+                .expect("bootstrap");
             wait_for_ready(&port, &created.attachment.instance_id).await;
             controller.start().expect("start controller");
             assert!(matches!(
@@ -1641,7 +1734,9 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
         assert_eq!(materializations.load(Ordering::Relaxed), 1);
 
@@ -1709,7 +1804,9 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
 
         stalling.stalled.store(true, Ordering::Release);
@@ -1800,7 +1897,9 @@ mod tests {
             },
         )
         .expect("outage controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
 
         toggle_store.reads_available.store(false, Ordering::Release);
@@ -1872,7 +1971,9 @@ mod tests {
             CatalogProjectionConfig::default(),
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
 
         // The attachment goes away, and the store reports a new identity. The
@@ -1954,12 +2055,15 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
+        let bootstrap_resyncs = controller.metrics_snapshot().resyncs;
         controller.start().expect("start controller");
         wait_for(
             Duration::from_secs(2),
             "the worker reaches its park between rounds",
-            || controller.metrics_snapshot().resyncs >= 2,
+            || controller.metrics_snapshot().resyncs > bootstrap_resyncs,
         )
         .await;
 
@@ -2001,7 +2105,10 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
+        let bootstrap_resyncs = controller.metrics_snapshot().resyncs;
         controller.start().expect("start controller");
         // The worker always runs one round of its own before it parks, so the
         // baseline is taken after that round; otherwise this would pass on the
@@ -2009,7 +2116,7 @@ mod tests {
         wait_for(
             Duration::from_secs(2),
             "the worker performs its own first round before parking",
-            || controller.metrics_snapshot().resyncs >= 2,
+            || controller.metrics_snapshot().resyncs > bootstrap_resyncs,
         )
         .await;
         let parked = controller.metrics_snapshot().resyncs;

@@ -84,18 +84,12 @@ impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemp
         )
     }
 
-    fn begin_automatic_maintenance_attempt(
-        &self,
-        capacity: Option<
-            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        >,
-    ) -> Result<BackgroundMaintenanceAttempt, String> {
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
         core_capabilities::background_maintenance_attempt(
             self.role,
             self.topology.clone(),
             self.runtime_policy.max_attempt_duration(),
             &self.runtime,
-            capacity,
         )
     }
 }

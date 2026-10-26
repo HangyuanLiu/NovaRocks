@@ -511,35 +511,6 @@ impl StatementObservationOwner {
         handle.owner = Some(Arc::downgrade(self));
         Ok(Some(handle))
     }
-    pub(crate) fn bind_nominated_attempt(
-        self: &Arc<Self>,
-        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
-        execution: QueryExecutionId,
-    ) -> Result<Option<novarocks_failpoint::target_binding::StatementWorkNomination>, String> {
-        let token = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| "statement observation lock poisoned")?;
-            if !self.active(&mut state) {
-                return Ok(None);
-            }
-            state
-                .runs
-                .get(&nomination.statement_run_token)
-                .and_then(|run| run.statement)
-        };
-        if let Some(token) = token
-            && let Some(handle) = self.bound_statement(token)
-        {
-            if handle.nomination().as_ref() != Some(nomination) {
-                return Err("distributed attempt differs from its nominated statement".into());
-            }
-            handle.bind_attempt(execution);
-            return Ok(handle.nomination_for_exact_execution(execution));
-        }
-        Ok(None)
-    }
     pub(crate) fn bound_statement(
         self: &Arc<Self>,
         statement: StatementToken,
@@ -1241,27 +1212,22 @@ mod session_owner_tests {
         let other_cohort = execution(42, 1);
         let replacement = execution(41, 2);
         assert!(handle.nomination_for_exact_execution(first).is_none());
+        handle.bind_attempt(first);
         assert_eq!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&nomination, first)
-                .unwrap(),
+            handle.nomination_for_exact_execution(first),
             Some(nomination.clone())
         );
         fixture.owner.publish(&snapshot(first));
+        handle.bind_attempt(first);
         assert_eq!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&nomination, first)
-                .unwrap(),
+            handle.nomination_for_exact_execution(first),
             Some(nomination.clone())
         );
         assert!(fixture.owner.peek("cohorts").unwrap().snapshot.is_some());
+        handle.bind_attempt(other_cohort);
         assert!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&nomination, other_cohort)
-                .unwrap()
+            handle
+                .nomination_for_exact_execution(other_cohort)
                 .is_none()
         );
         assert!(
@@ -1282,45 +1248,27 @@ mod session_owner_tests {
                 .as_deref(),
             Some("-19:41:1")
         );
+        handle.bind_attempt(replacement);
         assert_eq!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&nomination, replacement)
-                .unwrap(),
+            handle.nomination_for_exact_execution(replacement),
             Some(nomination.clone())
         );
         assert!(fixture.owner.peek("cohorts").unwrap().snapshot.is_none());
-        assert!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&nomination, first)
-                .unwrap()
-                .is_none()
-        );
+        handle.bind_attempt(first);
+        assert!(handle.nomination_for_exact_execution(first).is_none());
         assert!(handle.nomination_for_exact_execution(first).is_none());
         assert_eq!(
             handle.nomination_for_exact_execution(replacement),
             Some(nomination.clone())
         );
         fixture.owner.publish(&snapshot(replacement));
+        handle.bind_attempt(replacement);
         assert_eq!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&nomination, replacement)
-                .unwrap(),
+            handle.nomination_for_exact_execution(replacement),
             Some(nomination.clone())
         );
         assert!(fixture.owner.peek("cohorts").unwrap().snapshot.is_some());
-        let mut foreign = nomination.clone();
-        foreign.statement_generation += 1;
-        assert!(
-            fixture
-                .owner
-                .bind_nominated_attempt(&foreign, replacement)
-                .is_err()
-        );
-        // The parent statement nomination remains available; projection into
-        // another actual query is what the existing journal refuses.
+        // Exact execution refinement leaves the parent nomination available.
         assert_eq!(handle.nomination(), Some(nomination));
         fixture.owner.drain("cohorts").unwrap();
         assert!(handle.nomination_for_exact_execution(replacement).is_none());

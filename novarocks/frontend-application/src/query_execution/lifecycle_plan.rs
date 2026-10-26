@@ -558,18 +558,6 @@ impl QueryCredentialLeases {
         }
     }
 
-    pub(crate) fn try_new(
-        mut leases: Vec<QueryCredentialLease>,
-    ) -> Result<Self, DistributedQueryError> {
-        canonicalize_credential_leases(&mut leases)?;
-        Ok(Self {
-            storage: Arc::new(AttemptCredentialStorage {
-                leases,
-                route: None,
-            }),
-        })
-    }
-
     pub(crate) fn leases(&self) -> &[QueryCredentialLease] {
         &self.storage.leases
     }
@@ -578,15 +566,6 @@ impl QueryCredentialLeases {
     /// retain the original allocation rather than replacing it with absence.
     pub(crate) fn into_storage(self) -> Arc<AttemptCredentialStorage> {
         self.storage
-    }
-
-    /// Native initialization has already borrowed this exact table while
-    /// encoding Establish. No new table or credential copy is created here.
-    pub(crate) fn into_attempt_storage_resolver(self) -> Option<Arc<AttemptCredentialStorage>> {
-        if self.storage.leases.is_empty() {
-            return None;
-        }
-        Some(self.storage)
     }
 }
 
@@ -1306,7 +1285,8 @@ mod tests {
         ));
         assert!(collector.drain_credential_leases().is_err());
         assert!(collector.resolve_vended_s3(&request).is_err());
-        let native = leases.into_attempt_storage_resolver().unwrap();
+        assert!(!leases.leases().is_empty());
+        let native = leases.into_storage();
         assert!(Arc::ptr_eq(&native, &original));
         let repeated = collector.seal_for_terminal().unwrap();
         assert!(Arc::ptr_eq(&repeated, &native));
@@ -1352,7 +1332,10 @@ mod tests {
         let native = native_collector.drain_credential_leases().unwrap();
         let frozen_empty = native_collector.seal_for_terminal().unwrap();
         assert!(Arc::ptr_eq(&native.storage, &frozen_empty));
-        assert!(native.into_attempt_storage_resolver().is_none());
+        let native = native.into_storage();
+        assert!(Arc::ptr_eq(&native, &frozen_empty));
+        assert!(native.leases.is_empty());
+        drop(native);
         assert!(native_collector.drain_credential_leases().is_err());
         assert!(Arc::ptr_eq(
             &frozen_empty,
@@ -1474,7 +1457,8 @@ mod tests {
         let leases = collector.drain_credential_leases().unwrap();
         assert!(collector.resolve_vended_s3(&request).is_err());
         assert!(selected.resolve(&request).is_ok());
-        let original = leases.into_attempt_storage_resolver().unwrap();
+        assert!(!leases.leases().is_empty());
+        let original = leases.into_storage();
         let route = collector.storage_resolver();
         drop(collector);
         assert!(route.resolve_vended_s3(&request).is_ok());

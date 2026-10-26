@@ -44,8 +44,8 @@ use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorControlResolver, ConnectorError, ConnectorRewriteCohortRead,
     ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
-    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
-    ConnectorWriteCohortId, ConnectorWriteInputShape, PreparedBatch,
+    ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteCohortId,
+    ConnectorWriteInputShape, PreparedBatch,
 };
 use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
@@ -209,11 +209,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
     ) -> Result<RequestScopedMaintenanceEngine, String> {
         Err("original governed Rewrite engine is unsupported".into())
     }
-    fn for_admitted_execution(
-        &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<Arc<dyn TableMaintenanceEngine>, String>;
-
     #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
         &self,
@@ -247,15 +242,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         target: &MaintenanceTarget,
     ) -> Result<ConnectorTableObjectId, String>;
-
-    /// Rebind the logical target only when it remains the captured physical
-    /// object. This intentionally has no default: silently skipping the
-    /// binding check would allow maintenance work on a replacement table.
-    fn rebind_target_object(
-        &self,
-        target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String>;
 
     async fn reject_user_action_on_mv(
         &self,
@@ -523,19 +509,6 @@ impl RequestScopedMaintenanceEngine {
             self.connector_context.clone(),
         )
     }
-
-    fn rebind_target_object_with_context(
-        &self,
-        target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        rebind_target_object_with_ports(
-            self.kernel.connector_control().as_ref(),
-            target,
-            expected_object_id,
-            self.connector_context.clone(),
-        )
-    }
 }
 
 fn capture_target_object_id_with_ports(
@@ -625,32 +598,6 @@ fn capture_admitted_optimize_target_with_ports(
     })
 }
 
-fn rebind_target_object_with_ports(
-    controls: &dyn ConnectorControlResolver,
-    target: &MaintenanceTarget,
-    expected_object_id: &ConnectorTableObjectId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MaintenanceTargetRebind, String> {
-    let identity = RequestScopedMaintenanceEngine::target_identity(target)?;
-    let lease = controls
-        .acquire_current(&identity.instance_id)
-        .map_err(|error| {
-            format!("acquire current connector generation for target rebind: {error}")
-        })?;
-    let binding =
-        lease
-            .binding()
-            .metadata()
-            .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
-                table: identity,
-                expected_object_id: expected_object_id.clone(),
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                selector: ConnectorTableObjectSelector::Current,
-                context,
-            });
-    maintenance_target_rebind_from_connector_result(binding.map(|_| ()))
-}
-
 fn captured_target_object_id_from_connector_result(
     object_id: Result<ConnectorTableObjectId, ConnectorError>,
 ) -> Result<ConnectorTableObjectId, String> {
@@ -712,12 +659,7 @@ pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
     ) -> Result<BackgroundMaintenanceAttempt, String> {
         Err("original governed maintenance context is unsupported".into())
     }
-    fn begin_automatic_maintenance_attempt(
-        &self,
-        capacity: Option<
-            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        >,
-    ) -> Result<BackgroundMaintenanceAttempt, String>;
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
 }
 
 /// Long-lived automatic-maintenance engine.
@@ -744,9 +686,7 @@ impl BackgroundMaintenanceEngine {
     }
 
     fn request_engine(&self) -> Result<RequestScopedMaintenanceEngine, String> {
-        let attempt = self
-            .attempt_factory
-            .begin_automatic_maintenance_attempt(None)?;
+        let attempt = self.attempt_factory.begin_automatic_maintenance_attempt()?;
         Ok(RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             attempt.execution,
@@ -829,32 +769,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         Some(nomination)
     }
 
-    fn for_admitted_execution(
-        &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
-        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-            capacity.scope(),
-            &capacity.window_alias(),
-        )?;
-        let original = self
-            .execution
-            .result_capacity()
-            .ok_or("request maintenance engine has no admitted root binding")?;
-        if !original.window_alias().is_for_scope(capacity.scope())
-            || !original
-                .window_alias()
-                .shares_capacity_with(&capacity.window_alias())
-        {
-            return Err("request maintenance engine cannot change its admitted root".into());
-        }
-        Ok(Arc::new(Self::new(
-            self.kernel.clone(),
-            self.execution.clone(),
-            self.connector_context.clone(),
-        )))
-    }
-
     fn capture_admitted_optimize_target(
         &self,
         target: &MaintenanceTarget,
@@ -906,14 +820,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         target: &MaintenanceTarget,
     ) -> Result<ConnectorTableObjectId, String> {
         self.capture_target_object_id_with_context(target)
-    }
-
-    fn rebind_target_object(
-        &self,
-        target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        self.rebind_target_object_with_context(target, expected_object_id)
     }
 
     async fn reject_user_action_on_mv(
@@ -1105,35 +1011,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         ))
     }
 
-    fn for_admitted_execution(
-        &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
-        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-            capacity.scope(),
-            &capacity.window_alias(),
-        )?;
-        let attempt = self
-            .attempt_factory
-            .begin_automatic_maintenance_attempt(Some(capacity))?;
-        let returned = attempt
-            .execution
-            .result_capacity()
-            .ok_or("automatic maintenance factory omitted its admitted root")?;
-        if !returned.window_alias().is_for_scope(capacity.scope())
-            || !returned
-                .window_alias()
-                .shares_capacity_with(&capacity.window_alias())
-        {
-            return Err("automatic maintenance factory replaced its admitted root".into());
-        }
-        Ok(Arc::new(RequestScopedMaintenanceEngine::new(
-            self.kernel.clone(),
-            attempt.execution,
-            attempt.connector_context,
-        )))
-    }
-
     fn resolve_target(
         &self,
         name_parts: &[String],
@@ -1147,15 +1024,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         target: &MaintenanceTarget,
     ) -> Result<ConnectorTableObjectId, String> {
         self.request_engine()?.capture_target_object_id(target)
-    }
-
-    fn rebind_target_object(
-        &self,
-        target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        self.request_engine()?
-            .rebind_target_object(target, expected_object_id)
     }
 
     async fn reject_user_action_on_mv(
@@ -2060,8 +1928,8 @@ mod admitted_background_context_tests {
         BackendTopologyValidationError,
     };
     use novarocks_workload_control::{
-        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
-        WorkloadConfig, WorkloadControl,
+        ResourceConfig, ResultCapacityConfig, WorkClass, WorkRequest, WorkloadConfig,
+        WorkloadControl,
     };
     use std::time::Duration;
 
@@ -2072,7 +1940,7 @@ mod admitted_background_context_tests {
         fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
             assert!(
                 self.allow_snapshot,
-                "capacity refusal must precede topology capture"
+                "Root refusal must precede topology capture"
             );
             Ok(BackendTopologySnapshot::empty(7))
         }
@@ -2117,56 +1985,69 @@ mod admitted_background_context_tests {
     }
 
     #[tokio::test]
-    async fn local_window_refuses_before_automatic_topology_capture() {
+    async fn cancelled_original_root_refuses_before_background_topology_capture() {
         let (control, _) = control();
-        let (root, window) = control
+        let root = control
             .root_admission()
-            .try_begin_root_with_result(
-                WorkRequest::new(WorkClass::Management),
-                ResultWindowClass::Local,
-            )
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
             .unwrap();
-        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
-        let result = crate::capabilities::background_maintenance_attempt(
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        let expected = root.owner.scope().check().unwrap_err().to_string();
+        let result = crate::capabilities::original_background_maintenance_attempt(
             novarocks_types::ClusterRole::Fe,
             Arc::new(TopologyProbe {
                 allow_snapshot: false,
             }),
             Duration::from_secs(60),
             &tokio::runtime::Handle::current(),
-            Some(&binding),
+            &root.owner,
         );
-        assert!(matches!(result, Err(error) if error.contains("Internal")));
-        drop(binding);
-        drop(window);
+        assert!(matches!(result, Err(error) if error == expected));
+        let notice = control
+            .next_control()
+            .expect("the original Cancel notification");
+        assert_eq!(notice.scope().id(), root.owner.scope().id());
+        assert!(
+            notice
+                .intents()
+                .contains(novarocks_workload_control::ControlIntent::Cancel)
+        );
+        notice.acknowledge();
+        assert!(control.next_control().is_none());
         root.owner.complete();
         root.business.release();
+        control.close_admission();
+        control.shutdown().unwrap_or_else(|failure| {
+            panic!(
+                "cancelled maintenance Root did not drain: {}",
+                failure.error()
+            )
+        });
     }
 
     #[tokio::test]
-    async fn automatic_attempt_keeps_original_root_deadline_cancellation_and_window() {
-        let (control, capacity) = control();
+    async fn background_attempt_keeps_original_root_deadline_cancellation_and_data_budget() {
+        let (control, _) = control();
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut request = WorkRequest::new(WorkClass::Management);
         request.deadline = Some(deadline.into());
-        let (root, window) = control
-            .root_admission()
-            .try_begin_root_with_result(request, ResultWindowClass::Internal)
-            .unwrap();
-        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
-        let attempt = crate::capabilities::background_maintenance_attempt(
+        let root = control.root_admission().try_begin_root(request).unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(&root.owner).unwrap();
+        let attempt = crate::capabilities::original_background_maintenance_attempt(
             novarocks_types::ClusterRole::Fe,
             Arc::new(TopologyProbe {
                 allow_snapshot: true,
             }),
             Duration::from_secs(60),
             &tokio::runtime::Handle::current(),
-            Some(&binding),
+            &root.owner,
         )
         .unwrap();
         assert_eq!(attempt.execution.deadline(), Some(deadline));
         assert_eq!(attempt.execution.topology().revision(), 7);
         let returned = attempt.execution.result_capacity().unwrap();
+        assert!(returned.is_root_backed_internal());
         assert!(returned.window_alias().is_for_scope(binding.scope()));
         assert!(
             returned
@@ -2176,13 +2057,28 @@ mod admitted_background_context_tests {
         root.owner
             .cancel(novarocks_workload_control::CancellationReason::Requested);
         assert!(attempt.execution.cancellation().is_cancelled());
+        let notice = control
+            .next_control()
+            .expect("the original Cancel notification");
+        assert_eq!(notice.scope().id(), root.owner.scope().id());
+        assert!(
+            notice
+                .intents()
+                .contains(novarocks_workload_control::ControlIntent::Cancel)
+        );
+        notice.acknowledge();
+        assert!(control.next_control().is_none());
         drop(binding);
-        drop(window);
         root.owner.complete();
         root.business.release();
-        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         drop(attempt);
-        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        control.close_admission();
+        control.shutdown().unwrap_or_else(|failure| {
+            panic!(
+                "original maintenance Root did not drain: {}",
+                failure.error()
+            )
+        });
     }
 }
 

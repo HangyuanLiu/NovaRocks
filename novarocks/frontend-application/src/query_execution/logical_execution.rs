@@ -543,11 +543,9 @@ mod initial_reservation_tests {
             prepared.vended_credential_lease_sink().unwrap(),
             native.vended_credential_lease_sink().unwrap(),
         ));
-        let storage = source
-            .test_into_credential_leases()
-            .unwrap()
-            .into_attempt_storage_resolver()
-            .expect("the original vended table");
+        let leases = source.test_into_credential_leases().unwrap();
+        assert!(!leases.leases().is_empty(), "the original vended table");
+        let storage = leases.into_storage();
         stable.verify_native_storage(&storage).unwrap();
         stable.seal_for_terminal().unwrap();
         assert!(Arc::ptr_eq(

@@ -704,6 +704,7 @@ impl PreparedDistributedQuery {
                 instance_index: task.instance_index(),
                 finst_id: task.fragment_instance_id(),
                 backend_idx: backend.backend_idx(),
+                #[cfg(test)]
                 endpoint: backend.endpoint().clone(),
                 scan_ranges,
             });
