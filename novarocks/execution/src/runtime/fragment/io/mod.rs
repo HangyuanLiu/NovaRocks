@@ -8,6 +8,7 @@ pub mod exchange_edge;
 pub mod exchange_metrics;
 pub mod exchange_queue;
 pub mod exchange_receiver;
+pub mod exchange_stream_sender;
 pub mod exchange_unit;
 pub mod result;
 

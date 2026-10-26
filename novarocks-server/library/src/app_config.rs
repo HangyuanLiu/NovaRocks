@@ -1271,8 +1271,6 @@ pub struct RuntimeConfig {
     pub exchange_instance_floor_slots: usize,
     #[serde(default = "default_exchange_instance_max_slots")]
     pub exchange_instance_max_slots: usize,
-    #[serde(default = "default_exchange_process_floor_slots")]
-    pub exchange_process_floor_slots: usize,
     #[serde(default = "default_exchange_floating_slots")]
     pub exchange_floating_slots: usize,
     #[serde(default = "default_exchange_stream_window")]
@@ -1859,10 +1857,6 @@ fn default_exchange_instance_floor_slots() -> usize {
 
 fn default_exchange_instance_max_slots() -> usize {
     ExchangeFlowLimits::default().instance_max_slots()
-}
-
-fn default_exchange_process_floor_slots() -> usize {
-    ExchangeFlowLimits::default().process_floor_slots()
 }
 
 fn default_exchange_floating_slots() -> usize {
@@ -2646,7 +2640,6 @@ impl Default for RuntimeConfig {
         Self {
             exchange_instance_floor_slots: default_exchange_instance_floor_slots(),
             exchange_instance_max_slots: default_exchange_instance_max_slots(),
-            exchange_process_floor_slots: default_exchange_process_floor_slots(),
             exchange_floating_slots: default_exchange_floating_slots(),
             exchange_stream_window: default_exchange_stream_window(),
             exchange_transport_timeout_ms: default_exchange_transport_timeout_ms(),
@@ -2854,7 +2847,6 @@ impl RuntimeConfig {
         ExchangeFlowLimits::try_new(
             self.exchange_instance_floor_slots,
             self.exchange_instance_max_slots,
-            self.exchange_process_floor_slots,
             self.exchange_floating_slots,
             self.exchange_stream_window,
             Duration::from_millis(self.exchange_transport_timeout_ms),
@@ -3209,7 +3201,6 @@ mod tests {
         );
         assert_eq!(expected.instance_floor_slots(), 1);
         assert_eq!(expected.instance_max_slots(), 32);
-        assert_eq!(expected.process_floor_slots(), 8192);
         assert_eq!(expected.floating_slots(), 8192);
         assert_eq!(expected.stream_window(), 2);
         assert_eq!(
@@ -3223,7 +3214,6 @@ mod tests {
         let runtime = toml::from_str::<RuntimeConfig>(
             "exchange_instance_floor_slots = 2\n\
              exchange_instance_max_slots = 5\n\
-             exchange_process_floor_slots = 17\n\
              exchange_floating_slots = 0\n\
              exchange_stream_window = 3\n\
              exchange_transport_timeout_ms = 71\n",
@@ -3234,7 +3224,6 @@ mod tests {
             .expect("valid explicit limits");
         assert_eq!(limits.instance_floor_slots(), 2);
         assert_eq!(limits.instance_max_slots(), 5);
-        assert_eq!(limits.process_floor_slots(), 17);
         assert_eq!(limits.floating_slots(), 0);
         assert_eq!(limits.stream_window(), 3);
         assert_eq!(
@@ -3253,14 +3242,6 @@ mod tests {
             (
                 "exchange_instance_max_slots = 0",
                 "exchange_instance_max_slots",
-            ),
-            (
-                "exchange_process_floor_slots = 0",
-                "exchange_process_floor_slots",
-            ),
-            (
-                "exchange_instance_floor_slots = 2\nexchange_process_floor_slots = 1",
-                "exchange_process_floor_slots",
             ),
             ("exchange_stream_window = 0", "exchange_stream_window"),
             (

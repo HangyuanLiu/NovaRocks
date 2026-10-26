@@ -587,3 +587,60 @@ fn wide_set_op_graph_uses_a_linear_completion_prefix() {
         assert!(graph.resolve().unwrap().is_acyclic());
     }
 }
+
+#[test]
+fn optional_rf_wait_is_removed_before_judging_required_rf_cycles() {
+    let required = FilterConsumerRef {
+        filter: RuntimeFilterId::new(1),
+        ordinal: 0,
+    };
+    let optional = FilterConsumerRef {
+        filter: RuntimeFilterId::new(2),
+        ordinal: 0,
+    };
+    let required_gate = WaitNode::FilterConsumer(required);
+    let optional_gate = WaitNode::FilterConsumer(optional);
+    let required_build = WaitNode::Filter(required.filter);
+    let optional_build = WaitNode::Filter(optional.filter);
+    // Required TopN build -> ordinary blocking consumer -> ordinary build ->
+    // TopN consumer -> TopN build. Only the ordinary wait may be removed.
+    let mut graph = WaitGraph::default();
+    graph.non_downgradable.insert(required);
+    graph.add_edge(
+        required_gate,
+        required_build,
+        WaitEdgeKind::FilterWait(required),
+    );
+    graph.add_edge(required_build, optional_gate, WaitEdgeKind::DataWait);
+    graph.add_edge(
+        optional_gate,
+        optional_build,
+        WaitEdgeKind::FilterWait(optional),
+    );
+    graph.add_edge(optional_build, required_gate, WaitEdgeKind::DataWait);
+    let resolved = graph.resolve().unwrap();
+    assert_eq!(resolved.filter_downgrades.as_ref(), &[optional]);
+    assert!(resolved.is_acyclic());
+    assert!(
+        graph.dependencies[&required_gate][&required_build]
+            .contains(&WaitEdgeKind::FilterWait(required))
+    );
+}
+
+#[test]
+fn required_rf_wait_is_rejected_when_its_own_cycle_remains() {
+    let required = FilterConsumerRef {
+        filter: RuntimeFilterId::new(1),
+        ordinal: 0,
+    };
+    let gate = WaitNode::FilterConsumer(required);
+    let build = WaitNode::Filter(required.filter);
+    let mut graph = WaitGraph::default();
+    graph.non_downgradable.insert(required);
+    graph.add_edge(gate, build, WaitEdgeKind::FilterWait(required));
+    graph.add_edge(build, gate, WaitEdgeKind::DataWait);
+    assert_eq!(
+        graph.resolve(),
+        Err(WaitGraphError::UnresolvableFilterConsumer(required))
+    );
+}

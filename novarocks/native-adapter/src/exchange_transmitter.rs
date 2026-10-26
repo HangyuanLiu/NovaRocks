@@ -8,6 +8,7 @@ use novarocks_execution::runtime::fragment::io::{
 
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
+use prost::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::{BackendDataRuntime, NativeRpcClient};
@@ -19,9 +20,14 @@ pub fn grpc_exchange_transmitter(
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
 ) -> Arc<dyn ExchangeFrameTransmitter> {
+    let grants = crate::exchange_grant_subscription::ExchangeGrantClients::new(
+        runtime.clone(),
+        send_timeout,
+    );
     Arc::new(GrpcExchangeFrameTransmitter {
         runtime,
         send_timeout,
+        grants,
         #[cfg(novarocks_dev_controls)]
         observations,
     })
@@ -41,9 +47,234 @@ struct GrpcExchangeFrameTransmitter {
     observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     runtime: BackendDataRuntime,
     send_timeout: Duration,
+    grants: Arc<crate::exchange_grant_subscription::ExchangeGrantClients>,
 }
 
 impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
+    fn deliver_unit(
+        &self,
+        frame: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        stop: CancellationToken,
+        activity: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+        done: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+    ) {
+        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+            ExchangeCallOutcome, ExchangeUnitReceipt,
+        };
+        use novarocks_task_codec::exchange_unit_codec as codec;
+        let stream = frame.receiver.stream;
+        let sequence = frame.receiver.item.sequence();
+        let local = self.runtime.native_trust().local_process_identity();
+        if local
+            != Some(novarocks_native_trust::NativeProcessIdentity::Backend(
+                stream.source().task().backend_process_id(),
+            ))
+        {
+            done(ExchangeCallOutcome::Refused(unit_failure(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                451,
+            )));
+            drop(activity);
+            return;
+        }
+        let request = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+            stream,
+            sender_count: frame.receiver.sender_count,
+            sender_id: frame.receiver.sender_id,
+            backend_number: frame.receiver.backend_number,
+            item: frame.receiver.item,
+            payload: frame.receiver.payload,
+            next_demand: frame.receiver.next_demand,
+        });
+        if let Err(fact) = checked_envelope(&request) {
+            done(ExchangeCallOutcome::Refused(fact));
+            drop(activity);
+            return;
+        }
+        if codec::decode_delivery_request(
+            request.clone(),
+            FieldPath::root("outgoing_exchange_unit"),
+        )
+        .is_err()
+        {
+            done(ExchangeCallOutcome::Refused(unit_failure(
+                novarocks_execution_contract::failure::FailureClass::Invariant,
+                464,
+            )));
+            drop(activity);
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let timeout = self.send_timeout;
+        self.runtime.handle().spawn(async move {
+            // This guard follows the real local request future, including its
+            // owned DTO/payload aliases. Unknown is only a result notification;
+            // the caller cannot release this guard from that callback.
+            let _activity = activity;
+            let client = NativeRpcClient::new_backend_endpoint(
+                runtime,
+                frame.destination.native_endpoint().clone(),
+                stream.destination().backend_process_id(),
+            );
+            let outcome = match client
+                .deliver_exchange_unit_async(request, timeout, stop)
+                .await
+            {
+                Ok(response) => match codec::decode_delivery_response(
+                    &response,
+                    stream,
+                    sequence,
+                    FieldPath::root("exchange_unit_response"),
+                ) {
+                    Ok(codec::DecodedExchangeDeliveryOutcome::Observed { verdict, facts }) => {
+                        ExchangeCallOutcome::Observed(ExchangeUnitReceipt { verdict, facts })
+                    }
+                    Ok(codec::DecodedExchangeDeliveryOutcome::Refused(fact)) => {
+                        ExchangeCallOutcome::Refused(fact)
+                    }
+                    Err(_) => ExchangeCallOutcome::Unknown(
+                        "exchange unit response cannot be fully validated".into(),
+                    ),
+                },
+                Err(crate::native_client::ExchangeRpcFailure::NotProcessed(detail)) => {
+                    ExchangeCallOutcome::NotProcessed(detail)
+                }
+                Err(crate::native_client::ExchangeRpcFailure::Unknown(detail)) => {
+                    ExchangeCallOutcome::Unknown(detail)
+                }
+            };
+            done(outcome);
+        });
+    }
+
+    fn register_unit_demands(
+        &self,
+        destination: novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+        entries: Vec<
+            novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandEntry,
+        >,
+        stop: CancellationToken,
+        done: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+    ) {
+        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+            ExchangeDemandCallOutcome, ExchangeDemandOperation,
+        };
+        use novarocks_task_codec::exchange_unit_codec as codec;
+        let streams = entries.iter().map(|entry| entry.stream).collect::<Vec<_>>();
+        let Some(first) = streams.first().copied() else {
+            done(ExchangeDemandCallOutcome::Refused(unit_failure(
+                novarocks_execution_contract::failure::FailureClass::Invariant,
+                464,
+            )));
+            return;
+        };
+        let local = self.runtime.native_trust().local_process_identity();
+        if streams.iter().any(|stream| {
+            local
+                != Some(novarocks_native_trust::NativeProcessIdentity::Backend(
+                    stream.source().task().backend_process_id(),
+                ))
+        }) {
+            done(ExchangeDemandCallOutcome::Refused(unit_failure(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                451,
+            )));
+            return;
+        }
+        let entries = entries
+            .into_iter()
+            .map(|entry| codec::DecodedExchangeDemandEntry {
+                stream: entry.stream,
+                operation: match entry.operation {
+                    ExchangeDemandOperation::Register(demand) => {
+                        codec::ExchangeDemandOperation::Demand(demand)
+                    }
+                    ExchangeDemandOperation::StopSender => {
+                        codec::ExchangeDemandOperation::StopSender
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        let request = match codec::encode_demand_request(
+            &entries,
+            FieldPath::root("outgoing_exchange_demands"),
+        ) {
+            Ok(request) => request,
+            Err(_) => {
+                done(ExchangeDemandCallOutcome::Refused(unit_failure(
+                    novarocks_execution_contract::failure::FailureClass::Invariant,
+                    464,
+                )));
+                return;
+            }
+        };
+        if let Err(fact) = checked_envelope(&request) {
+            done(ExchangeDemandCallOutcome::Refused(fact));
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let timeout = self.send_timeout;
+        self.runtime.handle().spawn(async move {
+            let client = NativeRpcClient::new_backend_endpoint(
+                runtime,
+                destination.native_endpoint().clone(),
+                first.destination().backend_process_id(),
+            );
+            let outcome = match client
+                .register_exchange_demand_async(request, timeout, stop)
+                .await
+            {
+                Ok(response) => match codec::decode_demand_response(
+                    &response,
+                    &streams,
+                    FieldPath::root("exchange_demand_response"),
+                ) {
+                    Ok(results) => ExchangeDemandCallOutcome::Observed(
+                        results
+                            .into_iter()
+                            .map(|result| (result.stream, result.outcome))
+                            .collect(),
+                    ),
+                    Err(_) => ExchangeDemandCallOutcome::Unknown(
+                        "exchange demand response cannot be fully validated".into(),
+                    ),
+                },
+                Err(crate::native_client::ExchangeRpcFailure::NotProcessed(detail)) => {
+                    ExchangeDemandCallOutcome::NotProcessed(detail)
+                }
+                Err(crate::native_client::ExchangeRpcFailure::Unknown(detail)) => {
+                    ExchangeDemandCallOutcome::Unknown(detail)
+                }
+            };
+            done(outcome);
+        });
+    }
+
+    fn watch_unit_facts(
+        &self,
+        destination: novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        wake: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+        self.grants.watch(destination, stream, wake)
+    }
+
+    fn forget_unit_facts(&self, stream: novarocks_execution_contract::ExchangeStreamIdentity) {
+        self.grants.forget(stream);
+    }
+
+    fn schedule_unit_retry(
+        &self,
+        delay: Duration,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+        self.runtime.handle().spawn(async move {
+            tokio::time::sleep(delay).await;
+            task();
+        });
+        Ok(())
+    }
+
     fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
         self.transmit_cancellable(frame, CancellationToken::new())
     }
@@ -120,6 +351,27 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                     .as_deref(),
             ),
         }
+    }
+}
+
+fn unit_failure(
+    class: novarocks_execution_contract::failure::FailureClass,
+    code: u16,
+) -> novarocks_execution_contract::failure::FailureFact {
+    crate::exchange_grant_subscription::exchange_failure(class, code)
+}
+
+fn checked_envelope(
+    value: &impl Message,
+) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+    if value.encoded_len() > novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+    {
+        Err(unit_failure(
+            novarocks_execution_contract::failure::FailureClass::Resource,
+            463,
+        ))
+    } else {
+        Ok(())
     }
 }
 

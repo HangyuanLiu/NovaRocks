@@ -387,10 +387,9 @@ impl WaitGraph {
             for (to, kinds) in destinations {
                 if component_by_node[from] == component_by_node[to] {
                     for kind in kinds {
-                        if let WaitEdgeKind::FilterWait(consumer) = kind {
-                            if self.non_downgradable.contains(consumer) {
-                                return Err(WaitGraphError::UnresolvableFilterConsumer(*consumer));
-                            }
+                        if let WaitEdgeKind::FilterWait(consumer) = kind
+                            && !self.non_downgradable.contains(consumer)
+                        {
                             downgrades.insert(*consumer);
                         }
                     }
@@ -406,8 +405,23 @@ impl WaitGraph {
                 !kinds.is_empty()
             });
         }
-        let data_cycles = self
-            .components()
+        let remaining = self.components();
+        // A required RF wait can share a component with an optional wait which
+        // breaks its cycle. Reject only after removing all optional waits.
+        for component in &remaining {
+            for node in component {
+                for (target, kinds) in &self.dependencies[node] {
+                    if component.contains(target) {
+                        for kind in kinds {
+                            if let WaitEdgeKind::FilterWait(consumer) = kind {
+                                return Err(WaitGraphError::UnresolvableFilterConsumer(*consumer));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let data_cycles = remaining
             .into_iter()
             .filter_map(|component| self.cycle_witness(&component))
             .collect::<Vec<_>>();

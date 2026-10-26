@@ -71,13 +71,12 @@ impl ExecutionRuntimeConfig {
 
 /// Validated structural exchange limits supplied by application composition.
 ///
-/// Slots count units, not bytes of resident memory. The process floor pool is
-/// separate from floating slots so instance registration has a finite source.
+/// Slots count units, not bytes of resident memory. Each installed instance has
+/// its own progress floor; registration does not consume a second process quota.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExchangeFlowLimits {
     instance_floor_slots: usize,
     instance_max_slots: usize,
-    process_floor_slots: usize,
     floating_slots: usize,
     stream_window: usize,
     transport_timeout: Duration,
@@ -87,14 +86,12 @@ impl ExchangeFlowLimits {
     pub fn try_new(
         instance_floor_slots: usize,
         instance_max_slots: usize,
-        process_floor_slots: usize,
         floating_slots: usize,
         stream_window: usize,
         transport_timeout: Duration,
     ) -> Result<Self, ExecutionRuntimeConfigError> {
         for (field, value) in [
             ("exchange_instance_floor_slots", instance_floor_slots),
-            ("exchange_process_floor_slots", process_floor_slots),
             ("exchange_stream_window", stream_window),
         ] {
             if value == 0 {
@@ -107,12 +104,6 @@ impl ExchangeFlowLimits {
                     .to_owned(),
             ));
         }
-        if process_floor_slots < instance_floor_slots {
-            return Err(ExecutionRuntimeConfigError::runtime(
-                "exchange_process_floor_slots must be at least exchange_instance_floor_slots"
-                    .to_owned(),
-            ));
-        }
         if transport_timeout.is_zero() {
             return Err(ExecutionRuntimeConfigError::invalid_field(
                 "exchange_transport_timeout_ms",
@@ -121,7 +112,6 @@ impl ExchangeFlowLimits {
         Ok(Self {
             instance_floor_slots,
             instance_max_slots,
-            process_floor_slots,
             floating_slots,
             stream_window,
             transport_timeout,
@@ -134,10 +124,6 @@ impl ExchangeFlowLimits {
 
     pub const fn instance_max_slots(self) -> usize {
         self.instance_max_slots
-    }
-
-    pub const fn process_floor_slots(self) -> usize {
-        self.process_floor_slots
     }
 
     pub const fn floating_slots(self) -> usize {
@@ -156,7 +142,7 @@ impl ExchangeFlowLimits {
 impl Default for ExchangeFlowLimits {
     fn default() -> Self {
         // Candidate defaults are calibrated before the production cutover.
-        Self::try_new(1, 32, 8192, 8192, 2, Duration::from_secs(30))
+        Self::try_new(1, 32, 8192, 2, Duration::from_secs(30))
             .expect("candidate exchange flow defaults must be valid")
     }
 }
@@ -412,11 +398,10 @@ mod tests {
 
     #[test]
     fn exchange_flow_limits_accept_zero_floating_and_preserve_explicit_values() {
-        let limits = ExchangeFlowLimits::try_new(2, 5, 17, 0, 3, Duration::from_millis(71))
-            .expect("the process can fund each instance floor without floating slots");
+        let limits = ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
+            .expect("instance progress does not require floating slots");
         assert_eq!(limits.instance_floor_slots(), 2);
         assert_eq!(limits.instance_max_slots(), 5);
-        assert_eq!(limits.process_floor_slots(), 17);
         assert_eq!(limits.floating_slots(), 0);
         assert_eq!(limits.stream_window(), 3);
         assert_eq!(limits.transport_timeout(), Duration::from_millis(71));
@@ -432,19 +417,16 @@ mod tests {
     }
 
     #[test]
-    fn exchange_flow_limits_refuse_unfunded_floors_and_zero_progress_resources() {
-        for (floor, cap, process_floor, window, timeout_ms, field) in [
-            (0, 5, 17, 3, 71, "exchange_instance_floor_slots"),
-            (2, 1, 17, 3, 71, "exchange_instance_max_slots"),
-            (2, 5, 0, 3, 71, "exchange_process_floor_slots"),
-            (2, 5, 1, 3, 71, "exchange_process_floor_slots"),
-            (2, 5, 17, 0, 71, "exchange_stream_window"),
-            (2, 5, 17, 3, 0, "exchange_transport_timeout_ms"),
+    fn exchange_flow_limits_refuse_inverted_bounds_and_zero_progress_resources() {
+        for (floor, cap, window, timeout_ms, field) in [
+            (0, 5, 3, 71, "exchange_instance_floor_slots"),
+            (2, 1, 3, 71, "exchange_instance_max_slots"),
+            (2, 5, 0, 71, "exchange_stream_window"),
+            (2, 5, 3, 0, "exchange_transport_timeout_ms"),
         ] {
             let error = ExchangeFlowLimits::try_new(
                 floor,
                 cap,
-                process_floor,
                 0,
                 window,
                 Duration::from_millis(timeout_ms),

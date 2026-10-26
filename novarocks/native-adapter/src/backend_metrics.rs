@@ -461,6 +461,7 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_NATIVE_LANE_STREAMS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_CONTROL_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_BLOCKING_QUEUE_WAIT).clone()),
+            Box::new(Lazy::force(&BACKEND_EXCHANGE_GRANT_EVENTS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG).clone()),
             Box::new(Lazy::force(&BACKEND_WORKER_CONTEXT_RESERVATIONS).clone()),
             Box::new(Lazy::force(&BACKEND_WORKER_RESERVATION_LAST_PUBLISHED).clone()),
@@ -950,6 +951,19 @@ static BACKEND_NATIVE_BLOCKING_QUEUE_WAIT: Lazy<HistogramVec> = Lazy::new(|| {
     )
     .expect("construct Native blocking queue wait histogram")
 });
+
+static BACKEND_EXCHANGE_GRANT_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(Opts::new(
+        "novarocks_backend_exchange_grant_events_total",
+        "Exchange observation feed events by fixed protocol event; no query or stream identity labels.",
+    ), &["event"]).expect("exchange grant metric")
+});
+
+pub(crate) fn exchange_grant_event(event: &'static str) {
+    BACKEND_EXCHANGE_GRANT_EVENTS
+        .with_label_values(&[event])
+        .inc();
+}
 
 static BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(

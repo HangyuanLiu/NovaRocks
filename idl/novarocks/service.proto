@@ -566,7 +566,7 @@ message ExchangeDemandEntry {
   }
 }
 message RegisterExchangeDemandRequest {
-  repeated ExchangeDemandEntry entries = 1; // bounded by the task codec
+  repeated ExchangeDemandEntry entries = 1; // nonempty, exact streams must be unique
 }
 message ExchangeDemandResult {
   ExchangeStreamIdentity stream = 1;
@@ -585,7 +585,7 @@ message ExchangeGrantBatch {
   uint64 generation = 1;
   bool snapshot = 2;
   bool snapshot_complete = 3;
-  repeated ExchangeStreamState states = 4; // bounded independently of snapshot size
+  repeated ExchangeStreamState states = 4; // publication may page a larger snapshot
 }
 
 message ScanRangeParams {

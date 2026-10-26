@@ -233,6 +233,13 @@ fn close_and_stream_facts_preserve_unsigned_end_and_independent_sender_stop() {
     let mut invalid = encode_stream_state(expected);
     invalid.custody_through -= 1;
     assert!(decode_stream_state(&invalid, path()).is_err());
+    let mut invalid = encode_stream_state(expected);
+    // End is not a data grant, even at the top of the unsigned domain.
+    invalid.granted_through = u64::MAX;
+    assert!(decode_stream_state(&invalid, path()).is_err());
+    let mut invalid = encode_stream_state(expected);
+    invalid.granted_through -= 1;
+    assert!(decode_stream_state(&invalid, path()).is_err());
 }
 
 #[test]
@@ -285,9 +292,9 @@ fn delivery_results_match_request_and_preserve_typed_refusals() {
 }
 
 #[test]
-fn demand_batches_are_bounded_unique_and_owned_by_one_process_pair() {
+fn demand_batches_accept_more_than_a_publication_page_and_preserve_identity_checks() {
     let pair = pair();
-    let entries = (0..MAX_EXCHANGE_UNIT_BATCH_ENTRIES)
+    let entries = (0..257)
         .map(|index| DecodedExchangeDemandEntry {
             stream: stream(pair, u32::try_from(index).unwrap()),
             operation: if index == 0 {
@@ -301,6 +308,18 @@ fn demand_batches_are_bounded_unique_and_owned_by_one_process_pair() {
     let decoded = decode_demand_request(&encoded, path()).unwrap();
     assert_eq!(decoded.pair, pair);
     assert_eq!(decoded.entries, entries);
+    let responses = entries
+        .iter()
+        .map(|entry| DecodedExchangeDemandResult {
+            stream: entry.stream,
+            outcome: Ok(facts()),
+        })
+        .collect::<Vec<_>>();
+    let streams = entries.iter().map(|entry| entry.stream).collect::<Vec<_>>();
+    assert_eq!(
+        decode_demand_response(&encode_demand_response(&responses), &streams, path()).unwrap(),
+        responses
+    );
     let mut duplicate = encoded.clone();
     duplicate.entries[1] = duplicate.entries[0].clone();
     assert_eq!(
@@ -318,14 +337,6 @@ fn demand_batches_are_bounded_unique_and_owned_by_one_process_pair() {
         1,
     )));
     assert!(decode_demand_request(&crossed, path()).is_err());
-    let mut oversized = encoded;
-    oversized.entries.push(oversized.entries[0].clone());
-    assert_eq!(
-        decode_demand_request(&oversized, path())
-            .unwrap_err()
-            .kind(),
-        &ProtocolErrorKind::OutOfRange
-    );
     assert!(
         decode_demand_request(
             &wire::RegisterExchangeDemandRequest { entries: vec![] },
@@ -389,7 +400,7 @@ fn subscription_requires_exact_process_identities_and_nonzero_generation() {
 }
 
 #[test]
-fn grant_batches_are_bounded_fenced_and_allow_empty_completed_snapshots() {
+fn grant_batches_accept_more_than_a_publication_page_and_preserve_snapshot_fences() {
     let expected = DecodedExchangeGrantSubscription {
         pair: pair(),
         generation: NonZeroU64::new(7).unwrap(),
@@ -398,10 +409,12 @@ fn grant_batches_are_bounded_fenced_and_allow_empty_completed_snapshots() {
         generation: expected.generation,
         snapshot: true,
         snapshot_complete: true,
-        states: vec![DecodedExchangeStreamState {
-            stream: stream(expected.pair, 1),
-            facts: facts(),
-        }],
+        states: (0..257)
+            .map(|ordinal| DecodedExchangeStreamState {
+                stream: stream(expected.pair, ordinal),
+                facts: facts(),
+            })
+            .collect(),
     };
     let encoded = encode_grant_batch(&value, expected.pair, path()).unwrap();
     assert_eq!(
@@ -428,14 +441,6 @@ fn grant_batches_are_bounded_fenced_and_allow_empty_completed_snapshots() {
     invalid = encoded.clone();
     invalid.states[0].stream = Some(encode_stream(stream(pair(), 1)));
     assert!(decode_grant_batch(&invalid, expected, path()).is_err());
-    invalid = encoded.clone();
-    invalid.states = vec![invalid.states[0].clone(); MAX_EXCHANGE_UNIT_BATCH_ENTRIES + 1];
-    assert_eq!(
-        decode_grant_batch(&invalid, expected, path())
-            .unwrap_err()
-            .kind(),
-        &ProtocolErrorKind::OutOfRange
-    );
     invalid = encoded;
     invalid.snapshot = false;
     assert!(decode_grant_batch(&invalid, expected, path()).is_err());

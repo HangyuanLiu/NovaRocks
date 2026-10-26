@@ -16,7 +16,10 @@
 // under the License.
 //! Native exchange wire projection and route settlement.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
@@ -204,6 +207,16 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
 pub struct NativeExchangeDataPlane {
     receiver_port: Arc<dyn ExchangeReceiverPort>,
     route_authorities: Vec<Arc<dyn ExchangeRouteAuthority>>,
+    unit_capabilities: Option<Arc<TaskInboundCapabilities>>,
+    unit_backend: Option<novarocks_types::BackendProcessId>,
+    unit_publisher: Arc<
+        OnceLock<
+            Result<
+                Arc<crate::exchange_grant_subscription::ExchangeGrantPublisher>,
+                novarocks_execution_contract::failure::FailureFact,
+            >,
+        >,
+    >,
 }
 
 impl NativeExchangeDataPlane {
@@ -214,7 +227,169 @@ impl NativeExchangeDataPlane {
         Self {
             receiver_port,
             route_authorities,
+            unit_capabilities: None,
+            unit_backend: None,
+            unit_publisher: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub(crate) fn with_unit_capabilities(
+        mut self,
+        capabilities: Arc<TaskInboundCapabilities>,
+        backend: novarocks_types::BackendProcessId,
+    ) -> Self {
+        self.unit_capabilities = Some(capabilities);
+        self.unit_backend = Some(backend);
+        self
+    }
+
+    /// Incremental construction leaves the legacy receiver unchanged. A
+    /// missing unit listener is a real refusal of the new capability, not a
+    /// successful empty subscription. Cutover installs this at startup.
+    pub(crate) fn initialize_unit_publications(
+        &self,
+    ) -> Result<
+        Arc<crate::exchange_grant_subscription::ExchangeGrantPublisher>,
+        novarocks_execution_contract::failure::FailureFact,
+    > {
+        self.unit_publisher
+            .get_or_init(|| {
+                crate::exchange_grant_subscription::ExchangeGrantPublisher::install(Arc::clone(
+                    &self.receiver_port,
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) fn deliver_unit(
+        &self,
+        raw: proto::novarocks::DeliverExchangeUnitRequest,
+        caller: novarocks_types::BackendProcessId,
+    ) -> Result<proto::novarocks::DeliverExchangeUnitResponse, tonic::Status> {
+        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+            ExchangeDemandEntry, ExchangeDemandOperation, ExchangeUnitReceiverFrame,
+        };
+        use novarocks_task_codec::exchange_unit_codec as codec;
+        let frame = codec::decode_delivery_request(
+            raw,
+            novarocks_proto_codec::FieldPath::root("exchange_unit_request"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let stream = frame.stream;
+        self.check_unit_pair(codec::ExchangeProcessPair::for_stream(stream), caller)?;
+        let sequence = frame.item.sequence();
+        let outcome = match &self.unit_capabilities {
+            Some(capabilities) => {
+                let key = ExchangeReceiverKey { fragment_instance_id: stream.destination_fragment_instance_id(), node_id: stream.destination_node().get() };
+                let next = frame.next_demand;
+                let delivery = capabilities.with_claimed_stream(stream, |admission| {
+                    if admission.sender_count() != frame.sender_count { return Err(unit_route_failure(460)); }
+                    let mut receipt = self.receiver_port.receive_unit(key, ExchangeUnitReceiverFrame {
+                        stream, sender_count: frame.sender_count, sender_id: frame.sender_id,
+                        backend_number: frame.backend_number, item: frame.item,
+                        payload: frame.payload, next_demand: None,
+                    })?;
+                    if let Some(demand) = next {
+                        let observation = self.receiver_port.register_unit_demand(key, ExchangeDemandEntry {
+                            stream, operation: ExchangeDemandOperation::Register(demand),
+                        })?;
+                        if observation.stream != stream { return Err(unit_route_failure(462)); }
+                        receipt.facts = observation.facts;
+                    }
+                    validate_unit_facts(stream, receipt.facts)?;
+                    Ok(receipt)
+                });
+                match delivery {
+                    Ok(Ok(receipt)) => codec::DecodedExchangeDeliveryOutcome::Observed { verdict: receipt.verdict, facts: receipt.facts },
+                    Ok(Err(fact)) => codec::DecodedExchangeDeliveryOutcome::Refused(fact),
+                    Err(claim) => codec::DecodedExchangeDeliveryOutcome::Refused(unit_claim_failure(claim)),
+                }
+            }
+            None => codec::DecodedExchangeDeliveryOutcome::Refused(novarocks_execution::runtime::fragment::io::exchange_unit::unit_transport_not_installed()),
+        };
+        Ok(codec::encode_delivery_response(stream, sequence, outcome))
+    }
+
+    pub(crate) fn register_unit_demands(
+        &self,
+        raw: proto::novarocks::RegisterExchangeDemandRequest,
+        caller: novarocks_types::BackendProcessId,
+    ) -> Result<proto::novarocks::RegisterExchangeDemandResponse, tonic::Status> {
+        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+            ExchangeDemandEntry, ExchangeDemandOperation,
+        };
+        use novarocks_task_codec::exchange_unit_codec as codec;
+        let batch = codec::decode_demand_request(
+            &raw,
+            novarocks_proto_codec::FieldPath::root("exchange_demand_request"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        self.check_unit_pair(batch.pair, caller)?;
+        let mut outcomes = Vec::with_capacity(batch.entries.len());
+        for entry in batch.entries {
+            let stream = entry.stream;
+            let outcome = match &self.unit_capabilities {
+                None => Err(novarocks_execution::runtime::fragment::io::exchange_unit::unit_transport_not_installed()),
+                Some(capabilities) => match capabilities.with_claimed_stream(stream, |_| {
+                    let observation = self.receiver_port.register_unit_demand(ExchangeReceiverKey {
+                        fragment_instance_id: stream.destination_fragment_instance_id(), node_id: stream.destination_node().get(),
+                    }, ExchangeDemandEntry {
+                        stream, operation: match entry.operation {
+                            codec::ExchangeDemandOperation::Demand(demand) => ExchangeDemandOperation::Register(demand),
+                            codec::ExchangeDemandOperation::StopSender => ExchangeDemandOperation::StopSender,
+                        },
+                    })?;
+                    if observation.stream != stream { return Err(unit_route_failure(462)); }
+                    validate_unit_facts(stream, observation.facts)?;
+                    Ok(observation.facts)
+                }) {
+                    Ok(outcome) => outcome,
+                    Err(claim) => Err(unit_claim_failure(claim)),
+                },
+            };
+            outcomes.push(codec::DecodedExchangeDemandResult { stream, outcome });
+        }
+        Ok(codec::encode_demand_response(&outcomes))
+    }
+
+    pub(crate) fn subscribe_unit_grants(
+        &self,
+        raw: proto::novarocks::SubscribeExchangeGrantsRequest,
+        caller: novarocks_types::BackendProcessId,
+        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
+    ) -> Result<crate::exchange_grant_subscription::ExchangeGrantStream, tonic::Status> {
+        use novarocks_task_codec::exchange_unit_codec as codec;
+        let subscription = codec::decode_grant_subscription(
+            &raw,
+            novarocks_proto_codec::FieldPath::root("exchange_grant_subscription"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        self.check_unit_pair(subscription.pair, caller)?;
+        let publisher = self
+            .initialize_unit_publications()
+            .map_err(crate::exchange_grant_subscription::failure_status)?;
+        publisher.subscribe(subscription, ownership)
+    }
+
+    fn check_unit_pair(
+        &self,
+        pair: novarocks_task_codec::exchange_unit_codec::ExchangeProcessPair,
+        caller: novarocks_types::BackendProcessId,
+    ) -> Result<(), tonic::Status> {
+        if caller != pair.sender {
+            return Err(tonic::Status::permission_denied(
+                "exchange sender differs from authenticated backend process",
+            ));
+        }
+        let backend = self.unit_backend.ok_or_else(|| {
+            tonic::Status::failed_precondition("exchange unit backend capability is not installed")
+        })?;
+        if backend != pair.receiver {
+            return Err(tonic::Status::failed_precondition(
+                "exchange destination differs from this backend process",
+            ));
+        }
+        Ok(())
     }
 
     pub fn transmit(
@@ -225,6 +400,59 @@ impl NativeExchangeDataPlane {
             self.route_authorities.iter().map(Arc::as_ref).collect();
         handle_transmit_chunk(self.receiver_port.as_ref(), &authorities, request)
     }
+}
+
+pub(crate) fn authenticated_unit_sender<T>(
+    request: &tonic::Request<T>,
+) -> Result<novarocks_types::BackendProcessId, tonic::Status> {
+    match request
+        .extensions()
+        .get::<novarocks_native_trust::AuthenticatedNativeCaller>()
+        .and_then(|caller| caller.process_identity())
+    {
+        Some(novarocks_native_trust::NativeProcessIdentity::Backend(sender)) => Ok(sender),
+        _ => Err(tonic::Status::unauthenticated(
+            "exchange requires an authenticated backend process identity",
+        )),
+    }
+}
+
+fn unit_route_failure(code: u16) -> novarocks_execution_contract::failure::FailureFact {
+    crate::exchange_grant_subscription::exchange_failure(
+        novarocks_execution_contract::failure::FailureClass::Invariant,
+        code,
+    )
+}
+
+fn unit_claim_failure(
+    claim: InboundFrameClaim,
+) -> novarocks_execution_contract::failure::FailureFact {
+    match claim {
+        // The legacy close carrier has a different sequence domain. Only
+        // P06's simultaneous author/codec migration can project it as units.
+        InboundFrameClaim::NormallyClosed(_) => {
+            crate::exchange_grant_subscription::exchange_failure(
+                novarocks_execution_contract::failure::FailureClass::Unsupported,
+                461,
+            )
+        }
+        InboundFrameClaim::NotHeld
+        | InboundFrameClaim::Refused(_)
+        | InboundFrameClaim::Authorized => unit_route_failure(460),
+    }
+}
+
+fn validate_unit_facts(
+    stream: ExchangeStreamIdentity,
+    facts: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts,
+) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+    use novarocks_task_codec::exchange_unit_codec as codec;
+    codec::decode_stream_state(
+        &codec::encode_stream_state(codec::DecodedExchangeStreamState { stream, facts }),
+        novarocks_proto_codec::FieldPath::root("exchange_receiver_facts"),
+    )
+    .map(|_| ())
+    .map_err(|_| unit_route_failure(462))
 }
 
 /// Why one inbound exchange frame is not admitted.

@@ -54,6 +54,26 @@ pub struct NativeRpcClient {
     backend_process_id: Option<BackendProcessId>,
 }
 
+/// Classification is made at the local dispatch boundary, never by parsing
+/// an error string. Receiver-authored refusals travel in the typed response.
+#[derive(Clone, Debug)]
+pub(crate) enum ExchangeRpcFailure {
+    NotProcessed(Box<str>),
+    Unknown(Box<str>),
+}
+
+fn exchange_rpc_status(status: tonic::Status) -> ExchangeRpcFailure {
+    let detail = format!("exchange RPC returned {:?}", status.code()).into_boxed_str();
+    match status.code() {
+        // These unit methods carry every application refusal in their DTO.
+        // These statuses therefore come from pre-execution admission/auth.
+        tonic::Code::ResourceExhausted
+        | tonic::Code::Unauthenticated
+        | tonic::Code::PermissionDenied => ExchangeRpcFailure::NotProcessed(detail),
+        _ => ExchangeRpcFailure::Unknown(detail),
+    }
+}
+
 /// BE-origin methods use this role-local cache. Exchange unit methods share a
 /// physical connection owner; manifest routing still names the exact RPC.
 /// Membership has no BE peer identity.
@@ -98,6 +118,113 @@ impl NativeChannelKey {
 }
 
 impl NativeRpcClient {
+    pub(crate) async fn deliver_exchange_unit_async(
+        &self,
+        value: proto::DeliverExchangeUnitRequest,
+        timeout: Duration,
+        stop: CancellationToken,
+    ) -> Result<proto::DeliverExchangeUnitResponse, ExchangeRpcFailure> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                ExchangeRpcFailure::NotProcessed("exchange deadline cannot be represented".into())
+            })?;
+        let mut client = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Err(ExchangeRpcFailure::NotProcessed("exchange stopped before dispatch".into())),
+            result = self.make_deadline_async_client("exchange unit", NativeRpcMethod::DeliverExchangeUnit, deadline) => {
+                result.map_err(|error| ExchangeRpcFailure::NotProcessed(error.into_boxed_str()))?
+            }
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ExchangeRpcFailure::NotProcessed(
+                "exchange deadline elapsed before dispatch".into(),
+            ));
+        }
+        let mut request = Request::new(value);
+        request.set_timeout(remaining);
+        // This future owns this local request. Cancellation drops it in this
+        // scope; no detached subrequest outlives the outer activity owner.
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => Err(ExchangeRpcFailure::Unknown("exchange stopped after dispatch".into())),
+            result = tokio::time::timeout_at(deadline, client.deliver_exchange_unit(request)) => {
+                result.map_err(|_| ExchangeRpcFailure::Unknown("exchange unit transmission deadline elapsed".into()))?
+                    .map(|response| response.into_inner()).map_err(exchange_rpc_status)
+            }
+        }
+    }
+
+    pub(crate) async fn register_exchange_demand_async(
+        &self,
+        value: proto::RegisterExchangeDemandRequest,
+        timeout: Duration,
+        stop: CancellationToken,
+    ) -> Result<proto::RegisterExchangeDemandResponse, ExchangeRpcFailure> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                ExchangeRpcFailure::NotProcessed("exchange deadline cannot be represented".into())
+            })?;
+        let mut client = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Err(ExchangeRpcFailure::NotProcessed("exchange demand stopped before dispatch".into())),
+            result = self.make_deadline_async_client("exchange demand", NativeRpcMethod::RegisterExchangeDemand, deadline) => {
+                result.map_err(|error| ExchangeRpcFailure::NotProcessed(error.into_boxed_str()))?
+            }
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ExchangeRpcFailure::NotProcessed(
+                "exchange deadline elapsed before dispatch".into(),
+            ));
+        }
+        let mut request = Request::new(value);
+        request.set_timeout(remaining);
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => Err(ExchangeRpcFailure::Unknown("exchange demand stopped after dispatch".into())),
+            result = tokio::time::timeout_at(deadline, client.register_exchange_demand(request)) => {
+                result.map_err(|_| ExchangeRpcFailure::Unknown("exchange demand transmission deadline elapsed".into()))?
+                    .map(|response| response.into_inner()).map_err(exchange_rpc_status)
+            }
+        }
+    }
+
+    pub(crate) async fn subscribe_exchange_grants_async(
+        &self,
+        value: proto::SubscribeExchangeGrantsRequest,
+        timeout: Duration,
+        stop: CancellationToken,
+    ) -> Result<tonic::Streaming<proto::ExchangeGrantBatch>, tonic::Status> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                tonic::Status::invalid_argument(
+                    "exchange subscription deadline cannot be represented",
+                )
+            })?;
+        let mut client = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Err(tonic::Status::cancelled("exchange subscription stopped before dispatch")),
+            result = self.make_deadline_async_client("exchange grant subscription", NativeRpcMethod::SubscribeExchangeGrants, deadline) => {
+                result.map_err(tonic::Status::unavailable)?
+            }
+        };
+        // The deadline bounds establishment only. Sending grpc-timeout would
+        // incorrectly turn an otherwise healthy observation stream into an
+        // input-idle timer after its headers had already arrived.
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => Err(tonic::Status::cancelled("exchange subscription stopped during establishment")),
+            result = tokio::time::timeout_at(deadline, client.subscribe_exchange_grants(Request::new(value))) => {
+                result.map_err(|_| tonic::Status::deadline_exceeded("exchange subscription establishment deadline elapsed"))?
+                    .map(|response| response.into_inner())
+            }
+        }
+    }
+
     pub fn new_membership_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
         Self {
             runtime,
@@ -476,5 +603,56 @@ mod tests {
                 .to_string(),
             "http://[::1]:9070/"
         );
+    }
+}
+
+#[cfg(test)]
+mod exchange_unit_call_tests {
+    use super::*;
+
+    #[test]
+    fn admission_statuses_are_not_processed_and_ambiguous_transport_is_unknown() {
+        for code in [
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+        ] {
+            assert!(matches!(
+                exchange_rpc_status(tonic::Status::new(code, "bounded test")),
+                ExchangeRpcFailure::NotProcessed(_)
+            ));
+        }
+        for code in [
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+        ] {
+            assert!(matches!(
+                exchange_rpc_status(tonic::Status::new(code, "bounded test")),
+                ExchangeRpcFailure::Unknown(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_refusal_before_dispatch_is_not_processed() {
+        let endpoint = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            novarocks_types::NativeEndpoint::from_socket_addr(listener.local_addr().unwrap())
+        };
+        let client = NativeRpcClient::new_backend_endpoint(
+            crate::backend_test_support::test_backend_data_runtime(),
+            endpoint,
+            BackendProcessId::new_v7(),
+        );
+        let result = client
+            .deliver_exchange_unit_async(
+                proto::DeliverExchangeUnitRequest::default(),
+                Duration::from_millis(500),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ExchangeRpcFailure::NotProcessed(_))));
     }
 }

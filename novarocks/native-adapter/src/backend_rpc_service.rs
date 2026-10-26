@@ -63,6 +63,7 @@ impl BackendRpcService {
         heartbeat: BackendHeartbeatResponder,
         control_executor: Arc<NativeControlExecutor>,
     ) -> Self {
+        let unit_backend = heartbeat.process_id();
         Self {
             task_execution_ingress,
             catalog_reachability,
@@ -70,9 +71,10 @@ impl BackendRpcService {
             exchange_data_plane: NativeExchangeDataPlane::new(
                 exchange_receiver_port,
                 vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
-                    task_inbound_capabilities,
+                    Arc::clone(&task_inbound_capabilities),
                 ))],
-            ),
+            )
+            .with_unit_capabilities(task_inbound_capabilities, unit_backend),
             runtime_filter_ingress,
             control_executor,
             #[cfg(novarocks_dev_controls)]
@@ -112,29 +114,60 @@ impl NovaRocksGrpc for BackendRpcService {
 
     async fn deliver_exchange_unit(
         &self,
-        _request: tonic::Request<proto::DeliverExchangeUnitRequest>,
+        request: tonic::Request<proto::DeliverExchangeUnitRequest>,
     ) -> Result<tonic::Response<proto::DeliverExchangeUnitResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "Exchange unit delivery is not installed",
-        ))
+        let caller = crate::exchange_data_plane::authenticated_unit_sender(&request)?;
+        let ownership = ingress_ownership(&request);
+        let kernel = self.exchange_data_plane.clone();
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "exchange_unit",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            kernel.deliver_unit(raw, caller)
+        })
+        .await
+        .map_err(|_| tonic::Status::internal("exchange unit handler panicked"))??;
+        Ok(tonic::Response::new(response))
     }
 
     async fn register_exchange_demand(
         &self,
-        _request: tonic::Request<proto::RegisterExchangeDemandRequest>,
+        request: tonic::Request<proto::RegisterExchangeDemandRequest>,
     ) -> Result<tonic::Response<proto::RegisterExchangeDemandResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "Exchange demand registration is not installed",
-        ))
+        let caller = crate::exchange_data_plane::authenticated_unit_sender(&request)?;
+        let ownership = ingress_ownership(&request);
+        let kernel = self.exchange_data_plane.clone();
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "exchange_demand",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            kernel.register_unit_demands(raw, caller)
+        })
+        .await
+        .map_err(|_| tonic::Status::internal("exchange demand handler panicked"))??;
+        Ok(tonic::Response::new(response))
     }
 
     async fn subscribe_exchange_grants(
         &self,
-        _request: tonic::Request<proto::SubscribeExchangeGrantsRequest>,
+        request: tonic::Request<proto::SubscribeExchangeGrantsRequest>,
     ) -> Result<tonic::Response<Self::SubscribeExchangeGrantsStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "Exchange grant subscription is not installed",
-        ))
+        let caller = crate::exchange_data_plane::authenticated_unit_sender(&request)?;
+        let ownership = ingress_ownership(&request);
+        let stream = self.exchange_data_plane.subscribe_unit_grants(
+            request.into_inner(),
+            caller,
+            ownership,
+        )?;
+        Ok(tonic::Response::new(Box::pin(stream)))
     }
 
     type ExchangeStream = std::pin::Pin<

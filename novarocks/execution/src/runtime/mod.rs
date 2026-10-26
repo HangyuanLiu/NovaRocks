@@ -4,6 +4,7 @@ pub mod cache;
 pub mod dispatch_metrics;
 pub mod endpoint;
 pub mod exchange;
+pub mod exchange_slots;
 pub mod exec_env;
 pub mod execution_health;
 pub mod execution_runtime;

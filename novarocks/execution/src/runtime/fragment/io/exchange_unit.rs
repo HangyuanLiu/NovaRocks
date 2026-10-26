@@ -129,6 +129,8 @@ pub enum ExchangeGrantNotice {
     /// Its owner must replay its original demand/item through Worker routing
     /// to obtain authoritative live or closed facts; absence is not a fact.
     Resynchronize,
+    /// A definite observation-protocol refusal is terminal, not a reconnect.
+    Refused(FailureFact),
 }
 
 pub type ExchangeGrantWake = Arc<dyn Fn(ExchangeGrantNotice) + Send + Sync + 'static>;

@@ -37,11 +37,7 @@ use novarocks_types::identity::BackendProcessId;
 
 use crate::exchange_flow_codec::{decode_stream, encode_stream};
 use crate::status::{decode_failure_fact, encode_failure_fact};
-use crate::{duplicate, inconsistent, invalid, invalid_enum, missing, out_of_range};
-
-/// Bounds one demand request, demand reply or grant publication independently of
-/// the number of streams in a process-pair subscription snapshot.
-pub const MAX_EXCHANGE_UNIT_BATCH_ENTRIES: usize = 256;
+use crate::{duplicate, inconsistent, invalid, invalid_enum, missing};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExchangeProcessPair {
@@ -185,12 +181,9 @@ fn require_pair(
     Ok(())
 }
 
-fn check_batch_len(length: usize, allow_empty: bool, path: FieldPath) -> Result<(), ProtocolError> {
-    if (!allow_empty && length == 0) || length > MAX_EXCHANGE_UNIT_BATCH_ENTRIES {
-        return Err(out_of_range(
-            path,
-            "exchange control batch has an unsupported number of entries",
-        ));
+fn require_nonempty_batch(length: usize, path: FieldPath) -> Result<(), ProtocolError> {
+    if length == 0 {
+        return Err(invalid(path, "exchange control batch cannot be empty"));
     }
     Ok(())
 }
@@ -387,11 +380,12 @@ pub fn decode_stream_state(
         ));
     }
     if let Some(ExchangeUnitCloseDisposition::Consumed { final_sequence }) = receiver_closed
-        && final_sequence.get() != value.custody_through
+        && (final_sequence.get() != value.custody_through
+            || value.granted_through.checked_add(1) != Some(final_sequence.get()))
     {
         return Err(inconsistent(
             path.field("receiver_closed"),
-            "exchange consumed End differs from the custody prefix",
+            "exchange consumed End differs from the custody or granted data prefix",
         ));
     }
     Ok(DecodedExchangeStreamState {
@@ -510,7 +504,7 @@ pub fn decode_demand_request(
     value: &wire::RegisterExchangeDemandRequest,
     path: FieldPath,
 ) -> Result<DecodedExchangeDemandBatch, ProtocolError> {
-    check_batch_len(value.entries.len(), false, path.field("entries"))?;
+    require_nonempty_batch(value.entries.len(), path.field("entries"))?;
     let mut pair = None;
     let mut seen = BTreeSet::new();
     let mut entries = Vec::with_capacity(value.entries.len());
@@ -583,7 +577,7 @@ pub fn decode_demand_response(
     expected_streams: &[ExchangeStreamIdentity],
     path: FieldPath,
 ) -> Result<Vec<DecodedExchangeDemandResult>, ProtocolError> {
-    check_batch_len(value.results.len(), false, path.field("results"))?;
+    require_nonempty_batch(value.results.len(), path.field("results"))?;
     if value.results.len() != expected_streams.len() {
         return Err(inconsistent(
             path.field("results"),
@@ -716,7 +710,6 @@ pub fn decode_grant_batch(
     expected: DecodedExchangeGrantSubscription,
     path: FieldPath,
 ) -> Result<DecodedExchangeGrantBatch, ProtocolError> {
-    check_batch_len(value.states.len(), true, path.field("states"))?;
     if value.generation != expected.generation.get() {
         return Err(inconsistent(
             path.field("generation"),

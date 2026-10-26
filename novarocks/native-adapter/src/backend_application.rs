@@ -1622,7 +1622,7 @@ mod tests {
         use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
         let exchange_flow_limits =
-            super::ExchangeFlowLimits::try_new(2, 5, 17, 0, 3, Duration::from_millis(71))
+            super::ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
                 .expect("explicit exchange configuration is valid");
         let services = compose_backend_application_services(
             test_data_runtime(),
