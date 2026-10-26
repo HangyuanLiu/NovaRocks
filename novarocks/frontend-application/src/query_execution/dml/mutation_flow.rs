@@ -3458,6 +3458,17 @@ fn build_exact_cow_merge_selection_query(
     )
 }
 
+/// SQL derives the true-only scope from this producer's selected action.
+/// Unmatched INSERT rows may keep a NULL target identity without inventing one.
+fn mor_merge_pre_expand_assertion(has_matched_action: bool) -> Option<DmlPreExpandKeyedAssert> {
+    has_matched_action.then(|| DmlPreExpandKeyedAssert {
+        applicability_output_ordinal: None,
+        key_column_name: "__nr_row_id".to_string(),
+        key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        message_prefix: "MOR MERGE matched target row".to_string(),
+    })
+}
+
 fn build_merge_mor_producer(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -3588,15 +3599,7 @@ fn build_merge_mor_producer(
             matched_delete: has_matched_delete,
             not_matched_insert: has_not_matched_insert,
         },
-        (has_matched_update || has_matched_delete).then(|| DmlPreExpandKeyedAssert {
-            applicability_output_ordinal: None,
-            // Matched rows use the real target `_row_id`; unmatched rows use
-            // a generated negative row number so fresh-only rows do not
-            // collide under the same NULL key before expansion.
-            key_column_name: "__nr_merge_assert_key".to_string(),
-            key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-            message_prefix: "MOR MERGE matched target row".to_string(),
-        }),
+        mor_merge_pre_expand_assertion(has_matched_update || has_matched_delete),
     ))
 }
 
@@ -3657,14 +3660,6 @@ fn build_merge_match_query_sql(
         let value = qualify(column);
         format!("CASE WHEN {row_id} IS NOT NULL THEN {value} ELSE NULL END")
     };
-    let matched_apply_expr = format!(
-        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END)",
-        matched_predicate_sql.unwrap_or("TRUE")
-    );
-    let unmatched_apply_expr = format!(
-        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END)",
-        not_matched_predicate_sql.unwrap_or("TRUE")
-    );
     let mut action_cases = Vec::new();
     if let Some(action) = matched_action {
         action_cases.push(format!(
@@ -3702,18 +3697,11 @@ fn build_merge_match_query_sql(
             "{} AS __nr_last_updated_sequence_number",
             nullable_target_column("_last_updated_sequence_number")
         ),
-        format!(
-            "CASE WHEN {row_id} IS NOT NULL THEN {row_id} ELSE -ROW_NUMBER() OVER () END AS __nr_merge_assert_key"
-        ),
+        // This is the sole author of WHEN evaluation. SQL installs NoAction
+        // filtering, assertion applicability and effects above this value.
         format!("({action_expr}) AS __nr_merge_action"),
-        format!(
-            "(CASE WHEN {} IS NOT NULL THEN 'matched' ELSE 'unmatched' END) AS __nr_match_kind",
-            row_id
-        ),
     ];
     select_items.extend(target_select_items);
-    select_items.push(format!("{matched_apply_expr} AS __nr_matched_apply"));
-    select_items.push(format!("{unmatched_apply_expr} AS __nr_unmatched_apply"));
     for (column, expr) in matched_assignments_sql {
         select_items.push(format!("({expr}) AS __nr_new_{column}"));
     }
@@ -3811,6 +3799,10 @@ fn build_merge_unmatched_insert_query(
 
 #[cfg(test)]
 mod tests {
+    mod selected_action {
+        use super::*;
+        include!("merge_selected_action_tests.rs");
+    }
     use super::*;
     mod before_begin_necessary {
         use super::*;
@@ -5032,7 +5024,12 @@ mod tests {
         assert!(sql.contains("(s.v) AS __nr_new_v"), "{sql}");
         assert!(sql.contains("(s.id) AS __nr_ins_id"), "{sql}");
         assert!(sql.contains("AS __nr_merge_action"), "{sql}");
-        assert!(sql.contains("AS __nr_merge_assert_key"), "{sql}");
+        assert!(
+            sql.contains(
+                "CASE WHEN t.`_row_id` IS NOT NULL THEN t.`_row_id` ELSE NULL END AS __nr_row_id"
+            ),
+            "{sql}"
+        );
     }
 
     #[test]

@@ -58,7 +58,6 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
         Some(MERGE_ACTION_MATCHED_UPDATE),
         true,
     );
-    assert!(match_sql.contains("LEFT JOIN") && match_sql.contains("ROW_NUMBER() OVER"));
     let query = parse_generated_query(&match_sql, "MOR MERGE router witness").unwrap();
     let control = SqlCompileControl::unbounded();
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
@@ -173,12 +172,7 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
                     requirements: Vec::new(),
                 })
                 .collect(),
-            pre_expand_keyed_assert: Some(DmlPreExpandKeyedAssert {
-                applicability_output_ordinal: None,
-                key_column_name: "__nr_merge_assert_key".into(),
-                key_label: "_row_id".into(),
-                message_prefix: "MOR MERGE matched target row".into(),
-            }),
+            pre_expand_keyed_assert: mor_merge_pre_expand_assertion(true),
             shape: DmlWritePlanShape::Dataflow,
         },
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -240,6 +234,44 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
             ))
             .count(),
         2
+    );
+    // A generated source must not force one global window to invent identities.
+    // Exact target identity remains nullable for unmatched source rows; only
+    // selected matched actions enter the real keyed assertion.
+    let mut assertions = 0;
+    for fragment in finalized.physical_plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            assert!(
+                !matches!(node.kind, novarocks_physical_plan::NodeKind::Window(_)),
+                "MERGE action selection must preserve independent source placement"
+            );
+            if let novarocks_physical_plan::NodeKind::AssertOneRow(
+                novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne {
+                    applicability,
+                    keys,
+                    labels,
+                    ..
+                },
+            ) = &node.kind
+            {
+                assertions += 1;
+                assert_eq!(labels.as_ref(), [Box::<str>::from("_row_id")]);
+                assert_eq!(keys.len(), 1);
+                assert_eq!(fragment.values()[&keys[0]].ty.data_type(), &DataType::Int64);
+                assert!(fragment.values()[&keys[0]].ty.nullable());
+                let novarocks_physical_plan::AssertionApplicability::WhenTrue(mask) = applicability
+                else {
+                    panic!("only selected matched actions own a target-key obligation")
+                };
+                assert_eq!(fragment.values()[mask].ty.data_type(), &DataType::Boolean);
+                // WhenTrue admits the compiler's actual nullable Boolean
+                // declaration; FALSE and NULL both bypass target identity.
+            }
+        }
+    }
+    assert_eq!(
+        assertions, 1,
+        "the frozen graph has one scoped target assertion"
     );
     let (plan, writer_routes) = finalized.into_parts();
     assert_eq!(writer_routes.len(), 2);
