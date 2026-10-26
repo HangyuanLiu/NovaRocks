@@ -23,7 +23,6 @@
 //! composition must therefore make every authority edge visible at startup.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 use tokio::runtime::Handle;
@@ -761,67 +760,7 @@ pub(crate) fn mv_refresh_provider_activation(
     )
 }
 
-/// Exact leaves retained by the Frontend-owned durable ANALYZE worker.
-///
-/// The connector registry is intentionally absent: Core creates and retains
-/// it inside the returned executor, preloaded with the same Iceberg MV
-/// capability as the rest of this startup composition.
-#[derive(Clone)]
-pub struct StatisticsAttemptExecutorPorts {
-    constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: CompiledPackageCarrier,
-    execution_role: novarocks_types::ClusterRole,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
-    backend_topology: BackendTopologyService,
-    client: novarocks_query_application::api::QueryExecutionClient,
-    launcher: Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
-    completion: crate::query_execution::completion_facts::CompletionFactOwners,
-    execution_runtime: (
-        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
-        crate::native::data_runtime::FrontendDataRuntime,
-    ),
-    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    attempt_timeout: Duration,
-    runtime: tokio::runtime::Handle,
-}
-
-impl StatisticsAttemptExecutorPorts {
-    pub(crate) fn new(
-        execution_role: novarocks_types::ClusterRole,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
-        backend_topology: BackendTopologyService,
-        client: novarocks_query_application::api::QueryExecutionClient,
-        launcher: Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
-        completion: crate::query_execution::completion_facts::CompletionFactOwners,
-        execution_runtime: (
-            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
-            crate::native::data_runtime::FrontendDataRuntime,
-        ),
-        function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-        attempt_timeout: Duration,
-        runtime: tokio::runtime::Handle,
-        constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: CompiledPackageCarrier,
-    ) -> Self {
-        Self {
-            constant_policy,
-            static_plan_carrier,
-            execution_role,
-            connector_control,
-            typed_connector_control,
-            backend_topology,
-            client,
-            launcher,
-            completion,
-            execution_runtime,
-            function_catalog,
-            attempt_timeout,
-            runtime,
-        }
-    }
-}
+pub use crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutorPorts;
 
 /// Build the product worker's explicit prepare/collect/publish adapter from
 /// the same role-owned leaves. This is constructed before SQL serving opens;
@@ -830,23 +769,7 @@ pub(crate) fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
 ) -> Arc<dyn novarocks_statistics_application::StatisticsAttemptExecutor> {
     Arc::new(
-        crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(
-            crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
-                ports.execution_role,
-                ports.connector_control,
-                ports.typed_connector_control,
-                ports.backend_topology,
-                ports.client,
-                ports.launcher,
-                ports.completion,
-                ports.execution_runtime,
-                ports.function_catalog,
-                ports.attempt_timeout,
-                ports.runtime,
-                ports.constant_policy,
-                ports.static_plan_carrier,
-            ),
-        ),
+        crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(ports),
     )
 }
 

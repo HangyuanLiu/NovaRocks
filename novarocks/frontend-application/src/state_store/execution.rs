@@ -842,17 +842,14 @@ impl Body {
         }
     }
 }
+type StateStoreReservationFuture = Pin<
+    Box<dyn Future<Output = Result<QueryBlockingReservation, QueryBlockingReserveRefusal>> + Send>,
+>;
+
 struct PhysicalPhase {
     request: Request,
     call: Arc<PhaseCall>,
-    reserve: Option<
-        Pin<
-            Box<
-                dyn Future<Output = Result<QueryBlockingReservation, QueryBlockingReserveRefusal>>
-                    + Send,
-            >,
-        >,
-    >,
+    reserve: Option<StateStoreReservationFuture>,
     reservation: Option<QueryBlockingReservation>,
     prepared: Option<QueryBlockingPreparedJob>,
     receipt: Option<QueryBlockingReceipt<()>>,

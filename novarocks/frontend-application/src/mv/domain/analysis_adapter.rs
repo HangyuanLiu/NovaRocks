@@ -23,7 +23,6 @@ use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_prov
 use crate::mv::domain::application::MvShowStatement;
 use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::readiness::MvListedManageability;
@@ -121,41 +120,7 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
     )
 }
 
-/// List materialized views from the readiness-filtered Accelerator projection.
-pub(crate) fn list_mv_result_with_ports(
-    readiness: &MvReadinessPort,
-    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
-    current_catalog: Option<&str>,
-    stmt: &MvShowStatement,
-    storage_filter: Option<MvStorageEngine>,
-) -> Result<QueryResult, String> {
-    let mut inventory = readiness
-        .local_projection_inventory()
-        .map_err(|e| format!("load materialized view Accelerator inventory failed: {e}"))?;
-    inventory.order_by_namespace_and_name();
-    let mut rows = MvShowResultRows::new()?;
-    while let Some(listed) = inventory
-        .next_listable()
-        .map_err(|e| format!("load materialized view Accelerator projection failed: {e}"))?
-    {
-        let Some(selection) =
-            rows.begin_row(&listed, entrance, current_catalog, stmt, storage_filter)?
-        else {
-            continue;
-        };
-        let dependencies = if selection.read_dependencies {
-            readiness
-                .list_local_dependencies_by_downstream(&listed.loaded)
-                .map_err(|e| format!("load MV dependencies for display failed: {e}"))?
-        } else {
-            Vec::new()
-        };
-        rows.append(&listed.loaded.projection, selection, &dependencies)?;
-    }
-    rows.finish()
-}
-
-/// The one pure row author, shared by legacy display and the closed SHOW CPU turn.
+/// The pure row author used by the closed SHOW CPU turn.
 pub(crate) struct MvShowResultRows {
     table: novarocks_query_application::api::LocalTableBuilder,
 }

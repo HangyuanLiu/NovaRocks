@@ -1227,3 +1227,497 @@ mod product_failure_tests {
         assert!(selected.compile_control_error().is_none());
     }
 }
+
+#[cfg(test)]
+mod publication_migration_tests {
+
+    use super::*;
+    use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+    use crate::query_execution::write_result::DecodedPreparedWriteSet;
+    use crate::query_execution::write_session::tests as write_session_tests;
+    use novarocks_mv_application::product::MvProductErrorKind;
+    use novarocks_mv_application::publication::{
+        MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
+    };
+    use novarocks_spi::connector::{
+        ConnectorCommittedVersion, ConnectorTableObjectId, ConnectorWriteReceipt,
+        ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
+        LakePublicationId,
+    };
+    pub(super) fn committed_version(snapshot_id: i64) -> ConnectorCommittedVersion {
+        ConnectorCommittedVersion::try_new(
+            bytes::Bytes::from_static(b"mv-publication-receipt"),
+            Some(snapshot_id),
+        )
+        .expect("committed version")
+    }
+
+    /// What a publication that actually committed reports back.
+    pub(super) fn published_outcome(
+        row_count: u64,
+    ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            effect: ExternalMutationEffect::Applied,
+            receipt: ConnectorWriteReceipt::try_new_with_committed_facts(
+                bytes::Bytes::from_static(b"mv-publication-receipt"),
+                committed_version(42),
+                Some(row_count),
+            )
+            .expect("receipt"),
+            finalization: ExternalMutationFinalization::Complete,
+        }
+    }
+
+    /// What a publication that declared `AbortWithoutExternalCommit` reports
+    /// when its write produced nothing: the unchanged snapshot, and no
+    /// committed facts at all. This mirrors the provider's
+    /// `settle_empty_write_without_commit`.
+    pub(super) fn skipped_publication_outcome() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            effect: ExternalMutationEffect::NoOp,
+            receipt: ConnectorWriteReceipt::try_new_with_committed_facts(
+                bytes::Bytes::from_static(b"mv-publication-receipt"),
+                committed_version(7),
+                None,
+            )
+            .expect("receipt"),
+            finalization: ExternalMutationFinalization::Complete,
+        }
+    }
+
+    pub(super) fn publication_intent() -> MvRefreshPublicationIntent {
+        let publication_id = LakePublicationId::new_v7();
+        let target_object_id =
+            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"mv-target-object"))
+                .expect("target object id");
+        MvRefreshPublicationIntent::try_new(
+            publication_id,
+            target_object_id.clone(),
+            Some(7),
+            crate::mv::domain::test_admission::publication_admission(
+                "ice",
+                "db",
+                "mv",
+                publication_id,
+                &target_object_id,
+            ),
+            MvRefreshPublicationTechnique::Full,
+            vec![
+                MvRefreshPublicationBase::try_new(
+                    0,
+                    "ice.db.base".to_string(),
+                    ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object"))
+                        .expect("base object id"),
+                    None,
+                    7,
+                )
+                .expect("base"),
+            ],
+            "fingerprint".to_string(),
+            "ice".to_string(),
+            "db".to_string(),
+            "mv".to_string(),
+        )
+        .expect("publication intent")
+    }
+
+    pub(super) fn ordinal(value: u32) -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(value).expect("ordinal")
+    }
+
+    pub(super) fn sole_target() -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        ordinal(0)
+    }
+
+    pub(super) fn provider_resource_failure(
+        message: &'static str,
+    ) -> (
+        novarocks_spi::connector::ConnectorMutationFailure,
+        novarocks_failure_contract::SharedFailureCause,
+    ) {
+        let error = novarocks_spi::connector::ConnectorError::from_domain(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            novarocks_workload_control::WorkError::Capacity(message),
+        );
+        let original = std::error::Error::source(&error)
+            .and_then(|source| {
+                source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            })
+            .expect("actual Connector domain source")
+            .clone();
+        (
+            novarocks_spi::connector::ConnectorMutationFailure::from_connector(error),
+            original,
+        )
+    }
+    pub(super) fn publication_after_actual_call(
+        outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+        targets: usize,
+        rows: u64,
+        fragments: Vec<(
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            Vec<u8>,
+        )>,
+    ) -> (write_session_tests::Fixture, StatementPublication) {
+        let fixture = write_session_tests::fixture_with_outcome(targets, 16, outcome);
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(rows, fragments))
+            .unwrap();
+        let context = write_session_tests::request_context();
+        let mut call = fixture
+            .session
+            .prepare_finish_call(context.clone())
+            .unwrap();
+        futures::executor::block_on(std::future::poll_fn(|cx| call.poll_completed(cx)));
+        let target = MvTarget::from_parts(Some("ice"), "db", "mv");
+        let attempt = MvRefreshAttemptIdentity {
+            publication_id: LakePublicationId::new_v7(),
+        };
+        let mut publication = new_publication(&target, &attempt).unwrap();
+        let initial_unknown = matches!(call.outcome(), Some(Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { .. })));
+        publication.call = Some(call);
+        if !initial_unknown {
+            // Known results traverse the real StatementPublication receiver.
+            futures::executor::block_on(std::future::poll_fn(|cx| {
+                publication.poll_settle(Some(&fixture.session), &context, false, cx)
+            }));
+            futures::executor::block_on(std::future::poll_fn(|cx| publication.poll_retirement(cx)));
+            publication.freeze_terminal().unwrap();
+        }
+        // The original Unknown remains in its actual Call before the later
+        // adjudication phase. Its pure selector is tested at that exact cut.
+        (fixture, publication)
+    }
+
+    pub(super) fn assert_original_source_through_command(
+        provider: MvProviderFailure,
+        original: &novarocks_failure_contract::SharedFailureCause,
+    ) {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        assert_eq!(provider.original_failure(), Some(original));
+        let product = provider.into_product_error();
+        assert_eq!(product.original_failure(), Some(original));
+        assert_eq!(
+            std::error::Error::source(&product)
+                .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+            Some(original)
+        );
+        let phase = product_failure(product);
+        assert_eq!(phase.service.failure_cause(), Some(original));
+        let application = phase.domain.expect("actual Product domain projection");
+        assert_eq!(application.original_failure(), Some(original));
+        let user = crate::mv::command::project_product_failure_for_test(application);
+        assert_eq!(user.failure_cause(), Some(original));
+        assert_eq!(
+            user.failure_cause().unwrap().failure_fact(),
+            original.failure_fact()
+        );
+        assert!(
+            user.failure_cause()
+                .unwrap()
+                .downcast_ref::<novarocks_workload_control::WorkError>()
+                .is_some()
+        );
+        assert_eq!(
+            user.compile_control_error(),
+            None,
+            "a Provider cause is not compiler authority"
+        );
+    }
+
+    #[test]
+    fn actual_uncommitted_session_keeps_primary_source_when_cleanup_also_fails() {
+        let (failure, original) = provider_resource_failure("provider publication refused");
+        let (cleanup, cleanup_source) = provider_resource_failure("artifact cleanup refused");
+        let (fixture, publication) = publication_after_actual_call(
+            ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Failed(cleanup),
+            },
+            1,
+            0,
+            Vec::new(),
+        );
+        let Some(Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted { cleanup: ExternalMutationFinalization::Failed(cleanup), .. })) = &publication.outcome else { panic!("actual original cleanup failure remains in the Call handoff") };
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(cleanup.failure_fact(), cleanup_source.failure_fact());
+        assert!(cleanup.to_string().contains("artifact cleanup refused"));
+        assert_eq!(
+            cleanup
+                .connector_source()
+                .and_then(|error| std::error::Error::source(error))
+                .and_then(|source| source
+                    .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()),
+            Some(&cleanup_source)
+        );
+        let failure = provider_error(publication.select(None).unwrap_err(), Some(&publication));
+        assert_eq!(failure.kind(), MvProviderFailureKind::KnownUncommitted);
+        assert_eq!(
+            product_failure(failure.clone().into_product_error())
+                .domain
+                .unwrap()
+                .kind(),
+            MvApplicationErrorKind::Engine
+        );
+        assert_ne!(failure.original_failure(), Some(&cleanup_source));
+        assert_original_source_through_command(failure, &original);
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+
+    #[test]
+    fn terminal_connector_refusal_preserves_source_and_plain_mutation_keeps_author_fact() {
+        use novarocks_failure_contract::FailureProjection;
+        let connector = novarocks_spi::connector::ConnectorError::from_domain(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            novarocks_workload_control::WorkError::Capacity("original terminal refusal"),
+        );
+        let original = std::error::Error::source(&connector)
+            .and_then(|source| {
+                source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            })
+            .unwrap()
+            .clone();
+        let phase = source::domain_error(MvApplicationError::from_connector(
+            MvApplicationErrorKind::Engine,
+            connector,
+        ));
+        let provider = provider_error(phase.service, None);
+        assert_eq!(
+            product_failure(provider.clone().into_product_error())
+                .domain
+                .unwrap()
+                .kind(),
+            MvApplicationErrorKind::Engine
+        );
+        assert_original_source_through_command(provider, &original);
+        let failure = novarocks_spi::connector::ConnectorMutationFailure::new(
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+            "ordinary provider failure without a domain wrapper",
+        );
+        let fact = failure.failure_fact();
+        let (_fixture, publication) = publication_after_actual_call(
+            ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            },
+            1,
+            0,
+            Vec::new(),
+        );
+        let application = product_failure(
+            provider_error(publication.select(None).unwrap_err(), Some(&publication))
+                .into_product_error(),
+        )
+        .domain
+        .unwrap();
+        let original = application.original_failure().unwrap();
+        assert_eq!(original.failure_fact(), fact);
+        assert!(
+            original
+                .downcast_ref::<novarocks_spi::connector::ConnectorMutationFailure>()
+                .is_some()
+        );
+        assert_eq!(application.clone().original_failure(), Some(original));
+        let user = crate::mv::command::project_product_failure_for_test(application.clone());
+        assert_eq!(user.failure_cause(), Some(original));
+        assert_eq!(user.compile_control_error(), None);
+    }
+
+    #[test]
+    fn actual_write_finalization_failure_keeps_its_effect_through_product() {
+        for (effect, expected) in [
+            (
+                ExternalMutationEffect::Applied,
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+            ),
+            (ExternalMutationEffect::NoOp, MvApplicationErrorKind::Engine),
+        ] {
+            let mut outcome = published_outcome(0);
+            let ExternalMutationOutcome::KnownCommitted {
+                effect: actual_effect,
+                finalization,
+                ..
+            } = &mut outcome
+            else {
+                unreachable!()
+            };
+            *actual_effect = effect;
+            let (failure, original) =
+                provider_resource_failure("necessary provider finalization failed");
+            *finalization = ExternalMutationFinalization::Failed(failure);
+            let (fixture, publication) = publication_after_actual_call(outcome, 1, 0, Vec::new());
+            assert_eq!(publication.received_committed_effect(), Some(effect));
+            let provider =
+                provider_error(publication.select(None).unwrap_err(), Some(&publication));
+            let terminal = product_failure(provider.clone().into_product_error())
+                .domain
+                .unwrap();
+            assert_eq!(terminal.kind(), expected);
+            assert!(
+                terminal
+                    .message()
+                    .contains("necessary provider finalization failed")
+            );
+            let needed = publication.committed_needed().unwrap();
+            let ExternalMutationFinalization::Failed(original_finalization) = needed.finalization()
+            else {
+                panic!("actual necessary finalization failure")
+            };
+            assert!(
+                original_finalization
+                    .to_string()
+                    .contains("necessary provider finalization failed")
+            );
+            assert_original_source_through_command(provider, &original);
+            assert_eq!(fixture.session.finish_invocations(), 1);
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        }
+    }
+
+    #[test]
+    fn actual_unknown_does_not_gain_a_committed_mv_fact() {
+        let (failure, original) = provider_resource_failure("provider outcome is unknown");
+        let mut outcome = write_session_tests::commit_unknown();
+        let ExternalMutationOutcome::CommitUnknown {
+            failure: actual, ..
+        } = &mut outcome
+        else {
+            unreachable!()
+        };
+        *actual = failure;
+        let (fixture, publication) = publication_after_actual_call(outcome, 1, 0, Vec::new());
+        assert_eq!(
+            publication.disposition(),
+            Some(LakePublicationDisposition::CommitUnknown)
+        );
+        assert!(publication.committed_needed().is_none());
+        let call = publication.call.as_ref().unwrap();
+        let outcome = call.outcome().expect("same retained initial Unknown");
+        assert!(matches!(outcome, Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { .. })));
+        let selected =
+            crate::query::write_action::select_publication(outcome, None, None).unwrap_err();
+        let provider = provider_error(selected, Some(&publication));
+        let terminal = product_failure(provider.clone().into_product_error())
+            .domain
+            .unwrap();
+        assert_eq!(terminal.kind(), MvApplicationErrorKind::CommitUnknown);
+        assert_original_source_through_command(provider, &original);
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+
+    #[test]
+    fn known_committed_publication_keeps_its_fact_when_projection_fails() {
+        let error = product_failure(MvProductError::new(
+            MvProductErrorKind::KnownCommittedFinalizeFailed,
+            "projector store unavailable",
+        ))
+        .domain
+        .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        );
+        assert!(error.message().contains("projector store unavailable"));
+    }
+
+    #[test]
+    fn product_refresh_publication_conflict_is_already_active() {
+        let error = product_failure(MvProductError::new(
+            MvProductErrorKind::Conflict,
+            "an MV publication is already active for this target",
+        ))
+        .domain
+        .unwrap();
+
+        assert_eq!(error.kind(), MvApplicationErrorKind::AlreadyActive);
+    }
+
+    #[test]
+    fn refresh_activation_source_survives_provider_product_and_command_bridges() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let source = SharedFailureCause::new(original);
+            let fact = source.failure_fact();
+            let application = MvApplicationError::from_compile(SqlCompileError::CompilationSource(
+                source.clone(),
+            ));
+            let terminal = source::domain_error(application).domain.unwrap();
+            assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
+            assert_eq!(terminal.original_failure(), Some(&source));
+            assert_eq!(terminal.unavailable_implementation(), None);
+            let Some(CompileControlError::Source(carried)) = terminal.compile_control_error()
+            else {
+                panic!("the provider/product bridge must retain the compile source");
+            };
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+            let (fixture, publication) =
+                publication_after_actual_call(published_outcome(0), 1, 0, Vec::new());
+            let provider = provider_error(
+                source::domain_error(terminal.clone()).service,
+                Some(&publication),
+            );
+            let committed = product_failure(provider.into_product_error())
+                .domain
+                .unwrap();
+            assert_eq!(
+                committed.kind(),
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed
+            );
+            let Some(CompileControlError::Source(carried)) = committed.compile_control_error()
+            else {
+                panic!("postcommit classification must preserve the original typed source");
+            };
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+            assert_eq!(committed.original_failure(), Some(&source));
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+            let user = crate::mv::command::project_product_failure_for_test(terminal);
+            assert_eq!(user.failure_cause(), Some(&source));
+            let Some(CompileControlError::Source(carried)) = user.compile_control_error() else {
+                panic!("the final command must retain the compile source");
+            };
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+        }
+    }
+
+    #[test]
+    fn refresh_activation_refusal_survives_provider_product_and_frontend_bridges() {
+        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+        use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/activation/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(expected) = &compile else {
+            panic!("missing pure implementation must be typed analysis");
+        };
+        let application = MvApplicationError::from_compile(compile.clone());
+        let terminal = source::domain_error(application).domain.unwrap();
+        assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(terminal.unavailable_implementation(), Some(expected));
+        assert_eq!(terminal.compile_control_error(), None);
+
+        let ordinary = MvApplicationError::from_compile(SqlCompileError::Analyze(
+            AnalyzeError::internal("unsupported diagnostic: UnavailableImplementation"),
+        ));
+        let ordinary = source::domain_error(ordinary).domain.unwrap();
+        assert_eq!(ordinary.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(ordinary.unavailable_implementation(), None);
+        assert_eq!(
+            ordinary.message(),
+            "unsupported diagnostic: UnavailableImplementation"
+        );
+    }
+}

@@ -40,15 +40,6 @@ impl Drop for QueryStopRelay {
     }
 }
 
-pub(crate) fn query_connector_request_context(
-    deadline: Instant,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-) -> Result<ConnectorRequestContext, String> {
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| "connector query cancellation requires the FE runtime".to_string())?;
-    query_connector_request_context_on_runtime(&runtime, deadline, cancellation)
-}
-
 pub(crate) fn query_connector_request_context_on_runtime(
     runtime: &tokio::runtime::Handle,
     deadline: Instant,
@@ -138,15 +129,6 @@ pub(crate) fn connector_planning_context_for_query_on_runtime(
         cancellation,
     )?)
     .map_err(|error| error.to_string())
-}
-
-/// Freeze a Connector request context to the execution round's authoritative
-/// statement deadline and cancellation identity.
-pub fn connector_request_context_for_deadline(
-    deadline: std::time::Instant,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-) -> Result<ConnectorRequestContext, String> {
-    query_connector_request_context(deadline, cancellation)
 }
 
 /// Derive connector admission from the immutable query execution captured by
@@ -369,27 +351,6 @@ pub(crate) fn metadata_binding_typed(
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     })?;
     controls.acquire_current(&instance_id)
-}
-
-pub fn metadata_namespace_exists(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-) -> Result<bool, String> {
-    let binding = metadata_binding(controls, catalog)?;
-    let instance_id = binding.binding().descriptor().instance_id.clone();
-    binding
-        .binding()
-        .metadata()
-        .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
-            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-            },
-            context,
-        })
-        .map_err(|error| error.to_string())
 }
 
 /// Await namespace existence using the same exact planning generation.
@@ -737,32 +698,6 @@ pub(crate) fn metadata_load_connector_table_with_planning_lease_typed(
         })
 }
 
-/// Load through the retained generation's original asynchronous I/O author.
-/// The same schema-creation observer checks the original operation control;
-/// this does not create a second query, resource permit or metadata snapshot.
-pub(crate) async fn metadata_load_connector_table_with_planning_lease_async(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    context: ConnectorRequestContext,
-    namespace: &str,
-    table: &str,
-    resolution: ConnectorTableResolution,
-) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
-    let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease_typed(binding, context)?;
-    super::schema_creation::load_frontend_table_async(
-        binding.binding().metadata().as_ref(),
-        ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            resolution,
-            context,
-        },
-    )
-    .await
-}
 pub(crate) fn sql_columns_from_connector_metadata(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {

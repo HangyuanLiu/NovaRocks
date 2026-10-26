@@ -466,23 +466,7 @@ mod tests {
     };
     use novarocks_spi::connector::ExternalMutationOutcome;
     use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
-    use novarocks_spi::connector::{
-        LakePublicationFamily, LakePublicationId, LakePublicationTarget,
-    };
-    fn original_attempt() -> DmlPublicationAttempt {
-        DmlPublicationAttempt::new(
-            LakePublicationId::new_v7(),
-            LakePublicationFamily::DataMutation,
-            LakePublicationTarget::try_new(
-                "catalog".to_owned(),
-                "namespace".to_owned(),
-                Some("table".to_owned()),
-                None,
-            )
-            .unwrap(),
-            None,
-        )
-    }
+
     #[test]
     fn complete_receiving_segments_feed_one_original_session_and_one_actual_call() {
         let (_control, root, binding, _capacity) =
@@ -557,7 +541,7 @@ mod tests {
         let fixture = fixture_with_outcome(1, 16, known_committed());
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 7,
                 vec![(
                     WriteTargetOrdinal::try_new(0).unwrap(),
@@ -789,7 +773,7 @@ mod tests {
             );
             fixture
                 .session
-                .accumulate(DecodedPreparedWriteSet::for_test(
+                .receive_for_test(DecodedPreparedWriteSet::for_test(
                     7,
                     vec![(
                         WriteTargetOrdinal::try_new(0).unwrap(),
@@ -851,5 +835,99 @@ mod tests {
             drop(binding);
             root.owner.complete();
         }
+    }
+}
+
+#[cfg(test)]
+fn original_attempt() -> DmlPublicationAttempt {
+    DmlPublicationAttempt::new(
+        novarocks_spi::connector::LakePublicationId::new_v7(),
+        novarocks_spi::connector::LakePublicationFamily::DataMutation,
+        novarocks_spi::connector::LakePublicationTarget::try_new(
+            "catalog".to_owned(),
+            "namespace".to_owned(),
+            Some("table".to_owned()),
+            None,
+        )
+        .unwrap(),
+        None,
+    )
+}
+
+#[cfg(test)]
+mod selection_migration_tests {
+    use super::*;
+    use crate::query_execution::write_session::tests::{
+        fixture_with_outcome, known_committed, request_context,
+    };
+    fn assert_original_rows_reach_actual_selection(
+        outcome: novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        expected: LakePublicationDisposition,
+    ) {
+        let fixture = fixture_with_outcome(1, 16, outcome);
+        let prepared =
+            crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(7, Vec::new());
+        let decoded = fixture
+            .session
+            .computation_decode(&fixture.session.expected_targets())
+            .unwrap()
+            .interpret(prepared)
+            .unwrap();
+        let accepted = fixture.session.receiving_port().accept(decoded).unwrap();
+        assert!(accepted.belongs_to(&fixture.session));
+        assert_eq!(accepted.row_count(), 7);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+        let mut publication = StatementPublication::new(original_attempt());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), false, &mut cx)
+                .is_ready()
+        );
+        assert_eq!(publication.disposition(), Some(expected));
+        match expected {
+            LakePublicationDisposition::KnownCommitted => publication
+                .select(None)
+                .expect("only a known committed write selects success"),
+            _ => assert!(
+                publication.select(None).is_err(),
+                "an uncommitted or unknown write cannot select success"
+            ),
+        }
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finish_rows,
+            accepted.row_count()
+        );
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+    #[test]
+    fn affected_rows_are_reported_only_after_a_known_successful_commit() {
+        assert_original_rows_reach_actual_selection(
+            known_committed(),
+            LakePublicationDisposition::KnownCommitted,
+        );
+    }
+    #[test]
+    fn a_commit_unknown_outcome_reports_no_affected_rows() {
+        assert_original_rows_reach_actual_selection(
+            crate::query_execution::write_session::tests::commit_unknown(),
+            LakePublicationDisposition::CommitUnknown,
+        );
+    }
+    #[test]
+    fn a_known_uncommitted_commit_reports_no_affected_rows() {
+        assert_original_rows_reach_actual_selection(
+            novarocks_spi::connector::ExternalMutationOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    "scripted rejection",
+                ),
+                cleanup: ExternalMutationFinalization::Complete,
+            },
+            LakePublicationDisposition::KnownUncommitted,
+        );
     }
 }

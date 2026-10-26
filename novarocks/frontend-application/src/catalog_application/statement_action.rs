@@ -354,12 +354,12 @@ impl State {
             .outcome
             .as_ref()
             .expect("catalog business result received");
-        return Poll::Ready(match outcome {
+        Poll::Ready(match outcome {
             Ok(()) => Ok(StatementActionValue::Ok),
             Err(error) => Err(QueryServiceError::from_failure_cause(
                 SharedFailureCause::new(error.clone()),
             )),
-        });
+        })
     }
 }
 impl GovernedStatementAction for Action {

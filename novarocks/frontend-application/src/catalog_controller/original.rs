@@ -190,10 +190,10 @@ impl Round {
             std::task::ready!(original.poll_closed(cx)).map_err(|cause| cause.to_string())?;
         }
         if let Some(io) = &self.io {
-            if let Some(_) = io
+            let withdrawn = io
                 .withdraw_unstarted_in()
-                .map_err(|error| error.to_string())?
-            {
+                .map_err(|error| error.to_string())?;
+            if withdrawn.is_some() {
                 self.closed = true;
                 return Poll::Ready(Ok(()));
             }

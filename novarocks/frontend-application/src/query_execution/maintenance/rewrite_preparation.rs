@@ -451,7 +451,10 @@ pub(crate) async fn prepare_original_cohort_in(
     )?;
     custody.sink = Some(ReadAccessSink::new());
     let mut facts = provider
-        .resolve_provider_reads(&[recipe.need.clone()], custody.sink.as_ref().unwrap())
+        .resolve_provider_reads(
+            std::slice::from_ref(&recipe.need),
+            custody.sink.as_ref().unwrap(),
+        )
         .await?;
     if facts.len() != 1 {
         return Err("Rewrite preparation requires its exact single read fact".into());

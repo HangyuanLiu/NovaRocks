@@ -89,45 +89,6 @@ pub struct UnifiedStatisticsResolver {
 }
 
 impl UnifiedStatisticsResolver {
-    pub fn resolve(
-        &self,
-        table: &ResolvedStatisticsTable,
-        statistics: &dyn ConnectorStatistics,
-        metrics: StatisticsMetricRequest,
-        context: ConnectorRequestContext,
-    ) -> Result<Arc<StatisticsEvidence>, StatisticsResolutionFailure> {
-        if statistics.descriptor().instance_id != *table.table.owner() {
-            return Err(StatisticsResolutionFailure::OwnerMismatch);
-        }
-        if statistics.incarnation() != table.incarnation {
-            return Err(StatisticsResolutionFailure::IncarnationMismatch);
-        }
-        let key = ResolvedCacheKey {
-            instance_id: table.table.owner().clone(),
-            incarnation: table.incarnation,
-            table_payload: table.table.payload().clone(),
-            data_version: table.data_version.clone(),
-            metrics: metrics.metrics().to_vec(),
-        };
-        let evidence = statistics
-            .read_statistics(StatisticsReadRequest {
-                // No negotiation has happened at this point, so this asks
-                // about the table rather than about a narrowed read.
-                narrowed_read: None,
-                table: table.table.clone(),
-                data_version: table.data_version.clone(),
-                metrics,
-                context,
-            })
-            .map_err(|error| match error.kind() {
-                novarocks_spi::connector::ConnectorErrorKind::CorruptData => {
-                    StatisticsResolutionFailure::CorruptEvidence(error.to_string())
-                }
-                _ => StatisticsResolutionFailure::Connector(error),
-            })?;
-        self.retain_evidence(table, key, evidence)
-    }
-
     pub async fn resolve_async(
         &self,
         table: &ResolvedStatisticsTable,
@@ -240,25 +201,6 @@ mod tests {
         evidence: StatisticsEvidence,
     }
 
-    impl StatisticsReader for TestStatistics {
-        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
-            &self.descriptor
-        }
-
-        fn incarnation(&self) -> ProviderBindingEpoch {
-            self.incarnation
-        }
-
-        fn read_statistics(
-            &self,
-            _request: StatisticsReadRequest,
-        ) -> Result<StatisticsEvidence, ConnectorError> {
-            Ok(self.evidence.clone())
-        }
-    }
-
-    impl ConnectorStatistics for TestStatistics {}
-
     fn descriptor(instance: &str) -> ConnectorInstanceDescriptor {
         ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider id"),
@@ -296,35 +238,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolver_fails_closed_for_owner_incarnation_and_data_version_mismatch() {
+    #[tokio::test]
+    async fn resolver_fails_closed_for_owner_incarnation_and_data_version_mismatch() {
         let resolver = UnifiedStatisticsResolver::default();
+        let asynchronous = |inner| AsyncOnlyStatistics {
+            inner,
+            gate: Mutex::new(None),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
         let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
         let table = resolved_table("ice.main", incarnation);
 
-        let owner_mismatch = TestStatistics {
+        let owner_mismatch = asynchronous(TestStatistics {
             descriptor: descriptor("ice.foreign"),
             incarnation,
             evidence: evidence(),
-        };
+        });
         assert_eq!(
-            resolver.resolve(&table, &owner_mismatch, metric_request(), request_context(),),
+            resolver
+                .resolve_async(&table, &owner_mismatch, metric_request(), request_context())
+                .await,
             Err(StatisticsResolutionFailure::OwnerMismatch)
         );
+        assert_eq!(
+            owner_mismatch
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
 
-        let incarnation_mismatch = TestStatistics {
+        let incarnation_mismatch = asynchronous(TestStatistics {
             descriptor: descriptor("ice.main"),
             incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
             evidence: evidence(),
-        };
+        });
         assert_eq!(
-            resolver.resolve(
-                &table,
-                &incarnation_mismatch,
-                metric_request(),
-                request_context(),
-            ),
+            resolver
+                .resolve_async(
+                    &table,
+                    &incarnation_mismatch,
+                    metric_request(),
+                    request_context(),
+                )
+                .await,
             Err(StatisticsResolutionFailure::IncarnationMismatch)
+        );
+        assert_eq!(
+            incarnation_mismatch
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
         );
 
         let foreign_evidence = StatisticsEvidence::try_new(
@@ -335,20 +298,29 @@ mod tests {
             BTreeMap::new(),
         )
         .expect("foreign evidence");
-        let data_version_mismatch = TestStatistics {
+        let data_version_mismatch = asynchronous(TestStatistics {
             descriptor: descriptor("ice.main"),
             incarnation,
             evidence: foreign_evidence,
-        };
+        });
         assert_eq!(
-            resolver.resolve(
-                &table,
-                &data_version_mismatch,
-                metric_request(),
-                request_context(),
-            ),
+            resolver
+                .resolve_async(
+                    &table,
+                    &data_version_mismatch,
+                    metric_request(),
+                    request_context(),
+                )
+                .await,
             Err(StatisticsResolutionFailure::DataVersionMismatch)
         );
+        assert_eq!(
+            data_version_mismatch
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(resolver.artifacts.lock().unwrap().is_empty());
     }
 
     struct AsyncOnlyStatistics {

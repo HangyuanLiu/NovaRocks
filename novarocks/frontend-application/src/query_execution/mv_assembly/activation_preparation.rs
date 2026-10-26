@@ -453,7 +453,7 @@ mod original_failure_tests {
         drop(recorded);
         fixture
             .session
-            .abort(crate::query_execution::write_session::tests::request_context())
+            .abort_for_test(crate::query_execution::write_session::tests::request_context())
             .expect("retire the same original uncommitted session");
         assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
     }

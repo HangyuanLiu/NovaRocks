@@ -46,8 +46,7 @@ use crate::query_execution::maintenance::{
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
 use novarocks_table_maintenance::runtime::{MaintenanceJobState, TerminalError};
 use novarocks_table_maintenance::{
-    AutomaticMaintenanceOutcome, AutomaticOptimizeOutcome, MaintenanceActionRequest,
-    MaintenanceEffectId, MaintenanceTarget, OptimizeSubmission,
+    MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
 
 // Both public OPTIMIZE and automatic callers consume this same original
@@ -382,70 +381,6 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, String> {
         self.show_optimize(statement, context)
-    }
-
-    async fn execute_automatic_action_with_effect_id(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        state: &crate::query_execution::maintenance::MaintenanceActionState,
-        request: MaintenanceActionRequest,
-        effect_id: novarocks_table_maintenance::MaintenanceEffectId,
-        context: &crate::query_execution::maintenance::AutomaticMaintenanceContext,
-    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-        context
-            .ensure_active()
-            .map_err(TerminalError::cancelled_before_dispatch)?;
-        self.product
-            .execute_automatic_action(
-                &LegacyMaintenanceEffects::new(engine, state),
-                request,
-                effect_id,
-            )
-            .await
-    }
-
-    fn execute_automatic_optimize_with_effect_id(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-        effect_id: MaintenanceEffectId,
-        context: &crate::query_execution::maintenance::AutomaticMaintenanceContext,
-    ) -> Result<AutomaticOptimizeOutcome, TerminalError> {
-        context
-            .ensure_active()
-            .map_err(TerminalError::cancelled_before_dispatch)?;
-        let capture = FrontendOptimizeTargetCapturePort::new(engine);
-        let submission = self.block_on(
-            self.product
-                .submit_automatic_optimize(target, &capture, effect_id),
-        )?;
-        let Some(handle) = submission.handle() else {
-            return Ok(AutomaticOptimizeOutcome::AlreadyActive);
-        };
-        let job = self
-            .block_on(self.product.wait_automatic_optimize(handle))
-            .map_err(TerminalError::commit_unknown)?;
-        if job.state == MaintenanceJobState::Finished {
-            let committed = job
-                .outcome
-                .as_ref()
-                .and_then(|outcome| outcome.commit_occurred)
-                .ok_or_else(|| {
-                    TerminalError::commit_unknown(format!(
-                        "automatic optimize job {} finished without an exact commit fact",
-                        handle.job_id()
-                    ))
-                })?;
-            return Ok(AutomaticOptimizeOutcome::Finished {
-                handle,
-                commit_occurred: committed,
-            });
-        }
-        Err(optimize_terminal_record_error(
-            handle,
-            job,
-            "automatic optimize",
-        ))
     }
 
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {

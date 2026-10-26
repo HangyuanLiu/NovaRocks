@@ -34,11 +34,11 @@ pub mod scan_model;
 
 pub use application::{
     acquire_metadata_planning_lease, connector_request_context,
-    connector_request_context_for_deadline, connector_request_context_for_execution,
-    connector_write_default_at, metadata_list_namespaces_with_planning_lease,
-    metadata_list_tables_with_planning_lease, metadata_load_connector_table_with_planning_lease,
-    metadata_load_table, metadata_read_reference_facts_with_planning_lease,
-    metadata_table_exists_with_planning_lease, validate_request_context,
+    connector_request_context_for_execution, connector_write_default_at,
+    metadata_list_namespaces_with_planning_lease, metadata_list_tables_with_planning_lease,
+    metadata_load_connector_table_with_planning_lease, metadata_load_table,
+    metadata_read_reference_facts_with_planning_lease, metadata_table_exists_with_planning_lease,
+    validate_request_context,
 };
 pub(crate) use application::{
     connector_planning_context_for_query_on_runtime,

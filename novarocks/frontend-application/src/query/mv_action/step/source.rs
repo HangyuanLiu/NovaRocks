@@ -506,11 +506,7 @@ impl StepSource {
             None => body.needed = Some(needed.clone()),
         }
         let result = (|| {
-            if needed.effect() != ExternalMutationEffect::Applied {
-                return Err(phase_service(
-                    "MV publication did not apply its declared document set",
-                ));
-            }
+            require_applied_receipt(needed)?;
             let intent = body
                 .intent
                 .as_ref()
@@ -525,24 +521,7 @@ impl StepSource {
                 .activation
                 .interpret_write_commit(intent, needed.receipt());
             guard.normal = true;
-            let committed = interpreted.map_err(|message| {
-                domain_error(MvApplicationError::new(
-                    MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                    message,
-                ))
-            })?;
-            body.published = Some(
-                MvRefreshPublicationFinalizationFacts::try_new(
-                    committed.intent().clone(),
-                    committed.committed_version().clone(),
-                )
-                .map_err(|message| {
-                    domain_error(MvApplicationError::new(
-                        MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                        message,
-                    ))
-                })?,
-            );
+            body.published = Some(publication_facts_from_interpreted(interpreted)?);
             Ok(())
         })();
         body.commit_result = Some(result.clone());
@@ -1085,10 +1064,7 @@ impl Body {
             .published
             .as_ref()
             .ok_or_else(|| phase_service("MV projection has no received committed facts"))?;
-        let snapshot_id = published
-            .publication_version()
-            .snapshot_id()
-            .ok_or_else(|| phase_service("MV committed receipt has no exact snapshot"))?;
+        let snapshot_id = publication_snapshot_id(published)?;
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = &self.input.services.controls {
             let target = self.product_target.as_ref().unwrap();
@@ -1322,4 +1298,202 @@ fn distributed_error(
     crate::query::routed_execution_service_error(crate::query::routed_distributed_query_failure(
         error,
     ))
+}
+
+fn require_applied_receipt(needed: &ConnectorWriteNeededReady) -> Result<(), MvPhaseFailure> {
+    if needed.effect() != ExternalMutationEffect::Applied {
+        return Err(phase_service(
+            "MV publication did not apply its declared document set",
+        ));
+    }
+    Ok(())
+}
+
+fn publication_facts_from_interpreted(
+    interpreted: Result<novarocks_mv_application::publication::MvRefreshCommittedFacts, String>,
+) -> Result<MvRefreshPublicationFinalizationFacts, MvPhaseFailure> {
+    let committed = interpreted.map_err(|message| {
+        domain_error(MvApplicationError::new(
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+            message,
+        ))
+    })?;
+    MvRefreshPublicationFinalizationFacts::try_new(
+        committed.intent().clone(),
+        committed.committed_version().clone(),
+    )
+    .map_err(|message| {
+        domain_error(MvApplicationError::new(
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+            message,
+        ))
+    })
+}
+
+#[cfg(test)]
+mod receipt_migration_tests {
+    use super::super::publication_migration_tests::*;
+    use super::*;
+    use crate::query_execution::write_session::tests as write_session_tests;
+    use novarocks_mv_application::publication::MvRefreshCommittedFacts;
+    use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorWriteReceipt};
+
+    #[test]
+    fn a_first_refresh_commits_exactly_once_through_its_write_session() {
+        let (fixture, publication) = publication_after_actual_call(
+            published_outcome(7),
+            1,
+            7,
+            vec![(sole_target(), write_session_tests::commit_fragment_bytes())],
+        );
+        publication.select(None).unwrap();
+        let needed = publication.committed_needed().unwrap();
+        assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+        assert_eq!(needed.receipt().resulting_row_count(), Some(7));
+        require_applied_receipt(needed).unwrap();
+        let facts = publication_facts_from_interpreted(
+            MvRefreshCommittedFacts::from_write_receipt(publication_intent(), needed.receipt()),
+        )
+        .unwrap();
+        assert_eq!(facts.publication_version().snapshot_id(), Some(42));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+    #[test]
+    fn an_empty_first_refresh_still_reaches_its_publication_commit() {
+        let (fixture, publication) =
+            publication_after_actual_call(published_outcome(0), 1, 0, Vec::new());
+        let needed = publication.committed_needed().unwrap();
+        assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+        require_applied_receipt(needed).unwrap();
+        publication_facts_from_interpreted(MvRefreshCommittedFacts::from_write_receipt(
+            publication_intent(),
+            needed.receipt(),
+        ))
+        .unwrap();
+        assert_eq!(fixture.session.finish_invocations(), 1);
+    }
+    #[test]
+    fn an_incremental_refresh_commits_every_branch_once_through_its_write_session() {
+        let (fixture, publication) = publication_after_actual_call(
+            published_outcome(7),
+            2,
+            7,
+            vec![
+                (ordinal(0), write_session_tests::commit_fragment_bytes()),
+                (ordinal(1), write_session_tests::commit_fragment_bytes()),
+            ],
+        );
+        let needed = publication.committed_needed().unwrap();
+        assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+        assert_eq!(needed.receipt().resulting_row_count(), Some(7));
+        require_applied_receipt(needed).unwrap();
+        publication_facts_from_interpreted(MvRefreshCommittedFacts::from_write_receipt(
+            publication_intent(),
+            needed.receipt(),
+        ))
+        .unwrap();
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+    #[test]
+    fn an_empty_append_refresh_retains_noop_but_cannot_cross_the_applied_barrier() {
+        let (fixture, publication) =
+            publication_after_actual_call(skipped_publication_outcome(), 1, 0, Vec::new());
+        let needed = publication.committed_needed().unwrap();
+        assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
+        assert!(needed.receipt().resulting_row_count().is_none());
+        let refusal = require_applied_receipt(needed).unwrap_err();
+        assert!(refusal.domain.is_none());
+        let error =
+            MvRefreshCommittedFacts::from_write_receipt(publication_intent(), needed.receipt())
+                .unwrap_err();
+        assert!(
+            error.contains("without resulting row-count fact"),
+            "unexpected interpretation failure: {error}"
+        );
+        assert_eq!(
+            publication.disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
+        );
+        assert_eq!(
+            publication.received_committed_effect(),
+            Some(ExternalMutationEffect::NoOp)
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+    #[test]
+    fn actual_applied_receipt_validation_failure_keeps_committed_fact() {
+        // The original two valid generic Provider receipts reach their real
+        // MV-specific refusal cuts: interpretation and later projection gate.
+        for (snapshot, rows) in [(Some(42), None), (None, Some(0))] {
+            let receipt = ConnectorWriteReceipt::try_new_with_committed_facts(
+                bytes::Bytes::from_static(b"mv-committed-receipt"),
+                ConnectorCommittedVersion::try_new(
+                    bytes::Bytes::from_static(b"mv-committed-version"),
+                    snapshot,
+                )
+                .unwrap(),
+                rows,
+            )
+            .unwrap();
+            let outcome = ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt,
+                finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            };
+            let (fixture, publication) = publication_after_actual_call(outcome, 1, 0, Vec::new());
+            let needed = publication.committed_needed().unwrap();
+            require_applied_receipt(needed).unwrap();
+            let interpreted =
+                MvRefreshCommittedFacts::from_write_receipt(publication_intent(), needed.receipt());
+            let failure = match publication_facts_from_interpreted(interpreted) {
+                Err(failure) => failure,
+                Ok(facts) => publication_snapshot_id(&facts)
+                    .expect_err("the real projection cut requires the exact snapshot"),
+            };
+            let terminal = super::super::product_failure(
+                super::super::provider_error(failure.service, Some(&publication))
+                    .into_product_error(),
+            )
+            .domain
+            .unwrap();
+            assert_eq!(
+                terminal.kind(),
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed
+            );
+            assert_eq!(
+                publication.received_committed_effect(),
+                Some(ExternalMutationEffect::Applied)
+            );
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        }
+    }
+    #[test]
+    fn actual_noop_does_not_gain_a_committed_mv_fact() {
+        let (fixture, publication) =
+            publication_after_actual_call(skipped_publication_outcome(), 1, 0, Vec::new());
+        let needed = publication.committed_needed().unwrap();
+        let failure = require_applied_receipt(needed).unwrap_err();
+        assert!(failure.domain.is_none());
+        assert_eq!(
+            super::super::provider_error(failure.service, Some(&publication)).kind(),
+            novarocks_mv_application::ports::MvProviderFailureKind::KnownUncommitted
+        );
+        assert_eq!(
+            publication.received_committed_effect(),
+            Some(ExternalMutationEffect::NoOp)
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+    }
+}
+
+fn publication_snapshot_id(
+    published: &MvRefreshPublicationFinalizationFacts,
+) -> Result<i64, MvPhaseFailure> {
+    published
+        .publication_version()
+        .snapshot_id()
+        .ok_or_else(|| phase_service("MV committed receipt has no exact snapshot"))
 }

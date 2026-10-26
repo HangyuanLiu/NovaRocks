@@ -137,65 +137,77 @@ fn decoder(
 }
 #[test]
 fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_complete() {
-    let (control, mut driver) = original_runtime();
-    let work = control
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let scope = work.owner.scope();
-    bind(&scope, &mut driver);
-    let fixture = fixture_with_outcome(1, 1, known_committed());
-    let session = fixture.session;
-    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
-    let mut decoder = decoder(&session, execution, plan);
-    decoder
-        .apply_relay_body(
-            &crate::query_execution::write_result::tests::component_write_body(
-                commit_fragment_bytes(),
-            ),
-        )
-        .unwrap();
-    assert!(
-        decoder.finish().is_err(),
-        "a real prefix cannot manufacture complete End"
-    );
-    assert_eq!(session.accumulated_row_count().unwrap(), 0);
-    assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
-    let mut call = session.prepare_abort_call(request_context()).unwrap();
-    assert!(
-        call.poll_completed(&mut Context::from_waker(Waker::noop()))
-            .is_ready()
-    );
-    assert!(
-        call.local_health_failure().is_none(),
-        "missing End is retained responsibility, not a local poll failure"
-    );
-    let mut outcome = None;
-    call.take_abort_outcome_in(&mut outcome).unwrap();
-    let outcome = outcome.unwrap().unwrap();
-    assert!(matches!(
-        outcome,
-        ConnectorWriteAbortOutcome::KnownUncommitted {
-            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Failed(_)
-        }
-    ));
-    assert_eq!(owner.pending_records().unwrap(), 2);
-    assert!(owner.retains_facts(&facts).unwrap());
-    assert!(
-        session.has_no_accepted_formation().unwrap(),
-        "actual abort may retire decoded formation without disposing unknown production"
-    );
-    assert_eq!(
-        session.cleanup_responsibility().unwrap(),
-        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
-    );
-    let retired = work.owner.retirement_observer().unwrap();
-    drop(session);
-    work.business.release();
-    work.owner.complete();
-    drive(&mut driver);
-    assert_eq!(owner.pending_records().unwrap(), 2);
-    assert!(owner.retains_facts(&facts).unwrap());
-    assert!(!retired.is_reclaimed().unwrap());
+    for targets in [1, 2] {
+        let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
+        barrier.observe_execution_terminals(true);
+        assert!(barrier.into_committable().is_err());
+
+        let (control, mut driver) = original_runtime();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        bind(&scope, &mut driver);
+        let fixture = fixture_with_outcome(targets, 1, known_committed());
+        let session = fixture.session;
+        let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+        let mut decoder = decoder(&session, execution, plan);
+        decoder
+            .apply_relay_body(
+                &crate::query_execution::write_result::tests::component_write_body(
+                    commit_fragment_bytes(),
+                ),
+            )
+            .unwrap();
+        assert!(
+            decoder.finish().is_err(),
+            "a real prefix cannot manufacture complete End"
+        );
+        let failure = session
+            .prepare_finish_call(request_context())
+            .err()
+            .expect("a registered writer prefix cannot publish without complete End");
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(session.terminal.lock().unwrap().is_none());
+        assert_eq!(session.accumulated_row_count().unwrap(), 0);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+        let mut call = session.prepare_abort_call(request_context()).unwrap();
+        assert!(
+            call.poll_completed(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert!(
+            call.local_health_failure().is_none(),
+            "missing End is retained responsibility, not a local poll failure"
+        );
+        let mut outcome = None;
+        call.take_abort_outcome_in(&mut outcome).unwrap();
+        let outcome = outcome.unwrap().unwrap();
+        assert!(matches!(
+            outcome,
+            ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Failed(_)
+            }
+        ));
+        assert_eq!(owner.pending_records().unwrap(), 2);
+        assert!(owner.retains_facts(&facts).unwrap());
+        assert!(
+            session.has_no_accepted_formation().unwrap(),
+            "actual abort may retire decoded formation without disposing unknown production"
+        );
+        assert_eq!(
+            session.cleanup_responsibility().unwrap(),
+            novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+        );
+        let retired = work.owner.retirement_observer().unwrap();
+        drop(session);
+        work.business.release();
+        work.owner.complete();
+        drive(&mut driver);
+        assert_eq!(owner.pending_records().unwrap(), 2);
+        assert!(owner.retains_facts(&facts).unwrap());
+        assert!(!retired.is_reclaimed().unwrap());
+    }
 }
 #[test]
 fn complete_actual_end_moves_same_set_then_requires_explicit_publication_disposition() {
@@ -238,13 +250,25 @@ fn complete_actual_end_moves_same_set_then_requires_explicit_publication_disposi
     );
     // Real original scripted Provider invocation; its verdict is stable here
     // before the borrowed disposition/notification seam is consumed.
-    let outcome = session.finish_accumulated(request_context()).unwrap();
-    assert!(matches!(
-        outcome,
-        ExternalMutationOutcome::KnownCommitted { .. }
-    ));
-    let notification = session.settle_received_productions_in().unwrap().unwrap();
-    notification.notify();
+    let mut call = session.prepare_finish_call(request_context()).unwrap();
+    assert!(owner.retains_facts(&facts).unwrap());
+    assert!(!retired.is_reclaimed().unwrap());
+    assert!(
+        call.poll_needed_ready(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    assert!(call.needed_ready().is_some());
+    assert_eq!(
+        call.publication_disposition(),
+        Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
+    );
+    // The actual Call has already installed the disposition and consumed its
+    // original notice. Do not settle or notify the same cohort a second time.
+    assert!(
+        call.poll_completed(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    drop(call);
     drive(&mut driver);
     assert!(!owner.retains_facts(&facts).unwrap());
     assert!(retired.is_reclaimed().unwrap());
@@ -274,7 +298,7 @@ fn terminal_decision_during_paid_registration_keeps_both_original_sources() {
     let mut ready = receive(&mut admission).unwrap();
     let mut facts = Some(encode_occurrences(cohorts.into_iter(), quote).unwrap());
     let expected = facts.as_ref().unwrap().to_vec();
-    let _actual_abort = session.abort(request_context()).unwrap();
+    let _actual_abort = session.abort_for_test(request_context()).unwrap();
     assert!(
         session
             .register_production_ready_in(execution, plan, &mut ready, &mut facts)

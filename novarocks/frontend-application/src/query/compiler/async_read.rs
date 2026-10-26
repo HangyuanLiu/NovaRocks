@@ -17,6 +17,13 @@
 
 //! Async ordinary Read completion in the original statement source.
 use super::*;
+
+struct ReadSqlInput<'query, 'catalog, 'database> {
+    query: &'query Query,
+    current_catalog: Option<&'catalog str>,
+    current_database: &'database str,
+}
+
 impl FrontendQueryCompiler {
     pub(crate) async fn prepare_read_async(
         &self,
@@ -104,9 +111,11 @@ impl FrontendQueryCompiler {
         .await?;
         self.complete_async_read(
             purpose,
-            &query,
-            current_catalog,
-            current_database,
+            ReadSqlInput {
+                query: &query,
+                current_catalog,
+                current_database,
+            },
             query_options,
             planning,
             context.execution(),
@@ -121,9 +130,7 @@ impl FrontendQueryCompiler {
     async fn complete_async_read(
         &self,
         purpose: FrontendQueryPurpose,
-        query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
+        sql: ReadSqlInput<'_, '_, '_>,
         query_options: Option<QueryOptions>,
         connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
@@ -134,6 +141,11 @@ impl FrontendQueryCompiler {
             &crate::mv::test_controls::MvRewriteStatementTarget,
         >,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        let ReadSqlInput {
+            query,
+            current_catalog,
+            current_database,
+        } = sql;
         let connector_context = connector_planning_context.request();
         let bindings = Arc::new(
             crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()

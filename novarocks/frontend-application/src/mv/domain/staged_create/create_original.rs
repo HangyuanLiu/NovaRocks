@@ -112,23 +112,13 @@ enum Phase {
     Register,
 }
 type OriginalFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[derive(Default)]
 struct OriginalCall {
     future: Option<ManuallyDrop<OriginalFuture>>,
     phase: Option<Phase>,
     borrowed: bool,
     drop_started: bool,
     poisoned: bool,
-}
-impl Default for OriginalCall {
-    fn default() -> Self {
-        Self {
-            future: None,
-            phase: None,
-            borrowed: false,
-            drop_started: false,
-            poisoned: false,
-        }
-    }
 }
 /// This header is installed in the Action before its first phase borrower.
 /// Its Future owns only an Arc of State, which has no back-reference to this
@@ -1072,8 +1062,8 @@ impl Body {
         result
     }
     fn record_applied_terminal(&mut self) -> Result<(), CreatePhaseFailure> {
-        if self.terminal.is_some() {
-            return self.terminal.as_ref().unwrap().clone();
+        if let Some(result) = &self.terminal {
+            return result.clone();
         }
         let object = self
             .handle

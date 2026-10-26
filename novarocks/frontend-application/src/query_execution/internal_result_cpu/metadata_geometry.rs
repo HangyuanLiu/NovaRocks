@@ -144,18 +144,20 @@ impl InternalCpuMetadataGeometry {
     }
 }
 
+type OperationForwarderFactory<F> = fn(
+    QueryBlockingExecutor,
+    Option<super::InternalCpuFactoryBinding>,
+    Option<InternalCpuActionSource>,
+    CpuWorkControl,
+    Arc<dyn StatusIntakeWake>,
+    Arc<InternalCpuRetirement<Output>>,
+    Completion,
+) -> F;
+
 // An output type derived from the actual same production function, without
 // constructing any Work, packet, operation, closure, runtime or input graph.
 fn forwarder_layout<F: std::future::Future<Output = ()>>(
-    _: fn(
-        QueryBlockingExecutor,
-        Option<super::InternalCpuFactoryBinding>,
-        Option<InternalCpuActionSource>,
-        CpuWorkControl,
-        Arc<dyn StatusIntakeWake>,
-        Arc<InternalCpuRetirement<Output>>,
-        Completion,
-    ) -> F,
+    _: OperationForwarderFactory<F>,
 ) -> Layout {
     Layout::new::<F>()
 }

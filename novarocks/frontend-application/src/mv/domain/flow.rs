@@ -17,13 +17,10 @@
 
 //! Iceberg materialized-view metadata statement dispatch.
 
-use crate::mv::domain::application::{MvAlterAction, MvCreateRefreshPolicy, MvShowStatement};
-use crate::mv::domain::iceberg_backend::IcebergMvBackend;
-use crate::mv::domain::lifecycle::ListMvsRequest;
+use crate::mv::domain::application::{MvAlterAction, MvCreateRefreshPolicy};
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_parser::ast::Visit;
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::naming::normalize_identifier;
 
 fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPolicy, Option<i64>) {
@@ -96,20 +93,6 @@ pub(crate) fn configuration_after_alter(
         }
     }
     .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
-}
-
-/// List MVs through the injected backend, with no registry lookup. Sorting is
-/// retained here because it is part of the SQL presentation contract.
-pub fn list_mvs_with_backend(
-    mv_backend: &IcebergMvBackend,
-    current_catalog: Option<&str>,
-    stmt: &MvShowStatement,
-) -> Result<StatementResult, String> {
-    let req = ListMvsRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-    };
-    Ok(StatementResult::Query(mv_backend.list_mvs(req)?))
 }
 
 /// Analyze the output column types of a MV SELECT SQL without executing it.

@@ -19,6 +19,11 @@
 use super::*;
 use novarocks_spi::connector::{ConnectorDistributedRewriteLease, RewriteCpuInput, RewriteCpuPort};
 
+type RewriteCpuPorts = (
+    Arc<dyn RewriteCpuPort>,
+    Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+);
+
 impl InternalResultCpu {
     /// Two typed facades, one original serial slot. Metadata accepts only the
     /// selected first-party binding input; Rewrite accepts only its selected
@@ -32,13 +37,7 @@ impl InternalResultCpu {
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<
-        (
-            Arc<dyn RewriteCpuPort>,
-            Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
-        ),
-        WorkError,
-    > {
+    ) -> Result<RewriteCpuPorts, WorkError> {
         if !window.is_for_scope(scope) || window.class() != ResultWindowClass::Internal {
             return Err(WorkError::Conflict);
         }

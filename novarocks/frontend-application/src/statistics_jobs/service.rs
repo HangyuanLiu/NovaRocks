@@ -1720,20 +1720,18 @@ mod admission_and_conclusion_tests {
         let cases = [
             (
                 StatisticsPublicationOutcome::KnownUncommitted {
-                    failure: failure.clone(),
+                    failure,
                     cleanup_failure: None,
                 },
                 Some(LakePublicationDisposition::KnownUncommitted),
             ),
             (
-                StatisticsPublicationOutcome::CommitUnknown {
-                    failure: failure.clone(),
-                },
+                StatisticsPublicationOutcome::CommitUnknown { failure },
                 Some(LakePublicationDisposition::CommitUnknown),
             ),
             (
                 StatisticsPublicationOutcome::KnownCommitted {
-                    finalization_failure: Some(failure.clone()),
+                    finalization_failure: Some(failure),
                     cleanup_failure: None,
                 },
                 Some(LakePublicationDisposition::KnownCommitted),
@@ -1741,7 +1739,7 @@ mod admission_and_conclusion_tests {
             (
                 StatisticsPublicationOutcome::KnownCommitted {
                     finalization_failure: None,
-                    cleanup_failure: Some(failure.clone()),
+                    cleanup_failure: Some(failure),
                 },
                 None,
             ),

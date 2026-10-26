@@ -21,7 +21,6 @@ pub mod application;
 pub mod dependency;
 pub(crate) mod dependency_resolver;
 pub(crate) mod flow;
-pub mod iceberg_backend;
 pub mod iceberg_guard;
 pub mod iceberg_join_branch;
 pub mod iceberg_refresh;

@@ -487,6 +487,68 @@ impl TaskManifestBinding {
         tests::qualification_fixture(execution, processes, selected)
     }
 
+    /// Finite neutral protocol topology from the caller's exact attempt and
+    /// placements. This does not create a request ticket or executable Router.
+    #[cfg(test)]
+    pub(crate) fn protocol_fixture_for_test(
+        execution: QueryExecutionId,
+        frontend: novarocks_types::FrontendProcessId,
+        schedule: &crate::query_execution::schedule::SchedulingPlan,
+        edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        processes: &BTreeMap<usize, BackendProcessId>,
+        fragments: BTreeMap<
+            FragmentId,
+            std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        >,
+    ) -> Result<Self, DistributedQueryError> {
+        let (template, scheduled, topology) =
+            protocol_fixture_inputs(execution, frontend, schedule, edges, processes, fragments)?;
+        Self::bind(template, &scheduled, topology)
+    }
+
+    /// Exercise the real bind rejection with one exact endpoint fact absent.
+    #[cfg(test)]
+    pub(crate) fn protocol_missing_backend_for_test(
+        execution: QueryExecutionId,
+        frontend: novarocks_types::FrontendProcessId,
+        schedule: &crate::query_execution::schedule::SchedulingPlan,
+        edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        processes: &BTreeMap<usize, BackendProcessId>,
+        fragments: BTreeMap<
+            FragmentId,
+            std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        >,
+        missing: usize,
+    ) -> Result<Self, DistributedQueryError> {
+        let (template, scheduled, topology) =
+            protocol_fixture_inputs(execution, frontend, schedule, edges, processes, fragments)?;
+        let (revision, mut backends, eligible) = topology.into_parts();
+        let process = processes
+            .get(&missing)
+            .ok_or_else(|| contract_error("negative fixture must name an original backend"))?;
+        backends.remove(process);
+        Self::bind_facts(
+            template,
+            execution,
+            ScheduleFacts::from_schedule(&scheduled),
+            revision,
+            backends,
+            eligible,
+        )
+    }
+
+    /// The production collision recorder rejects the same two original keys.
+    #[cfg(test)]
+    pub(crate) fn protocol_collision_for_test(
+        first: UniqueId,
+        second: UniqueId,
+    ) -> Result<(), DistributedQueryError> {
+        let mut seen = BTreeSet::new();
+        derive_and_record_fragment_instance_id(&mut seen, || Ok(first))?;
+        derive_and_record_fragment_instance_id(&mut seen, || Ok(second))?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn original_writer_occurrences_for_test() -> Vec<BoundWriterCohort> {
         tests::original_writer_occurrences()
@@ -1467,6 +1529,191 @@ fn validate_schedule_execution(
             "attempt manifest schedule execution differs from the dormant attempt",
         ))
     }
+}
+
+/// Only the existing development test graph calls this value fixture. Its
+/// supplied Result/Stream bytes and neutral control DAG remain separate; no
+/// provider, runtime or application preparation ticket is manufactured.
+#[cfg(test)]
+fn protocol_fixture_inputs(
+    execution: QueryExecutionId,
+    frontend: novarocks_types::FrontendProcessId,
+    schedule: &crate::query_execution::schedule::SchedulingPlan,
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    processes: &BTreeMap<usize, BackendProcessId>,
+    fragments: BTreeMap<
+        FragmentId,
+        std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+    >,
+) -> Result<
+    (
+        RequestBoundNativeTemplate,
+        AttemptSchedule,
+        FrozenAttemptTopology,
+    ),
+    DistributedQueryError,
+> {
+    use super::native_submission::{
+        NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
+    };
+    use crate::query_execution::fragment_scheduling::{
+        FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
+        SchedulingStreamKind,
+    };
+    use std::sync::Arc;
+    let order = schedule.by_fragment.keys().copied().collect::<Vec<_>>();
+    let scheduling = FragmentSchedulingFacts {
+        handoff_id: 9,
+        order: order.clone(),
+        anchor: schedule.root_fragment_id,
+        fragments: schedule.by_fragment.iter().map(|(&fragment, placements)| {
+            let first = placements.first().ok_or_else(|| contract_error("protocol fixture fragment has no placement"))?;
+            let scans = first.scan_ranges.keys().map(|&node| SchedulingScanFacts {
+                node_id: node,
+                ranges: Vec::new(),
+                runtime_splits: Some(novarocks_query_application::api::RuntimeSplitPlacement::Spread),
+            }).collect();
+            for placement in placements {
+                if placement.scan_ranges.keys().ne(first.scan_ranges.keys()) || placement.scan_ranges.values().any(|ranges| !ranges.is_empty()) {
+                    return Err(contract_error("finite protocol fixture requires its original empty runtime-split assignments"));
+                }
+            }
+            Ok((fragment, SchedulingFragmentFacts { placement: novarocks_physical_plan::StagePlacementPolicy::ScanWork, scans }))
+        }).collect::<Result<_, DistributedQueryError>>()?,
+        edges: edges.iter().map(|edge| SchedulingEdgeFacts {
+            source: edge.source_fragment_id,
+            target: edge.target_fragment_id,
+            target_exchange_node_id: edge.target_exchange_node_id,
+            native_hash_partitioned: edge.partition_kind == AttemptPartitionKind::Hash,
+            stream_kind: if edge.partition_kind == AttemptPartitionKind::Unpartitioned { SchedulingStreamKind::Gather } else { SchedulingStreamKind::Partitioned },
+        }).collect(),
+    };
+    let seal = novarocks_query_application::api::PlanSeal::Version(
+        novarocks_physical_plan::PlanVersionId::try_new([9; 16])
+            .expect("original protocol fixture version"),
+    );
+    let native =
+        crate::query_execution::native_fragment::NativeFragmentAttachment::for_completed_plan(
+            fragments,
+            schedule.root_fragment_id,
+        )
+        .map_err(contract_error)?;
+    let facts = crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_completed(
+        scheduling,
+        edges.to_vec(),
+        Vec::new(),
+        SubmissionPlanFacts::for_completed_plan(
+            order.clone(),
+            order
+                .iter()
+                .map(|&id| {
+                    SubmissionFragmentFacts::for_completed_plan(
+                        id,
+                        if id == schedule.root_fragment_id {
+                            NativeSubmissionFragmentRole::Result
+                        } else {
+                            NativeSubmissionFragmentRole::NonTerminal
+                        },
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+            edges.iter().map(|e| e.source_fragment_id).collect(),
+        ),
+        Default::default(),
+        None,
+    );
+    let template = RequestBoundNativeTemplate {
+        execution,
+        template: PreparedDistributedNativeTemplate {
+            identity: super::PreparedDistributedTemplateIdentity::new(9, seal),
+            plan_facts: Arc::new(facts),
+            native_template: Arc::new(native),
+        },
+        affinity: Arc::new(super::PreparedDistributedAttemptAffinity),
+    };
+    let explicit = schedule
+        .by_fragment
+        .iter()
+        .map(|(&fragment, placements)| {
+            let backends = placements
+                .iter()
+                .map(|placement| {
+                    processes
+                        .get(&placement.backend_idx)
+                        .copied()
+                        .ok_or_else(|| {
+                            contract_error(format!(
+                                "protocol fixture backend {} lacks its original process",
+                                placement.backend_idx
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((fragment, backends))
+        })
+        .collect::<Result<BTreeMap<_, _>, DistributedQueryError>>()?;
+    let scheduled = novarocks_query_application::test_support::protocol_fixture_schedule(
+        execution,
+        frontend,
+        &template
+            .template
+            .attempt_scheduling_facts()
+            .map_err(contract_error)?,
+        &explicit,
+    )
+    .map_err(contract_error)?;
+    let mut placed_endpoints = BTreeMap::new();
+    for placement in schedule.by_fragment.values().flatten() {
+        if let Some(previous) =
+            placed_endpoints.insert(placement.backend_idx, placement.endpoint.clone())
+            && previous != placement.endpoint
+        {
+            return Err(contract_error(
+                "one protocol backend process must retain one endpoint",
+            ));
+        }
+    }
+    let targets = processes
+        .iter()
+        .map(|(&index, &process)| {
+            let endpoint = placed_endpoints.get(&index).cloned().unwrap_or_else(|| {
+                RuntimeEndpoint::new("127.0.0.1", 9000 + index as i32)
+                    .expect("declared unused protocol endpoint")
+            });
+            let control_endpoint = RuntimeEndpoint::new("127.0.0.1", 11000 + index as i32)
+                .expect("declared protocol control endpoint");
+            let descriptor = novarocks_execution_contract::BackendProcessDescriptor::try_new(
+                process,
+                endpoint,
+                control_endpoint.clone(),
+                "test-deployment",
+                "test-build",
+                NativeCompatibilityId::new([0x71; 32]),
+                4096,
+            )
+            .map_err(|error| contract_error(error.to_string()))?;
+            let descriptor = descriptor
+                .with_bounded_root_support(
+                    novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+                        control_endpoint,
+                        novarocks_result_contract::RootProfileId::V1,
+                    ),
+                )
+                .map_err(|error| contract_error(error.to_string()))?;
+            Ok(LiveBackendTarget::new(
+                index,
+                descriptor,
+                AdmissionEpochCapability::try_from_bytes([0x61; 16])
+                    .expect("original protocol epoch"),
+            ))
+        })
+        .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+    let topology = FrozenAttemptTopology::capture(
+        BackendTopologySnapshot::try_new(91, targets)
+            .map_err(|error| contract_error(error.to_string()))?,
+    )?;
+    Ok((template, scheduled, topology))
 }
 
 #[cfg(test)]

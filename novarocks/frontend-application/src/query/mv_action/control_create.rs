@@ -580,7 +580,7 @@ fn poll_phase(
     std::task::ready!(Pin::new(phase.as_mut().unwrap()).poll(cx));
     source
         .take_phase_result_in(result)
-        .map_err(|error| CreatePhaseFailure::from(error))?;
+        .map_err(CreatePhaseFailure::from)?;
     phase.take();
     Poll::Ready(result.take().unwrap())
 }

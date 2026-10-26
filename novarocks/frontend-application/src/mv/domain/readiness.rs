@@ -48,10 +48,6 @@ pub(crate) struct MvLocalProjectionInventory {
 }
 
 impl MvLocalProjectionInventory {
-    pub(crate) fn order_by_namespace_and_name(&mut self) {
-        self.inventory.order_by_namespace_and_name();
-    }
-
     fn block_on<T>(
         handle: &tokio::runtime::Handle,
         future: impl std::future::Future<Output = T>,
@@ -66,15 +62,6 @@ impl MvLocalProjectionInventory {
         &mut self,
     ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
         Self::block_on(&self.handle, self.inventory.next_ready())
-    }
-
-    pub(crate) fn next_listable(
-        &mut self,
-    ) -> Result<
-        Option<novarocks_mv_application::readiness::ListedKeyedMvProjection>,
-        MvRepositoryError,
-    > {
-        Self::block_on(&self.handle, self.inventory.next_listable())
     }
 }
 
@@ -267,30 +254,6 @@ impl MvReadinessPort {
         Ok(())
     }
 
-    /// Whether plain SQL may read one MV target's storage. See
-    /// [`novarocks_mv_application::readiness::MvKeyedReadinessService::query_admission`].
-    pub(crate) fn query_admission(
-        &self,
-        target: &novarocks_sql::planning::mv::SqlMvTarget,
-    ) -> Result<novarocks_mv_application::readiness::MvQueryAdmission, MvRepositoryError> {
-        let target = novarocks_mv_application::product::MvTarget::from_parts(
-            target.catalog.as_deref(),
-            &target.database,
-            &target.name,
-        );
-        self.block_on(self.service.query_admission(&target))
-    }
-
-    pub(crate) fn load_ready(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.block_on(
-            self.service
-                .load_ready_settled(&canonical_mv_target(target)),
-        )
-    }
-
     /// Local-source profile: one finite locator snapshot and one decoded
     /// page. Planning/background callers keep their own inventory contract.
     pub(crate) fn local_projection_inventory(
@@ -302,16 +265,6 @@ impl MvReadinessPort {
             inventory,
             handle: self.handle.clone(),
         })
-    }
-
-    /// Enumerate only projections whose current-process readiness permits
-    /// consumption.  A catalog/package observation failure therefore removes
-    /// exactly that target from SHOW, rewrite, scheduler and maintenance
-    /// candidates instead of reviving a retained StateStore projection.
-    pub(crate) async fn list_ready_projections_async(
-        &self,
-    ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.service.list_ready_projections().await
     }
 
     pub(crate) fn list_ready_projections(
@@ -330,22 +283,6 @@ impl MvReadinessPort {
         self.block_on(
             self.service
                 .list_ready_dependencies_by_downstream(projection),
-        )
-    }
-
-    pub(crate) fn list_local_dependencies_by_downstream(
-        &self,
-        projection: &LoadedKeyedMvProjection,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        use novarocks_mv_application::repository::MvDependencyReadBound;
-        let bound = MvDependencyReadBound {
-            inventory: local_inventory_bound(),
-            entries: 4096,
-            collection_bytes: 4 * 1024 * 1024,
-        };
-        self.block_on(
-            self.service
-                .list_ready_dependencies_by_downstream_bounded(projection, bound),
         )
     }
 
@@ -429,32 +366,6 @@ impl MvReadinessExecution<'_> {
             )
             .await
     }
-    pub(crate) async fn quarantine(
-        &self,
-        target: CanonicalMvTarget,
-        reason: String,
-    ) -> Result<(), MvProjectionError> {
-        self.service.invalidate_current(target, reason).await
-    }
-    pub(crate) async fn quarantine_catalog(
-        &self,
-        catalog: &str,
-        reason: String,
-    ) -> Result<(), MvProjectionError> {
-        for projection in self
-            .service
-            .candidate_reader()
-            .list_candidate_definitions()
-            .await?
-        {
-            if projection.facts.target().catalog() == Some(catalog) {
-                self.service
-                    .invalidate_current(projection.facts.target().clone(), reason.clone())
-                    .await?;
-            }
-        }
-        Ok(())
-    }
     pub(crate) async fn query_admission(
         &self,
         target: &MvTarget,
@@ -488,11 +399,6 @@ impl MvReadinessExecution<'_> {
     ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
         self.service.list_ready_projections().await
     }
-    pub(crate) async fn list_ready_projections_async(
-        &self,
-    ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.list_ready_projections().await
-    }
     pub(crate) async fn list_ready_dependencies_by_downstream(
         &self,
         projection: &LoadedKeyedMvProjection,
@@ -514,14 +420,6 @@ impl MvReadinessExecution<'_> {
                     collection_bytes: 4 * 1024 * 1024,
                 },
             )
-            .await
-    }
-    pub(crate) async fn ensure_no_ready_downstream_dependencies(
-        &self,
-        upstream: &MvDependencyObjectIdentity,
-    ) -> Result<(), MvRepositoryError> {
-        self.service
-            .ensure_no_ready_downstream_dependencies(upstream)
             .await
     }
     pub(crate) async fn prepare_drop(

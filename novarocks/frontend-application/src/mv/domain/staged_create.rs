@@ -943,7 +943,7 @@ impl CurrentProjectionRegistration {
                 observation.needed_committed().cloned(),
                 observation
                     .validated_outcome()
-                    .map(|outcome| outcome.map(Clone::clone).map_err(Clone::clone)),
+                    .map(|outcome| outcome.cloned().map_err(Clone::clone)),
                 observation.dispatched(),
             )
         };

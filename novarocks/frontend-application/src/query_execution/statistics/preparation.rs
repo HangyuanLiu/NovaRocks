@@ -151,6 +151,13 @@ impl PreparedStatisticsComputationAssembly {
     }
 }
 
+/// Mutable borrows of the original Action PlanSlot's stable receiving cells.
+pub(crate) struct StatisticsPreparationCells<'a> {
+    pub(crate) custody: &'a mut StatisticsPreparationCustody,
+    pub(crate) job: &'a mut Option<StatisticsPreparationJob>,
+    pub(crate) outcome: &'a mut Option<StatisticsPreparationOutcome>,
+}
+
 /// The borrowed future owns neither the Provider join nor the CPU job. Its
 /// caller keeps `provider`, `job` and `outcome` in the same stable action and
 /// joins their actual exits even when this preparation future is cancelled.
@@ -165,10 +172,13 @@ pub(crate) async fn prepare_statistics_computation_in(
     planning_lease: ConnectorControlPlanningLease,
     stage: &WorkScope,
     provider: &FrontendCompletionCustody,
-    custody: &mut StatisticsPreparationCustody,
-    job: &mut Option<StatisticsPreparationJob>,
-    outcome: &mut Option<StatisticsPreparationOutcome>,
+    cells: StatisticsPreparationCells<'_>,
 ) -> Result<(), DistributedQueryError> {
+    let StatisticsPreparationCells {
+        custody,
+        job,
+        outcome,
+    } = cells;
     if job.is_some() || outcome.is_some() || custody.started || custody.closed {
         return Err(contract_violation(
             "statistics preparation already owns its original CPU slot",

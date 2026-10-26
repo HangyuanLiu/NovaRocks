@@ -221,7 +221,7 @@ impl ConnectorWriteSession {
             }
             Err(error) => {
                 production.current = None;
-                return Err(production_work_error(error));
+                Err(production_work_error(error))
             }
         }
     }
@@ -297,27 +297,6 @@ impl ConnectorWriteSession {
         owner
             .map(|owner| owner.settle_received_in().map_err(production_work_error))
             .transpose()
-    }
-    /// Preserve publication's KnownUncommitted verdict while refusing a false
-    /// cleanup Complete. Missing End is not CommitUnknown and is not deleted.
-    pub(super) fn qualify_abort_cleanup(
-        &self,
-        outcome: ConnectorWriteAbortOutcome,
-    ) -> ConnectorWriteAbortOutcome {
-        let unknown = !matches!(self.has_unreceived_productions(), Ok(false));
-        match outcome {
-            ConnectorWriteAbortOutcome::KnownUncommitted {
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            } if unknown => ConnectorWriteAbortOutcome::KnownUncommitted {
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Failed(
-                    novarocks_spi::connector::ConnectorMutationFailure::new(
-                        novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                        "unreceived writer outputs retain an unknown object inventory",
-                    ),
-                ),
-            },
-            outcome => outcome,
-        }
     }
 }
 fn encode_cohorts(

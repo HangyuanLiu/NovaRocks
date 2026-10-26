@@ -1821,7 +1821,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             options: Arc::clone(&self.options),
             aborts: Arc::clone(&self.aborts),
             delivery,
-            diagnostics: self.diagnostics.clone(),
+            diagnostics: self.diagnostics,
             initial_credentials: self.initial_credentials.clone(),
             pending_credential_source: None,
             pending_initializer: None,

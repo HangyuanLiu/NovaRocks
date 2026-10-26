@@ -40,7 +40,6 @@ use std::time::Instant;
 
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use novarocks_query_application::api::QueryResult;
-use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorControlResolver, ConnectorError, ConnectorRewriteCohortRead,
@@ -106,71 +105,6 @@ impl PreparedDistributedRewriteCohort {
 pub struct MaintenanceRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
     pub current_database: &'a str,
-}
-
-/// Immutable worker-owned cancellation context for automatic maintenance.
-/// It crosses the Core-to-Frontend port without exposing a session, catalog,
-/// or provider object. Implementations must check it before every durable
-/// dispatch and preserve durable recovery state if cancellation races a
-/// dispatched external mutation.
-#[derive(Clone)]
-pub struct AutomaticMaintenanceContext {
-    cancellation: QueryCancellationView,
-    deadline: Option<Instant>,
-    runtime: Option<tokio::runtime::Handle>,
-}
-
-impl AutomaticMaintenanceContext {
-    pub fn with_deadline_on_runtime(
-        cancellation: QueryCancellationView,
-        deadline: Instant,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            cancellation,
-            deadline: Some(deadline),
-            runtime: Some(runtime),
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-
-    pub fn connector_request_context(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        let deadline = self.deadline.ok_or_else(|| {
-            "automatic maintenance requires an exact request deadline".to_string()
-        })?;
-        match &self.runtime {
-            Some(runtime) => crate::connector::query_connector_request_context_on_runtime(
-                runtime,
-                deadline,
-                self.cancellation.clone(),
-            ),
-            None => crate::connector::connector_request_context_for_deadline(
-                deadline,
-                self.cancellation.clone(),
-            ),
-        }
-        .map(|context| {
-            context
-                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
-        })
-    }
-
-    pub fn ensure_active(&self) -> Result<(), String> {
-        if self.is_cancelled() {
-            return Err("automatic maintenance cancelled before durable dispatch".to_string());
-        }
-        self.deadline
-            .is_none_or(|deadline| Instant::now() < deadline)
-            .then_some(())
-            .ok_or_else(|| {
-                "automatic maintenance deadline elapsed before durable dispatch".to_string()
-            })
-    }
 }
 
 /// Write capability for one frontend-owned maintenance execution attempt.
@@ -466,37 +400,6 @@ pub trait TableMaintenanceService: Send + Sync {
         _context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    /// The MV management owner has already frozen and admitted this action's
-    /// effect identity. Implementations must pass it to the provider and keep
-    /// the exact terminal classification.
-    async fn execute_automatic_action_with_effect_id(
-        &self,
-        _engine: &dyn TableMaintenanceEngine,
-        _state: &MaintenanceActionState,
-        _request: MaintenanceActionRequest,
-        _effect_id: MaintenanceEffectId,
-        _context: &AutomaticMaintenanceContext,
-    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic maintenance effect identity is unsupported",
-        ))
-    }
-
-    /// An automatic MV OPTIMIZE runs under one caller-owned management effect.
-    /// The service waits for the exact submitted handle and returns whether
-    /// that job actually committed a provider mutation.
-    fn execute_automatic_optimize_with_effect_id(
-        &self,
-        _engine: &dyn TableMaintenanceEngine,
-        _target: MaintenanceTarget,
-        _effect_id: MaintenanceEffectId,
-        _context: &AutomaticMaintenanceContext,
-    ) -> Result<novarocks_table_maintenance::AutomaticOptimizeOutcome, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic optimize effect identity is unsupported",
-        ))
     }
 
     fn original_optimize_host(&self) -> Result<OriginalOptimizeHost, String> {

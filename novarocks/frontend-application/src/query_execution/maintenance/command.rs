@@ -355,21 +355,21 @@ pub(crate) fn is_async_metadata_command(
     ))
 }
 
+type MaintenanceStatementFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    MaintenanceStatementResult,
+                    novarocks_table_maintenance::runtime::TerminalError,
+                >,
+            > + Send,
+    >,
+>;
+
 /// Source-owned product future and its independent fixed row. Field order
 /// leaves the row alive if completed Product F Drop unwinds. It is not a grant.
 pub struct MaintenanceCommandCall {
-    future: Option<
-        std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            MaintenanceStatementResult,
-                            novarocks_table_maintenance::runtime::TerminalError,
-                        >,
-                    > + Send,
-            >,
-        >,
-    >,
+    future: Option<MaintenanceStatementFuture>,
     result: Option<
         Result<MaintenanceStatementResult, novarocks_table_maintenance::runtime::TerminalError>,
     >,
@@ -549,7 +549,6 @@ impl MaintenanceCommandCall {
             primary.message.push_str(" (cleanup: ");
             primary.message.push_str(cleanup.message());
             primary.message.push(')');
-            return;
         }
         // An exited writer abort failure is cleanup evidence, not proof that a
         // required business finalization failed. The Product alone classifies

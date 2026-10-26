@@ -108,7 +108,7 @@ pub(crate) async fn execute_automatic_metadata_action_with_ports(
     )
     .await
     {
-        ResolvedMetadataMaintenance::KnownCommitted(completed) => completed,
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => *completed,
         ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
             return Err(TerminalError::known_uncommitted(
                 crate::connector::mutation::known_uncommitted_message(failure, &cleanup),

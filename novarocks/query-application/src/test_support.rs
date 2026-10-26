@@ -1035,3 +1035,15 @@ pub fn qualification_schedule(
     )
     .expect("fixture uses the original QA schedule builder")
 }
+
+/// Schedule only the explicit placements of a finite role protocol fixture.
+/// No actor, Root, request ticket, runtime or execution capability is created.
+pub fn protocol_fixture_schedule(
+    execution: novarocks_types::QueryExecutionId,
+    frontend: novarocks_types::identity::FrontendProcessId,
+    facts: &crate::api::ExecutionSchedulingFacts,
+    placements: &std::collections::BTreeMap<u32, Vec<novarocks_types::identity::BackendProcessId>>,
+) -> Result<crate::coordination::AttemptSchedule, String> {
+    crate::coordination::protocol_fixture_schedule(execution, frontend, facts, placements)
+        .map_err(|error| error.to_string())
+}

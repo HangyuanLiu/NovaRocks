@@ -112,15 +112,6 @@ pub(crate) async fn load_frontend_table_async(
     .map_err(connector_schema_error)
 }
 
-pub(crate) fn load_write_table(
-    lease: &novarocks_spi::connector::ConnectorWriteLease,
-    request: ConnectorTableRequest,
-) -> Result<ConnectorTableMetadata, ConnectorError> {
-    let control = request.context.original_operation_control();
-    with_original_control(control, |creation| lease.load_table(request, creation))
-        .map_err(connector_schema_error)
-}
-
 /// Project a typed preparation refusal at an existing ConnectorError boundary.
 /// Provider classifications and retry evidence survive unchanged.
 pub(crate) fn connector_schema_error(

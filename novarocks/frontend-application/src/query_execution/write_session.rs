@@ -41,15 +41,14 @@ use novarocks_proto_codec::connector_write::{
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
     ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishPublication,
-    ConnectorWriteFinishRequest, ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor,
-    ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
-    PreparedWriteSetLedger, UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
+    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, PreparedWriteSetLedger,
+    UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
     ConnectorDocumentPublicationDeclaration, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorStorageResolver, ConnectorWriteAbortOutcome,
-    ConnectorWriteReceipt, ExternalMutationEvidence, ExternalMutationOutcome,
-    KeyedPublicationIntent,
+    ExternalMutationEvidence, KeyedPublicationIntent,
 };
 
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
@@ -112,10 +111,6 @@ pub(crate) struct ConnectorWriteSession {
     >,
     lease: ConnectorWriteStackLease,
     plan: ConnectorWriteSessionPlan,
-    /// Only an invisible staged target may be sealed without a distributed
-    /// data plane. The provider still decides what an empty prepared set
-    /// means; this flag prevents ordinary DML from manufacturing one.
-    implicit_empty_staged_create: bool,
     metadata_only_publication: bool,
     /// The application-owned publication attached to the provider's single
     /// external commit. Its declaration is frozen at begin, while its exact
@@ -189,31 +184,6 @@ struct AccumulatedWriteSet {
 }
 
 impl ConnectorWriteSession {
-    /// Admit the write and freeze its recipes. On return either a session
-    /// exists and nothing external has happened yet, or an error was raised and
-    /// nothing was started.
-    pub(crate) fn begin(
-        lease: ConnectorWriteStackLease,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        request: ConnectorWriteBeginRequest,
-    ) -> Result<Self, ConnectorError> {
-        if matches!(
-            request.flavor,
-            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
-        ) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "application-document writes require an application-document session entrypoint",
-            ));
-        }
-        Self::begin_validated(
-            lease,
-            catalog_properties,
-            request,
-            WritePublicationState::Ordinary,
-        )
-    }
-
     /// The statement owns `receiving` before polling this borrowed begin.
     /// Adopt the actual Provider result before dropping its original child F.
     pub(crate) async fn begin_async_in(
@@ -281,12 +251,8 @@ impl ConnectorWriteSession {
         finish_publication: WritePublicationState,
         receiving: &WriteBeginReceiving,
     ) -> Result<Arc<Self>, ConnectorError> {
-        let staged = matches!(
-            &request.flavor,
-            ConnectorWriteSessionFlavor::StagedCreate(_)
-        );
         request.context = context_for_write_begin(request.context, &catalog_properties)?;
-        receiving.install_publication_input(lease, catalog_properties, staged, finish_publication);
+        receiving.install_publication_input(lease, catalog_properties, finish_publication);
         let control = receiving.control();
         receiving.enter_factory();
         let mut original = control.begin_write_async(request);
@@ -336,7 +302,7 @@ impl ConnectorWriteSession {
             ));
         }
         receiving.claim()?;
-        receiving.install_input(lease, catalog_properties, false);
+        receiving.install_input(lease, catalog_properties);
         let mut request = Some(request);
         receiving.control().prepare_rewrite_begin_source_in(
             &mut request,
@@ -541,99 +507,11 @@ impl ConnectorWriteSession {
         Ok(input)
     }
 
-    /// Admit an application-document write before its exact publication can be
-    /// constructed. The frozen declaration is the authority against which the
-    /// one later bind is validated.
-    pub(crate) fn begin_pending_application_document_publication(
-        lease: ConnectorWriteStackLease,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        request: ConnectorWriteBeginRequest,
-    ) -> Result<Self, ConnectorError> {
-        let declaration = match &request.flavor {
-            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } => {
-                declaration.clone()
-            }
-            _ => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "pending application-document publication requires an application-document write",
-                ));
-            }
-        };
-        Self::begin_validated(
-            lease,
-            catalog_properties,
-            request,
-            WritePublicationState::Pending { declaration },
-        )
-    }
-
-    /// Admit a write whose one terminal commit must carry an exact frozen
-    /// application-document publication.
-    #[cfg(test)]
-    pub(crate) fn begin_with_finish_publication(
-        lease: ConnectorWriteStackLease,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        request: ConnectorWriteBeginRequest,
-        publication: KeyedPublicationIntent,
-    ) -> Result<Self, ConnectorError> {
-        let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
-            &request.flavor
-        else {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "application-document publication intent requires an application-document write",
-            ));
-        };
-        publication.validate_for(declaration)?;
-        Self::begin_validated(
-            lease,
-            catalog_properties,
-            request,
-            WritePublicationState::Bound(publication),
-        )
-    }
-
-    fn begin_validated(
-        lease: ConnectorWriteStackLease,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        mut request: ConnectorWriteBeginRequest,
-        finish_publication: WritePublicationState,
-    ) -> Result<Self, ConnectorError> {
-        let implicit_empty_staged_create = matches!(
-            &request.flavor,
-            ConnectorWriteSessionFlavor::StagedCreate(_)
-        );
-        // A metadata-only publication has no query behind it, so it is the one
-        // document publication allowed to seal an explicitly empty prepared
-        // set. Reading it off the declaration at begin, rather than from
-        // whatever the caller asks for at finish, is what keeps a data
-        // publication from taking the same route when its data plane is
-        // missing.
-        let metadata_only_publication = matches!(
-            &request.flavor,
-            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. }
-                if declaration.technique()
-                    == novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
-        );
-        request.context = context_for_write_begin(request.context, &catalog_properties)?;
-        let plan = lease.session().begin_write(request)?;
-        Ok(Self::from_begin_plan(
-            lease,
-            catalog_properties,
-            plan,
-            finish_publication,
-            implicit_empty_staged_create,
-            metadata_only_publication,
-        ))
-    }
-
     fn from_begin_plan(
         lease: ConnectorWriteStackLease,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         plan: ConnectorWriteSessionPlan,
         finish_publication: WritePublicationState,
-        implicit_empty_staged_create: bool,
         metadata_only_publication: bool,
     ) -> Self {
         Self {
@@ -655,7 +533,6 @@ impl ConnectorWriteSession {
             ),
             lease,
             plan,
-            implicit_empty_staged_create,
             metadata_only_publication,
             finish_publication: Mutex::new(finish_publication),
             catalog_properties,
@@ -702,7 +579,6 @@ impl ConnectorWriteSession {
             ),
             lease,
             plan,
-            implicit_empty_staged_create: false,
             metadata_only_publication: false,
             finish_publication: Mutex::new(WritePublicationState::Ordinary),
             catalog_properties,
@@ -765,29 +641,6 @@ impl ConnectorWriteSession {
                 "application-document publication is already bound",
             )),
         }
-    }
-
-    /// Retain the query attempt's terminal-only storage capability for this
-    /// session's external decision.
-    ///
-    /// The caller takes the capability from a lifecycle lease that has not yet
-    /// been finalized, because the hold it carries is what tells finalization
-    /// that a connector write still needs the attempt's credential leases.
-    ///
-    /// A statement that drives several rounds against one session installs the
-    /// newest round's capability. The one it replaces releases its hold right
-    /// away: the round that produced it can no longer be the round that
-    /// commits, so its credential material is nothing this session still needs.
-    pub(crate) fn retain_terminal_storage_resolver(
-        &self,
-        resolver: Arc<dyn ConnectorStorageResolver>,
-    ) {
-        let previous = self
-            .terminal_storage
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.replace(resolver));
-        drop(previous);
     }
 
     /// The sealed ordinal set a prepared write set may not exceed.
@@ -900,24 +753,6 @@ impl ConnectorWriteSession {
         ))
     }
 
-    /// Project the visible-row effect of one complete MV write before binding
-    /// its publication. The provider interprets its own exact fragments; the
-    /// generic affected-row count retains its original meaning.
-    pub(crate) fn logical_rows_after_write(
-        &self,
-        prepared: &DecodedPreparedWriteSet,
-        previous: Option<u64>,
-        context: &ConnectorRequestContext,
-    ) -> Result<Option<u64>, ConnectorError> {
-        let decoded = self
-            .computation_decode(&self.expected_targets())?
-            .interpret_borrowed(prepared)
-            .map_err(
-                crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error,
-            )?;
-        self.logical_rows_after_prepared(&decoded, previous, context)
-    }
-
     pub(crate) fn logical_rows_after_empty_publication(
         &self,
         previous: Option<u64>,
@@ -996,292 +831,11 @@ impl ConnectorWriteSession {
         Ok(received)
     }
 
-    /// Collect one query's complete prepared write set into this session.
-    ///
-    /// A statement that drives several queries against one session -- a
-    /// copy-on-write mutation, a distributed rewrite -- calls this once per
-    /// query and commits once at the end. Each set is complete for its own
-    /// execution graph; what accumulates is the statement's union.
-    ///
-    /// The frozen budgets are charged here, on the union. Charging them per
-    /// query would let a statement hold an unbounded amount before commit while
-    /// every individual query looked well inside its limit, and the limits
-    /// exist to bound exactly what the frontend holds.
-    pub(crate) fn accumulate(
-        &self,
-        prepared: DecodedPreparedWriteSet,
-    ) -> Result<(), ConnectorError> {
-        drop(self.receiving_terminal_guard()?);
-        let segment = self
-            .computation_decode(&self.expected_targets())?
-            .interpret(prepared)
-            .map_err(
-                crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error,
-            )?;
-        self.accept_interpreted(segment).map(|_| ())
-    }
-
-    /// Perform the one external commit over everything accumulated so far.
-    ///
-    /// The caller must already have established BOTH halves of the barrier for
-    /// every query it drove: a complete prepared write set each time, and a
-    /// lifecycle terminal set in which every participant succeeded. Neither
-    /// implies the other, so neither is checked here -- this method exists to be
-    /// un-callable until both hold.
-    pub(crate) fn finish_accumulated(
-        &self,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        ensure_finish_context_active(&context)?;
-        self.require_received_productions()?;
-        if self.lock_accumulated()?.received.is_some() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "sealed received input requires its borrowed publication call",
-            ));
-        }
-        let publication = self.finish_publication_for_commit()?;
-        self.claim_terminal(TerminalDecision::Committed)?;
-        let outcome = self.commit_accumulated(context, publication);
-        // Reconciliation is the one decision that may still follow a commit,
-        // and it reads the same object store. Every other way out of here --
-        // committed, uncommitted, or an error that leaves neither a retry nor
-        // an abort reachable -- settles the session.
-        if !self.awaits_reconciliation() {
-            self.release_terminal_storage_resolver();
-        }
-        outcome
-    }
-
-    fn commit_accumulated(
-        &self,
-        context: ConnectorRequestContext,
-        publication: ConnectorWriteFinishPublication,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        self.require_received_productions()?;
-        let context = self.terminal_context(context)?;
-        self.commit_accumulated_with_context(context, publication)
-    }
-
-    fn commit_accumulated_with_context(
-        &self,
-        context: ConnectorRequestContext,
-        publication: ConnectorWriteFinishPublication,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        self.require_received_productions()?;
-        let (row_count, fragments, statistics, _retention) = {
-            let mut accumulated = self.lock_accumulated()?;
-            if accumulated.received.is_some() {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "sealed received input requires its borrowed publication call",
-                ));
-            }
-            (
-                accumulated.rows.get(),
-                std::mem::take(&mut accumulated.fragments),
-                std::mem::take(&mut accumulated.statistics),
-                accumulated.retention.take(),
-            )
-        };
-        let prepared =
-            ConnectorPreparedWriteSet::try_new(row_count, fragments, &self.expected_targets())?;
-        self.finish_invocations.fetch_add(1, Ordering::SeqCst);
-        let outcome = self
-            .lease
-            .session()
-            .finish_write(ConnectorWriteFinishRequest {
-                commit: self.plan.commit_handle(),
-                prepared,
-                statistics,
-                publication,
-                context,
-            })?;
-        if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {
-            self.record_terminal(TerminalDecision::CommitUnknown);
-        }
-        Ok(outcome)
-    }
-
     /// The rows accumulated so far. Report them to a client only after the
     /// external commit is known to have succeeded.
     #[cfg(test)]
     pub(crate) fn accumulated_row_count(&self) -> Result<u64, ConnectorError> {
         Ok(self.lock_accumulated()?.rows.get())
-    }
-
-    /// Accumulate one query's set and commit immediately. The shape almost
-    /// every write has.
-    pub(crate) fn finish(
-        &self,
-        prepared: DecodedPreparedWriteSet,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        self.accumulate(prepared)?;
-        self.finish_accumulated(context)
-    }
-
-    /// Seal a write whose statement-level owner still has one terminal action
-    /// to perform with the same query-attempt storage capability.
-    ///
-    /// A staged CTAS first seals its writer reports and only then publishes
-    /// the catalog-side staged-create action. The seal itself has no external
-    /// catalog effect, so releasing the capability here would leave the
-    /// following manifest and metadata I/O with the already-revoked planning
-    /// route. Transfer one cloned terminal context to that owner instead.
-    pub(crate) fn finish_for_following_terminal_action(
-        &self,
-        prepared: DecodedPreparedWriteSet,
-        context: ConnectorRequestContext,
-    ) -> Result<
-        (
-            ExternalMutationOutcome<ConnectorWriteReceipt>,
-            ConnectorRequestContext,
-        ),
-        ConnectorError,
-    > {
-        self.accumulate(prepared)?;
-        let publication = self.finish_publication_for_commit()?;
-        self.claim_terminal(TerminalDecision::Committed)?;
-        let terminal_context = self.terminal_context(context)?;
-        let outcome = self.commit_accumulated_with_context(terminal_context.clone(), publication);
-        // The returned context owns the terminal capability from here. On an
-        // error it drops below, so the session never leaves an orphaned hold.
-        self.release_terminal_storage_resolver();
-        outcome.map(|outcome| (outcome, terminal_context))
-    }
-
-    /// Seal the provider's explicit empty prepared set for an invisible staged
-    /// CREATE that has no query data plane. This is intentionally unavailable
-    /// to ordinary writes: no caller may substitute an invented empty result
-    /// for a missing distributed completion.
-    fn finish_implicit_empty_staged_create_for_following_terminal_action(
-        &self,
-        context: ConnectorRequestContext,
-    ) -> Result<
-        (
-            ExternalMutationOutcome<ConnectorWriteReceipt>,
-            ConnectorRequestContext,
-        ),
-        ConnectorError,
-    > {
-        if !self.implicit_empty_staged_create {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "only an invisible staged-create write may seal an implicit empty prepared set",
-            ));
-        }
-        // Unlike a distributed completion, this path has no coordinator
-        // barrier that already proved the request was live. Check it before
-        // claiming the one terminal decision so cancellation cannot consume a
-        // staged CREATE that never dispatched a seal.
-        ensure_finish_context_active(&context)?;
-        let publication = self.finish_publication_for_commit()?;
-        self.claim_terminal(TerminalDecision::Committed)?;
-        let terminal_context = self.terminal_context(context)?;
-        let outcome = self.commit_accumulated_with_context(terminal_context.clone(), publication);
-        self.release_terminal_storage_resolver();
-        outcome.map(|outcome| (outcome, terminal_context))
-    }
-
-    /// Seal the explicit empty prepared set of a metadata-only publication.
-    ///
-    /// Like the staged-create seal above, this is deliberately not reachable
-    /// from an ordinary write: no caller may substitute an invented empty
-    /// result for a data plane that did not close. What makes it legitimate
-    /// here is that a metadata-only publication never had one -- its inputs
-    /// did not move, so there was nothing to read and no query to run, and the
-    /// empty commit is the published output version itself.
-    fn finish_empty_metadata_only_publication(
-        &self,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        if !self.metadata_only_publication {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "only a metadata-only publication may seal an explicit empty prepared set",
-            ));
-        }
-        // No coordinator barrier proved this request was still live, so check
-        // it before claiming the one terminal decision.
-        ensure_finish_context_active(&context)?;
-        let publication = self.finish_publication_for_commit()?;
-        self.claim_terminal(TerminalDecision::Committed)?;
-        let terminal_context = self.terminal_context(context)?;
-        let outcome = self.commit_accumulated_with_context(terminal_context, publication);
-        self.release_terminal_storage_resolver();
-        outcome
-    }
-
-    /// Release a session that never reached a complete prepared write set.
-    pub(crate) fn abort(
-        &self,
-        context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-        self.claim_terminal(TerminalDecision::Aborted)?;
-        let outcome = self.terminal_context(context).and_then(|context| {
-            let production = self.abort_production()?;
-            let received = if production == novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived {
-                Some(self.freeze_publication_input(
-                    context.clone(), ConnectorWriteFinishPublication::None, production,
-                )?)
-            } else { None };
-            self.lease
-                .session()
-                .abort_write(ConnectorWriteSessionAbortRequest {
-                    commit: self.plan.commit_handle(),
-                    context,
-                    production,
-                    received: received.as_ref().map(|input| &input.received.prepared),
-                })
-        });
-        // An aborted session can reach nothing else, whether the provider's
-        // cleanup succeeded or not.
-        let outcome = outcome.map(|outcome| self.qualify_abort_cleanup(outcome));
-        // A later observation failure must not discard the original Provider
-        // verdict. Unknown/poisoned responsibility keeps its resolver custody.
-        if matches!(self.has_unreceived_productions(), Ok(false)) {
-            self.release_terminal_storage_resolver();
-        }
-        outcome
-    }
-
-    /// Resolve a commit whose external outcome is unknown. Only reachable after
-    /// a commit that reported exactly that.
-    pub(crate) fn reconcile(
-        &self,
-        evidence: ExternalMutationEvidence,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        {
-            let terminal = self.lock_terminal()?;
-            if *terminal != Some(TerminalDecision::CommitUnknown) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "connector write session has no unknown commit outcome to reconcile",
-                ));
-            }
-        }
-        let outcome = self.terminal_context(context).and_then(|context| {
-            self.lease
-                .session()
-                .reconcile_write(ConnectorWriteSessionReconcileRequest {
-                    commit: self.plan.commit_handle(),
-                    evidence,
-                    context,
-                })
-        });
-        // A reconciliation that came back unknown, or that failed to reach the
-        // provider at all, may be asked again and needs the same capability.
-        // Anything else is the session's last external decision.
-        let settled = matches!(
-            &outcome,
-            Ok(outcome) if !matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. })
-        );
-        if settled {
-            self.release_terminal_storage_resolver();
-        }
-        outcome
     }
 
     /// Decorate one terminal request with this session's retained capability.
@@ -1307,13 +861,6 @@ impl ConnectorWriteSession {
             Some(resolver) => context.with_storage_resolver(Arc::clone(resolver)),
             None => context,
         })
-    }
-
-    /// Whether a commit reported an unknown outcome that reconciliation has
-    /// not answered yet.
-    fn awaits_reconciliation(&self) -> bool {
-        self.lock_terminal()
-            .is_ok_and(|terminal| *terminal == Some(TerminalDecision::CommitUnknown))
     }
 
     /// Drop the retained capability, releasing the hold that deferred the
@@ -1492,7 +1039,7 @@ pub(crate) async fn begin_cow_connector_write_session_async_in(
             original.clone(),
         ))
     })?;
-    receiving.install_input(lease, catalog_properties, false);
+    receiving.install_input(lease, catalog_properties);
     let control = receiving.control();
     receiving.enter_factory();
     let mut child = control.begin_cow_write_checked_async(request, original);
@@ -1540,112 +1087,10 @@ pub(crate) async fn begin_connector_application_document_write_session_pending_a
     .await
 }
 
-/// The external commit of one completed write session, and the rows it made
-/// visible.
-///
-/// `affected_rows` exists only on `KnownCommitted`. That is the whole point of
-/// the type: the row count is known as soon as the data plane closes, but
-/// reporting it to a client before the commit succeeded would name rows that
-/// may never become visible -- and on `CommitUnknown` nobody yet knows whether
-/// they did.
-pub(crate) struct CommittedWriteSession {
-    outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
-    affected_rows: Option<u64>,
-}
-
-impl CommittedWriteSession {
-    /// The rows a client may be told about, present only after a commit that
-    /// is known to have succeeded.
-    pub(crate) const fn affected_rows(&self) -> Option<u64> {
-        self.affected_rows
-    }
-
-    pub(crate) fn into_outcome(self) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
-        self.outcome
-    }
-}
-
-/// A sealed write whose statement owner must perform one following terminal
-/// action using the same attempt-scoped storage capability.
-///
-/// This is frontend-local and carries only a request context. CTAS is its
-/// sole consumer: its staged writer receipt becomes catalog metadata during
-/// the subsequent publication step.
-pub(crate) struct FollowupTerminalWriteSession {
-    outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
-    affected_rows: Option<u64>,
-    context: ConnectorRequestContext,
-}
-
-impl FollowupTerminalWriteSession {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ExternalMutationOutcome<ConnectorWriteReceipt>,
-        Option<u64>,
-        ConnectorRequestContext,
-    ) {
-        (self.outcome, self.affected_rows, self.context)
-    }
-}
-
-/// Perform the one external commit for a write whose data plane closed and
-/// whose execution succeeded, then gate its affected-row count on the result.
-pub(crate) fn finish_write_session(
-    completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    context: ConnectorRequestContext,
-) -> Result<CommittedWriteSession, ConnectorError> {
-    let row_count = completion.row_count();
-    let (session, prepared) = completion.into_parts();
-    let outcome = session.finish(prepared, context)?;
-    let affected_rows =
-        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(row_count);
-    Ok(CommittedWriteSession {
-        outcome,
-        affected_rows,
-    })
-}
-
-/// Seal a write while transferring its terminal storage capability to the
-/// immediately following statement-owned action.
-pub(crate) fn finish_write_session_for_following_terminal_action(
-    completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    context: ConnectorRequestContext,
-) -> Result<FollowupTerminalWriteSession, ConnectorError> {
-    let row_count = completion.row_count();
-    let (session, prepared) = completion.into_parts();
-    let (outcome, context) = session.finish_for_following_terminal_action(prepared, context)?;
-    let affected_rows =
-        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(row_count);
-    Ok(FollowupTerminalWriteSession {
-        outcome,
-        affected_rows,
-        context,
-    })
-}
-
-/// Seal an invisible staged target with the provider's explicit empty prepared
-/// set, then transfer the terminal storage capability to staged publication.
-///
-/// MV CREATE uses this before its first target exists in the catalog. It is
-/// not a replacement for a missing distributed write completion.
-pub(crate) fn finish_empty_staged_create_write_for_following_terminal_action(
-    session: &ConnectorWriteSession,
-    context: ConnectorRequestContext,
-) -> Result<FollowupTerminalWriteSession, ConnectorError> {
-    let (outcome, context) =
-        session.finish_implicit_empty_staged_create_for_following_terminal_action(context)?;
-    let affected_rows =
-        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(0);
-    Ok(FollowupTerminalWriteSession {
-        outcome,
-        affected_rows,
-        context,
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
+    use novarocks_spi::connector::write_stack::ConnectorWriteFinishRequest;
+    use novarocks_spi::connector::{ConnectorWriteReceipt, ExternalMutationOutcome};
     use std::sync::Arc;
 
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
@@ -1762,7 +1207,7 @@ pub(crate) mod tests {
         begin_future_drops: usize,
         panic_begin_future_drop: bool,
         source_drops: usize,
-        finish_rows: u64,
+        pub(crate) finish_rows: u64,
         panic_finish_future_drop: bool,
         pub(crate) defer_finish_cleanup: bool,
         pub(crate) allow_cleanup_exit: bool,
@@ -2437,6 +1882,93 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn begin_for_test(
+        lease: ConnectorWriteStackLease,
+        properties: novarocks_spi::connector::CatalogProperties,
+        request: ConnectorWriteBeginRequest,
+    ) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
+        let original = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original));
+        let result = futures::executor::block_on(ConnectorWriteSession::begin_async_in(
+            lease, properties, request, &receiving,
+        ));
+        drop(receiving);
+        drop(original);
+        result
+    }
+
+    pub(crate) fn begin_pending_for_test(
+        lease: ConnectorWriteStackLease,
+        properties: novarocks_spi::connector::CatalogProperties,
+        request: ConnectorWriteBeginRequest,
+    ) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
+        let original = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original));
+        let result = futures::executor::block_on(
+            ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+                lease, properties, request, &receiving,
+            ),
+        );
+        drop(receiving);
+        drop(original);
+        result
+    }
+
+    pub(crate) fn drain_call_for_test(
+        call: &mut WritePublicationCall,
+    ) -> Result<
+        novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+        ConnectorError,
+    > {
+        futures::executor::block_on(std::future::poll_fn(|cx| call.poll_completed(cx)));
+        let mut result = None;
+        call.take_outcome_in(&mut result)?;
+        result.expect("same original completed publication")
+    }
+
+    impl ConnectorWriteSession {
+        pub(crate) fn receive_for_test(
+            self: &Arc<Self>,
+            prepared: DecodedPreparedWriteSet,
+        ) -> Result<(), ConnectorError> {
+            let segment = self.computation_decode(&self.expected_targets())?
+                .interpret(prepared)
+                .map_err(crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error)?;
+            self.receiving_port().accept(segment).map(|_| ())
+        }
+        pub(crate) fn publish_for_test(
+            self: &Arc<Self>,
+            context: ConnectorRequestContext,
+        ) -> Result<
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+            ConnectorError,
+        > {
+            let mut call = self.prepare_finish_call(context)?;
+            drain_call_for_test(&mut call)
+        }
+        pub(crate) fn publish_prepared_for_test(
+            self: &Arc<Self>,
+            prepared: DecodedPreparedWriteSet,
+            context: ConnectorRequestContext,
+        ) -> Result<
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+            ConnectorError,
+        > {
+            self.receive_for_test(prepared)?;
+            self.publish_for_test(context)
+        }
+        pub(crate) fn abort_for_test(
+            self: &Arc<Self>,
+            context: ConnectorRequestContext,
+        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+            let mut call = self.prepare_abort_call(context)?;
+            futures::executor::block_on(std::future::poll_fn(|cx| call.poll_completed(cx)));
+            let mut result = None;
+            call.take_abort_outcome_in(&mut result)?;
+            result.expect("same original completed abort")
+        }
+    }
+
     pub(crate) struct Fixture {
         pub(crate) session: Arc<ConnectorWriteSession>,
         pub(crate) recorded: Arc<Mutex<Recorded>>,
@@ -2490,20 +2022,23 @@ pub(crate) mod tests {
         )>,
     ) -> Fixture {
         let (lease, recorded) = unopened_fixture(targets, payload_bytes, outcome);
-        let session = Arc::new(
-            match publication {
-                Some((declaration, publication)) => {
-                    ConnectorWriteSession::begin_with_finish_publication(
-                        lease,
-                        catalog_properties(),
-                        application_document_begin_request(declaration),
-                        publication,
-                    )
-                }
-                None => ConnectorWriteSession::begin(lease, catalog_properties(), begin_request()),
+        let session = match publication {
+            Some((declaration, publication)) => {
+                let session = begin_pending_for_test(
+                    lease,
+                    catalog_properties(),
+                    application_document_begin_request(declaration),
+                )
+                .expect("begin pending write");
+                session
+                    .bind_keyed_document_publication(publication)
+                    .expect("bind exact publication");
+                session
             }
-            .expect("begin write"),
-        );
+            None => {
+                begin_for_test(lease, catalog_properties(), begin_request()).expect("begin write")
+            }
+        };
         Fixture { session, recorded }
     }
 
@@ -2589,10 +2124,8 @@ pub(crate) mod tests {
             group,
             || {},
         );
-        let session = Arc::new(
-            ConnectorWriteSession::begin(lease, catalog_properties(), begin_request())
-                .expect("begin write"),
-        );
+        let session =
+            begin_for_test(lease, catalog_properties(), begin_request()).expect("begin write");
         Fixture { session, recorded }
     }
 
@@ -2940,7 +2473,9 @@ pub(crate) mod tests {
         session: &Arc<ConnectorWriteSession>,
     ) -> Arc<TerminalCredentialAccounting> {
         let accounting = Arc::new(TerminalCredentialAccounting::default());
-        session.retain_terminal_storage_resolver(accounting.retain_capability());
+        session
+            .retain_computation_storage_resolver(accounting.retain_capability())
+            .unwrap();
         accounting.finalize();
         accounting
     }
@@ -3003,60 +2538,46 @@ pub(crate) mod tests {
         }
     }
 
-    fn completion(
-        session: &Arc<ConnectorWriteSession>,
-        row_count: u64,
-    ) -> crate::query_execution::outcome::ConnectorWriteSessionCompletion {
-        crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
-            Arc::clone(session),
-            DecodedPreparedWriteSet::for_test(row_count, Vec::new()),
-        )
-    }
-
-    #[test]
-    fn affected_rows_are_reported_only_after_a_known_successful_commit() {
-        let fixture = fixture_with_outcome(1, 16, known_committed());
-        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
-            .expect("finish");
-
-        assert_eq!(committed.affected_rows(), Some(7));
-        assert_eq!(fixture.session.finish_invocations(), 1);
-        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
-    }
-
     #[test]
     fn logical_row_projection_uses_provider_effect_without_committing_or_changing_affected_rows() {
         use novarocks_spi::connector::write_stack::ConnectorWriteRowChange;
         let fixture = fixture_with_outcome(1, 16, known_committed());
-        let completion = completion(&fixture.session, 1);
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(1, Vec::new()))
+            .unwrap();
         fixture.recorded.lock().unwrap().row_change = Some(Some(ConnectorWriteRowChange::Delta {
             inserted: 1,
             deleted: 0,
         }));
         assert_eq!(
-            completion
-                .logical_rows_after_write(Some(2), &request_context())
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
                 .unwrap(),
             Some(3)
         );
-        assert_eq!(completion.row_count(), 1);
+        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 1);
         assert_eq!(fixture.session.finish_invocations(), 0);
         fixture.recorded.lock().unwrap().row_change = Some(None);
         assert_eq!(
-            completion
-                .logical_rows_after_write(Some(2), &request_context())
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
                 .unwrap(),
             None
         );
         fixture.recorded.lock().unwrap().row_change = None;
         assert!(
-            completion
-                .logical_rows_after_write(Some(2), &request_context())
+            fixture
+                .session
+                .logical_rows_after_received_write(Some(2), &request_context())
                 .is_err()
         );
         assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 3);
-        let committed = finish_write_session(completion, request_context()).unwrap();
-        assert_eq!(committed.affected_rows(), Some(1));
+        let completed = fixture.session.publish_for_test(request_context()).unwrap();
+        assert!(matches!(completed, novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { .. }));
+        assert_eq!(fixture.recorded.lock().unwrap().finish_rows, 1);
         assert_eq!(fixture.session.finish_invocations(), 1);
     }
 
@@ -3109,13 +2630,7 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .session
-                .accumulate(DecodedPreparedWriteSet::for_test(1, Vec::new()))
-                .is_err()
-        );
-        assert!(
-            fixture
-                .session
-                .finish_accumulated(request_context())
+                .receive_for_test(DecodedPreparedWriteSet::for_test(1, Vec::new()))
                 .is_err()
         );
         assert!(fixture.session.lock_terminal().unwrap().is_none());
@@ -3123,6 +2638,13 @@ pub(crate) mod tests {
             .session
             .prepare_finish_call(request_context())
             .unwrap();
+        assert!(
+            fixture
+                .session
+                .prepare_finish_call(request_context())
+                .is_err()
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
         {
             let input = fixture.session.publication_input.lock().unwrap();
             assert!(Arc::ptr_eq(&received, &input.as_ref().unwrap().received));
@@ -3151,7 +2673,7 @@ pub(crate) mod tests {
             let target = WriteTargetOrdinal::try_new(0).unwrap();
             fixture
                 .session
-                .accumulate(DecodedPreparedWriteSet::for_test(
+                .receive_for_test(DecodedPreparedWriteSet::for_test(
                     1,
                     vec![(target, commit_fragment_bytes())],
                 ))
@@ -3218,7 +2740,7 @@ pub(crate) mod tests {
         let target = WriteTargetOrdinal::try_new(0).unwrap();
         fixture
             .session
-            .accumulate(
+            .receive_for_test(
                 DecodedPreparedWriteSet::for_test_with_statistics(
                     1,
                     vec![(target, commit_fragment_bytes())],
@@ -3259,7 +2781,7 @@ pub(crate) mod tests {
         let target = WriteTargetOrdinal::try_new(0).unwrap();
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 1,
                 vec![(target, commit_fragment_bytes())],
             ))
@@ -3324,7 +2846,7 @@ pub(crate) mod tests {
         fixture.recorded.lock().unwrap().retain_decoded_payload = true;
         fixture
             .session
-            .accumulate(
+            .receive_for_test(
                 DecodedPreparedWriteSet::for_test(1, vec![(target, encoded)])
                     .with_test_capacity(&binding),
             )
@@ -3370,40 +2892,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_commit_unknown_outcome_reports_no_affected_rows() {
-        // The rows were accepted by every writer, so the count is known -- but
-        // whether they became visible is not, and reporting success here would
-        // tell a client about rows that may not exist.
-        let fixture = fixture_with_outcome(1, 16, commit_unknown());
-        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
-            .expect("finish");
-
-        assert!(committed.affected_rows().is_none());
-        assert!(matches!(
-            committed.into_outcome(),
-            ExternalMutationOutcome::CommitUnknown { .. }
-        ));
-        assert_eq!(fixture.session.finish_invocations(), 1);
-    }
-
-    #[test]
-    fn a_known_uncommitted_commit_reports_no_affected_rows() {
-        let fixture = fixture(1, 16);
-        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
-            .expect("finish");
-
-        assert!(committed.affected_rows().is_none());
-        assert!(matches!(
-            committed.into_outcome(),
-            ExternalMutationOutcome::KnownUncommitted { .. }
-        ));
-    }
-
-    #[test]
     fn ordinary_begin_finishes_without_an_application_publication() {
         let fixture = fixture_with_statistics(1);
 
-        let _ = fixture.session.finish(empty_prepared(), request_context());
+        let _ = fixture
+            .session
+            .publish_prepared_for_test(empty_prepared(), request_context());
 
         assert_eq!(
             fixture.recorded.lock().expect("recorded").publication,
@@ -3424,7 +2918,7 @@ pub(crate) mod tests {
 
         fixture
             .session
-            .finish(empty_prepared(), request_context())
+            .publish_prepared_for_test(empty_prepared(), request_context())
             .expect("finish");
 
         assert_eq!(
@@ -3473,13 +2967,9 @@ pub(crate) mod tests {
             declaration
         );
         assert!(!session.metadata_only_publication);
-        assert!(
-            session
-                .finish_empty_metadata_only_publication(request_context())
-                .is_err()
-        );
+        assert!(session.publish_for_test(request_context()).is_err());
         assert_eq!(recorded.lock().unwrap().finish, 0);
-        session.accumulate(empty_prepared()).unwrap();
+        session.receive_for_test(empty_prepared()).unwrap();
         session
             .bind_keyed_document_publication(publication.clone())
             .unwrap();
@@ -3488,7 +2978,7 @@ pub(crate) mod tests {
                 .bind_keyed_document_publication(publication)
                 .is_err()
         );
-        session.finish_accumulated(request_context()).unwrap();
+        session.publish_for_test(request_context()).unwrap();
         let recorded = recorded.lock().unwrap();
         assert_eq!(recorded.begin, 1);
         assert_eq!(recorded.begin_async, 1);
@@ -3528,11 +3018,7 @@ pub(crate) mod tests {
             declaration
         );
         assert!(session.metadata_only_publication);
-        assert!(
-            session
-                .finish_empty_metadata_only_publication(request_context())
-                .is_err()
-        );
+        assert!(session.publish_for_test(request_context()).is_err());
         assert_eq!(
             recorded.lock().unwrap().finish,
             0,
@@ -3541,9 +3027,7 @@ pub(crate) mod tests {
         session
             .bind_keyed_document_publication(publication)
             .unwrap();
-        session
-            .finish_empty_metadata_only_publication(request_context())
-            .unwrap();
+        session.publish_for_test(request_context()).unwrap();
         let recorded = recorded.lock().unwrap();
         assert_eq!(recorded.begin_async, 1);
         assert_eq!(recorded.begin_declaration, Some(declaration));
@@ -3632,7 +3116,7 @@ pub(crate) mod tests {
         let (declaration, publication) = application_document_publication();
         let expected = ConnectorWriteFinishPublication::KeyedDocuments(publication.clone());
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
-        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+        let session = begin_pending_for_test(
             lease,
             catalog_properties(),
             application_document_begin_request(declaration),
@@ -3640,13 +3124,13 @@ pub(crate) mod tests {
         .expect("begin pending application-document publication");
 
         session
-            .accumulate(empty_prepared())
+            .receive_for_test(empty_prepared())
             .expect("execution result");
         session
             .bind_keyed_document_publication(publication)
             .expect("bind exact publication");
         session
-            .finish_accumulated(request_context())
+            .publish_for_test(request_context())
             .expect("finish bound publication");
 
         let recorded = recorded.lock().expect("recorded");
@@ -3659,7 +3143,7 @@ pub(crate) mod tests {
     fn pending_application_publication_refuses_finish_before_provider_invocation() {
         let (declaration, publication) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
-        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+        let session = begin_pending_for_test(
             lease,
             catalog_properties(),
             application_document_begin_request(declaration),
@@ -3667,7 +3151,7 @@ pub(crate) mod tests {
         .expect("begin pending application-document publication");
 
         let error = session
-            .finish(empty_prepared(), request_context())
+            .publish_prepared_for_test(empty_prepared(), request_context())
             .expect_err("pending publication must not finish");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(session.finish_invocations(), 0);
@@ -3677,7 +3161,7 @@ pub(crate) mod tests {
             .bind_keyed_document_publication(publication)
             .expect("failed finish must leave publication bindable");
         session
-            .finish_accumulated(request_context())
+            .publish_for_test(request_context())
             .expect("finish after bind");
         assert_eq!(recorded.lock().expect("recorded").finish, 1);
     }
@@ -3686,7 +3170,7 @@ pub(crate) mod tests {
     fn application_document_publication_rejects_a_second_bind() {
         let (declaration, publication) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
-        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+        let session = begin_pending_for_test(
             lease,
             catalog_properties(),
             application_document_begin_request(declaration),
@@ -3709,7 +3193,7 @@ pub(crate) mod tests {
         let (declaration, publication) = application_document_publication();
         let (_, other_publication) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
-        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+        let session = begin_pending_for_test(
             lease,
             catalog_properties(),
             application_document_begin_request(declaration),
@@ -3746,7 +3230,7 @@ pub(crate) mod tests {
         let (declaration, _) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
 
-        let error = ConnectorWriteSession::begin(
+        let error = begin_for_test(
             lease,
             catalog_properties(),
             application_document_begin_request(declaration),
@@ -3762,17 +3246,11 @@ pub(crate) mod tests {
 
     #[test]
     fn application_document_begin_rejects_an_ordinary_flavor_before_provider_begin() {
-        let (_, publication) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
 
-        let error = ConnectorWriteSession::begin_with_finish_publication(
-            lease,
-            catalog_properties(),
-            begin_request(),
-            publication,
-        )
-        .err()
-        .expect("publication intent must require an application-document flavor");
+        let error = begin_pending_for_test(lease, catalog_properties(), begin_request())
+            .err()
+            .expect("publication intent must require an application-document flavor");
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         let recorded = recorded.lock().expect("recorded");
@@ -3784,13 +3262,9 @@ pub(crate) mod tests {
     fn pending_application_document_begin_rejects_an_ordinary_flavor_before_provider_begin() {
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
 
-        let error = ConnectorWriteSession::begin_pending_application_document_publication(
-            lease,
-            catalog_properties(),
-            begin_request(),
-        )
-        .err()
-        .expect("pending publication requires an application-document flavor");
+        let error = begin_pending_for_test(lease, catalog_properties(), begin_request())
+            .err()
+            .expect("pending publication requires an application-document flavor");
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         let recorded = recorded.lock().expect("recorded");
@@ -3799,24 +3273,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn application_document_begin_rejects_a_mismatched_intent_before_provider_begin() {
-        let (declaration, _) = application_document_publication();
+    fn application_document_pending_bind_rejects_a_mismatched_intent_without_finishing() {
+        let (declaration, publication) = application_document_publication();
         let (_, other_publication) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
-
-        let error = ConnectorWriteSession::begin_with_finish_publication(
+        let session = begin_pending_for_test(
             lease,
             catalog_properties(),
             application_document_begin_request(declaration),
-            other_publication,
         )
-        .err()
-        .expect("publication intent must match the exact begin declaration");
-
+        .unwrap();
+        let error = session
+            .bind_keyed_document_publication(other_publication)
+            .expect_err("publication intent must match the exact begin declaration");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        let recorded = recorded.lock().expect("recorded");
-        assert_eq!(recorded.begin, 0);
-        assert_eq!(recorded.finish, 0);
+        assert_eq!(recorded.lock().expect("recorded").begin, 1);
+        assert_eq!(recorded.lock().expect("recorded").finish, 0);
+        session
+            .bind_keyed_document_publication(publication)
+            .expect("mismatched intent leaves the exact bind available");
     }
 
     #[test]
@@ -3852,8 +3327,7 @@ pub(crate) mod tests {
             known_committed(),
             Arc::new(RefusingEncoder(original.clone())),
         );
-        let session =
-            ConnectorWriteSession::begin(lease, catalog_properties(), begin_request()).unwrap();
+        let session = begin_for_test(lease, catalog_properties(), begin_request()).unwrap();
         let payload_error = session
             .encode_writer_handle_payload(session.targets()[0].handle())
             .expect_err("actual provider encoder refuses the payload");
@@ -3881,7 +3355,7 @@ pub(crate) mod tests {
             }
         }
         session
-            .abort(request_context())
+            .abort_for_test(request_context())
             .expect("abort the same unstarted write session");
         assert_eq!(recorded.lock().unwrap().abort, 1);
     }
@@ -3917,7 +3391,9 @@ pub(crate) mod tests {
         assert_eq!(fixture.session.finish_invocations(), 0);
 
         let prepared = empty_prepared();
-        let _ = fixture.session.finish(prepared, request_context());
+        let _ = fixture
+            .session
+            .publish_prepared_for_test(prepared, request_context());
         assert_eq!(fixture.session.finish_invocations(), 1);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
 
@@ -3925,7 +3401,7 @@ pub(crate) mod tests {
         // asked again.
         let error = fixture
             .session
-            .abort(request_context())
+            .abort_for_test(request_context())
             .expect_err("abort after commit");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(fixture.recorded.lock().expect("recorded").abort, 0);
@@ -3971,16 +3447,14 @@ pub(crate) mod tests {
         root.owner.complete();
         root.business.release();
         assert_eq!(capacity.snapshot().held_positions[2], 1);
-        let _ = fixture
-            .session
-            .finish_accumulated(request_context())
-            .unwrap();
+        let _ = fixture.session.publish_for_test(request_context()).unwrap();
         assert_eq!(
             fixture.recorded.lock().unwrap().decoded_fragments,
             1,
             "publication cannot decode again"
         );
         assert_eq!(fixture.session.finish_invocations(), 1);
+        drop(fixture);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
@@ -4049,11 +3523,11 @@ pub(crate) mod tests {
 
         let outcome = fixture
             .session
-            .finish(committable, request_context())
+            .publish_prepared_for_test(committable, request_context())
             .expect("finish reaches the connector");
         assert!(matches!(
             outcome,
-            ExternalMutationOutcome::KnownUncommitted { .. }
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted { .. }
         ));
         assert_eq!(fixture.session.finish_invocations(), 1);
     }
@@ -4087,7 +3561,7 @@ pub(crate) mod tests {
         for path in ["s3://b/a.parquet", "s3://b/b.parquet"] {
             fixture
                 .session
-                .accumulate(
+                .receive_for_test(
                     DecodedPreparedWriteSet::for_test(4, vec![(target, fragment_bytes(path))])
                         .with_test_capacity(&binding),
                 )
@@ -4095,7 +3569,7 @@ pub(crate) mod tests {
         }
         let error = fixture
             .session
-            .accumulate(
+            .receive_for_test(
                 DecodedPreparedWriteSet::for_test(
                     4,
                     vec![(target, fragment_bytes("s3://b/c.parquet"))],
@@ -4113,8 +3587,9 @@ pub(crate) mod tests {
         root.owner.complete();
         root.business.release();
         assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
-        let _ = fixture.session.finish_accumulated(request_context());
+        let _ = fixture.session.publish_for_test(request_context());
         assert_eq!(fixture.session.finish_invocations(), 1);
+        drop(fixture);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
@@ -4125,14 +3600,14 @@ pub(crate) mod tests {
 
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 4,
                 vec![(target, fragment_bytes("s3://b/a.parquet"))],
             ))
             .expect("first query");
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 6,
                 vec![
                     (target, fragment_bytes("s3://b/b.parquet")),
@@ -4150,7 +3625,7 @@ pub(crate) mod tests {
         );
         assert_eq!(fixture.session.finish_invocations(), 0);
 
-        let _ = fixture.session.finish_accumulated(request_context());
+        let _ = fixture.session.publish_for_test(request_context());
         // One commit for the whole statement, not one per query.
         assert_eq!(fixture.session.finish_invocations(), 1);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
@@ -4164,7 +3639,7 @@ pub(crate) mod tests {
         fixture.recorded.lock().unwrap().expected_finish_capacity = Some(capacity.clone());
         fixture
             .session
-            .accumulate(
+            .receive_for_test(
                 DecodedPreparedWriteSet::for_test(
                     7,
                     vec![(
@@ -4180,9 +3655,10 @@ pub(crate) mod tests {
         assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         fixture
             .session
-            .finish_accumulated(request_context())
+            .publish_for_test(request_context())
             .expect("provider callback returned");
         assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        drop(fixture);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
@@ -4191,7 +3667,7 @@ pub(crate) mod tests {
         let fixture = fixture_with_statistics(2);
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+            .receive_for_test(DecodedPreparedWriteSet::for_test_with_statistics(
                 4,
                 Vec::new(),
                 vec![statistics_artifact(0, 1, b"zero")],
@@ -4199,14 +3675,14 @@ pub(crate) mod tests {
             .expect("first query statistics");
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+            .receive_for_test(DecodedPreparedWriteSet::for_test_with_statistics(
                 6,
                 Vec::new(),
                 vec![statistics_artifact(1, 2, b"one")],
             ))
             .expect("second query statistics");
 
-        let _ = fixture.session.finish_accumulated(request_context());
+        let _ = fixture.session.publish_for_test(request_context());
         let recorded = fixture.recorded.lock().expect("recorded");
         assert_eq!(recorded.finish, 1);
         assert_eq!(recorded.statistics.len(), 2);
@@ -4221,7 +3697,7 @@ pub(crate) mod tests {
         let fixture = fixture_with_statistics(1);
         let error = fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+            .receive_for_test(DecodedPreparedWriteSet::for_test_with_statistics(
                 9,
                 Vec::new(),
                 vec![statistics_artifact(0, 99, b"foreign")],
@@ -4238,13 +3714,13 @@ pub(crate) mod tests {
 
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+            .receive_for_test(DecodedPreparedWriteSet::for_test_with_statistics(
                 3,
                 Vec::new(),
                 vec![statistics_artifact(0, 1, b"valid")],
             ))
             .expect("valid set after rejection");
-        let _ = fixture.session.finish_accumulated(request_context());
+        let _ = fixture.session.publish_for_test(request_context());
         let recorded = fixture.recorded.lock().expect("recorded");
         assert_eq!(recorded.statistics.len(), 1);
         assert_eq!(recorded.statistics[0].draft().body().as_ref(), b"valid");
@@ -4263,7 +3739,7 @@ pub(crate) mod tests {
         for _ in 0..2 {
             fixture
                 .session
-                .accumulate(DecodedPreparedWriteSet::for_test(
+                .receive_for_test(DecodedPreparedWriteSet::for_test(
                     0,
                     vec![(target, fragment.clone()); per_query],
                 ))
@@ -4275,7 +3751,7 @@ pub(crate) mod tests {
         );
         let error = fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 0,
                 vec![(target, fragment)],
             ))
@@ -4291,10 +3767,12 @@ pub(crate) mod tests {
     #[test]
     fn a_set_arriving_after_the_terminal_decision_is_refused() {
         let fixture = fixture(1, 16);
-        let _ = fixture.session.finish(empty_prepared(), request_context());
+        let _ = fixture
+            .session
+            .publish_prepared_for_test(empty_prepared(), request_context());
         let error = fixture
             .session
-            .accumulate(empty_prepared())
+            .receive_for_test(empty_prepared())
             .expect_err("accumulate after terminal");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(fixture.session.finish_invocations(), 1);
@@ -4303,9 +3781,12 @@ pub(crate) mod tests {
     #[test]
     fn reconcile_is_unreachable_until_a_commit_reported_an_unknown_outcome() {
         let fixture = fixture(1, 16);
-        let error = fixture
+        let mut call = fixture
             .session
-            .reconcile(evidence(), request_context())
+            .prepare_finish_call(request_context())
+            .unwrap();
+        let error = call
+            .start_reconciliation(evidence(), request_context())
             .expect_err("nothing to reconcile");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(fixture.recorded.lock().expect("recorded").reconcile, 0);
@@ -4327,15 +3808,26 @@ pub(crate) mod tests {
         assert_eq!(accounting.holds(), 1);
         assert!(!accounting.leases_cleared());
 
-        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(7, Vec::new()))
+            .unwrap();
+        let outcome = fixture
+            .session
+            .publish_for_test(request_context())
             .expect("finish");
-
-        assert_eq!(committed.affected_rows(), Some(7));
+        assert!(matches!(
+            outcome,
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { .. }
+        ));
+        assert_eq!(fixture.recorded.lock().unwrap().finish_rows, 7);
         assert_eq!(
             fixture.recorded.lock().expect("recorded").terminal_storage,
             Some(Ok(TABLE_PREFIX.to_string()))
         );
-        // The decision is made, so the credentials are not pinned any longer.
+        // The original publication input still belongs to the Session. Retire
+        // that real holder before observing the final credential release.
+        drop(fixture);
         assert_eq!(accounting.holds(), 0);
         assert!(accounting.leases_cleared());
     }
@@ -4347,51 +3839,52 @@ pub(crate) mod tests {
     fn a_following_terminal_action_keeps_vended_storage_until_its_context_drops() {
         let fixture = fixture_with_outcome(1, 16, known_committed());
         let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
-
-        let committed = finish_write_session_for_following_terminal_action(
-            completion(&fixture.session, 7),
-            request_context(),
-        )
-        .expect("seal write");
-        let (outcome, affected_rows, terminal_context) = committed.into_parts();
-
-        assert!(matches!(
-            outcome,
-            ExternalMutationOutcome::KnownCommitted { .. }
-        ));
-        assert_eq!(affected_rows, Some(7));
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(7, Vec::new()))
+            .unwrap();
+        // The scripted Provider returns this same retained capability through
+        // its real finalization getter; a following context is not an effect.
+        let provider_context = fixture.session.terminal_context(request_context()).unwrap();
+        fixture.recorded.lock().unwrap().finalization_context = Some(Ok(Some(provider_context)));
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .expect("seal write");
+        let completed = drain_call_for_test(&mut call).unwrap();
+        assert!(matches!(completed, novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { .. }));
+        let terminal_context = call
+            .existing_finalization_context()
+            .unwrap()
+            .expect("actual Provider finalization context")
+            .clone();
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finalization_context_reads,
+            1
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish_rows, 7);
+        drop(call);
+        let provider_context = {
+            let mut recorded = fixture.recorded.lock().unwrap();
+            recorded.finalization_context.take()
+        };
+        drop(provider_context);
+        // Leave the following context as the actual last capability holder.
+        drop(fixture);
         assert_eq!(
             probe_vended_storage(&terminal_context),
             Ok(TABLE_PREFIX.to_string())
         );
         assert_eq!(accounting.holds(), 1);
         assert!(!accounting.leases_cleared());
-
         drop(terminal_context);
-
         assert_eq!(accounting.holds(), 0);
         assert!(accounting.leases_cleared());
     }
 
     #[test]
-    fn an_implicit_empty_seal_rejects_an_ordinary_write() {
-        let fixture = fixture_with_outcome(1, 16, known_committed());
-
-        let error = match finish_empty_staged_create_write_for_following_terminal_action(
-            fixture.session.as_ref(),
-            request_context(),
-        ) {
-            Ok(_) => panic!("ordinary write cannot manufacture an empty staged-create seal"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(fixture.session.finish_invocations(), 0);
-    }
-
-    #[test]
     fn an_implicit_empty_seal_reaches_an_invisible_staged_create() {
-        let (lease, _) = unopened_fixture(1, 16, known_committed());
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
         let mut request = begin_request();
         request.flavor =
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
@@ -4401,23 +3894,18 @@ pub(crate) mod tests {
                 )
                 .expect("staged target handle"),
             );
-        let session = Arc::new(
-            ConnectorWriteSession::begin(lease, catalog_properties(), request)
-                .expect("begin staged write"),
-        );
+        let session =
+            begin_for_test(lease, catalog_properties(), request).expect("begin staged write");
 
-        let sealed = finish_empty_staged_create_write_for_following_terminal_action(
-            session.as_ref(),
-            request_context(),
-        )
-        .expect("seal provider-managed empty staged write");
-        let (outcome, affected_rows, _) = sealed.into_parts();
+        let outcome = session
+            .publish_for_test(request_context())
+            .expect("seal provider-managed empty staged write");
 
         assert!(matches!(
             outcome,
-            ExternalMutationOutcome::KnownCommitted { .. }
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { .. }
         ));
-        assert_eq!(affected_rows, Some(0));
+        assert_eq!(recorded.lock().unwrap().finish_rows, 0);
         assert_eq!(session.finish_invocations(), 1);
     }
 
@@ -4429,7 +3917,12 @@ pub(crate) mod tests {
         let fixture = fixture_with_outcome(1, 16, commit_unknown());
         let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
 
-        let _ = fixture.session.finish(empty_prepared(), request_context());
+        fixture.session.receive_for_test(empty_prepared()).unwrap();
+        let mut call = fixture
+            .session
+            .prepare_finish_call(request_context())
+            .unwrap();
+        futures::executor::block_on(std::future::poll_fn(|cx| call.poll_completed(cx)));
         assert_eq!(
             fixture.recorded.lock().expect("recorded").terminal_storage,
             Some(Ok(TABLE_PREFIX.to_string()))
@@ -4440,7 +3933,9 @@ pub(crate) mod tests {
         // Reconciliation reaches the provider with the same capability. This
         // fixture scripts no reconcile outcome, so the session stays
         // reconcilable and keeps holding.
-        let _ = fixture.session.reconcile(evidence(), request_context());
+        call.start_reconciliation(evidence(), request_context())
+            .unwrap();
+        futures::executor::block_on(std::future::poll_fn(|cx| call.poll_completed(cx)));
         assert_eq!(fixture.recorded.lock().expect("recorded").reconcile, 1);
         assert_eq!(
             fixture.recorded.lock().expect("recorded").terminal_storage,
@@ -4456,7 +3951,10 @@ pub(crate) mod tests {
         let fixture = fixture(1, 16);
         let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
 
-        fixture.session.abort(request_context()).expect("abort");
+        fixture
+            .session
+            .abort_for_test(request_context())
+            .expect("abort");
 
         assert_eq!(
             fixture.recorded.lock().expect("recorded").terminal_storage,
@@ -4513,7 +4011,7 @@ pub(crate) mod tests {
         let target = WriteTargetOrdinal::try_new(0).unwrap();
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 7,
                 vec![(target, commit_fragment_bytes())],
             ))
@@ -4670,7 +4168,7 @@ pub(crate) mod tests {
         let fixture = fixture_with_outcome(1, 16, commit_unknown());
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 7,
                 vec![(
                     WriteTargetOrdinal::try_new(0).unwrap(),
@@ -4936,7 +4434,7 @@ pub(crate) mod tests {
         let target = WriteTargetOrdinal::try_new(0).unwrap();
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 7,
                 vec![(target, commit_fragment_bytes())],
             ))
@@ -5145,7 +4643,7 @@ pub(crate) mod tests {
         let session_receiving = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&session_receiving));
         receiving.claim().unwrap();
-        receiving.install_input(lease, catalog_properties(), false);
+        receiving.install_input(lease, catalog_properties());
         let control = receiving.control();
         receiving.enter_factory();
         let mut child = control.begin_cow_write_checked_async(begin_request(), original);
@@ -5193,7 +4691,7 @@ pub(crate) mod tests {
         let slot = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&slot));
         receiving.claim().unwrap();
-        receiving.install_input(lease, catalog_properties(), false);
+        receiving.install_input(lease, catalog_properties());
         let control = receiving.control();
         receiving.enter_factory();
         let mut child = control.begin_cow_write_checked_async(begin_request(), original);
@@ -5233,7 +4731,7 @@ pub(crate) mod tests {
         recorded.lock().unwrap().panic_begin_future_drop = true;
         let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
         receiving.claim().unwrap();
-        receiving.install_input(lease, catalog_properties(), false);
+        receiving.install_input(lease, catalog_properties());
         let control = receiving.control();
         receiving.enter_factory();
         // The same original control authors the typed stop failure.

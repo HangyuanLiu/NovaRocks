@@ -76,6 +76,8 @@ pub(crate) struct MetadataIoAdmission {
     original: Mutex<Option<Body>>,
     cleanup: Mutex<CleanupReceipt>,
 }
+type MetadataCleanupCompletion = (Result<(), ConnectorError>, Option<Box<dyn Any + Send>>);
+
 /// One fixed first-wins domain-failure receipt in the same Source. The
 /// original result/raw cause moves here before its request cell can be reused.
 #[derive(Default)]
@@ -235,9 +237,7 @@ impl RequestCell {
             root,
         }
     }
-    fn take_cleanup_completion(
-        &self,
-    ) -> Option<(Result<(), ConnectorError>, Option<Box<dyn Any + Send>>)> {
+    fn take_cleanup_completion(&self) -> Option<MetadataCleanupCompletion> {
         let mut slot = self.stream.lock().unwrap_or_else(|p| p.into_inner());
         let stream = slot.as_mut()?;
         if stream.reserved
@@ -806,7 +806,7 @@ impl MetadataIoAdmission {
                     result = Ok(true);
                 }
             }
-            let cells = body.cells.iter().cloned().collect::<Vec<_>>();
+            let cells = body.cells.to_vec();
             (result, cells, body.changed, body.reobserve)
         };
         // Restore original fields before nested credential/abort I/O can ask

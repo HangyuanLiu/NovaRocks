@@ -1714,7 +1714,7 @@ fn provider_constraint(
     }
     ConnectorReadConstraint::try_new(summary, filter.expression().clone(), assignments).map_err(
         |error| {
-            ProviderReadError::from(error).context(format!("read constraint cannot be offered"))
+            ProviderReadError::from(error).context("read constraint cannot be offered".to_string())
         },
     )
 }
@@ -1942,11 +1942,11 @@ fn request_control_for(
     let planning =
         ConnectorPlanningContext::try_from_request(context.clone().without_attempt_capabilities())
             .map_err(|error| {
-                ProviderReadError::from(error).context(format!("read planning context"))
+                ProviderReadError::from(error).context("read planning context".to_string())
             })?;
     factory
         .for_planning(&planning)
-        .map_err(|error| ProviderReadError::from(error).context(format!("read request control")))
+        .map_err(|error| ProviderReadError::from(error).context("read request control".to_string()))
 }
 
 #[async_trait]

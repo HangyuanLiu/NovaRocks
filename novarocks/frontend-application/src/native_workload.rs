@@ -143,6 +143,7 @@ pub(crate) struct NativeProcessCapacitySources {
     pub(crate) apply_records: usize,
     pub(crate) subscription_records: usize,
     pub(crate) transport: NativeTaskOperationCapacityFacts,
+    #[cfg(test)]
     pub(crate) physical: novarocks_native_adapter::native_transport_admission::AdmissionDimensions,
 }
 

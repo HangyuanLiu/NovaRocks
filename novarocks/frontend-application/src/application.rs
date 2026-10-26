@@ -368,7 +368,6 @@ struct FrontendExecutionRuntimeOwner {
     #[cfg(novarocks_dev_controls)]
     namespace: QueryProcessNamespace,
     native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
-    native_capacity_sources: crate::native_workload::FrontendNativeCapacitySources,
     clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     supervisor: LogicalExecutionSupervisor,
@@ -383,7 +382,8 @@ struct FrontendExecutionRuntimeOwner {
     query_blocking: QueryBlockingExecutorOwner,
     query_blocking_executor: QueryBlockingExecutor,
     internal_result_cpu: InternalResultCpuOwner,
-    internal_result_cpu_runtime: InternalResultCpu,
+    /// The original strong pool capability outlives the worker owner.
+    _retained_internal_result_cpu_runtime: InternalResultCpu,
     /// The complete result-window profile, installed before readiness.
     /// Statements take windows through admission; closing deliveries take
     /// their separate positions here.
@@ -552,7 +552,6 @@ impl FrontendExecutionRuntimeOwner {
         );
         Ok(Self {
             native_capacity_profile,
-            native_capacity_sources,
             #[cfg(novarocks_dev_controls)]
             namespace,
             clock,
@@ -569,7 +568,7 @@ impl FrontendExecutionRuntimeOwner {
             query_blocking,
             query_blocking_executor,
             internal_result_cpu,
-            internal_result_cpu_runtime,
+            _retained_internal_result_cpu_runtime: internal_result_cpu_runtime,
             result_capacity,
             terminal_error: None,
             shutdown_complete: false,
@@ -807,10 +806,6 @@ impl FrontendExecutionRuntimeOwner {
 
     fn query_blocking_executor(&self) -> QueryBlockingExecutor {
         self.query_blocking_executor.clone()
-    }
-
-    fn internal_result_cpu(&self) -> InternalResultCpu {
-        self.internal_result_cpu_runtime.clone()
     }
 
     fn is_shutdown_complete(&self) -> bool {

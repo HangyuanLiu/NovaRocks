@@ -21,15 +21,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::mv::domain::application::{MvRefreshRequest, MvShowStatement};
+use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::refresh::planning::RefreshPlanContract;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-
-#[derive(Clone, Debug)]
-pub struct ListMvsRequest {
-    pub stmt: MvShowStatement,
-    pub current_catalog: Option<String>,
-}
 
 #[derive(Clone, Debug)]
 #[allow(

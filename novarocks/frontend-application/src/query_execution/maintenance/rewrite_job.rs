@@ -1376,7 +1376,7 @@ fn project_rewrite_publication(
             .as_ref()
             .map(|error| receive_connector_failure(failure_receiving, error)),
     };
-    let disposition = publication.disposition().or_else(|| {
+    let disposition = publication.disposition().or({
         match (&publication.outcome, &publication.abort_outcome) {
             (Some(Ok(ConnectorWritePublicationCompletion::KnownUncommitted { .. })), _) => {
                 Some(LakePublicationDisposition::KnownUncommitted)

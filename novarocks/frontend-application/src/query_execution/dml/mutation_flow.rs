@@ -6637,29 +6637,26 @@ mod tests {
             ),
             || {},
         );
-        let session = Arc::new(
-            ConnectorWriteSession::begin(
-                lease,
-                row_mutation_catalog_properties(),
-                novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
-                    table: Arc::from("db1.t"),
-                    target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                    intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-                    purpose:
-                        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                    input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                        fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                            arrow::datatypes::Field::new("v", DataType::Int64, true),
-                        )],
-                    },
-                    base: None,
-                    flavor:
-                        novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
-                    context: connector_context_for_test(),
+        let session = crate::query_execution::write_session::tests::begin_for_test(
+            lease,
+            row_mutation_catalog_properties(),
+            novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+                table: Arc::from("db1.t"),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+                purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                    fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                        arrow::datatypes::Field::new("v", DataType::Int64, true),
+                    )],
                 },
-            )
-            .expect("begin row-mutation write session"),
-        );
+                base: None,
+                flavor:
+                    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+                context: connector_context_for_test(),
+            },
+        )
+        .expect("begin row-mutation write session");
         RowMutationSessionFixture { session, calls }
     }
 

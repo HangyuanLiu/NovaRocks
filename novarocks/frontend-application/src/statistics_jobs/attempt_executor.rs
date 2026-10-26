@@ -47,7 +47,7 @@ use novarocks_spi::connector::{
 /// only a logical target and physical object ID; a current binding, its data
 /// version, and schema columns are attempt-local facts.
 #[derive(Clone)]
-pub(crate) struct StatisticsAttemptExecutionPorts {
+pub struct StatisticsAttemptExecutorPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
     execution_role: novarocks_types::ClusterRole,
@@ -69,7 +69,11 @@ pub(crate) struct StatisticsAttemptExecutionPorts {
     runtime: tokio::runtime::Handle,
 }
 
-impl StatisticsAttemptExecutionPorts {
+impl StatisticsAttemptExecutorPorts {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit role-owned ANALYZE capabilities at composition."
+    )]
     pub(crate) fn new(
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -157,8 +161,8 @@ use crate::query_execution::{
     maintenance::io_admission::MetadataIoAdmission,
     statistics::preparation::{
         PreparedStatisticsComputationAssembly, StatisticsComputationPlanningServices,
-        StatisticsPreparationFailure, StatisticsPreparationJob, StatisticsPreparationOutcome,
-        prepare_statistics_computation_in,
+        StatisticsPreparationCells, StatisticsPreparationFailure, StatisticsPreparationJob,
+        StatisticsPreparationOutcome, prepare_statistics_computation_in,
     },
 };
 use novarocks_query_application::{
@@ -212,10 +216,10 @@ struct PlanSlot {
 }
 
 pub(crate) struct FrontendStatisticsAttemptExecutor {
-    ports: StatisticsAttemptExecutionPorts,
+    ports: StatisticsAttemptExecutorPorts,
 }
 impl FrontendStatisticsAttemptExecutor {
-    pub(crate) fn new(ports: StatisticsAttemptExecutionPorts) -> Self {
+    pub(crate) fn new(ports: StatisticsAttemptExecutorPorts) -> Self {
         Self { ports }
     }
     async fn execute_original(
@@ -457,7 +461,7 @@ impl CoreStatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
 // A concrete owned factory lets the original per-Root process-source quote
 // measure the actual Starting F before any job or MIO allocation exists.
 async fn execute_statistics_original(
-    ports: StatisticsAttemptExecutionPorts,
+    ports: StatisticsAttemptExecutorPorts,
     job: StatisticsJob,
     admission: StatisticsJobAdmission,
     progress: StatisticsJobProgress,
@@ -477,7 +481,7 @@ enum ActionPhase {
     Finished,
 }
 struct StatisticsState {
-    ports: StatisticsAttemptExecutionPorts,
+    ports: StatisticsAttemptExecutorPorts,
     root: WorkScope,
     execution: QueryExecutionContext,
     context: ConnectorRequestContext,
@@ -1240,7 +1244,7 @@ async fn begin_session(
 async fn prepare_plan(
     slot: Arc<tokio::sync::Mutex<PlanSlot>>,
     provider: Arc<FrontendCompletionCustody>,
-    ports: StatisticsAttemptExecutionPorts,
+    ports: StatisticsAttemptExecutorPorts,
     execution: QueryExecutionContext,
     context: ConnectorRequestContext,
     identity: crate::query_execution::statistics::StatisticsRelationIdentity,
@@ -1272,9 +1276,11 @@ async fn prepare_plan(
         planning,
         &stage,
         &provider,
-        custody,
-        job,
-        outcome,
+        StatisticsPreparationCells {
+            custody,
+            job,
+            outcome,
+        },
     )
     .await;
     match result {

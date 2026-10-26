@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use crate::native::fragment_encoder::frozen::tests as frozen_tests;
 use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticSinkTarget};
-use crate::query_execution::artifact::{FragmentId, NativePlacementAssignment};
+use crate::query_execution::artifact::{
+    FragmentId, NativePlacementAssignment, TaskManifestBinding,
+};
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use crate::task_execution::completion_facts::StageState;
 use crate::task_execution::lease::RenewSchedule;
@@ -71,7 +73,7 @@ use super::dispatch::OperationDispatcher;
 use super::error::{CapacityBound, TaskExecutionError};
 use super::execution::QueryTaskExecution;
 use super::graph::{
-    FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, TaskNode, build_task_graph,
+    FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskNode, build_task_graph_from_manifest,
 };
 use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
@@ -858,15 +860,12 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
         (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
         (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
     ];
-    let graph = build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution_id(),
-            FrontendProcessId::new_v7(),
-            &schedule,
-            &edges,
-            &processes,
-            TransportBudget::DEFAULT,
-        ),
+    let graph = build_protocol_graph(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
         &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(multicast_sink(leaf_targets)),
     )
     .expect("multicast graph");
@@ -903,17 +902,17 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
     assert_eq!(sink_edge_ids(&metadata[&leaves[1]]), expected);
 
     let mut moved = schedule.clone();
-    moved.by_fragment.get_mut(&MIDDLE_FRAGMENT).unwrap()[0].endpoint =
-        RuntimeEndpoint::new("127.0.0.9", 19099).expect("moved endpoint");
-    let moved_graph = build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution_id(),
-            FrontendProcessId::new_v7(),
-            &moved,
-            &edges,
-            &processes,
-            TransportBudget::DEFAULT,
-        ),
+    for placement in moved.by_fragment.values_mut().flatten() {
+        if placement.backend_idx == 1 {
+            placement.endpoint = RuntimeEndpoint::new("127.0.0.9", 19099).expect("moved endpoint");
+        }
+    }
+    let moved_graph = build_protocol_graph(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &moved,
+        &edges,
+        &processes,
         &mut FakePlans::new(&moved, &edges, 64).with_leaf_sink(multicast_sink(leaf_targets)),
     )
     .expect("moved graph");
@@ -939,15 +938,12 @@ fn router_route_positions_bind_their_actual_exchange_edge_ids() {
     let processes = backends(3);
     let schedule = chain_schedule(&[0], &[1]);
     let edges = multicast_edges();
-    let graph = build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution_id(),
-            FrontendProcessId::new_v7(),
-            &schedule,
-            &edges,
-            &processes,
-            TransportBudget::DEFAULT,
-        ),
+    let graph = build_protocol_graph(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
         &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(router_sink([
             (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
             (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
@@ -987,15 +983,12 @@ fn same_node_targets_bind_distinct_edges(router: bool) {
         stream_edge(LEAF_FRAGMENT, ROOT_FRAGMENT, 0),
     ];
     let targets = [(ROOT_FRAGMENT, 0), (MIDDLE_FRAGMENT, 0)];
-    let graph = build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution_id(),
-            FrontendProcessId::new_v7(),
-            &schedule,
-            &edges,
-            &processes,
-            TransportBudget::DEFAULT,
-        ),
+    let graph = build_protocol_graph(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
         &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(if router {
             router_sink(targets)
         } else {
@@ -1055,15 +1048,12 @@ fn static_sink_unknown_target_fragment_fails_closed() {
         stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
         stream_edge(LEAF_FRAGMENT, ROOT_FRAGMENT, 0),
     ];
-    let error = build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution_id(),
-            FrontendProcessId::new_v7(),
-            &schedule,
-            &edges,
-            &processes,
-            TransportBudget::DEFAULT,
-        ),
+    let error = build_protocol_graph(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
         &mut FakePlans::new(&schedule, &edges, 64)
             .with_leaf_sink(multicast_sink([(ROOT_FRAGMENT, 0), (99, 0)])),
     )
@@ -1096,21 +1086,49 @@ fn a_static_plan_over_the_descriptor_bound_is_refused_before_any_task_exists() {
     );
 }
 
+fn protocol_frozen_fragments(
+    schedule: &SchedulingPlan,
+    plans: &mut FakePlans<'_>,
+) -> Result<BTreeMap<FragmentId, Arc<FragmentArtifact>>, TaskExecutionError> {
+    let mut fragments = BTreeMap::new();
+    for &fragment in schedule.by_fragment.keys() {
+        fragments.insert(fragment, plans.take_plan(fragment, 0)?.fragment);
+    }
+    Ok(fragments)
+}
+
+fn build_protocol_graph(
+    execution: QueryExecutionId,
+    frontend: FrontendProcessId,
+    schedule: &SchedulingPlan,
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    processes: &BTreeMap<usize, BackendProcessId>,
+    plans: &mut FakePlans<'_>,
+) -> Result<TaskGraph, TaskExecutionError> {
+    let fragments = protocol_frozen_fragments(schedule, plans)?;
+    let manifest = TaskManifestBinding::protocol_fixture_for_test(
+        execution, frontend, schedule, edges, processes, fragments,
+    )
+    .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
+    let graph = build_task_graph_from_manifest(&manifest, plans, TransportBudget::DEFAULT);
+    // The graph now owns only its original per-task fragment aliases. The
+    // temporary fixture template must really retire before callers count them.
+    drop(manifest);
+    graph
+}
+
 fn build_graph(
     schedule: &SchedulingPlan,
     edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     processes: &BTreeMap<usize, BackendProcessId>,
     plan_bytes: usize,
 ) -> Result<TaskGraph, TaskExecutionError> {
-    build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution_id(),
-            FrontendProcessId::new_v7(),
-            schedule,
-            edges,
-            processes,
-            TransportBudget::DEFAULT,
-        ),
+    build_protocol_graph(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        schedule,
+        edges,
+        processes,
         &mut FakePlans::new(schedule, edges, plan_bytes),
     )
 }
@@ -1649,7 +1667,6 @@ fn every_destination_and_source_carries_both_addresses() {
 
 #[test]
 fn a_repeated_kernel_key_is_refused() {
-    let processes = backends(2);
     let mut schedule = chain_schedule(&[0, 1], &[1]);
     let leaf = schedule
         .by_fragment
@@ -1657,24 +1674,49 @@ fn a_repeated_kernel_key_is_refused() {
         .expect("the leaf fragment is placed");
     leaf[1].finst_id = leaf[0].finst_id;
 
-    let error = build_graph(&schedule, &chain_edges(), &processes, 512)
-        .expect_err("two tasks may not share one kernel key");
-    assert!(matches!(
-        error,
-        TaskExecutionError::KernelKeyCollision { .. }
-    ));
+    let error =
+        TaskManifestBinding::protocol_collision_for_test(leaf[0].finst_id, leaf[1].finst_id)
+            .expect_err("two tasks may not share one kernel key");
+    assert_eq!(
+        error.kind(),
+        crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation
+    );
+    assert!(
+        error
+            .message()
+            .contains("fragment-instance identity collision")
+    );
+    assert!(error.message().contains(&leaf[0].finst_id.to_string()));
 }
 
 #[test]
 fn a_scheduled_backend_without_a_frozen_process_identity_is_refused() {
-    let processes = backends(1);
+    let processes = backends(2);
     let schedule = chain_schedule(&[0, 1], &[0]);
-    let error = build_graph(&schedule, &chain_edges(), &processes, 512)
-        .expect_err("a placement needs a frozen backend process identity");
-    assert!(matches!(
-        error,
-        TaskExecutionError::UnknownBackend { backend_idx: 1 }
-    ));
+    let edges = chain_edges();
+    let fragments =
+        protocol_frozen_fragments(&schedule, &mut FakePlans::new(&schedule, &edges, 512))
+            .expect("original fragments");
+    let error = TaskManifestBinding::protocol_missing_backend_for_test(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
+        fragments,
+        1,
+    )
+    .expect_err("a placement needs a frozen backend process identity");
+    assert_eq!(
+        error.kind(),
+        crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation
+    );
+    assert!(
+        error
+            .message()
+            .contains("names backend process absent from the frozen endpoint snapshot")
+    );
+    assert!(error.message().contains(&processes[&1].to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -7992,15 +8034,12 @@ fn manifest_protocol_harness(execution: QueryExecutionId) -> Harness {
     let processes = backends(1);
     let schedule = chain_schedule(&[0], &[0]);
     let edges = chain_edges();
-    let graph = build_task_graph(
-        TaskGraphInputs::from_schedule(
-            execution,
-            FrontendProcessId::new_v7(),
-            &schedule,
-            &edges,
-            &processes,
-            TransportBudget::DEFAULT,
-        ),
+    let graph = build_protocol_graph(
+        execution,
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
         &mut FakePlans::new(&schedule, &edges, 64),
     )
     .expect("the caller execution builds one original graph");

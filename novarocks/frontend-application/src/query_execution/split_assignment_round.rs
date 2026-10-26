@@ -1077,9 +1077,11 @@ mod tests {
         AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransportError,
     };
 
+    type CapturedSplitUpdateRequest = (usize, usize, bool, u64, i32);
+
     #[derive(Default)]
     struct AcknowledgedSplitUpdates {
-        requests: Mutex<Vec<(usize, usize, bool, u64, i32)>>,
+        requests: Mutex<Vec<CapturedSplitUpdateRequest>>,
     }
     impl TaskUpdateTransport for AcknowledgedSplitUpdates {
         fn begin(

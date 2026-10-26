@@ -29,7 +29,6 @@ type CowPlanOutcome = Result<
 struct BeginInput {
     lease: ConnectorWriteStackLease,
     catalog_properties: novarocks_spi::connector::CatalogProperties,
-    staged: bool,
     finish_publication: WritePublicationState,
     metadata_only_publication: bool,
 }
@@ -105,20 +104,13 @@ impl WriteBeginReceiving {
         &self,
         lease: ConnectorWriteStackLease,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
-        staged: bool,
     ) {
-        self.install_publication_input(
-            lease,
-            catalog_properties,
-            staged,
-            WritePublicationState::Ordinary,
-        );
+        self.install_publication_input(lease, catalog_properties, WritePublicationState::Ordinary);
     }
     pub(super) fn install_publication_input(
         &self,
         lease: ConnectorWriteStackLease,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
-        staged: bool,
         finish_publication: WritePublicationState,
     ) {
         let metadata_only_publication = matches!(
@@ -135,7 +127,6 @@ impl WriteBeginReceiving {
         *slot = Some(BeginInput {
             lease,
             catalog_properties,
-            staged,
             finish_publication,
             metadata_only_publication,
         });
@@ -177,7 +168,6 @@ impl WriteBeginReceiving {
                     input.catalog_properties,
                     plan,
                     input.finish_publication,
-                    input.staged,
                     input.metadata_only_publication,
                 ));
                 Ok(session)

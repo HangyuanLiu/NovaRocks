@@ -136,7 +136,7 @@ pub enum MetadataMaintenanceDispatchState {
 /// invitation to dispatch the maintenance action again.
 #[derive(Clone, Debug)]
 pub enum ResolvedMetadataMaintenance {
-    KnownCommitted(CompletedMetadataMaintenance),
+    KnownCommitted(Box<CompletedMetadataMaintenance>),
     KnownUncommitted {
         failure: KnownUncommittedMetadataMaintenance,
         cleanup: ExternalMutationFinalization,
@@ -428,6 +428,7 @@ fn completed_projection(
 ) -> Result<CompletedMetadataMaintenance, String> {
     match result {
         ResolvedMetadataMaintenance::KnownCommitted(completed) => {
+            let completed = *completed;
             if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
                 Err(
                     EngineError::commit_known_committed_finalize_failed(failure.to_string())
@@ -855,12 +856,12 @@ fn project_terminal_without_cache(
             if let ExternalMutationFinalization::Failed(error) = &cleanup {
                 tracing::warn!(%error, "committed metadata maintenance retains incomplete cleanup");
             }
-            ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
+            ResolvedMetadataMaintenance::KnownCommitted(Box::new(CompletedMetadataMaintenance {
                 effect,
                 receipt,
                 finalization,
                 cleanup,
-            })
+            }))
         }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedMetadataMaintenance::KnownUncommitted {
@@ -1851,10 +1852,11 @@ mod tests {
         ));
         assert!(matches!(
             call.resolve(&finalizer).await,
-            ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
-                finalization: ExternalMutationFinalization::Failed(_),
-                ..
-            })
+            ResolvedMetadataMaintenance::KnownCommitted(completed)
+                if matches!(
+                    &completed.finalization,
+                    ExternalMutationFinalization::Failed(_)
+                )
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(finalizer.0.load(Ordering::SeqCst), 1);

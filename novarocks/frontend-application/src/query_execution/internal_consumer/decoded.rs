@@ -293,20 +293,19 @@ impl std::fmt::Debug for DecodedComputationConsumer {
     }
 }
 
+type DecodedConsumerParts = (
+    Arc<dyn InternalComputationConsumer>,
+    AttemptHandoffOfferPort,
+    Arc<Holder>,
+);
+
 fn construct(
     description: &FrozenExecutionDescription,
     plan: PlanSeal,
     domain: Domain,
     state: InternalDomainState,
     runtime: DecodedConsumerRuntime,
-) -> Result<
-    (
-        Arc<dyn InternalComputationConsumer>,
-        AttemptHandoffOfferPort,
-        Arc<Holder>,
-    ),
-    QueryExecutionError,
-> {
+) -> Result<DecodedConsumerParts, QueryExecutionError> {
     if description.finish_boundary() != ExecutionFinishBoundary::ComputationReady
         || description.effect() != ExecutionEffect::None
         || description.recovery() != RecoveryMode::NoRecovery

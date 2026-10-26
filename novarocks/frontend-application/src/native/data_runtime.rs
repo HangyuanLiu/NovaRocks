@@ -350,6 +350,7 @@ impl FrontendDataRuntime {
             apply_records: self.apply_send_port.installed_records()?,
             subscription_records: self.subscription_port.installed_records()?,
             transport: self.task_transport_supervisor.capacity_sources(),
+            #[cfg(test)]
             physical: self.transport_admission.dimensions(),
         })
     }

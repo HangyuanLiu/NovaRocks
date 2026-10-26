@@ -166,12 +166,14 @@ async fn prepare_refresh_inner(
                 source,
                 current_catalog,
                 current_database,
-                &plan.contract,
+                FirstRefreshTargetFacts {
+                    contract: &plan.contract,
+                    base_table_object_ids: &base_table_object_ids,
+                    repartition_transition: repartition_transition.as_ref(),
+                    retained_repartition_target: retained_repartition_target.as_ref(),
+                },
                 &request.attempt,
-                &base_table_object_ids,
                 observed_binding.clone(),
-                repartition_transition.as_ref(),
-                retained_repartition_target.as_ref(),
                 connector_context.clone(),
             )
             .await?;
@@ -529,20 +531,30 @@ async fn prepare_managed_repartition_transition(
     })
 }
 
+struct FirstRefreshTargetFacts<'contract, 'objects, 'transition, 'retained> {
+    contract: &'contract RefreshPlanContract,
+    base_table_object_ids: &'objects BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
+    repartition_transition: Option<&'transition PreparedManagedRepartitionTransition>,
+    retained_repartition_target: Option<&'retained RetainedRepartitionTarget>,
+}
+
 async fn prepare_frontend_first_refresh_write(
     io: &MvRefreshPreparationIo,
     captured: &mut CapturedPreparation,
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    contract: &RefreshPlanContract,
+    target_facts: FirstRefreshTargetFacts<'_, '_, '_, '_>,
     attempt: &MvRefreshAttemptIdentity,
-    base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     observed_binding: ConnectorProviderBindingKey,
-    repartition_transition: Option<&PreparedManagedRepartitionTransition>,
-    retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication), PreparationError> {
+    let FirstRefreshTargetFacts {
+        contract,
+        base_table_object_ids,
+        repartition_transition,
+        retained_repartition_target,
+    } = target_facts;
     captured.rewrite = None;
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
@@ -1076,6 +1088,10 @@ async fn prepare_metadata_only_publication(
     Ok((write, admitted))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This boundary retains the original owned publication target facts across asynchronous provenance observation before constructing the complete product intent."
+)]
 async fn mv_refresh_publication_intent(
     io: &MvRefreshPreparationIo,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
@@ -1332,12 +1348,14 @@ async fn prepare_frontend_incremental_write(
                 source,
                 current_catalog,
                 current_database,
-                contract,
+                FirstRefreshTargetFacts {
+                    contract,
+                    base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
+                    repartition_transition: None,
+                    retained_repartition_target: None,
+                },
                 attempt,
-                &rewrite.pinned_objects_by_occurrence()?,
                 observed_binding,
-                None,
-                None,
                 connector_context,
             )
             .await?;
@@ -1516,12 +1534,14 @@ async fn prepare_frontend_incremental_write(
                 source,
                 current_catalog,
                 current_database,
-                contract,
+                FirstRefreshTargetFacts {
+                    contract,
+                    base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
+                    repartition_transition: None,
+                    retained_repartition_target: None,
+                },
                 attempt,
-                &rewrite.pinned_objects_by_occurrence()?,
                 observed_binding,
-                None,
-                None,
                 connector_context,
             )
             .await?;

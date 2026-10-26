@@ -559,7 +559,7 @@ impl ScheduledCall {
                 self.connector.as_ref().unwrap().clone(),
                 self.completion.clone(),
             )
-            .map_err(|error| crate::query::product_command_service_error(error))?;
+            .map_err(crate::query::product_command_service_error)?;
             self.action = Some(Box::new(BackgroundMvAction(action)));
             self.initialized = true;
         }

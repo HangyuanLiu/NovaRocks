@@ -67,6 +67,11 @@ impl ClosedCreatorInput {
     }
 }
 
+type StatisticsReadCpuPorts = (
+    Arc<dyn StatisticsCpuPort>,
+    Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+);
+
 impl InternalResultCpu {
     /// Reuse the existing unqualified creator fixture only for linear custody
     /// and actual-exit tests; production always requires its bound source.
@@ -431,13 +436,7 @@ impl InternalResultCpu {
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<
-        (
-            Arc<dyn StatisticsCpuPort>,
-            Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
-        ),
-        WorkError,
-    > {
+    ) -> Result<StatisticsReadCpuPorts, WorkError> {
         if !window.is_for_scope(scope)
             || !matches!(
                 window.class(),

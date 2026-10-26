@@ -32,9 +32,7 @@ use novarocks_execution::task_execution::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
     OperationOutcome, QueryContextRef, RequestError, TaskOperationId, TaskState,
 };
-use novarocks_types::identity::{BackendProcessId, TaskId};
-
-use crate::query_execution::schedule::FragmentInstancePlacement;
+use novarocks_types::identity::BackendProcessId;
 
 /// Why a task-status subscription can no longer represent its frozen
 /// participant. Identity violations are not transport uncertainty and must
@@ -74,16 +72,6 @@ pub enum TaskExecutionError {
     Descriptor(DescriptorError),
     /// A request built from the static schedule is not a legal value.
     Request(RequestError),
-    /// A frozen backend process identity is missing for a scheduled backend.
-    UnknownBackend {
-        backend_idx: usize,
-    },
-    /// Two tasks of one query execution derive the same kernel key, so a
-    /// destination address would be ambiguous.
-    KernelKeyCollision {
-        first: TaskId,
-        second: TaskId,
-    },
     /// A capacity bound of the operation transport was reached.
     Capacity(CapacityBound),
     /// A locally queued operation reached its residence deadline before any
@@ -389,14 +377,6 @@ impl fmt::Display for TaskExecutionError {
                 formatter,
                 "task protocol request is not a legal value: {error}"
             ),
-            Self::UnknownBackend { backend_idx } => write!(
-                formatter,
-                "scheduled backend {backend_idx} has no frozen backend process identity"
-            ),
-            Self::KernelKeyCollision { first, second } => write!(
-                formatter,
-                "tasks {first} and {second} derive the same fragment instance id"
-            ),
             Self::Capacity(bound) => write!(formatter, "task protocol capacity bound: {bound}"),
             Self::QueueResidenceExpired {
                 operation_id,
@@ -514,17 +494,6 @@ impl From<CapacityBound> for TaskExecutionError {
     fn from(bound: CapacityBound) -> Self {
         Self::Capacity(bound)
     }
-}
-
-/// A schedule fact that names the placement it came from.
-pub(crate) fn schedule_error(
-    placement: &FragmentInstancePlacement,
-    detail: impl fmt::Display,
-) -> TaskExecutionError {
-    TaskExecutionError::Schedule(format!(
-        "fragment {} instance {}: {detail}",
-        placement.fragment_id, placement.instance_index
-    ))
 }
 
 /// FE-authored facts for ordinary Worker protocol verdicts. An originating

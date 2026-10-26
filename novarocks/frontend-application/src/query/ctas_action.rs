@@ -1773,7 +1773,7 @@ mod tests {
         let fixture = fixture::fixture_with_outcome(1, 16, actual);
         fixture
             .session
-            .accumulate(DecodedPreparedWriteSet::for_test(
+            .receive_for_test(DecodedPreparedWriteSet::for_test(
                 7,
                 vec![(
                     WriteTargetOrdinal::try_new(0).unwrap(),

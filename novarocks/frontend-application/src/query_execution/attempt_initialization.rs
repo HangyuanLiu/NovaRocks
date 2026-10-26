@@ -194,6 +194,9 @@ struct OpenedAttemptSource<O> {
     opened: O,
 }
 
+type AttemptSourceOpenOutcome<O> =
+    Result<Result<OpenedAttemptSource<O>, DistributedQueryError>, ConnectorBlockingIoError>;
+
 trait SerialAttemptInitialization: Send + Sized + 'static {
     type Ready: Send + 'static;
     type Recipe: Send + 'static;
@@ -213,12 +216,7 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
     fn poll_open_in(
         opening: &mut Self::Opening,
         cx: &mut std::task::Context<'_>,
-        outcome: &mut Option<
-            Result<
-                Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError>,
-                ConnectorBlockingIoError,
-            >,
-        >,
+        outcome: &mut Option<AttemptSourceOpenOutcome<Self::Opened>>,
     ) -> std::task::Poll<()>;
 
     fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError>;
@@ -300,12 +298,7 @@ struct InitializationProgress<S: SerialAttemptInitialization> {
     lifecycle: AttemptInitializationLifecycle,
     expected: Option<AttemptSourceIdentity>,
     opening: Option<S::Opening>,
-    outcome: Option<
-        Result<
-            Result<OpenedAttemptSource<S::Opened>, DistributedQueryError>,
-            ConnectorBlockingIoError,
-        >,
-    >,
+    outcome: Option<AttemptSourceOpenOutcome<S::Opened>>,
     close_job: Option<ConnectorBlockingIoJob<()>>,
     close_outcome: Option<Result<(), ConnectorBlockingIoError>>,
     failure: Option<DistributedQueryError>,
