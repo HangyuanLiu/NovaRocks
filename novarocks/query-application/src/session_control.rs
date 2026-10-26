@@ -350,6 +350,12 @@ pub trait QueryControlPort: Send + Sync + 'static {
         &self,
         statement: StatementToken,
     ) -> GovernedStatementVisibilitySealOutcome;
+    /// Internal same-source dispatch for the original SQL action's poll loan.
+    #[doc(hidden)]
+    fn seal_governed_statement_action_visibility(
+        &self,
+        request: &StatementActionVisibilityRequest<'_>,
+    ) -> GovernedStatementVisibilitySealOutcome;
     fn fail_governed_statement(&self, statement: StatementToken) -> GovernedStatementFinishOutcome;
     fn cancel_governed_statement(
         &self,
@@ -864,6 +870,77 @@ impl GovernedControlLink {
     }
 }
 
+/// A synchronous request borrowed only from the original SQL poll loan.
+/// Read-only access serves the trusted control implementation; neither an
+/// observer's Source alias nor a statement token can construct this request.
+#[doc(hidden)]
+pub struct StatementActionVisibilityRequest<'a> {
+    statement: StatementToken,
+    source: &'a Arc<StatementActionSource>,
+}
+impl StatementActionVisibilityRequest<'_> {
+    pub fn statement(&self) -> StatementToken {
+        self.statement
+    }
+
+    pub fn source(&self) -> &Arc<StatementActionSource> {
+        self.source
+    }
+}
+
+// This synchronous loan borrows the original owner's visibility fields. Its
+// registered form also borrows the exact Source; a scope or token alone cannot
+// construct it, and neither a Background owner nor a public view supplies it.
+struct StatementVisibilityLoan<'a> {
+    service: &'a GovernedControlLink,
+    token: StatementToken,
+    source: Option<&'a Arc<StatementActionSource>>,
+    finished: &'a bool,
+    accepted_delivery_cut: &'a Option<ResultClosingCut>,
+    cancellation: &'a CancellationView,
+    success_visibility_sealed: &'a mut bool,
+}
+impl StatementVisibilityLoan<'_> {
+    fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
+        if *self.finished {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        match self.accepted_delivery_cut {
+            Some(ResultClosingCut::OriginatingFailure) => {
+                return GovernedStatementVisibilitySealOutcome::Failed;
+            }
+            Some(ResultClosingCut::AcceptedCancellation) => {
+                return GovernedStatementVisibilitySealOutcome::Cancelled(
+                    self.cancellation
+                        .reason()
+                        .expect("accepted cancellation cut retains its reason"),
+                );
+            }
+            None => {}
+        }
+        if *self.success_visibility_sealed {
+            return GovernedStatementVisibilitySealOutcome::Sealed;
+        }
+        let outcome = match self.source {
+            Some(source) => self
+                .service
+                .port()
+                .seal_governed_statement_action_visibility(&StatementActionVisibilityRequest {
+                    statement: self.token,
+                    source,
+                }),
+            None => self
+                .service
+                .port()
+                .seal_governed_statement_visibility(self.token),
+        };
+        if outcome == GovernedStatementVisibilitySealOutcome::Sealed {
+            *self.success_visibility_sealed = true;
+        }
+        outcome
+    }
+}
+
 /// A synchronous borrow of one original action's existing root slots.
 /// This view owns no Work, result alias, registration, permit or authority;
 /// constructing it neither admits work nor manufactures a background root.
@@ -875,6 +952,7 @@ pub struct GovernedActionContext<'a> {
     timeout_ms: Option<u64>,
     result_window: Option<&'a ResultWindowAlias>,
     query_permit: Option<&'a mut Option<QueryConcurrencyPermit>>,
+    visibility: Option<StatementVisibilityLoan<'a>>,
 }
 
 impl<'a> GovernedActionContext<'a> {
@@ -892,6 +970,16 @@ impl<'a> GovernedActionContext<'a> {
             timeout_ms,
             result_window,
             query_permit: None,
+            visibility: None,
+        }
+    }
+
+    /// Seal only this original registered SQL action's visibility boundary.
+    /// A plain view or Background action has no statement visibility loan.
+    pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
+        match self.visibility.as_mut() {
+            Some(visibility) => visibility.seal_success_visibility(),
+            None => GovernedStatementVisibilitySealOutcome::Stale,
         }
     }
 
@@ -984,6 +1072,31 @@ impl GovernedQueryStatementOwner {
             result_window,
         )
         .with_query_permit(&mut self.query_concurrency)
+    }
+
+    // Only the SQL ActionBody in its original poll loan supplies this Source.
+    fn registered_action_context<'a>(
+        &'a mut self,
+        result_window: Option<&'a ResultWindowAlias>,
+        source: &'a Arc<StatementActionSource>,
+    ) -> GovernedActionContext<'a> {
+        GovernedActionContext {
+            scope: &self.scope,
+            execution_owner: &mut self.execution_owner,
+            cancellation: self.registration.cancellation(),
+            timeout_ms: self.timeout_ms,
+            result_window,
+            query_permit: Some(&mut self.query_concurrency),
+            visibility: Some(StatementVisibilityLoan {
+                service: &self.service,
+                token: self.registration.token(),
+                source: Some(source),
+                finished: &self.finished,
+                accepted_delivery_cut: &self.accepted_delivery_cut,
+                cancellation: self.registration.cancellation(),
+                success_visibility_sealed: &mut self.success_visibility_sealed,
+            }),
+        }
     }
 
     fn park_control_link(&mut self) {
@@ -1114,33 +1227,16 @@ impl GovernedQueryStatementOwner {
     /// Atomically wins the terminal success boundary against every later
     /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
-        if self.finished {
-            return GovernedStatementVisibilitySealOutcome::Stale;
+        StatementVisibilityLoan {
+            service: &self.service,
+            token: self.registration.token(),
+            source: None,
+            finished: &self.finished,
+            accepted_delivery_cut: &self.accepted_delivery_cut,
+            cancellation: self.registration.cancellation(),
+            success_visibility_sealed: &mut self.success_visibility_sealed,
         }
-        match self.accepted_delivery_cut {
-            Some(ResultClosingCut::OriginatingFailure) => {
-                return GovernedStatementVisibilitySealOutcome::Failed;
-            }
-            Some(ResultClosingCut::AcceptedCancellation) => {
-                return GovernedStatementVisibilitySealOutcome::Cancelled(
-                    self.cancellation()
-                        .reason()
-                        .expect("accepted cancellation cut retains its reason"),
-                );
-            }
-            None => {}
-        }
-        if self.success_visibility_sealed {
-            return GovernedStatementVisibilitySealOutcome::Sealed;
-        }
-        let outcome = self
-            .service
-            .port()
-            .seal_governed_statement_visibility(self.registration.token());
-        if outcome == GovernedStatementVisibilitySealOutcome::Sealed {
-            self.success_visibility_sealed = true;
-        }
-        outcome
+        .seal_success_visibility()
     }
 
     pub fn finish(mut self) -> GovernedStatementFinishOutcome {
@@ -1301,6 +1397,14 @@ impl QueryControlPort for TestQueryControlPort {
         &self,
         _statement: StatementToken,
     ) -> GovernedStatementVisibilitySealOutcome {
+        GovernedStatementVisibilitySealOutcome::Stale
+    }
+
+    fn seal_governed_statement_action_visibility(
+        &self,
+        _request: &StatementActionVisibilityRequest<'_>,
+    ) -> GovernedStatementVisibilitySealOutcome {
+        // This fixture does not publish or supervise SQL Actions.
         GovernedStatementVisibilitySealOutcome::Stale
     }
 

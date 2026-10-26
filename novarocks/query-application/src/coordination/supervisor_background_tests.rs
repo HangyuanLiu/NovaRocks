@@ -56,6 +56,11 @@ impl crate::session_control::GovernedBackgroundAction for BackgroundHostAction {
     ) -> Poll<Result<(), crate::session_error::QueryServiceError>> {
         assert!(owner.cancellation().is_for_scope(owner.scope()));
         assert!(owner.execution_owner_slot().is_some());
+        assert_eq!(
+            owner.seal_success_visibility(),
+            crate::session_control::GovernedStatementVisibilitySealOutcome::Stale,
+            "the original Background Root is not a SQL visibility authority"
+        );
         Poll::Ready(self.error.take().map_or(Ok(()), Err))
     }
     fn handoff_residual_in(

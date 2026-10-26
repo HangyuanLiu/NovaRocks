@@ -352,12 +352,13 @@ impl ActionBody {
     fn poll_action(
         &mut self,
         owner: &mut ActionOwner,
+        source: &Arc<StatementActionSource>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         match (self, owner) {
             (Self::Sql(action), ActionOwner::Sql(owner)) => {
                 let window = owner.result_window_alias();
-                let mut context = owner.action_context(window.as_ref());
+                let mut context = owner.registered_action_context(window.as_ref(), source);
                 action.poll_action(&mut context, cx)
             }
             (Self::Background(action), ActionOwner::Background(owner)) => owner
@@ -655,7 +656,7 @@ impl StatementActionSource {
             loan.action
                 .as_mut()
                 .unwrap()
-                .poll_action(loan.owner.as_mut().unwrap(), &mut cx)
+                .poll_action(loan.owner.as_mut().unwrap(), self, &mut cx)
         }));
         match result {
             Ok(Poll::Pending) => {

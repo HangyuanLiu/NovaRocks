@@ -195,6 +195,47 @@ impl QueryApplicationControl {
         QueryControlService::new(Arc::new(Self::default()))
     }
 
+    fn seal_statement_visibility(
+        &self,
+        statement: StatementToken,
+        source: Option<&Arc<crate::session_control::StatementActionSource>>,
+    ) -> GovernedStatementVisibilitySealOutcome {
+        let mut state = self.lock();
+        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        };
+        if entry.session_epoch != statement.session().session_epoch() {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        let Some(active) = entry.active.as_mut() else {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        };
+        if active.generation != statement.generation() {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        match (&active.action, source) {
+            (None, None) => {}
+            (Some(active), Some(source)) if Arc::ptr_eq(active, source) => {}
+            _ => return GovernedStatementVisibilitySealOutcome::Stale,
+        }
+        let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        };
+        if active.success_visibility_sealed {
+            return GovernedStatementVisibilitySealOutcome::Sealed;
+        }
+        match cancellation.success_sealer().seal() {
+            Ok(WorkSuccessSealOutcome::Sealed | WorkSuccessSealOutcome::AlreadySealed) => {
+                active.success_visibility_sealed = true;
+                GovernedStatementVisibilitySealOutcome::Sealed
+            }
+            Ok(WorkSuccessSealOutcome::Cancelled(reason)) => {
+                GovernedStatementVisibilitySealOutcome::Cancelled(reason)
+            }
+            Err(_) => GovernedStatementVisibilitySealOutcome::Stale,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, QueryControlState> {
         self.state
             .lock()
@@ -646,38 +687,14 @@ impl QueryControlPort for QueryApplicationControl {
         &self,
         statement: StatementToken,
     ) -> GovernedStatementVisibilitySealOutcome {
-        let mut state = self.lock();
-        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        };
-        if entry.session_epoch != statement.session().session_epoch() {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        }
-        let Some(active) = entry.active.as_mut() else {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        };
-        if active.generation != statement.generation() {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        }
-        if active.action.is_some() {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        }
-        let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        };
-        if active.success_visibility_sealed {
-            return GovernedStatementVisibilitySealOutcome::Sealed;
-        }
-        match cancellation.success_sealer().seal() {
-            Ok(WorkSuccessSealOutcome::Sealed | WorkSuccessSealOutcome::AlreadySealed) => {
-                active.success_visibility_sealed = true;
-                GovernedStatementVisibilitySealOutcome::Sealed
-            }
-            Ok(WorkSuccessSealOutcome::Cancelled(reason)) => {
-                GovernedStatementVisibilitySealOutcome::Cancelled(reason)
-            }
-            Err(_) => GovernedStatementVisibilitySealOutcome::Stale,
-        }
+        self.seal_statement_visibility(statement, None)
+    }
+
+    fn seal_governed_statement_action_visibility(
+        &self,
+        request: &crate::session_control::StatementActionVisibilityRequest<'_>,
+    ) -> GovernedStatementVisibilitySealOutcome {
+        self.seal_statement_visibility(request.statement(), Some(request.source()))
     }
 
     fn finish_governed_statement(
@@ -2187,6 +2204,272 @@ mod tests {
         }
         panic!("original statement scanner did not reach idle");
     }
+    #[test]
+    fn ordinary_action_views_cannot_seal_statement_visibility() {
+        use crate::session_control::GovernedActionContext;
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
+            .unwrap();
+        let scope = statement.scope().clone();
+        let cancellation = statement.cancellation().clone();
+        let window = statement.result_window_alias();
+        assert_eq!(
+            statement
+                .action_context(window.as_ref())
+                .seal_success_visibility(),
+            GovernedStatementVisibilitySealOutcome::Stale
+        );
+        let mut no_owner = None;
+        assert_eq!(
+            GovernedActionContext::new(&scope, &mut no_owner, &cancellation, None, None)
+                .seal_success_visibility(),
+            GovernedStatementVisibilitySealOutcome::Stale,
+            "a real same-Root scope is not a registered SQL visibility loan"
+        );
+        assert!(cancellation.reason().is_none());
+        assert_eq!(
+            statement.seal_success_visibility(),
+            GovernedStatementVisibilitySealOutcome::Sealed,
+            "the original unregistered protocol owner retains its existing seal"
+        );
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Completed
+        );
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
+    #[tokio::test]
+    async fn registered_action_visibility_loan_checks_source_and_preserves_cancel_order() {
+        use crate::session_control::{
+            GovernedActionContext, GovernedStatementAction, StatementActionValue,
+        };
+        use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        struct SealAction {
+            gate: futures::channel::oneshot::Receiver<()>,
+            outcomes: Arc<Mutex<Vec<GovernedStatementVisibilitySealOutcome>>>,
+        }
+        impl GovernedStatementAction for SealAction {
+            fn poll_action(
+                &mut self,
+                owner: &mut GovernedActionContext<'_>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
+                match std::pin::Pin::new(&mut self.gate).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(ready) => ready.expect("original seal gate"),
+                }
+                let outcome = owner.seal_success_visibility();
+                assert_eq!(owner.seal_success_visibility(), outcome);
+                self.outcomes.lock().unwrap().push(outcome.clone());
+                Poll::Ready(match outcome {
+                    GovernedStatementVisibilitySealOutcome::Sealed => Ok(StatementActionValue::Ok),
+                    GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
+                        Err(QueryServiceError::new(
+                            QueryServiceErrorKind::Interrupted,
+                            "test action stopped before visibility",
+                        ))
+                    }
+                    _ => panic!("same registered action has its original visibility loan"),
+                })
+            }
+        }
+        for cancel_first in [false, true] {
+            let (control, service, workload) = governed_control();
+            let session = register(&control, 7, 1, "root");
+            let foreign_session = register(&control, 9, 1, "root");
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
+            let mut owner = Some(
+                service
+                    .begin_governed_query_statement(
+                        session,
+                        &workload.root_admission(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            );
+            let token = owner.as_ref().unwrap().token();
+            let scope = owner.as_ref().unwrap().scope().clone();
+            let cancellation = owner.as_ref().unwrap().cancellation().clone();
+            let (release, gate) = futures::channel::oneshot::channel();
+            let outcomes = Arc::new(Mutex::new(Vec::new()));
+            let mut action: Option<Box<dyn GovernedStatementAction>> = Some(Box::new(SealAction {
+                gate,
+                outcomes: Arc::clone(&outcomes),
+            }));
+            let mut receiver = None;
+            service
+                .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            assert!(outcomes.lock().unwrap().is_empty());
+            let source = control.next_statement_action(None).unwrap().1.unwrap();
+            assert!(Arc::ptr_eq(
+                &source,
+                control.lock().sessions[&session.connection_id()]
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .action
+                    .as_ref()
+                    .unwrap(),
+            ));
+            assert_eq!(
+                control.seal_governed_statement_visibility(token),
+                GovernedStatementVisibilitySealOutcome::Stale,
+                "the old protocol ingress cannot seal a registered action"
+            );
+            let mut foreign_owner = Some(
+                service
+                    .begin_governed_query_statement(
+                        foreign_session,
+                        &workload.root_admission(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            );
+            let foreign_token = foreign_owner.as_ref().unwrap().token();
+            assert_eq!(
+                control.seal_statement_visibility(foreign_token, Some(&source)),
+                GovernedStatementVisibilitySealOutcome::Stale,
+                "an unbound statement cannot borrow another Source's qualification"
+            );
+            let (foreign_release, foreign_gate) = futures::channel::oneshot::channel();
+            let foreign_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut foreign_action: Option<Box<dyn GovernedStatementAction>> =
+                Some(Box::new(OriginalStatementGate {
+                    gate: foreign_gate,
+                    drops: Arc::clone(&foreign_drops),
+                }));
+            let mut foreign_receiver = None;
+            service
+                .publish_statement_action_in(
+                    &mut foreign_owner,
+                    &mut foreign_action,
+                    &mut foreign_receiver,
+                )
+                .unwrap()
+                .finish()
+                .unwrap();
+            let foreign_source = control.lock().sessions[&foreign_session.connection_id()]
+                .active
+                .as_ref()
+                .unwrap()
+                .action
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                control.seal_statement_visibility(token, Some(&foreign_source)),
+                GovernedStatementVisibilitySealOutcome::Stale,
+                "only the registry's exact original Source can seal"
+            );
+            for stale in [
+                StatementToken::new(
+                    SessionToken::new(session.connection_id(), session.session_epoch() + 1),
+                    token.generation(),
+                ),
+                StatementToken::new(session, token.generation() + 1),
+            ] {
+                assert_eq!(
+                    control.seal_statement_visibility(stale, Some(&source)),
+                    GovernedStatementVisibilitySealOutcome::Stale
+                );
+            }
+            assert!(
+                !control.lock().sessions[&session.connection_id()]
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .success_visibility_sealed
+            );
+            assert!(cancellation.reason().is_none());
+            drive_original_statement_actions(&slot);
+            assert!(outcomes.lock().unwrap().is_empty());
+            assert_eq!(workload.snapshot().root_responsibilities, 2);
+            if cancel_first {
+                assert_eq!(
+                    control
+                        .cancel_governed_statement(token, CancellationReason::Requested)
+                        .unwrap(),
+                    Some(WorkCancellationRequestOutcome::Requested)
+                );
+            }
+            release.send(()).unwrap();
+            drive_original_statement_actions(&slot);
+            let expected = if cancel_first {
+                GovernedStatementVisibilitySealOutcome::Cancelled(CancellationReason::Requested)
+            } else {
+                GovernedStatementVisibilitySealOutcome::Sealed
+            };
+            assert_eq!(*outcomes.lock().unwrap(), vec![expected.clone()]);
+            if !cancel_first {
+                assert_eq!(
+                    control.kill_query(session, 7),
+                    QueryCancelOutcome::NoActiveStatement
+                );
+                assert!(cancellation.reason().is_none());
+            }
+            let receipt = receiver.take().unwrap().await.unwrap();
+            let mut ready = None;
+            receipt
+                .take_ready_in(&mut ready)
+                .unwrap_or_else(|_| panic!("same original action receiver"))
+                .finish()
+                .unwrap();
+            let mut ready = ready.take().unwrap();
+            assert_eq!(ready.owner.token(), token);
+            assert_eq!(ready.owner.scope().id(), scope.id());
+            assert_eq!(ready.owner.seal_success_visibility(), expected);
+            assert_eq!(ready.result.is_err(), cancel_first);
+            assert_eq!(
+                ready.owner.finish(),
+                if cancel_first {
+                    GovernedStatementFinishOutcome::Cancelled(CancellationReason::Requested)
+                } else {
+                    GovernedStatementFinishOutcome::Completed
+                }
+            );
+            foreign_release.send(()).unwrap();
+            drive_original_statement_actions(&slot);
+            let mut ready = None;
+            foreign_receiver
+                .take()
+                .unwrap()
+                .await
+                .unwrap()
+                .take_ready_in(&mut ready)
+                .unwrap_or_else(|_| panic!("foreign original receiver"))
+                .finish()
+                .unwrap();
+            let ready = ready.take().unwrap();
+            assert!(ready.result.is_ok());
+            assert_eq!(
+                ready.owner.finish(),
+                GovernedStatementFinishOutcome::Completed
+            );
+            assert_eq!(foreign_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drive_original_statement_actions(&slot);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+            assert!(!slot.has_sources());
+        }
+    }
+
     #[tokio::test]
     async fn original_statement_source_keeps_owner_until_actual_action_drop_and_protocol_take() {
         let (control, service, workload) = governed_control();
