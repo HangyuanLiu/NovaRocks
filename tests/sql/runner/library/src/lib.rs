@@ -1791,6 +1791,7 @@ struct InflightPublicationServiceShell<'a> {
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
     original_deadline: Option<Instant>,
+    complete_deadline: Instant,
     query_timeout: u64,
     sql: String,
     db: Option<String>,
@@ -1810,6 +1811,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
         server_handle,
         session_config,
         original_deadline,
+        complete_deadline: _,
         query_timeout,
         sql,
         db,
@@ -1929,6 +1931,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         server_handle,
         session_config,
         original_deadline,
+        complete_deadline,
         query_timeout,
         sql,
         db,
@@ -1942,16 +1945,16 @@ fn execute_target_query_while_publication_service_holds_shell(
     let shell = format!("shell: {shell}");
     let shell_thread = std::thread::spawn(move || {
         let storage = std::env::var(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV).ok();
-        shell::execute_shell_step_observed(
+        shell::execute_shell_step_with_group_observation(
             &shell,
-            Some(deadline),
+            deadline,
+            complete_deadline,
             Some(&run_context),
             storage.as_deref(),
-            false,
-            Some(&writer_exit),
         )
     });
     if let Err(error) = hold.wait_until_held(deadline) {
+        writer_exit.store(false, Ordering::Release);
         let _ = hold.release();
         let _ = shell_thread.join();
         return (
@@ -1984,6 +1987,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         ),
     };
     if let Err(error) = hold.release() {
+        writer_exit.store(false, Ordering::Release);
         let retry = hold.release();
         let actual_exit = shell_thread.join().is_ok();
         return (
@@ -1994,9 +1998,14 @@ fn execute_target_query_while_publication_service_holds_shell(
             ),
         );
     }
-    let (shell_ok, _, shell_error) = match shell_thread.join() {
+    let shell_result = shell_thread.join();
+    // This exact Hold owns the companion request. Always observe its delegate
+    // outcome and actual method exit, even if the shell's 409 assertion failed.
+    let remote_exit = hold.wait_for_original_exit(deadline);
+    let ((shell_ok, _, shell_error), local_group_exit) = match shell_result {
         Ok(result) => result,
         Err(_) => {
+            writer_exit.store(false, Ordering::Release);
             return (
                 false,
                 None,
@@ -2004,6 +2013,13 @@ fn execute_target_query_while_publication_service_holds_shell(
             );
         }
     };
+    if !local_group_exit || remote_exit.is_err() {
+        writer_exit.store(false, Ordering::Release);
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_service_hold original local_group_exit={local_group_exit} remote_exit={remote_exit:?}"
+    );
     if !shell_ok {
         return (
             false,
@@ -2011,6 +2027,15 @@ fn execute_target_query_while_publication_service_holds_shell(
             format!(
                 "FAIL (runner service hold companion): {shell_error}; primary query: {}",
                 query_result.2
+            ),
+        );
+    }
+    if !local_group_exit || remote_exit.is_err() {
+        return (
+            false,
+            None,
+            format!(
+                "FAIL (runner service hold actual exit): local_group_exit={local_group_exit}; remote_exit={remote_exit:?}"
             ),
         );
     }
@@ -3155,6 +3180,7 @@ fn run_case_observed(
                             server_handle: &ctx.server_handle,
                             session_config: case_target_conn.clone(),
                             original_deadline: Some(step_deadline),
+                            complete_deadline: ctx.cleanup_deadline(),
                             query_timeout: ctx.query_timeout,
                             sql: step.sql.clone(),
                             db: step.meta.db.clone(),
