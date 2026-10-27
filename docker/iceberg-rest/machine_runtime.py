@@ -526,8 +526,20 @@ class MachineDocker(runtime.Docker):
             raise runtime.RuntimeFailure(code, str(journal))
         return result
 
+    # Design: ADR-0199 (docs/adr/ADR-0199-readonly-observation-and-mutation-settlement.md)
+    @staticmethod
+    def readonly_command(args):
+        # Closed Docker read verbs used by this owner. A word named inspect in
+        # an arbitrary command is not evidence that the command is readonly.
+        if not isinstance(args, (list, tuple)) or not args or not all(isinstance(a, str) for a in args):
+            return False
+        return (args[0] in {"ps", "info", "inspect", "version"}
+                or tuple(args[:2]) == ("context", "show")
+                or (len(args) >= 2 and args[0] in {"container", "image", "network", "volume", "context"}
+                    and args[1] == "inspect"))
+
     def command(self, args, *, absent_ok=False, catalog_removal=None):
-        readonly = args[0] in {"ps", "info", "inspect", "version"} or "inspect" in args[:2] or args[:2] == ["context", "show"]
+        readonly = self.readonly_command(args)
         deadline = min(time.monotonic() + self.timeout,
                        getattr(self, "operation_deadline", None) or float("inf"))
         timeout = deadline - time.monotonic()
@@ -570,7 +582,8 @@ class MachineDocker(runtime.Docker):
 
     @staticmethod
     def _readonly_deadline_settled(args, original, result, journal):
-        if (original["mutating"] is not False or result.get("mutating") is not False
+        if (not MachineDocker.readonly_command(args)
+                or original["mutating"] is not False or result.get("mutating") is not False
                 or type(result.get("schema")) is not int
                 or any(result.get(key) != original[key] for key in
                        ("schema", "kind", "control_root", "machine"))
@@ -617,7 +630,7 @@ class MachineDocker(runtime.Docker):
             return False
         return False
 
-    def unsettled_operations(self, base):
+    def unsettled_operations(self, base, *, include_disposed=False):
         pending = []
         paths = [*Path(base).glob("activations/**/operations/*.json"), *Path(base).glob("operations/*.json")]
         for path in sorted(paths):
@@ -627,8 +640,86 @@ class MachineDocker(runtime.Docker):
             if fact.get("schema") != 1 or fact.get("phase") not in {"intent", "creating", "create-unknown", "created", "running", "settled", "cleanup-failed", "command-unknown"}:
                 raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid operation journal")
             if fact["phase"] != "settled":
+                if not include_disposed and self.failed_readonly_disposition(path, fact, base):
+                    continue
                 pending.append((path, fact))
         return pending
+
+    def _failed_readonly_control_material(self, path, fact, base):
+        # This classification proves absence of a daemon mutation obligation,
+        # never CLI success, local process exit, or remote writer quiescence.
+        base, path = Path(base), Path(path)
+        if (path.parent != base / "operations" or not re.fullmatch(r"control-[0-9a-f]{32}\.json", path.name)
+                or fact.get("schema") != 1 or fact.get("kind") != "control"
+                or fact.get("phase") not in {"cleanup-failed", "command-unknown"}
+                or fact.get("control_root") != str(base.parent) or fact.get("machine") != base.name
+                or fact.get("mutating") is not False):
+            return None
+        try:
+            paths = (path, path.with_suffix(".request"), base / "state.json")
+            material = {name: self._terminal_material(name) for name in paths}
+            original, request, state = (json.loads(material[name][0]) for name in paths)
+            if original != fact or not isinstance(request, dict) or not isinstance(state, dict):
+                return None
+            arguments = request.get("args")
+            if (request.get("operation") != "control" or not self.readonly_command(arguments)
+                    or set(request) != {"operation", "args", "environment", "deadline_monotonic"}
+                    or not isinstance(request.get("environment"), dict)
+                    or not all(isinstance(k, str) and isinstance(v, str) for k, v in request["environment"].items())
+                    or type(request.get("deadline_monotonic")) not in (int, float)
+                    or not math.isfinite(request["deadline_monotonic"])
+                    or state.get("schema") != PROTOCOL or state.get("kind") != "machine"
+                    or state.get("id") != base.name or state.get("control_root") != str(base.parent)
+                    or state.get("project") != PROJECT or not isinstance(state.get("daemon_id"), str)
+                    or base.name != "machine-" + runtime.digest(state["daemon_id"])[:16]):
+                return None
+            original = {k: v for k, v in fact.items() if k != "observation_disposition"}
+            expected = dict(schema=1, kind="failed-readonly-control",
+                            mutation_obligation="none",
+                            original_failure_sha256=runtime.digest(original),
+                            request_sha256=hashlib.sha256(material[paths[1]][0]).hexdigest(),
+                            machine=base.name, daemon_id=state["daemon_id"])
+            return expected, material
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+    def failed_readonly_disposition(self, path, fact, base):
+        if "observation_disposition" not in fact:
+            return False
+        verified = self._failed_readonly_control_material(path, fact, base)
+        return verified is not None and fact["observation_disposition"] == verified[0]
+
+    def reconcile_failed_readonly_control(self, path, fact, base):
+        # Only an explicitly invoked owner settlement may author this disposition.
+        if (getattr(self, "maintenance_fd", None) is None
+                or getattr(self, "maintenance_base", None) != Path(base)
+                or "observation_disposition" in fact):
+            return False
+        verified = self._failed_readonly_control_material(path, fact, base)
+        if verified is None:
+            return False
+        disposition, material = verified
+        try:
+            if any(self._terminal_material(name) != observed for name, observed in material.items()):
+                return False
+        except (OSError, ValueError):
+            return False
+        fact = dict(fact, observation_disposition=disposition)
+        runtime.atomic_json(path, fact)
+        return True
+
+    def observation_status(self, path, fact, base):
+        return dict(journal=str(path), phase=fact["phase"], error=fact.get("error"),
+                    observation_disposition=fact.get("observation_disposition"),
+                    original_completion={k: fact[k] for k in ("command_dispatched", "cli_pid", "command_exit",
+                        "timed_out", "command_succeeded", "leader_waited", "group_exit_confirmed",
+                        "group_exit_observed") if k in fact},
+                    disposition_valid=self.failed_readonly_disposition(path, fact, base))
+
+    def failed_observation_status(self, base):
+        return [self.observation_status(path, fact, base)
+                for path, fact in self.unsettled_operations(base, include_disposed=True)
+                if fact.get("kind") == "control" and fact.get("phase") in {"cleanup-failed", "command-unknown"}]
 
     def reconcile_terminal_port_failure(self, path, fact, base):
         # A native daemon bind rejection is a terminal RPC result, whereas
@@ -920,6 +1011,34 @@ class MachineOwner:
                 or value.get("control_root") != str(self.root) or value.get("phase") not in {"maintenance", "ready"}):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "invalid machine authority state")
         return value
+
+    def resolve_readonly_observation(self, journal):
+        """Dispose one failed read's mutation obligation, never its exit proof."""
+        deadline = time.monotonic() + self.timeout
+        previous = getattr(self.backend, "operation_deadline", None)
+        deadline = min(deadline, previous) if previous is not None else deadline
+        self.backend.operation_deadline = deadline
+        try:
+            with self.maintenance_lock(deadline):
+                self.assert_live_daemon()
+                if self.read_saved_state() is None:
+                    raise runtime.RuntimeFailure("MachineUnavailable", "machine authority state is absent")
+                journal = Path(journal)
+                if not journal.is_absolute() or journal.parent != self.base / "operations":
+                    raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "observation belongs to another machine")
+                try:
+                    fact = json.loads(self.backend._terminal_material(journal)[0])
+                    if not isinstance(fact, dict):
+                        raise ValueError("invalid control journal")
+                except (OSError, ValueError, TypeError) as error:
+                    raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid observation journal") from error
+                if not self.backend.failed_readonly_disposition(journal, fact, self.base):
+                    if not self.backend.reconcile_failed_readonly_control(journal, fact, self.base):
+                        raise runtime.RuntimeFailure("MachineOperationUnconfirmed", "observation has no readonly disposition")
+                    fact = json.loads(self.backend._terminal_material(journal)[0])
+                return self.backend.observation_status(journal, fact, self.base)
+        finally:
+            self.backend.operation_deadline = previous
 
     def load_config(self):
         state = self.read_saved_state()
@@ -1229,6 +1348,8 @@ def main(argv=None):
         sub.add_argument("--store", type=Path)
     commands.add_parser("status")
     commands.add_parser("sweep")
+    resolve = commands.add_parser("resolve-readonly-observation")
+    resolve.add_argument("--journal", type=Path, required=True)
     args = parser.parse_args(argv)
     runtime.install_signal_handlers()
     try:
@@ -1237,6 +1358,8 @@ def main(argv=None):
             config = machine_config(runtime.read_json(args.config)) if args.config else owner.load_config()
             bom = verified_bom(runtime.SCRIPT_DIR.parent.parent, args.store)
             result = owner.activate(owner.required_definition(config, bom), upgrade=args.operation == "upgrade")
+        elif args.operation == "resolve-readonly-observation":
+            result = owner.resolve_readonly_observation(args.journal)
         elif args.operation == "sweep":
             result = owner.sweep()
         else:
@@ -1244,6 +1367,7 @@ def main(argv=None):
             if result:
                 result["observed_healthy"] = owner.backend.healthy(result) if result["phase"] == "ready" else False
                 result["scratch_observation"] = owner.scratch_observation(result)
+                result["failed_observations"] = owner.backend.failed_observation_status(owner.base)
         print(json.dumps(public_snapshot(result), sort_keys=True))
         return 0
     except runtime.RuntimeFailure as error:
