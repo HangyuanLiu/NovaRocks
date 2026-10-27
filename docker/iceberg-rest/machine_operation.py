@@ -37,6 +37,7 @@ import subprocess
 import struct
 import sys
 import time
+import traceback
 from typing import NamedTuple
 
 import fixture_runtime as runtime
@@ -322,7 +323,12 @@ def main():
     try:
         return owner.run_control() if request.get("operation") == "control" else owner.run()
     except BaseException as error:
-        owner.save(phase="cleanup-failed", error=getattr(error, "code", type(error).__name__))
+        owner.save(phase="cleanup-failed", error=getattr(error, "code", type(error).__name__),
+                   error_diagnostics=dict(
+                       errno=error.errno if isinstance(error, OSError) else None,
+                       filename=os.fsdecode(error.filename)
+                           if isinstance(error, OSError) and error.filename is not None else None,
+                       message=str(error), traceback=traceback.format_exc()))
         return 1
 
 
