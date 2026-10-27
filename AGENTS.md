@@ -224,7 +224,8 @@ SQL client
   Client 复用原结果窗口，Internal 计算位置与保留数据分开，不与 worker 数绑定。
   复制前按实际 buffer 的 old+new 并存峰取得同一预算回执，最后实际 alias 退出才退款；
   额外 schema lifetime 不授予 byte author。same Root 自持数据导致预算不足时 typed 拒绝，
-  不等待自己、不建立递归 SDK invoice。完整迁移与原生/最终全工作区验证仍待完成。
+  不等待自己、不建立递归 SDK invoice。当前实现沿上述 owner 接线；原生/最终全工作区验证范围、
+  失败处置与验收资格分别核对。
 
 - `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs` 与
   `novarocks/frontend-application/src/mv/service/background_original.rs`
@@ -234,7 +235,7 @@ SQL client
   process wrapper 独持 `process_runtime.rs` 的异步后台任务和原 Join；不让活动 Source 强持
   wrapper 形成循环。借用 future 的取消不丢原 owner，停止等待不替代真实 close。
   旧同步 runner、协调器及其第二身份来源已退役；未触及的 CALL/Host 辅助入口不能据此称为全域
-  异步完成。ADR-0198 保持 implementation pending，失败处置与最终原生验证仍须独立核对。
+  异步完成。ADR-0198 所述架构已实施；既有基线失败、能力限制与正式准入资格仍须独立核对。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
@@ -509,7 +510,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
    稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
    业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
-   结构退役不代表整族 Native 通过，最终验证与已有失败处置仍待完成。
+   结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
    ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
    `execute_round_on_task_protocol` establishes every context and creates every
    task through a bounded, fair dispatcher

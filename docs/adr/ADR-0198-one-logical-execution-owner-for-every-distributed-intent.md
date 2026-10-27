@@ -22,7 +22,7 @@ partially-supersedes:
     scope: "Synchronous control waiting, the undifferentiated finalize/cleanup completion boundary and unconditional age-gated GC continuation; immutable intent, dependencies, field inheritance, the physical artifact ledger, actual-exit observation and protection of Unknown objects remain active"
     link: "ADR-0171-commit-operation-model.md"
 date: 2026-10-25
-implementation-status: pending
+implementation-status: implemented
 provenance:
   - "discussion: 2026-10-22 and 2026-10-23 unified logical execution, publication custody and bounded settlement"
   - "discussion: 2026-10-25 actual resource owners, cancellable backpressure and payload lifetime"
@@ -81,7 +81,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-本条记录已接受的契约及其源码接缝。旧同步协调器、runner 和专属第二身份来源已从执行组合退役；这只是结构事实，不能用本条的 active 状态证明整族实现、原生接线或测试通过。implementation pending 保留，最终全工作区与原生验证及已有失败的处置仍未完成。
+本条记录已实施的统一执行架构及其源码接缝。旧同步协调器、runner 和专属第二身份来源已从执行组合退役。implementation-status 表示本文所述架构已落地，不代表所有产品能力通过，也不授予准入或全量验收资格。
 
 当前源码已有普通 Read、Internal 写入、Statistics、Rewrite/Cleanup 与多步骤 MV 的 governed Action 接缝。Statistics 的前台 capture 保留原请求与 CPU/Provider source，capture 实际关闭后才把同一 query permit 交给 job 的稳定接收格，再通知原串行 worker；不是先持一个许可等待第二个许可。后台计算沿同一逻辑执行 owner，统计 Ready 在移走 payload 前续接原 statement retention，计算退出与后续 publication/清理分别观察。
 
@@ -89,7 +89,7 @@ code-anchors:
 
 MV 的数据、控制与只读语句使用同 Root 的 Action；原准备 CPU、Provider publication 与 Current/StateStore 步骤由各自稳定 Source 借用推进。异步后台沿同 scheduler 和业务闸门进入统一执行 owner，业务 operations 与进程后台生命周期分开，活动 Source 不反向强持 runtime wrapper。取消等待保留同一原件和真实退出观察，不把业务终态当作 Join 或库存已处置。
 
-这些是当前源码接缝，不是各语句族的完整验收结论。仍存的未触及 CALL/Host 辅助路径不因名称相关而自动成为本条的全域异步完成主张。最终组合、目标二进制、完整原生场景及失败处置须分别核对；局部类型检查、离树候选和组件通过不能提升 implementation pending。
+这些是当前源码接缝，不是各语句族的完整验收结论。仍存的未触及 CALL/Host 辅助路径不因名称相关而自动成为本条的全域异步完成主张。最终组合、目标二进制、原生场景范围及失败处置须分别核对；基线失败与能力限制保留原始失败和精确处置，不能因架构实施或局部通过改记为通过。
 
 | 责任 | 唯一 owner | 不拥有的权力 |
 |---|---|---|
@@ -249,7 +249,7 @@ operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用
 
 验证分别覆盖就绪早于清理、取消/授权/派发顺序、累计效果与响应结果、BE seal/FE 完整接收切点、缺清单不虚报 Complete 与 GC 缺证拒绝。资源组件覆盖真实队列 Full/取消/恢复、出队与运行退出的不同寿命、原输入只执行一次、真实 buffer 的 old+new 授权与最后 alias、同 Root 多段足额推进及自持不足拒绝、Client 原 window 与 Internal 位置分离，以及有资源且依赖可返回时启动/完成的公平性。共享池全部永久阻塞时保留实际等待或不可用结果，不用隔离公式的自洽测试代替行为。
 
-contract/组件测试只证明局部性质；原生 1FE+3BE 才证明端到端接线。本文保持 implementation pending，完整调用面、原生场景与最终全工作区验证仍未完成；局部通过、离树包、类型检查和源码存在都不能提升这些状态。本文不新增测量、吞吐、RSS 或跨崩溃恢复结论。
+contract/组件测试只证明局部性质；原生 1FE+3BE 才证明对应范围的端到端接线。实现状态、验证范围、失败处置与验收资格分别记录；原始失败、隔离登记与未观察后缀不能由局部通过或组合记录改写。本文不新增测量、吞吐、RSS 或跨崩溃恢复结论。
 
 本条只按 frontmatter 指定范围部分替代旧 ADR；Native 的准确身份、接管/安装/覆盖观察、dataflow writer、Provider 不可变提交意图与字段继承等有效规则继续成立。Native wire、Task 协议和单次派发 journal 不因统一 FE owner 而重造。
 
