@@ -113,7 +113,7 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 FORWARD_STAGES = frozenset({
     "request-validate", "request-body", "upstream-open", "upstream-connect",
     "upstream-send", "upstream-response", "upstream-transport-eof", "client-send", "request-completion",
-    "unknown-operation",
+    "idle-client-read", "unknown-operation",
 })
 
 
@@ -849,10 +849,12 @@ class ObserverHandler(BaseHTTPRequestHandler):
             self.connection.settimeout(None)
             try:
                 first = self.pair.client_reader.read(1)
-            except OSError:
+            except OSError as error:
                 with self.server.audit.lock:
                     if not self.pair.closing:
-                        self.server.audit.failure("idle client transport failed")
+                        self.server.audit.failure(
+                            "idle client transport failed",
+                            diagnostic=forwarding_failure_details("idle-client-read", error, None))
                 return
             if not first:
                 return
@@ -1208,6 +1210,33 @@ class PureTests(unittest.TestCase):
                                   "exception_category": "os-error", "errno": None,
                                   "request_sequence": None})
         self.assertNotIn(private.encode(), encode(details))
+
+    def test_idle_read_diagnostic_keeps_failure_without_a_request(self):
+        private = "PRIVATE peer URL Authorization password body"
+        for error, number in [(OSError(errno.EIO, private), errno.EIO), (OSError(private), None)]:
+            with self.subTest(errno=number):
+                ledger = io.BytesIO()
+                audit = Audit(ledger)
+                handler = ObserverHandler.__new__(ObserverHandler)
+                handler.server = mock.Mock(audit=audit, bounds=BOUNDS)
+                handler.connection = mock.Mock()
+                handler.pair = mock.Mock(closing=False)
+                handler.pair.client_reader.read.side_effect = error
+                handler.handle()
+                events = [parse_json(line) for line in ledger.getvalue().splitlines()]
+                self.assertEqual(events, [{
+                    "event": "failure", "phase": "unclassified", "generation": 1,
+                    "reason": "idle client transport failed",
+                    "diagnostic": {"operation_stage": "idle-client-read",
+                                   "exception_category": "os-error", "errno": number,
+                                   "request_sequence": None}}])
+                self.assertNotIn(private.encode(), ledger.getvalue())
+                audit.ledger = None
+                snapshot = audit.snapshot()
+                self.assertFalse(snapshot["valid_observation"])
+                self.assertEqual(snapshot["lifetime_failures"], 1)
+                self.assertEqual(snapshot["counters"]["requests"], 0)
+                self.assertEqual(snapshot["active_requests"], 0)
 
 
 class LoopbackTests(unittest.TestCase):
