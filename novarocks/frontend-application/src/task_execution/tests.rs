@@ -351,7 +351,7 @@ enum QueueRefusal {
 /// every reservation asked for is counted, so a test can see which requests
 /// an admission pass reached.
 #[derive(Debug, Default)]
-struct RecordingSink {
+pub(crate) struct RecordingSink {
     batches: Mutex<Vec<(DispatchLane, Vec<OperationIntent>)>>,
     refusals: Mutex<BTreeMap<(DispatchLane, BackendProcessId), QueueRefusal>>,
     reservations: Mutex<Vec<(DispatchLane, BackendProcessId)>>,
@@ -359,7 +359,7 @@ struct RecordingSink {
 }
 
 impl RecordingSink {
-    fn take(&self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
+    pub(crate) fn take(&self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
         std::mem::take(&mut *self.batches.lock().expect("recording sink"))
     }
 
@@ -1165,6 +1165,20 @@ impl Harness {
 
     fn from_graph_with_preparing_positions(graph: TaskGraph, preparing_positions: usize) -> Self {
         let sink = Arc::new(RecordingSink::default());
+        Self::from_graph_with_original_transport(
+            graph,
+            preparing_positions,
+            Arc::clone(&sink),
+            Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        )
+    }
+
+    fn from_graph_with_original_transport(
+        graph: TaskGraph,
+        preparing_positions: usize,
+        sink: Arc<RecordingSink>,
+        transport: Arc<dyn TaskOperationSink>,
+    ) -> Self {
         let clock = Arc::new(ManualClock::new());
         let wake = Arc::new(CountingWake::default());
         let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
@@ -1189,7 +1203,7 @@ impl Harness {
                 .map(|&process| (process, preparing_positions))
                 .collect(),
             Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-            Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+            transport,
             intake,
         )
         .expect("the graph composes into a task execution");
@@ -5856,7 +5870,7 @@ fn a_create_receipt_snapshot_older_than_the_observed_one_is_ignored_not_adopted(
 ///
 /// A fresh attempt's establish creates its context, so its lease sequence is
 /// the initial one and nothing has to be read back out of the execution.
-fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+pub(crate) fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
     let OperationIntent::EstablishQueryContext(request) = intent else {
         unreachable!("an establish intent carries its exact request");
     };
@@ -5875,7 +5889,7 @@ fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
 }
 
 /// Builds the exact Worker acknowledgement for one released admission request.
-fn admission_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+pub(crate) fn admission_ack(intent: &OperationIntent) -> OperationAcknowledgement {
     let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
         unreachable!("an admission intent carries its exact request");
     };
@@ -5914,7 +5928,7 @@ fn released_establishes(sink: &RecordingSink) -> Vec<OperationIntent> {
         .collect()
 }
 
-fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+pub(crate) fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowledgement {
     let OperationIntent::CreateTask(request) = intent else {
         unreachable!("a create intent carries its request");
     };
@@ -11812,4 +11826,171 @@ pub(crate) fn manifest_task_and_subscription_failure_round(
         *subscriptions.settled.lock().unwrap() = Some(subscription_state);
     }
     round
+}
+
+#[test]
+fn sealed_result_withdrawals_use_exact_graph_demands_without_settling_contexts() {
+    let mut harness = Harness::new(&[1], &[2], 512);
+    let root = harness.execution.graph().root_identity();
+    let activation = novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
+        901,
+        root.query_execution_id(),
+        1,
+    );
+    assert!(
+        harness
+            .execution
+            .result_context_withdrawals(activation)
+            .is_empty()
+    );
+    harness.publish(root.task_id(), TaskState::Finished, None, true);
+    assert!(
+        harness
+            .execution
+            .result_context_withdrawals(activation)
+            .is_empty()
+    );
+    let original = harness
+        .execution
+        .graph()
+        .contexts()
+        .map(|&context| {
+            let owner = harness.execution.owner(context).unwrap();
+            (
+                context,
+                (
+                    owner.state(),
+                    owner.establish_acknowledged(),
+                    owner.is_released(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    harness.execution.begin_normal_drain();
+    let facts = harness.execution.result_context_withdrawals(activation);
+    assert_eq!(facts.len(), 2);
+    for fact in facts {
+        assert_eq!(fact.activation(), activation);
+        assert_eq!(fact.root(), root);
+        assert_ne!(
+            fact.context().backend_process_id(),
+            root.backend_process_id()
+        );
+        let owner = harness.execution.owner(fact.context()).unwrap();
+        assert_eq!(
+            (
+                owner.state(),
+                owner.establish_acknowledged(),
+                owner.is_released()
+            ),
+            original[&fact.context()]
+        );
+        assert!(!owner.establish_acknowledged());
+        assert!(!owner.is_released());
+    }
+    let foreign = novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
+        901,
+        QueryExecutionId::new(QueryId::new(7, 8), AttemptId::new(1).unwrap()).unwrap(),
+        1,
+    );
+    assert!(
+        harness
+            .execution
+            .result_context_withdrawals(foreign)
+            .is_empty()
+    );
+}
+
+#[test]
+fn normal_stand_down_without_finished_root_does_not_withdraw_result_contexts() {
+    let mut harness = Harness::new(&[1], &[2], 512);
+    let root = harness.execution.graph().root_identity();
+    let activation = novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
+        902,
+        root.query_execution_id(),
+        1,
+    );
+    harness.execution.begin_normal_drain();
+    assert!(
+        harness
+            .execution
+            .result_context_withdrawals(activation)
+            .is_empty()
+    );
+}
+
+#[test]
+fn exact_output_withdrawal_does_not_infer_an_unclosed_sibling_or_missing_edge() {
+    let harness = Harness::new(&[0], &[1, 2], 512);
+    let graph = harness.execution.graph();
+    let producer = harness.identity(harness.stage_tasks(1)[0]);
+    let receivers = harness
+        .stage_tasks(2)
+        .into_iter()
+        .map(|id| harness.identity(id))
+        .collect::<Vec<_>>();
+    let mut demands = EdgeOpenTracker::from_graph(graph);
+    assert_ne!(
+        demands.normal_output_withdrawals(graph).get(&producer),
+        Some(&true)
+    );
+    demands.note_normally_closed(receivers[0]);
+    assert_ne!(
+        demands.normal_output_withdrawals(graph).get(&producer),
+        Some(&true)
+    );
+    demands.note_created(receivers[1]);
+    assert_ne!(
+        demands.normal_output_withdrawals(graph).get(&producer),
+        Some(&true)
+    );
+    demands.note_normally_closed(receivers[1]);
+    assert_eq!(
+        demands.normal_output_withdrawals(graph).get(&producer),
+        Some(&true)
+    );
+    assert_ne!(
+        demands
+            .normal_output_withdrawals(graph)
+            .get(&graph.root_identity()),
+        Some(&true)
+    );
+}
+
+/// Original graph/dispatcher constructor with the actor gate installed before
+/// the first turn. The returned recorder is only the Worker-facing transport.
+pub(crate) fn manifest_original_gated_round_fixture(
+    sink: Arc<RecordingSink>,
+    transport: Arc<dyn TaskOperationSink>,
+) -> (
+    TaskRoundForTest,
+    super::actor_gate::ActorGateOwner,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    super::status_intake::StatusIntakeHandle,
+    Arc<ManualClock>,
+) {
+    let schedule = chain_schedule(&[1, 2], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &backends(3), 64).unwrap();
+    let wake = Arc::new(CountingWake::default());
+    let (gated, owner, observer) = super::actor_gate::ActorGatedTaskOperationSink::pair(
+        transport,
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+        NativeCompatibilityId::new([0x41; 32]),
+    );
+    let harness = Harness::from_graph_with_original_transport(graph, 4096, sink, Arc::new(gated));
+    let status = harness.execution.intake().handle();
+    let clock = Arc::clone(&harness.clock);
+    let intake = crate::native::task_transport::TaskAckIntake::new(
+        Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>
+    );
+    let acks = intake.handle();
+    let mut round = super::round::TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()) as Arc<dyn super::round::StatusSubscriptions>,
+    )
+    .observing(observer);
+    round.seal_pumps();
+    (round, owner, acks, status, clock)
 }

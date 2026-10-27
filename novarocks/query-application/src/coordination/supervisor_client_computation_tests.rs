@@ -54,7 +54,7 @@ mod client_computation_tests {
                 request.accept_terminal_control().unwrap();
             } else {
                 request
-                    .accept(self.sender.lock().unwrap().take().unwrap())
+                    .accept(self.sender.lock().unwrap().take().unwrap(), Vec::new())
                     .unwrap();
                 self.signals.sealed.store(true, Ordering::SeqCst);
             }

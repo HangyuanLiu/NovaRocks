@@ -227,7 +227,10 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REWRITE MANIFESTS;
 
 -- query 43
 -- Remove orphan files
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- Governed preparation preserves the original HMS refusal through its safe typed projection.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 44

@@ -1832,3 +1832,252 @@ async fn unary_unknown_root_refusal_carries_original_domain_fact_without_ack() {
     drop(body);
     drop(fixture.fill_process(PROCESS - FIXED - fixture.header_bytes()));
 }
+
+#[cfg(all(novarocks_dev_controls, unix))]
+mod end_observation {
+    use super::*;
+    use novarocks_failpoint::{
+        liveness::{PreparedRoleSession, RoleSessionOwner, RunnerSession},
+        scope::ProcessBinding,
+        session::{DomainGrant, SessionDeclaration, SessionRole},
+        target_binding::StatementExecutionBinding,
+    };
+    use novarocks_native_adapter::test_observation_controls::{DOMAIN, NativeObservationControls};
+    use serde_json::json;
+
+    struct ObservationSession {
+        _directory: tempfile::TempDir,
+        role: RoleSessionOwner,
+        runner: RunnerSession,
+        controls: Arc<NativeObservationControls>,
+    }
+    impl ObservationSession {
+        fn new(task: TaskIdentity, execution: QueryExecutionId) -> Self {
+            let directory = tempfile::Builder::new()
+                .prefix("nr-end-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let root = directory.path();
+            let declaration = SessionDeclaration {
+                schema_version: 1,
+                session_id: "root-end-be".into(),
+                launch_id: "root-end-launch".into(),
+                role: SessionRole::Be,
+                lifetime_millis: 3000,
+                liveness_socket: root.join("live.sock"),
+                handshake_secret: "e".repeat(32),
+                domain_grants: vec![DomainGrant {
+                    domain: DOMAIN.into(),
+                    grant_id: "root-end-grant".into(),
+                    parameters: json!({
+                        "action": "grpc-fragment", "root": root,
+                        "backend_index": 0, "statement_run_token": "root-end",
+                        "target_session_id": "root-end-be", "max_events": 2,
+                        "attempt_id": execution.attempt_id().get(),
+                    }),
+                }],
+            };
+            let file = root.join("session.json");
+            declaration.write_private(&file).unwrap();
+            let prepared = PreparedRoleSession::read_and_claim(&file, SessionRole::Be).unwrap();
+            let runner = RunnerSession::start(declaration).unwrap();
+            let role = prepared
+                .bind(ProcessBinding::Backend(task.backend_process_id()))
+                .unwrap();
+            StatementExecutionBinding::new(
+                "root-end-be".into(),
+                "root-end".into(),
+                0,
+                task.backend_process_id(),
+                execution,
+            )
+            .unwrap()
+            .write_private(
+                &novarocks_native_adapter::test_observation_controls::attempt_binding_path(
+                    root,
+                    "grpc-fragment",
+                    0,
+                    "root-end",
+                    Some(execution.attempt_id().get()),
+                ),
+            )
+            .unwrap();
+            let controls = Arc::new(
+                NativeObservationControls::from_grants(role.scope().grants_for(DOMAIN)).unwrap(),
+            );
+            Self {
+                _directory: directory,
+                role,
+                runner,
+                controls,
+            }
+        }
+        fn hits(&self) -> usize {
+            self.role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|event| event.event == "hit")
+                .count()
+        }
+    }
+    impl Drop for ObservationSession {
+        fn drop(&mut self) {
+            self.role.close_and_join().unwrap();
+            self.runner.end_and_join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_empty_root_end_claims_the_exact_existing_observation() {
+        let mut fixture = Fixture::new(false);
+        let task = fixture.root.spec().task;
+        let session = ObservationSession::new(task, task.query_execution_id());
+        assert_eq!(session.hits(), 0);
+        fixture.reader = fixture
+            .reader
+            .with_observation_controls(Some(Arc::clone(&session.controls)));
+        let producer = fixture.root.start_producer().unwrap();
+        fixture.root.request_finish().unwrap();
+        fixture.root.publish_end().unwrap();
+        producer.finish_encoder();
+        let reply = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
+        assert!(
+            matches!(reply.reply().outcome, RootReadOutcome::End(end) if end.sequence.get() == 1 && end.output_rows == 0)
+        );
+        assert_eq!(session.hits(), 1);
+        drop(reply);
+        assert!(fixture.root.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn fused_end_is_observed_but_ack_refusal_and_foreign_attempt_are_not() {
+        let mut fixture = Fixture::new(false);
+        let task = fixture.root.spec().task;
+        let session = ObservationSession::new(task, task.query_execution_id());
+        fixture.reader = fixture
+            .reader
+            .with_observation_controls(Some(Arc::clone(&session.controls)));
+        let observer = session
+            .controls
+            .observation_for("grpc-fragment", task.query_execution_id())
+            .unwrap()
+            .unwrap();
+        fixture.finish();
+        let data = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
+        assert!(
+            matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 1 && data.body().len() == 6 && data.end_after_data().is_some_and(|end| end.sequence.get() == 2 && end.output_rows == 1))
+        );
+        drop(data);
+        assert_eq!(session.hits(), 1);
+        assert!(observer.is_active());
+        let ack = owned(fixture.reader.read(&fixture.request(None, 2, 1)).await);
+        assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
+        assert_eq!(ack.reply().accepted_consumed, 2);
+        drop(ack);
+        assert_eq!(session.hits(), 1);
+        assert!(observer.is_active());
+        let wrong_task = TaskIdentity::new(
+            task.query_execution_id(),
+            task.stage_id(),
+            TaskId::new(2).unwrap(),
+            task.backend_process_id(),
+        );
+        let request = RootResultRead::try_new(
+            wrong_task,
+            RootProfileId::V1,
+            RootOutputKind::ClientRows,
+            NonZeroU64::new(1),
+            0,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let refusal = refused(fixture.reader.read(&request).await, &request);
+        assert_eq!(refusal.fact(), root_refusal_fact(165));
+        assert_eq!(session.hits(), 1);
+        assert!(observer.is_active());
+
+        let mut foreign = Fixture::new(true);
+        let task = foreign.root.spec().task;
+        let execution = QueryExecutionId::new(
+            task.query_execution_id().query_id(),
+            AttemptId::new(2).unwrap(),
+        )
+        .unwrap();
+        let foreign_session = ObservationSession::new(task, execution);
+        foreign.reader = foreign
+            .reader
+            .with_observation_controls(Some(Arc::clone(&foreign_session.controls)));
+        foreign.finish();
+        let end = owned(foreign.reader.read(&foreign.request(Some(1), 0, 1)).await);
+        assert!(matches!(end.reply().outcome, RootReadOutcome::End(end) if end.output_rows == 1));
+        assert_eq!(foreign_session.hits(), 0);
+        drop(end);
+    }
+
+    #[tokio::test]
+    async fn first_data_and_later_fused_end_preserve_the_finite_marker_policy() {
+        let mut fixture = Fixture::new(false);
+        let task = fixture.root.spec().task;
+        let session = ObservationSession::new(task, task.query_execution_id());
+        let observer = session
+            .controls
+            .observation_for("grpc-fragment", task.query_execution_id())
+            .unwrap()
+            .unwrap();
+        fixture.reader = fixture
+            .reader
+            .with_observation_controls(Some(Arc::clone(&session.controls)));
+        assert_eq!(session.hits(), 0);
+        assert!(observer.is_active());
+        let producer = fixture.root.start_producer().unwrap();
+        for sequence in 1..=2 {
+            fixture.root.note_rows(1).unwrap();
+            let mut builder = fixture.root.try_segment().unwrap().unwrap();
+            builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
+            fixture.root.publish_segment(builder, 6, false).unwrap();
+            let reply = owned(
+                fixture
+                    .reader
+                    .read(&fixture.request(Some(sequence), sequence - 1, 1))
+                    .await,
+            );
+            assert!(
+                matches!(&reply.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == sequence && data.body().len() == 6 && data.end_after_data().is_none())
+            );
+            drop(reply);
+            assert_eq!(session.hits(), 1);
+            // Exactly one of the two finite events has been used: the first
+            // Data is observed; the ordinary second Data is not another event.
+            assert!(observer.is_active());
+            let ack = owned(
+                fixture
+                    .reader
+                    .read(&fixture.request(None, sequence, 1))
+                    .await,
+            );
+            assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
+            drop(ack);
+            assert!(observer.is_active());
+        }
+        fixture.root.note_rows(1).unwrap();
+        fixture.root.request_finish().unwrap();
+        let mut builder = fixture.root.try_segment().unwrap().unwrap();
+        builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
+        fixture.root.publish_segment(builder, 6, true).unwrap();
+        producer.finish_encoder();
+        let data = owned(fixture.reader.read(&fixture.request(Some(3), 2, 1)).await);
+        assert!(
+            matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 3 && data.body().len() == 6 && data.end_after_data().is_some_and(|end| end.sequence.get() == 4 && end.output_rows == 3))
+        );
+        // A non-first Data with an actual fused End consumes the second event.
+        // No standalone End read is performed before the original ACK.
+        assert!(!observer.is_active());
+        assert_eq!(session.hits(), 1);
+        drop(data);
+        let ack = owned(fixture.reader.read(&fixture.request(None, 4, 1)).await);
+        assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
+        drop(ack);
+        assert!(fixture.root.physical_idle());
+    }
+}

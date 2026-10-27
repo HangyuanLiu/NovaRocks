@@ -39,7 +39,7 @@ use super::{
     LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError, ReplacementQualification,
     RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError, RunningAttemptPermit,
 };
-use novarocks_coordination_contract::AttemptFailureClass;
+use novarocks_coordination_contract::{AttemptFailureClass, ResultContextWithdrawal};
 
 pub(crate) struct NativeAttemptTerminalSender {
     sender: Option<oneshot::Sender<NativeAttemptTerminal>>,
@@ -210,13 +210,17 @@ impl AcceptedRootControlRequest {
         Ok(())
     }
 
-    pub fn accept(self, sender: AcceptedRootStatusSender) -> Result<(), QueryExecutionError> {
+    pub fn accept(
+        self,
+        sender: AcceptedRootStatusSender,
+        withdrawals: Vec<ResultContextWithdrawal>,
+    ) -> Result<(), QueryExecutionError> {
         if self.terminal_control_root().is_some() {
             let error = contract_error("terminal control request cannot seal success");
             let _ = self.reply.send(Err(error.clone()));
             return Err(error);
         }
-        let result = sender.seal_success();
+        let result = sender.seal_success(withdrawals);
         let _ = self.reply.send(result.clone());
         result
     }
@@ -229,7 +233,10 @@ impl AcceptedRootControlRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AcceptedRootProjection {
     Observation(Box<AcceptedRootObservation>),
-    SuccessSealed(Box<TaskStatus>),
+    SuccessSealed {
+        status: Box<TaskStatus>,
+        withdrawals: Vec<ResultContextWithdrawal>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -389,7 +396,10 @@ impl AcceptedRootStatusSender {
     /// owner proved success. The carried Finished snapshot lets a watch
     /// receiver observe status and seal atomically even if it skipped the
     /// immediately preceding observation.
-    fn seal_success(self) -> Result<(), QueryExecutionError> {
+    fn seal_success(
+        self,
+        withdrawals: Vec<ResultContextWithdrawal>,
+    ) -> Result<(), QueryExecutionError> {
         let status = match self.sender.borrow().as_ref() {
             Some(AcceptedRootProjection::Observation(observation))
                 if observation.status.state() == TaskState::Finished
@@ -403,10 +413,21 @@ impl AcceptedRootStatusSender {
                 ));
             }
         };
+        if withdrawals.iter().any(|fact| {
+            fact.root() != self.root
+                || fact.activation().execution() != self.root.query_execution_id()
+                || fact.context().query_execution_id() != self.root.query_execution_id()
+                || fact.context().backend_process_id() == self.root.backend_process_id()
+        }) {
+            return Err(contract_error(
+                "root seal contains a foreign result-demand withdrawal",
+            ));
+        }
         self.sender
-            .send_replace(Some(AcceptedRootProjection::SuccessSealed(Box::new(
-                status,
-            ))));
+            .send_replace(Some(AcceptedRootProjection::SuccessSealed {
+                status: Box::new(status),
+                withdrawals,
+            }));
         Ok(())
     }
 }
@@ -613,6 +634,7 @@ struct PumpRuntime {
     cancellation: CancellationView,
     root_finished: bool,
     success_sealed: bool,
+    result_withdrawals: Vec<ResultContextWithdrawal>,
     native_completed: bool,
     pending_root_failure: Option<TaskStatus>,
 }
@@ -656,7 +678,10 @@ impl PumpRuntime {
             AcceptedRootProjection::Observation(observation) => {
                 self.observe_status(*observation).await
             }
-            AcceptedRootProjection::SuccessSealed(status) => {
+            AcceptedRootProjection::SuccessSealed {
+                status,
+                withdrawals,
+            } => {
                 if self.pending_root_failure.is_some() || status.state() != TaskState::Finished {
                     return Err(PumpInterruption::Decision(contract_failure(
                         contract_error("invalid success seal for the accepted root status"),
@@ -672,6 +697,7 @@ impl PumpRuntime {
                         contract_error("success seal did not carry a Finished root status"),
                     )));
                 }
+                self.result_withdrawals = withdrawals;
                 self.success_sealed = true;
                 Ok(())
             }
@@ -1193,6 +1219,7 @@ async fn run_root_relay_core(
         cancellation,
         root_finished: false,
         success_sealed: false,
+        result_withdrawals: Vec::new(),
         native_completed: false,
         pending_root_failure: None,
     };
@@ -1444,7 +1471,10 @@ async fn run_root_relay_core(
         return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
     }
     let activation = permit.identity();
-    match permit.finish_result_stream().await {
+    match permit
+        .finish_result_stream(std::mem::take(&mut runtime.result_withdrawals))
+        .await
+    {
         Ok(conclusion) => {
             let streamed_cut = if conclusion == LogicalConclusion::Succeeded {
                 if let Some(source) = streamed {
@@ -2408,7 +2438,7 @@ mod tests {
             sender
                 .publish_attempt_observation(status, AcceptedAttemptFailure::None)
                 .unwrap();
-            let error = sender.seal_success().unwrap_err();
+            let error = sender.seal_success(Vec::new()).unwrap_err();
             assert_eq!(
                 error.kind(),
                 QueryExecutionErrorKind::InvalidRequest,
@@ -2449,7 +2479,7 @@ mod tests {
             sender
                 .publish_attempt_observation(finished(root), attempt_failure)
                 .unwrap();
-            let error = sender.seal_success().unwrap_err();
+            let error = sender.seal_success(Vec::new()).unwrap_err();
             assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
             assert_eq!(
                 error.message(),
@@ -2485,7 +2515,7 @@ mod tests {
             source.try_next().is_none(),
             "the foreign process must not advance the accepted Root"
         );
-        assert!(sender.seal_success().is_err());
+        assert!(sender.seal_success(Vec::new()).is_err());
     }
 
     #[tokio::test]
@@ -3132,7 +3162,7 @@ mod tests {
         assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
         status_sender.publish(finished(root)).unwrap();
         // Success needs the original seal, not the pending Backend final ACK.
-        seal_request.accept(status_sender).unwrap();
+        seal_request.accept(status_sender, Vec::new()).unwrap();
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("local End consumption and root Finished produce EOF");
         };
@@ -3238,7 +3268,11 @@ mod tests {
             drop(record);
             assert!(seal_port.requests.lock().unwrap().is_empty());
             segment.complete();
-            seal_port.next().await.accept(status_sender).unwrap();
+            seal_port
+                .next()
+                .await
+                .accept(status_sender, Vec::new())
+                .unwrap();
             let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
                 panic!("end")
             };
@@ -3302,7 +3336,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        seal.accept(status_sender).unwrap();
+        seal.accept(status_sender, Vec::new()).unwrap();
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("CountOnly must produce End without a data segment");
         };

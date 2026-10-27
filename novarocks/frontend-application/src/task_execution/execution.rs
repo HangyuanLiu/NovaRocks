@@ -1282,6 +1282,47 @@ impl QueryTaskExecution {
         }
     }
 
+    /// Project only this sealed read's actual, complete output-demand
+    /// withdrawals. Context custody and Worker settlements remain untouched.
+    pub(crate) fn result_context_withdrawals(
+        &self,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Vec<novarocks_coordination_contract::ResultContextWithdrawal> {
+        let root = self.graph.root_identity();
+        if !self.normal_drain_started
+            || self.failure_cause().is_some()
+            || activation.execution() != self.graph.execution_id()
+            || !self
+                .task_by_identity_ref(root)
+                .and_then(RemoteTask::status)
+                .is_some_and(|status| status.state() == TaskState::Finished)
+        {
+            return Vec::new();
+        }
+        let outputs = self.edges.normal_output_withdrawals(&self.graph);
+        let mut contexts = BTreeMap::<QueryContextRef, bool>::new();
+        for task in self.graph.tasks() {
+            // No output edge supplies no result-withdrawal evidence.
+            let withdrawn = outputs.get(&task.identity()) == Some(&true);
+            contexts
+                .entry(task.context())
+                .and_modify(|all| *all &= withdrawn)
+                .or_insert(withdrawn);
+        }
+        self.graph
+            .contexts()
+            .filter(|&&context| {
+                context.backend_process_id() != root.backend_process_id()
+                    && contexts.get(&context) == Some(&true)
+            })
+            .map(|&context| {
+                novarocks_coordination_contract::ResultContextWithdrawal::new(
+                    activation, root, context,
+                )
+            })
+            .collect()
+    }
+
     /// Applies one exact local no-more-input authorization. An unknown Create
     /// outcome is kept for Context fencing, but cannot keep this destination
     /// in the producer's opening barrier or revive its normal input need.

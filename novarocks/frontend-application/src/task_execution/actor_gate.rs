@@ -154,7 +154,9 @@ impl ActorGateShared {
         let mut queue = self.queue.lock().expect("Task actor gate queue");
         for intent in intents {
             let operation_id = intent.operation_id();
-            queue.requested.remove(&operation_id);
+            if !queue.requested.remove(&operation_id) {
+                continue;
+            }
             match result {
                 Ok(()) => {
                     queue.authorized.insert(operation_id);
@@ -164,6 +166,19 @@ impl ActorGateShared {
                 }
             }
         }
+        drop(queue);
+        self.wake.wake();
+    }
+
+    fn retire_authorization(&self, operation_id: TaskOperationId) {
+        let mut queue = self.queue.lock().expect("Task actor gate queue");
+        queue.requested.remove(&operation_id);
+        queue.authorized.remove(&operation_id);
+        queue.rejected.remove(&operation_id);
+        queue.authorization_requests.retain_mut(|intents| {
+            intents.retain(|intent| intent.operation_id() != operation_id);
+            !intents.is_empty()
+        });
         drop(queue);
         self.wake.wake();
     }
@@ -345,6 +360,15 @@ impl ActorGateOwner {
         if self.active_authorization.is_none() {
             self.active_authorization = self.shared.take_authorization_request();
         }
+        if let Some(intents) = self.active_authorization.as_mut() {
+            let queue = self.shared.queue.lock().expect("Task actor gate queue");
+            // A cancelled borrowed authorization can outlive its queued
+            // carrier. Only that carrier's still-requested intents may resume.
+            intents.retain(|intent| queue.requested.contains(&intent.operation_id()));
+            if intents.is_empty() {
+                self.active_authorization = None;
+            }
+        }
         let Some(intents) = self.active_authorization.as_ref().cloned() else {
             return Ok(moved);
         };
@@ -519,6 +543,17 @@ impl ActorGateOwner {
             let Some(acknowledgement) = self.active_acknowledgement.clone() else {
                 break;
             };
+            let operation_id = acknowledgement.operation_id();
+            let owns_acknowledgement = match acknowledgement.kind() {
+                OperationKind::AcquireQueryContextAdmissionTicket => {
+                    self.admission_issues.contains_key(&operation_id)
+                }
+                OperationKind::UpdateQueryContext => {
+                    self.establish_submissions.contains_key(&operation_id)
+                        || self.late_establish_settlements.contains_key(&operation_id)
+                }
+                _ => false,
+            };
             let settled = match acknowledgement.kind() {
                 OperationKind::AcquireQueryContextAdmissionTicket => {
                     self.settle_admission_acknowledgement(drive, &acknowledgement)
@@ -529,6 +564,21 @@ impl ActorGateOwner {
                 }
                 _ => Ok(0),
             };
+            if owns_acknowledgement
+                && acknowledgement.dispatch_result() != OperationDispatchResult::TransportUnknown
+            {
+                // A definitive result also retires an unsent replay's local
+                // authorization. TaskRound already cancelled that carrier;
+                // there will be no later transport handoff to clear this slot.
+                // The actual verdict and remote responsibility stay in QA.
+                self.shared.retire_authorization(operation_id);
+                if let Some(intents) = self.active_authorization.as_mut() {
+                    intents.retain(|intent| intent.operation_id() != operation_id);
+                    if intents.is_empty() {
+                        self.active_authorization = None;
+                    }
+                }
+            }
             match settled {
                 Ok(settled) => {
                     self.active_acknowledgement = None;
@@ -669,6 +719,18 @@ impl ActorGateOwner {
             return Err(actor_establish_error(error));
         }
         Ok(settled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_authorization_for_test(&self) -> Option<&[OperationIntent]> {
+        self.active_authorization.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_late_establish_for_test(&self, operation: TaskOperationId) -> bool {
+        self.late_establish_settlements
+            .get(&operation)
+            .is_some_and(|held| !held.is_empty())
     }
 
     #[cfg(test)]

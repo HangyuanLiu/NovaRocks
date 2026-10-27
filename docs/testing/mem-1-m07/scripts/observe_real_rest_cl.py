@@ -319,12 +319,19 @@ class Audit:
             self.connections -= 1
             need(self.connections >= 0, "connection ownership underflow")
 
-    def failure(self, reason, admission=False):
+    def failure(self, reason, admission=False, *, operation=None, error=None):
         with self.lock:
             self.counters["failures"] += 1
             self.total_failures += 1
             self.counters["admission_refusals"] += int(admission)
-            self.event({"event": "failure", "phase": self.phase, "generation": self.generation, "reason": reason})
+            event = {"event": "failure", "phase": self.phase, "generation": self.generation, "reason": reason}
+            if error is not None:
+                # Retain only structural exception facts, never message/body,
+                # request headers, target or credential-bearing diagnostics.
+                event["error"] = {"type": type(error).__name__,
+                                  "errno": error.errno if isinstance(error, OSError) else None,
+                                  "operation": operation}
+            self.event(event)
 
     def begin(self, method, target, category, peer):
         with self.lock:
@@ -562,6 +569,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
         response = None
         upstream_held = False
         category = "other"
+        operation = "validate_request"
         try:
             self.check()
             self.rfile.header_mode = False
@@ -576,12 +584,14 @@ class ObserverHandler(BaseHTTPRequestHandler):
             length = 0 if length is None else length
             need(length + len(self.path.encode()) <= self.server.bounds["max_request_bytes"], "request bytes exceed cap")
             record = audit.begin(self.command, self.path, category, self.client_address)
+            operation = "read_request_body"
             body = self.rfile.read(length)
             need(len(body) == length, "truncated request body")
             self.check()
             record["request_body_bytes"] = len(body)
             record["request_body_sha256"] = sha(body)
             upstream = self.server.downstream
+            operation = "connect_upstream"
             connection = http.client.HTTPConnection(upstream.hostname, upstream.port,
                                                     timeout=max(0.001, self.deadline - time.monotonic()))
             connection.response_class = lambda *a, **kw: BoundedResponse(
@@ -592,6 +602,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             self.check()
             audit.upstream_begin(category)
             upstream_held = True
+            operation = "send_upstream_headers"
             connection.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
             for name, value in headers:
                 if name.lower() not in hop and name.lower() != "host":
@@ -601,6 +612,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             connection.endheaders(body)
             record["upstream_request_sent"] = True
             audit.sent(self.command)
+            operation = "receive_upstream_headers"
             response = connection.getresponse()
             record["status"] = response.status
             if 300 <= response.status < 400:
@@ -614,6 +626,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
                  and not any(c in response.reason for c in ("\r", "\n", "\x00")), "unsupported downstream status line")
             if self.command != "HEAD" and declared is not None:
                 need(declared <= self.server.bounds["max_response_bytes"], "declared response body exceeds cap")
+            operation = "receive_upstream_body"
             raw = response.read(self.server.bounds["max_response_bytes"] + 1)
             self.check()
             need(len(raw) <= self.server.bounds["max_response_bytes"], "response body exceeds cap")
@@ -644,7 +657,9 @@ class ObserverHandler(BaseHTTPRequestHandler):
             original_lengths = [v for k, v in response_headers if k.lower() == "content-length"]
             forwarded_length = original_lengths[0] if original_lengths else str(len(raw))
             lines.extend(["Content-Length: " + forwarded_length + "\r\n", "Connection: close\r\n", "\r\n"])
+            operation = "send_client_headers"
             self.connection.sendall("".join(lines).encode("latin-1"))
+            operation = "send_client_body"
             remaining = memoryview(raw)
             while remaining:
                 self.check()
@@ -656,8 +671,9 @@ class ObserverHandler(BaseHTTPRequestHandler):
             self.check()
             record["outcome"] = "actual-response-forwarded"
             audit.complete()
-        except (Refusal, OSError, ValueError, http.client.HTTPException):
-            audit.failure("bounded forwarding failed; no substitute response or retry")
+        except (Refusal, OSError, ValueError, http.client.HTTPException) as error:
+            audit.failure("bounded forwarding failed; no substitute response or retry",
+                          operation=operation, error=error)
         finally:
             if upstream_held:
                 audit.upstream_end(category)
@@ -745,6 +761,47 @@ class PureTests(unittest.TestCase):
         self.reject(lambda: downstream_address("http://192.0.2.1:8181"))
         self.reject(lambda: route("GET", "http://other/v1/namespaces"))
         self.reject(lambda: route("GET", "/not-a-catalog"))
+
+    def test_forward_connect_failure_retains_errno_without_private_diagnostics(self):
+        import errno
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import tempfile
+
+        ledger = self.enterContext(tempfile.TemporaryFile())
+        audit = Audit(ledger)
+        handler = object.__new__(ObserverHandler)
+        handler.server = SimpleNamespace(audit=audit, bounds=BOUNDS,
+                                         downstream=urlsplit("http://127.0.0.1:1"))
+        handler.command = "GET"
+        handler.path = "/v1/namespaces/private/tables/literal?token=private-token"
+        handler.headers = http.client.parse_headers(io.BytesIO(
+            b"Host: 127.0.0.1\r\nAuthorization: Bearer private-token\r\n\r\n"))
+        handler.rfile = io.BytesIO()
+        handler.client_address = ("127.0.0.1", 1)
+        handler.started = time.monotonic()
+        handler.deadline = handler.started + BOUNDS["request_absolute_deadline_seconds"]
+        connection = mock.Mock()
+        connection.connect.side_effect = OSError(errno.EADDRNOTAVAIL,
+                                                 "private-message", "private-filename")
+        with mock.patch.object(http.client, "HTTPConnection", return_value=connection):
+            handler.forward()
+        connection.connect.assert_called_once()
+        connection.close.assert_called_once()
+        connection.putrequest.assert_not_called()
+        ledger.seek(0)
+        recorded = ledger.read()
+        events = [parse_json(line) for line in recorded.splitlines()]
+        failure = next(event for event in events if event["event"] == "failure")
+        self.assertEqual(failure["error"], {"type": "OSError", "errno": errno.EADDRNOTAVAIL,
+                                           "operation": "connect_upstream"})
+        self.assertEqual(failure["reason"], "bounded forwarding failed; no substitute response or retry")
+        self.assertEqual(audit.snapshot()["counters"]["completed"], 0)
+        self.assertEqual(audit.snapshot()["active_requests"], 0)
+        self.assertFalse(audit.snapshot()["valid_observation"])
+        for private in (b"private-token", b"private-message", b"private-filename", b"Authorization"):
+            self.assertNotIn(private, recorded)
 
 
 class LoopbackTests(unittest.TestCase):

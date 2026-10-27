@@ -277,6 +277,7 @@ pub(crate) struct TaskRound {
     protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsPublisher>,
     /// Result consumes root output; other intents retain their Task evidence.
     result_consumer_attached: bool,
+    root_activation: Option<novarocks_coordination_contract::AttemptActivationIdentity>,
     pending_success_seal:
         Option<novarocks_query_application::coordination::AcceptedRootControlRequest>,
     abort_effect_intake: Option<NativeAbortEffectIntake>,
@@ -343,6 +344,7 @@ impl TaskRound {
             root_status_source: Some(root_status_source),
             protocol_facts: None,
             result_consumer_attached: false,
+            root_activation: None,
             pending_success_seal: None,
             abort_effect_intake: None,
             abort_effects: BTreeMap::new(),
@@ -378,10 +380,24 @@ impl TaskRound {
         &mut self,
         drive: &novarocks_query_application::coordination::NativeAttemptDrive,
     ) -> Result<(), TaskExecutionError> {
+        if self
+            .root_activation
+            .is_some_and(|held| held != drive.identity())
+        {
+            return Err(TaskExecutionError::Schedule(
+                "root result belongs to another attempt activation".into(),
+            ));
+        }
+        if drive.identity().execution() != self.execution.graph().execution_id() {
+            return Err(TaskExecutionError::Schedule(
+                "root result drive names a foreign execution".into(),
+            ));
+        }
         if let Some(publisher) = self.protocol_facts.as_mut() {
             publisher.bind(drive)?;
             publisher.publish(&mut self.execution, self.success_sealed)?;
         }
+        self.root_activation = Some(drive.identity());
         Ok(())
     }
 
@@ -1517,6 +1533,9 @@ impl TaskRound {
             // Freeze admission in this same serial cut, before the seal reply
             // can race a residual transport error or this turn's pumps.
             self.begin_normal_drain();
+            let withdrawals = self.root_activation.map_or_else(Vec::new, |activation| {
+                self.execution.result_context_withdrawals(activation)
+            });
             let sender = self.root_status_sender.take().ok_or_else(|| {
                 TaskExecutionError::Schedule(
                     "success seal reached TaskRound after its publisher was consumed".to_owned(),
@@ -1525,7 +1544,7 @@ impl TaskRound {
             self.pending_success_seal
                 .take()
                 .expect("the success request was checked before settlement")
-                .accept(sender)
+                .accept(sender, withdrawals)
                 .map_err(|error| {
                     TaskExecutionError::Schedule(format!(
                         "seal accepted root Task success projection failed: {error}"

@@ -148,6 +148,8 @@ pub struct NativeRootResultReader {
     registry: Arc<TaskExecutionRegistry>,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(novarocks_dev_controls)]
+    observation_controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
 
 impl NativeRootResultReader {
@@ -156,6 +158,8 @@ impl NativeRootResultReader {
             registry,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
+            #[cfg(novarocks_dev_controls)]
+            observation_controls: None,
         }
     }
 
@@ -165,6 +169,15 @@ impl NativeRootResultReader {
         controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     ) -> Self {
         self.test_controls = controls;
+        self
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub fn with_observation_controls(
+        mut self,
+        controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    ) -> Self {
+        self.observation_controls = controls;
         self
     }
 
@@ -358,6 +371,18 @@ impl NativeRootResultReader {
             Err(error) => return refusal(request, error),
         };
         let (reply, guard) = delivery.into_parts();
+        #[cfg(novarocks_dev_controls)]
+        if crate::task_result_diagnostics::emit_root_read_marker(
+            self.observation_controls.as_deref(),
+            request.root_task(),
+            &reply.outcome,
+        )
+        .is_err()
+        {
+            // Missing observation remains missing evidence; it cannot change
+            // the original channel's settled business result or mint a fact.
+            tracing::warn!("authorized root read observation could not be recorded");
+        }
         NativeRootReadResponse::Owned(NativeRootResultReply {
             reply,
             ownership: NativeRootSendOwnership {

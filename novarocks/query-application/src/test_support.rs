@@ -961,6 +961,14 @@ impl LogicalExecutionTestHarness {
         self.actor().snapshot().await
     }
 
+    pub async fn establish_snapshot(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<Option<crate::coordination::EstablishIssueSnapshot>, LogicalExecutionActorError>
+    {
+        self.actor().establish_snapshot(context).await
+    }
+
     pub async fn join_readiness(
         &self,
     ) -> Result<LogicalExecutionJoinReadiness, LogicalExecutionRuntimeRegistryError> {

@@ -314,6 +314,29 @@ impl EdgeOpenTracker {
         resolution
     }
 
+    /// Reduce each frozen edge's exact destination withdrawals once. A
+    /// producer is present only when it owns a real output edge; all of its
+    /// edges must be withdrawn before it can release a result prerequisite.
+    pub(crate) fn normal_output_withdrawals(
+        &self,
+        graph: &TaskGraph,
+    ) -> BTreeMap<TaskIdentity, bool> {
+        let mut producers = BTreeMap::<TaskIdentity, bool>::new();
+        for edge in graph.edges() {
+            let closed = self.normally_closed.get(&edge.edge_id());
+            let all_closed = edge.destinations().iter().all(|destination| {
+                closed.is_some_and(|destinations| destinations.contains(destination))
+            });
+            for &producer in edge.producers() {
+                producers
+                    .entry(producer)
+                    .and_modify(|all| *all &= all_closed)
+                    .or_insert(all_closed);
+            }
+        }
+        producers
+    }
+
     pub fn producers_of(&self, edge_id: ExchangeEdgeId) -> &[TaskIdentity] {
         self.producers
             .get(&edge_id)

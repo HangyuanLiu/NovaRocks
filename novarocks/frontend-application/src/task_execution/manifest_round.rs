@@ -1177,6 +1177,20 @@ mod tests {
         novarocks_workload_control::WorkCancellationRequester,
         super::super::abort_effect::NativeAbortEffectIntake,
     ) {
+        terminal_regression_drive_for_contexts(vec![context], recovery).await
+    }
+
+    async fn terminal_regression_drive_for_contexts(
+        contexts: Vec<novarocks_execution_contract::QueryContextRef>,
+        recovery: bool,
+    ) -> (
+        novarocks_query_application::test_support::LogicalExecutionTestHarness,
+        NativeAttemptDrive,
+        CancellationView,
+        novarocks_workload_control::WorkCancellationRequester,
+        super::super::abort_effect::NativeAbortEffectIntake,
+    ) {
+        let context = *contexts.first().expect("the original graph has contexts");
         use novarocks_coordination_contract::ExecutionEffect;
         use novarocks_query_application::coordination::{
             AbortQueryContextEffectPort, LogicalExecutionActorConfig,
@@ -1216,7 +1230,7 @@ mod tests {
             LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
                 context.query_execution_id(),
                 NonZeroUsize::new(2).unwrap(),
-                vec![context],
+                contexts.clone(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 std::num::NonZeroU32::new(2).unwrap(),
@@ -1245,7 +1259,7 @@ mod tests {
                 context.query_execution_id(),
                 ExecutionEffect::None,
                 NonZeroUsize::new(2).unwrap(),
-                vec![context],
+                contexts.clone(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 governed.owner,
@@ -1261,7 +1275,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             config,
             context.query_execution_id(),
-            vec![context],
+            contexts.clone(),
         )
         .unwrap();
         logical.activate_initial().await.unwrap();
@@ -3176,5 +3190,433 @@ mod tests {
         drop(assembled);
         drop(drive);
         finish_pending_actor(logical, context).await;
+    }
+
+    #[derive(Debug)]
+    struct OriginalSelectiveTransport {
+        worker: Arc<super::super::tests::RecordingSink>,
+        target: std::sync::Mutex<
+            Option<(
+                novarocks_types::BackendProcessId,
+                novarocks_execution_contract::OperationKind,
+            )>,
+        >,
+        block: std::sync::atomic::AtomicBool,
+        held: std::sync::Mutex<Option<super::super::intent::OperationIntent>>,
+    }
+    impl OriginalSelectiveTransport {
+        fn new(worker: Arc<super::super::tests::RecordingSink>) -> Self {
+            Self {
+                worker,
+                target: std::sync::Mutex::new(None),
+                block: std::sync::atomic::AtomicBool::new(true),
+                held: std::sync::Mutex::new(None),
+            }
+        }
+        fn held(&self) -> Option<super::super::intent::OperationIntent> {
+            self.held.lock().unwrap().clone()
+        }
+    }
+    impl TaskOperationSink for OriginalSelectiveTransport {
+        fn try_reserve_queue(
+            &self,
+            request: super::super::intent::TaskOperationQueueRequest,
+            preparation: &mut super::super::intent::TaskOperationQueuePreparation,
+        ) -> super::super::intent::TaskOperationQueueAdmission {
+            self.worker.try_reserve_queue(request, preparation)
+        }
+        fn try_submit(
+            &self,
+            batch: super::super::intent::DispatchBatch,
+        ) -> super::super::intent::TaskOperationSubmit {
+            let target = *self.target.lock().unwrap();
+            if self.block.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(intent) = batch
+                    .operations()
+                    .iter()
+                    .find(|intent| target == Some((intent.backend_process_id(), intent.kind())))
+            {
+                let mut held = self.held.lock().unwrap();
+                if let Some(original) = held.as_ref() {
+                    assert_eq!(
+                        original.operation_id(),
+                        intent.operation_id(),
+                        "the fixture holds the original immutable carrier"
+                    );
+                } else {
+                    *held = Some(intent.clone());
+                }
+                return super::super::intent::TaskOperationSubmit::Backpressured(batch);
+            }
+            self.worker.try_submit(batch)
+        }
+    }
+
+    // The test answers only intents actually accepted by the Worker-facing
+    // original transport. It never calls the gated sink or dispatcher submit.
+    fn answer_original_worker_intents(
+        worker: &super::super::tests::RecordingSink,
+        acks: &crate::native::task_transport::TaskAckIntakeHandle,
+        unknown_target: Option<novarocks_execution_contract::QueryContextRef>,
+        transport: &OriginalSelectiveTransport,
+        late: &mut Option<super::super::intent::OperationAcknowledgement>,
+    ) {
+        use super::super::intent::{OperationAcknowledgement, OperationIntent};
+        for (_, intents) in worker.take() {
+            for intent in intents {
+                let reply = match &intent {
+                    OperationIntent::AcquireQueryContextAdmissionTicket(_) => {
+                        super::super::tests::admission_ack(&intent)
+                    }
+                    OperationIntent::EstablishQueryContext(request) => {
+                        let known = super::super::tests::establish_ack(&intent);
+                        if unknown_target == Some(request.context()) {
+                            if let Some(original) = late.as_ref() {
+                                assert_eq!(original.operation_id(), known.operation_id());
+                            }
+                            *late = Some(known);
+                            transport
+                                .block
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            OperationAcknowledgement::transport_unknown(
+                                intent.operation_id(),
+                                intent.kind(),
+                            )
+                        } else {
+                            known
+                        }
+                    }
+                    OperationIntent::CreateTask(_) => {
+                        super::super::tests::accepted_create_ack(&intent)
+                    }
+                    // Ordinary edge/Quiesce/Release custody remains with the
+                    // original round; it is not an actor authorization verdict.
+                    _ => continue,
+                };
+                acks.publish(reply);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_round_owns_queued_admission_and_unsent_establish_until_its_gate_closes() {
+        use novarocks_execution_contract::{
+            OperationKind, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
+        };
+        for (mode, cancel_before_startup, late_after_handoff) in [
+            (0, false, false),
+            (1, false, false),
+            (2, false, false),
+            (2, false, true),
+            (0, true, false),
+        ] {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let worker = Arc::new(super::super::tests::RecordingSink::default());
+            let transport = Arc::new(OriginalSelectiveTransport::new(Arc::clone(&worker)));
+            let (mut round, actor_gate, acks, statuses, clock) =
+                super::super::tests::manifest_original_gated_round_fixture(
+                    Arc::clone(&worker),
+                    Arc::clone(&transport) as Arc<dyn TaskOperationSink>,
+                );
+            let root = round.root_task();
+            let contexts = round
+                .execution()
+                .graph()
+                .contexts()
+                .copied()
+                .collect::<Vec<_>>();
+            let target = *contexts
+                .iter()
+                .rfind(|context| context.backend_process_id() != root.backend_process_id())
+                .unwrap();
+            *transport.target.lock().unwrap() = Some((
+                target.backend_process_id(),
+                if mode == 0 {
+                    OperationKind::AcquireQueryContextAdmissionTicket
+                } else {
+                    OperationKind::UpdateQueryContext
+                },
+            ));
+            transport
+                .block
+                .store(mode != 2, std::sync::atomic::Ordering::SeqCst);
+            let (mut logical, drive, cancellation, _, _abort) =
+                terminal_regression_drive_for_contexts(contexts.clone(), false).await;
+            let source = round.take_root_status_source().unwrap();
+            let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+            let convergence = NativeAttemptConvergenceOwner::new(
+                &round,
+                Arc::new(UnusedConvergenceSource),
+                contexts
+                    .iter()
+                    .map(|&context| {
+                        NativeAttemptConvergenceTarget::new(
+                            context,
+                            novarocks_execution::runtime::endpoint::RuntimeEndpoint::new(
+                                "127.0.0.1",
+                                1,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let mut assembled = ManifestAssembledRound {
+                round,
+                split_delivery,
+                actor_gate,
+                protocol_facts: None,
+                convergence,
+                notify: Arc::new(tokio::sync::Notify::new()),
+                terminal: None,
+                pending_terminal: None,
+                pending_pre_ready: None,
+                split_failure: None,
+                profile_diagnostics: None,
+            };
+            let mut late = None;
+            if cancel_before_startup {
+                use std::future::Future;
+                let mut borrowed = Box::pin(assembled.advance(&drive));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(matches!(
+                    borrowed.as_mut().poll(&mut cx),
+                    std::task::Poll::Pending
+                ));
+                drop(borrowed);
+                assert!(
+                    assembled
+                        .actor_gate
+                        .active_authorization_for_test()
+                        .is_some(),
+                    "the actual cancelled authorization remains in its original slot"
+                );
+                assert!(!assembled.round.accepted_root_success_sealed());
+            }
+            tokio::time::timeout_at(deadline, async {
+                loop {
+                    assembled.advance(&drive).await.unwrap();
+                    answer_original_worker_intents(
+                        &worker,
+                        &acks,
+                        (mode == 2).then_some(target),
+                        &transport,
+                        &mut late,
+                    );
+                    let other_tasks_owned = assembled
+                        .round
+                        .execution()
+                        .graph()
+                        .tasks()
+                        .filter(|task| task.context() != target)
+                        .all(|task| {
+                            assembled
+                                .round
+                                .execution()
+                                .task(task.identity().task_id())
+                                .unwrap()
+                                .create_ownership_proven()
+                        });
+                    if transport.held().is_some() && other_tasks_owned {
+                        break;
+                    }
+                    clock.advance(std::time::Duration::from_millis(1));
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the original non-target Workers accept their actual startup requests");
+            let held = transport.held().unwrap();
+            if mode == 2 {
+                assert_eq!(late.as_ref().unwrap().operation_id(), held.operation_id());
+                assert!(
+                    assembled
+                        .actor_gate
+                        .retained_late_establish_for_test(held.operation_id())
+                );
+            }
+            if mode == 2 && !late_after_handoff {
+                // Before handoff the original round and actor-gate owner still
+                // own this late receipt. Feed only its actual intake: advance
+                // cancels the exact queued replay and applies the Worker fact.
+                acks.publish(late.take().unwrap());
+                tokio::time::timeout_at(deadline, assembled.advance(&drive))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    assembled
+                        .round
+                        .execution()
+                        .owner(target)
+                        .unwrap()
+                        .establish_acknowledged(),
+                    "the active original owner must account its late Worker receipt"
+                );
+                assert!(
+                    !assembled
+                        .actor_gate
+                        .retained_late_establish_for_test(held.operation_id())
+                );
+                tokio::time::timeout_at(deadline, async {
+                    loop {
+                        if logical.establish_snapshot(target).await.unwrap().is_some_and(|snapshot| {
+                            snapshot.state() == novarocks_query_application::coordination::EstablishIssueState::WorkerSettled(
+                                novarocks_query_application::coordination::EstablishWorkerSettlement::Applied)
+                        }) { break; }
+                        tokio::task::yield_now().await;
+                    }
+                }).await.unwrap();
+            }
+            // The Worker may publish its latest exact Finished snapshot even
+            // when intermediate progress versions were coalesced.
+            statuses.publish(super::super::status_intake::StatusEvent::Published(
+                Box::new(
+                    TaskStatus::try_new(
+                        root,
+                        TaskStatusVersion::new(4).unwrap(),
+                        TaskState::Finished,
+                        None,
+                        TaskOutputFacts::new(true),
+                    )
+                    .unwrap(),
+                ),
+            ));
+            let mut reply = Some(source.begin_success_seal_request().unwrap());
+            let (publish_late, publish_after_handoff) = tokio::sync::oneshot::channel();
+            let late_worker = late.map(|receipt| {
+                let acks = acks.clone();
+                let reply = reply.take().unwrap();
+                tokio::spawn(async move {
+                    assert_eq!(reply.await.unwrap(), Ok(()));
+                    publish_after_handoff.await.unwrap();
+                    // This same original Worker receipt arrives after local
+                    // handoff. Publishing is not proof that the retired active
+                    // owner applied it, nor is it Worker physical exit.
+                    acks.publish(receipt);
+                })
+            });
+            let terminal = tokio::time::timeout_at(
+                deadline,
+                assembled.run(
+                    &drive,
+                    cancellation,
+                    ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+                ),
+            )
+            .await;
+            let seal_reply = reply.as_mut().map(|reply| reply.try_recv());
+            let sealed = assembled.round.accepted_root_success_sealed();
+            let empty = assembled.actor_gate.prepare_convergence();
+            let retained = format!("{:?}", assembled.actor_gate);
+            let target_established = assembled
+                .round
+                .execution()
+                .owner(target)
+                .unwrap()
+                .establish_acknowledged();
+            let target_released = assembled
+                .round
+                .execution()
+                .owner(target)
+                .unwrap()
+                .is_released();
+            if late_after_handoff {
+                // The snapshot names the latest replay, captured by the gate
+                // but never sent by its inner transport. Convergence marks
+                // that replay DefinitelyUnsent; the older unknown send still
+                // requires the original ticket/context Abort responsibility.
+                tokio::time::timeout_at(deadline, async {
+                    loop {
+                        if logical.establish_snapshot(target).await.unwrap().is_some_and(|snapshot| {
+                            snapshot.state() == novarocks_query_application::coordination::EstablishIssueState::DefinitelyUnsent
+                        }) { break; }
+                        tokio::task::yield_now().await;
+                    }
+                }).await.unwrap();
+            }
+            // Do not make the result seal or run wait for a later receipt.
+            // Its publisher is released only after the original local handoff.
+            if late_after_handoff {
+                publish_late.send(()).unwrap();
+                tokio::time::timeout_at(deadline, late_worker.unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(logical.establish_snapshot(target).await.unwrap().unwrap().state(),
+                    novarocks_query_application::coordination::EstablishIssueState::DefinitelyUnsent,
+                    "publishing into the original intake is not an applied actor settlement");
+            } else {
+                assert!(late_worker.is_none());
+            }
+            let actor_error = logical.actor_snapshot().await.unwrap().establish_error;
+            // Explicit fixture teardown is not a simulated physical-exit
+            // assertion. The regression verdict below uses only local gate/round.
+            drop(assembled);
+            drop(drive);
+            logical.abandon_running_attempt();
+            for &context in &contexts {
+                while logical
+                    .stand_down_snapshot(context)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+                if context == target {
+                    let closure = logical
+                        .stand_down_snapshot(context)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .closure();
+                    assert_ne!(closure,
+                        novarocks_query_application::coordination::ContextClosureState::NoRemoteResponsibility,
+                        "local gate closure cannot turn a pending admission or held ticket into NoGrant");
+                    assert!(
+                        !closure.residual_resource_settled(),
+                        "publishing a late receipt is not the Registry's physical closure fact"
+                    );
+                }
+                logical
+                    .observe_worker_process_replaced(context)
+                    .await
+                    .unwrap();
+            }
+            logical
+                .finish_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert!(sealed);
+            if let Some(reply) = seal_reply {
+                assert_eq!(reply.unwrap(), Ok(()));
+            }
+            assert!(
+                actor_error.is_none(),
+                "the exact original settlement must not create a ledger error: {actor_error:?}"
+            );
+            assert!(
+                !target_released,
+                "Native gate completion is not the Worker Release receipt"
+            );
+            if mode == 2 && !late_after_handoff {
+                assert!(
+                    target_established,
+                    "the pre-handoff original Worker receipt was applied"
+                );
+            } else {
+                assert!(
+                    !target_established,
+                    "an unsent or unobserved late carrier cannot fabricate an established context"
+                );
+            }
+            assert!(
+                matches!(terminal, Ok(NativeAttemptTerminal::Completed)),
+                "original queued carrier did not converge: {terminal:?}; gate={retained}"
+            );
+            assert!(empty, "Completed must not hide an orphan gate: {retained}");
+        }
     }
 }
