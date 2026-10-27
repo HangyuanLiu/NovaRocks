@@ -235,17 +235,23 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REMOVE ORPHAN FILES OLDER THAN '20
 
 -- query 44
 -- Rewrite data files
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 CALL ice_hms_${uuid0}.system.rewrite_data_files(table => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
 
 -- query 45
 -- Rewrite position deletes
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 CALL ice_hms_${uuid0}.system.rewrite_position_delete_files(table => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
 
 -- query 46
 -- Optimize admission
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 OPTIMIZE;
 
 -- query 47
