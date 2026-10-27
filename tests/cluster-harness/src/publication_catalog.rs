@@ -36,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -141,11 +141,30 @@ struct NextFaultState {
     trace: VecDeque<FaultTraceEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct FaultTraceEvent {
     sequence: u64,
     arm_id: String,
     event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<MatchedRequestObservation>,
+}
+
+/// Only public request routing facts, never headers, query strings or bodies.
+#[derive(Debug, Clone, Serialize)]
+struct MatchedRequestObservation {
+    method: String,
+    namespace: Option<String>,
+    table: Option<String>,
+    entered_unix_nanos: Option<u64>,
+    matched_unix_nanos: Option<u64>,
+}
+
+fn observed_unix_nanos() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -499,9 +518,14 @@ impl FixtureFaultGuard {
             .next_fault
             .lock()
             .expect("publication fault mutex");
-        Value::Array(state.trace.iter().filter(|event| event.arm_id == self.arm_id)
-            .map(|event| json!({"sequence":event.sequence,"arm_id":event.arm_id,"event":event.event}))
-            .collect())
+        Value::Array(
+            state
+                .trace
+                .iter()
+                .filter(|event| event.arm_id == self.arm_id)
+                .map(|event| json!(event))
+                .collect(),
+        )
     }
 
     pub fn wait_until_entered(&self, deadline: Instant) -> Result<()> {
@@ -691,6 +715,7 @@ async fn clear_next_fault(
 }
 
 async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
+    let entered_unix_nanos = observed_unix_nanos();
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -709,7 +734,15 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
             counts.table_load_while_commit_pending += 1;
         }
     }
-    let fault = action.and_then(|action| take_matching_fault(&state, action));
+    let fault = action.and_then(|action| {
+        take_matching_fault(
+            &state,
+            action,
+            &parts.method,
+            parts.uri.path(),
+            entered_unix_nanos,
+        )
+    });
     if let Some(armed) = fault.as_ref()
         && armed.fault == PublicationFault::BeforeDispatch
     {
@@ -993,12 +1026,19 @@ fn record_mutation(
     }
 }
 
-fn take_matching_fault(state: &AppState, action: PublicationAction) -> Option<ArmedNextFault> {
+fn take_matching_fault(
+    state: &AppState,
+    action: PublicationAction,
+    method: &Method,
+    path: &str,
+    entered_unix_nanos: Option<u64>,
+) -> Option<ArmedNextFault> {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
     let armed = next.armed.as_ref()?;
     if armed.action != action {
         return None;
     }
+    let matched_unix_nanos = observed_unix_nanos();
     // Consume the arm before the request is dispatched. In particular, a
     // definite OCC conflict may cause the product to issue one fresh attempt;
     // that second standard request must not re-enter this one-shot hold.
@@ -1010,6 +1050,18 @@ fn take_matching_fault(state: &AppState, action: PublicationAction) -> Option<Ar
         released: Arc::clone(&armed.released),
     });
     record_fault_event_locked(&mut next, &armed.arm_id, "matched");
+    // Only the actual matched request allocates diagnostic routing strings.
+    let target = exact_table_target(path);
+    next.trace
+        .back_mut()
+        .expect("the matched event was just recorded")
+        .request = Some(MatchedRequestObservation {
+        method: method.as_str().to_owned(),
+        namespace: target.map(|(namespace, _)| namespace.to_owned()),
+        table: target.map(|(_, table)| table.to_owned()),
+        entered_unix_nanos,
+        matched_unix_nanos,
+    });
     Some(armed)
 }
 
@@ -1027,6 +1079,7 @@ fn record_fault_event_locked(state: &mut NextFaultState, arm_id: &str, event: &s
         sequence: state.trace_sequence,
         arm_id: arm_id.to_string(),
         event: event.to_string(),
+        request: None,
     });
 }
 
@@ -1305,16 +1358,123 @@ mod tests {
             mutations: Arc::new(Mutex::new(BTreeMap::new())),
             traffic: Arc::new(Mutex::new(TrafficCounters::default())),
         };
-        assert!(take_matching_fault(&state, PublicationAction::StageCreate).is_none());
-        let consumed = take_matching_fault(&state, PublicationAction::TableCommit)
-            .expect("matching fault is consumed");
+        assert!(
+            take_matching_fault(
+                &state,
+                PublicationAction::StageCreate,
+                &Method::POST,
+                "/v1/namespaces/ns/tables/t",
+                None
+            )
+            .is_none()
+        );
+        let consumed = take_matching_fault(
+            &state,
+            PublicationAction::TableCommit,
+            &Method::POST,
+            "/v1/namespaces/ns/tables/t",
+            None,
+        )
+        .expect("matching fault is consumed");
         assert_eq!(consumed.arm_id, "one");
         assert_eq!(consumed.fault, PublicationFault::AfterCommitBeforeResponse);
-        assert!(take_matching_fault(&state, PublicationAction::TableCommit).is_none());
+        assert!(
+            take_matching_fault(
+                &state,
+                PublicationAction::TableCommit,
+                &Method::POST,
+                "/v1/namespaces/ns/tables/t",
+                None
+            )
+            .is_none()
+        );
         let trace = &state.next_fault.lock().unwrap().trace;
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].sequence, 1);
         assert_eq!(trace[0].event, "matched");
+    }
+
+    #[test]
+    fn matched_read_trace_keeps_actual_routing_and_times_without_request_secrets() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let downstream = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                consume_downstream_request(&mut socket);
+                let body = r#"{"metadata":"original"}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let guard = control.arm_next("table-load", "corrupt-package").unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let first = client
+            .get(format!(
+                "{}/v1/namespaces/ns_a/tables/a_mv?credential=query-secret",
+                fixture.uri()
+            ))
+            .header("authorization", "Bearer header-secret")
+            .send()
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.text().unwrap(), "{corrupt-package");
+        let second = client
+            .get(format!(
+                "{}/v1/namespaces/ns_b/tables/z_source",
+                fixture.uri()
+            ))
+            .send()
+            .unwrap();
+        assert_eq!(second.text().unwrap(), r#"{"metadata":"original"}"#);
+        let evidence = guard.finish().unwrap();
+        assert_eq!(
+            evidence.summary(),
+            "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> package-response-corrupted -> control-release"
+        );
+        let observed_trace = evidence.trace();
+        let matched = observed_trace
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "matched")
+            .collect::<Vec<_>>();
+        assert_eq!(matched.len(), 1);
+        let request = &matched[0]["request"];
+        assert_eq!(request["method"], "GET");
+        assert_eq!(request["namespace"], "ns_a");
+        assert_eq!(request["table"], "a_mv");
+        assert!(request["entered_unix_nanos"].as_u64().is_some());
+        assert!(request["matched_unix_nanos"].as_u64().is_some());
+        let trace = evidence.trace().to_string();
+        for excluded in [
+            "query-secret",
+            "header-secret",
+            "authorization",
+            "credential",
+            "ns_b",
+            "z_source",
+        ] {
+            assert!(!trace.contains(excluded));
+        }
+        assert_eq!(control.traffic_snapshot().requests, 2);
+        fixture.shutdown().unwrap();
+        downstream.join().unwrap();
     }
 
     #[test]

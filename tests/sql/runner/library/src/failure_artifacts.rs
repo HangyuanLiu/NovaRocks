@@ -280,6 +280,30 @@ impl FailureArtifactRecorder {
         Ok(pending.commit())
     }
 
+    /// Preserve an actual row result even when its text oracle has no golden.
+    pub(crate) fn persist_case_actual_result(
+        &self,
+        suite: &str,
+        case_id: &str,
+        query: usize,
+        execution: &crate::types::QueryExecution,
+    ) -> Result<PathBuf> {
+        let root = self.case_artifact_root()?;
+        let pending = PendingArtifactDir::create(
+            &root,
+            &case_artifact_name_prefix(&self.context.lane, suite, case_id, Some(query)),
+        )?;
+        pending.write_file(
+            "actual.json",
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "suite": suite, "case": case_id, "query": query,
+                "header": &execution.header, "rows": &execution.rows,
+            }))?,
+        )?;
+        pending.write_file("actual.txt", &execution.text_output)?;
+        Ok(pending.commit())
+    }
+
     pub(crate) fn persist_case_failure(
         &self,
         server_handle: &Mutex<Box<dyn ServerHandle>>,
@@ -1184,6 +1208,58 @@ mod tests {
                 .unwrap()
                 .contains("ready-identity")
         );
+    }
+
+    #[test]
+    fn text_oracle_failure_without_a_golden_keeps_the_complete_actual_privately() {
+        let temp = TempDir::new().unwrap();
+        let recorder = FailureArtifactRecorder::new(context(temp.path()));
+        let definition = "x".repeat(700);
+        let execution = crate::types::QueryExecution {
+            header: vec!["Name".into(), "Definition".into(), "Manageability".into()],
+            rows: vec![vec!["a_mv".into(), definition.clone(), "MANAGEABLE".into()]],
+            text_output: format!(
+                "Name\tDefinition\tManageability\na_mv\t{definition}\tMANAGEABLE\n"
+            ),
+            elapsed: std::time::Duration::ZERO,
+        };
+        let step = crate::types::SqlStep {
+            query_number: 3,
+            sql: "SHOW MATERIALIZED VIEWS".into(),
+            meta: crate::types::QueryMeta {
+                result_contains: vec!["UNAVAILABLE".into()],
+                ..Default::default()
+            },
+        };
+        let (accepted, reason) = crate::results::verify_text_assertions(&step, &execution);
+        assert!(!accepted);
+        assert!(reason.contains("UNAVAILABLE"));
+        let path = recorder
+            .persist_case_actual_result("lnp-3d", "isolation", step.query_number, &execution)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(path.join("actual.txt")).unwrap(),
+            execution.text_output
+        );
+        let actual: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path.join("actual.json")).unwrap()).unwrap();
+        assert_eq!(actual["header"][2], "Manageability");
+        assert_eq!(actual["rows"][0][1], definition);
+        assert_eq!(actual["rows"][0][2], "MANAGEABLE");
+        assert!(!path.join("expected.tsv").exists());
+        assert!(!path.join("case.result").exists());
+        assert!(!crate::results::verify_text_assertions(&step, &execution).0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+            for name in ["actual.txt", "actual.json"] {
+                assert_eq!(
+                    fs::metadata(path.join(name)).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+            }
+        }
     }
 
     #[test]

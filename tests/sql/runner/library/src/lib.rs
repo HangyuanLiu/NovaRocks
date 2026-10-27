@@ -3748,6 +3748,35 @@ fn run_case_observed(
                         let preview = execution.text_output.chars().take(500).collect::<String>();
                         let _ = writeln!(log, "    last result preview: {preview:?}");
                     }
+                    if last_failure.starts_with("VERIFY FAILED: ")
+                        && expected_results
+                            .as_ref()
+                            .and_then(|results| results.get(&step.query_number))
+                            .is_none()
+                        && let Some(execution) = last_execution.as_ref()
+                    {
+                        match ctx.failure_artifacts.persist_case_actual_result(
+                            &ctx.suite_name,
+                            &case.case_id,
+                            step.query_number,
+                            execution,
+                        ) {
+                            Ok(path) => {
+                                let _ = writeln!(
+                                    log,
+                                    "    complete actual result retained at {}",
+                                    path.display()
+                                );
+                                evidence.artifacts.push(path);
+                            }
+                            Err(error) => {
+                                let _ = writeln!(
+                                    log,
+                                    "    ⚠️ failed to retain complete actual result: {error:#}"
+                                );
+                            }
+                        }
+                    }
                     if let (Some(expected), Some(execution)) = (
                         expected_results
                             .as_ref()
@@ -4327,12 +4356,14 @@ fn run_case_observed(
         }
 
         if let Some(guard) = publication_catalog_fault_guard {
+            let trace_before_finish = guard.trace();
             match guard.finish() {
                 Ok(evidence) => {
                     let _ = writeln!(
                         log,
-                        "    @publication_catalog_fault consumed and cleared trace={}",
-                        evidence.summary()
+                        "    @publication_catalog_fault consumed and cleared trace={} details={}",
+                        evidence.summary(),
+                        evidence.trace()
                     );
                 }
                 Err(error) => {
@@ -4341,7 +4372,10 @@ fn run_case_observed(
                         Some(step.query_number),
                         format!("publication catalog fault cleanup: {error:#}"),
                     );
-                    let _ = writeln!(log, "    ❌ publication catalog fault cleanup: {error:#}");
+                    let _ = writeln!(
+                        log,
+                        "    ❌ publication catalog fault cleanup: {error:#}; trace_before_finish={trace_before_finish}"
+                    );
                 }
             }
         }
