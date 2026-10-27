@@ -17,7 +17,8 @@
 
 use crate::{
     ValueError, ValueFailure, ValueViolation,
-    arrow_raw::BoundView,
+    arrow_raw::{BoundView, OwnedView},
+    build::BuiltArray,
     decode::{DecodedBytes, RowMapping},
     reachability::SelectionSet,
 };
@@ -89,6 +90,9 @@ impl<'a> PreparedBytes<'a> {
     pub fn selection(&self) -> &SelectionSet {
         self.rows
     }
+    pub(crate) fn bottom_len(&self) -> usize {
+        self.decoded.bottom().len()
+    }
     pub(crate) fn mapping(&self) -> &RowMapping {
         self.decoded.mapping()
     }
@@ -103,6 +107,65 @@ impl<'a> PreparedBytes<'a> {
         }
     }
 }
+/// A checked, immutable view page published by the public value builder.
+/// The page owns its descriptor, validity, payload and defined-domain handles;
+/// a new or compacted page never changes an existing page's readable values.
+pub struct OwnedBytesPage {
+    owner: OwnedView,
+    defined: SelectionSet,
+}
+impl OwnedBytesPage {
+    pub fn new<E, G, W>(
+        built: BuiltArray,
+        defined: SelectionSet,
+        growth: &mut G,
+        work: &mut W,
+    ) -> Result<Self, ValueFailure<E>>
+    where
+        G: FnMut(std::alloc::Layout) -> Result<(), E>,
+        W: FnMut(usize) -> Result<(), E>,
+    {
+        if defined.len() != built.array.len() {
+            return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        }
+        let owner = OwnedView::bind_observed(built.array.as_ref(), growth, work)?;
+        let view = owner.view();
+        let mut control = super::RowWork::new(work);
+        let mut cursor = defined.cursor();
+        while let Some(row) = cursor.next_observed(&mut |n| control.observe_metadata(n))? {
+            control.row()?;
+            // Check the real descriptor extent, rather than trusting a caller's
+            // coverage assertion or a pointer to separately retained storage.
+            view.value(row)?;
+        }
+        control.flush()?;
+        Ok(Self { owner, defined })
+    }
+    /// Physical page coordinates, including positions outside its defined set.
+    pub fn len(&self) -> usize {
+        self.owner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn is_utf8(&self) -> bool {
+        self.owner.is_utf8()
+    }
+    pub fn defined_rows(&self) -> &SelectionSet {
+        &self.defined
+    }
+    pub(crate) fn view(&self) -> BoundView<'_> {
+        self.owner.view()
+    }
+    pub(crate) fn check_row(&self, row: usize) -> Result<(), ValueError> {
+        if self.defined.contains(row) {
+            Ok(())
+        } else {
+            Err(ValueError::Invariant(ValueViolation::UndefinedRow))
+        }
+    }
+}
+
 pub(crate) trait Mapping {
     fn index(&self, row: usize) -> Option<usize>;
 }
@@ -219,5 +282,133 @@ mod tests {
             });
             assert!(matches!(result, Err(ValueFailure::Caller("bitmap stop"))));
         }
+    }
+}
+
+#[cfg(test)]
+mod owned_tests {
+    use super::*;
+    use crate::{
+        ByteLayout,
+        build::ValueBuilder,
+        control::{global_growth, uncontrolled},
+        reachability::ReachableRows,
+    };
+
+    #[test]
+    fn checked_owned_page_keeps_real_source_and_sparse_domain() {
+        let text = "retained external backing after builder and source exit";
+        let mut builder = ValueBuilder::new(ByteLayout::Utf8View);
+        builder
+            .append_str(text, &mut global_growth, &mut uncontrolled)
+            .unwrap();
+        builder
+            .append_null(&mut global_growth, &mut uncontrolled)
+            .unwrap();
+        builder
+            .append_str("not admitted", &mut global_growth, &mut uncontrolled)
+            .unwrap();
+        let mut defined = SelectionSet::try_new(3).unwrap();
+        defined.insert(0).unwrap();
+        defined.insert(1).unwrap();
+        let built = builder.finish().unwrap();
+        let before = crate::arrow_raw::concrete_bindings();
+        let page =
+            OwnedBytesPage::new(built, defined, &mut global_growth, &mut uncontrolled).unwrap();
+        let bound = crate::arrow_raw::concrete_bindings();
+        assert_eq!(bound - before, 1);
+        assert_eq!(page.len(), 3);
+        assert!(page.is_utf8());
+        for _ in 0..3 {
+            assert_eq!(page.view().value(0).unwrap(), Some(text.as_bytes()));
+            assert_eq!(page.view().value(1).unwrap(), None);
+        }
+        assert_eq!(crate::arrow_raw::concrete_bindings(), bound);
+        assert!(matches!(
+            page.check_row(2),
+            Err(ValueError::Invariant(ValueViolation::UndefinedRow))
+        ));
+        assert!(matches!(
+            page.check_row(3),
+            Err(ValueError::Invariant(ValueViolation::UndefinedRow))
+        ));
+    }
+    #[test]
+    fn owned_binding_rejects_offsets_and_mismatched_domain() {
+        for (layout, domain) in [(ByteLayout::Utf8, 1), (ByteLayout::Utf8View, 2)] {
+            let mut builder = ValueBuilder::new(layout);
+            builder
+                .append_str("x", &mut global_growth, &mut uncontrolled)
+                .unwrap();
+            let defined = ReachableRows::all(domain)
+                .materialize(&mut global_growth)
+                .unwrap();
+            let result = OwnedBytesPage::new(
+                builder.finish().unwrap(),
+                defined,
+                &mut global_growth,
+                &mut uncontrolled,
+            );
+            assert!(matches!(
+                result,
+                Err(ValueFailure::Value(ValueError::Invariant(_)))
+            ));
+        }
+    }
+    #[test]
+    fn owned_page_preparation_preserves_control_failure_for_null_domain() {
+        let mut builder = ValueBuilder::new(ByteLayout::BinaryView);
+        for _ in 0..4096 {
+            builder
+                .append_null(&mut global_growth, &mut uncontrolled)
+                .unwrap();
+        }
+        let rows = ReachableRows::all(4096)
+            .materialize(&mut global_growth)
+            .unwrap();
+        let result =
+            OwnedBytesPage::new(builder.finish().unwrap(), rows, &mut |_| Ok(()), &mut |n| {
+                if n > 0 {
+                    Err("owned-page-stop")
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(matches!(
+            result,
+            Err(ValueFailure::Caller("owned-page-stop"))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod owned_growth_test {
+    use super::*;
+    use crate::{
+        ByteLayout,
+        build::ValueBuilder,
+        control::{global_growth, uncontrolled},
+        reachability::ReachableRows,
+    };
+    #[test]
+    fn owned_source_table_growth_refusal_keeps_original_caller() {
+        let mut builder = ValueBuilder::new(ByteLayout::Utf8View);
+        builder
+            .append_str(
+                "an external value owns a retained buffer",
+                &mut global_growth,
+                &mut uncontrolled,
+            )
+            .unwrap();
+        let rows = ReachableRows::all(1)
+            .materialize(&mut global_growth)
+            .unwrap();
+        let result = OwnedBytesPage::new(
+            builder.finish().unwrap(),
+            rows,
+            &mut |_| Err("page-growth"),
+            &mut |_| Ok(()),
+        );
+        assert!(matches!(result, Err(ValueFailure::Caller("page-growth"))));
     }
 }

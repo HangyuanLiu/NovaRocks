@@ -17,8 +17,14 @@
 
 //! Equality over prepared logical byte rows. Result positions are selection
 //! ordinals or pair ordinals, never implicit physical bottom coordinates.
-use super::{BYTE_BLOCK, PreparedBytes, RowWork, prepared::Mapping, with_mapping};
-use crate::{ValueError, ValueFailure, ValueViolation, hash_eq::NullEquality};
+use super::{
+    BYTE_BLOCK, OwnedBytesPage, PreparedBytes, RowWork,
+    prepared::{Identity, Mapping},
+    with_mapping,
+};
+use crate::{
+    ValueError, ValueFailure, ValueViolation, arrow_raw::BoundView, hash_eq::NullEquality,
+};
 
 /// Compare the same logical rows in two prepared selections. Both selections
 /// must contain exactly the same logical positions. Every successful output
@@ -40,7 +46,7 @@ where
     {
         return Err(ValueError::Invariant(ValueViolation::Bounds).into());
     }
-    validate_domains(left, right)?;
+    validate_domains(left.is_utf8(), right.is_utf8())?;
     work(0).map_err(ValueFailure::Caller)?;
     with_mapping!(left, |lm| {
         with_mapping!(right, |rm| {
@@ -84,7 +90,7 @@ where
     if left_rows.len() != right_rows.len() || output.len() != left_rows.len() {
         return Err(ValueError::Invariant(ValueViolation::Bounds).into());
     }
-    validate_domains(left, right)?;
+    validate_domains(left.is_utf8(), right.is_utf8())?;
     work(0).map_err(ValueFailure::Caller)?;
     with_mapping!(left, |lm| {
         with_mapping!(right, |rm| {
@@ -106,22 +112,87 @@ where
     })
 }
 
-fn validate_domains(left: &PreparedBytes<'_>, right: &PreparedBytes<'_>) -> Result<(), ValueError> {
-    if left.is_utf8() != right.is_utf8() {
+/// Compare ordered input/page row pairs against a previously published page.
+/// Page coordinates are physical page rows; input coordinates are logical rows
+/// in the prepared selection. Repeated pairs remain separate output positions.
+/// The immutable page binding is reused without decoding or copying its data.
+/// On error the caller must discard the entire output of this operation.
+pub fn compare_owned_pairs_into<E, W>(
+    left: &PreparedBytes<'_>,
+    left_rows: &[usize],
+    right: &OwnedBytesPage,
+    right_rows: &[usize],
+    nulls: NullEquality,
+    output: &mut [Option<bool>],
+    work: &mut W,
+) -> Result<(), ValueFailure<E>>
+where
+    W: FnMut(usize) -> Result<(), E>,
+{
+    if left_rows.len() != right_rows.len() || output.len() != left_rows.len() {
+        return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+    }
+    validate_domains(left.is_utf8(), right.is_utf8())?;
+    work(0).map_err(ValueFailure::Caller)?;
+    with_mapping!(left, |lm| {
+        let mut pairs = left_rows.iter().copied().zip(right_rows.iter().copied());
+        compare_rows(
+            CompareInputs {
+                left,
+                right,
+                positional: false,
+                nulls,
+            },
+            &lm,
+            &Identity,
+            |_: &mut RowWork<'_, W>| Ok(pairs.next()),
+            output,
+            work,
+        )
+    })
+}
+
+fn validate_domains(left_utf8: bool, right_utf8: bool) -> Result<(), ValueError> {
+    if left_utf8 != right_utf8 {
         return Err(ValueError::Invariant(ValueViolation::Layout));
     }
     Ok(())
 }
 
-struct CompareInputs<'p, 'a> {
-    left: &'p PreparedBytes<'a>,
-    right: &'p PreparedBytes<'a>,
+// These adapters select the source owner at the batch boundary. Both entry
+// points instantiate the same equality loop with concrete source/mapping types.
+trait CompareSource {
+    fn view(&self) -> BoundView<'_>;
+    fn check_row(&self, row: usize) -> Result<(), ValueError>;
+}
+
+impl CompareSource for PreparedBytes<'_> {
+    fn view(&self) -> BoundView<'_> {
+        self.view()
+    }
+    fn check_row(&self, row: usize) -> Result<(), ValueError> {
+        self.check_row(row)
+    }
+}
+
+impl CompareSource for OwnedBytesPage {
+    fn view(&self) -> BoundView<'_> {
+        self.view()
+    }
+    fn check_row(&self, row: usize) -> Result<(), ValueError> {
+        self.check_row(row)
+    }
+}
+
+struct CompareInputs<'p, LS, RS> {
+    left: &'p LS,
+    right: &'p RS,
     positional: bool,
     nulls: NullEquality,
 }
 
-fn compare_rows<E, W, L, R, N>(
-    inputs: CompareInputs<'_, '_>,
+fn compare_rows<E, W, L, R, N, LS, RS>(
+    inputs: CompareInputs<'_, LS, RS>,
     left_mapping: &L,
     right_mapping: &R,
     mut next: N,
@@ -133,6 +204,8 @@ where
     L: Mapping,
     R: Mapping,
     N: FnMut(&mut RowWork<'_, W>) -> Result<Option<(usize, usize)>, ValueFailure<E>>,
+    LS: CompareSource,
+    RS: CompareSource,
 {
     let CompareInputs {
         left,
@@ -199,6 +272,8 @@ mod tests {
     use crate::{
         ByteLayout,
         access::ByteSource,
+        build::ValueBuilder,
+        control::{global_growth, uncontrolled},
         decode::{DecodedBytes, ValueConversionContext},
         reachability::{ReachableRows, SelectionSet},
     };
@@ -225,6 +300,353 @@ mod tests {
     }
     fn all(len: usize) -> SelectionSet {
         rows(len, &(0..len).collect::<Vec<_>>())
+    }
+
+    // Pages are published through the same checked public builder consumed by
+    // key owners. Expected equality results below come from literal values,
+    // rather than comparisons between two implementations of the new API.
+    fn owned_page(layout: ByteLayout, values: &[Option<&[u8]>]) -> OwnedBytesPage {
+        let mut builder = ValueBuilder::new(layout);
+        for value in values {
+            match value {
+                Some(bytes) if layout.is_utf8() => builder
+                    .append_str(
+                        std::str::from_utf8(bytes).unwrap(),
+                        &mut global_growth,
+                        &mut uncontrolled,
+                    )
+                    .unwrap(),
+                Some(bytes) => builder
+                    .append_bytes(bytes, &mut global_growth, &mut uncontrolled)
+                    .unwrap(),
+                None => builder
+                    .append_null(&mut global_growth, &mut uncontrolled)
+                    .unwrap(),
+            }
+        }
+        let built = builder.finish().unwrap();
+        let before_binding = crate::arrow_raw::concrete_bindings();
+        let page = OwnedBytesPage::new(
+            built,
+            all(values.len()),
+            &mut global_growth,
+            &mut uncontrolled,
+        )
+        .unwrap();
+        assert_eq!(crate::arrow_raw::concrete_bindings() - before_binding, 1);
+        page
+    }
+
+    #[test]
+    fn owned_page_reuses_binding_across_replaced_dictionary_batches_and_slices() {
+        let page = owned_page(ByteLayout::Utf8View, &[Some(b"alpha"), Some(b"beta"), None]);
+        let first: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(2), Some(0), None, Some(1)]),
+                Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")])),
+            )
+            .unwrap(),
+        );
+        let second: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(0), Some(1), Some(2), None]),
+                Arc::new(StringArray::from(vec![Some("beta"), Some("alpha"), None])),
+            )
+            .unwrap(),
+        );
+        let third: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("ignored prefix"),
+            Some("alpha"),
+            None,
+            None,
+        ]));
+        for array in [first, second, third] {
+            let input = decoded(&array.slice(1, 3), ByteLayout::Utf8);
+            let selected = all(3);
+            let prepared = PreparedBytes::new(&input, &selected).unwrap();
+            let bound = crate::arrow_raw::concrete_bindings();
+            for _ in 0..3 {
+                let mut output = [None; 5];
+                compare_owned_pairs_into(
+                    &prepared,
+                    &[2, 0, 0, 1, 0],
+                    &page,
+                    &[2, 0, 0, 0, 1],
+                    NullEquality::Equal,
+                    &mut output,
+                    &mut uncontrolled,
+                )
+                .unwrap();
+                assert_eq!(
+                    output,
+                    [Some(true), Some(true), Some(true), Some(false), Some(false)]
+                );
+                assert_eq!(crate::arrow_raw::concrete_bindings(), bound);
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_page_keeps_old_alias_readable_after_publication() {
+        let a = "same prefix retained external value a";
+        let b = "same prefix retained external value b";
+        let original = Arc::new(owned_page(
+            ByteLayout::Utf8View,
+            &[Some(a.as_bytes()), Some(b.as_bytes())],
+        ));
+        let old_alias = Arc::clone(&original);
+        // A key owner compacts by publishing a new immutable page and updating
+        // its mapping. It cannot invalidate holders of the previous binding.
+        let compacted = owned_page(ByteLayout::Utf8View, &[Some(b.as_bytes())]);
+        drop(original);
+        let input: ArrayRef = Arc::new(StringArray::from(vec![a, b]));
+        let input = decoded(&input, ByteLayout::Utf8);
+        let selected = all(2);
+        let prepared = PreparedBytes::new(&input, &selected).unwrap();
+        let mut output = [None; 2];
+        compare_owned_pairs_into(
+            &prepared,
+            &[0, 1],
+            &old_alias,
+            &[0, 1],
+            NullEquality::Equal,
+            &mut output,
+            &mut uncontrolled,
+        )
+        .unwrap();
+        assert_eq!(output, [Some(true), Some(true)]);
+        compare_owned_pairs_into(
+            &prepared,
+            &[1, 0],
+            &compacted,
+            &[0, 0],
+            NullEquality::Equal,
+            &mut output,
+            &mut uncontrolled,
+        )
+        .unwrap();
+        assert_eq!(output, [Some(true), Some(false)]);
+    }
+
+    #[test]
+    fn owned_pairs_keep_all_three_null_policies() {
+        let array: ArrayRef = Arc::new(StringArray::from(vec![
+            None,
+            None,
+            Some("x"),
+            Some("x"),
+            Some("x"),
+        ]));
+        let input = decoded(&array, ByteLayout::Utf8);
+        let selected = all(5);
+        let prepared = PreparedBytes::new(&input, &selected).unwrap();
+        let page = owned_page(
+            ByteLayout::Utf8View,
+            &[None, Some(b"x"), None, Some(b"x"), Some(b"y")],
+        );
+        for (policy, expected) in [
+            (
+                NullEquality::Unknown,
+                [None, None, None, Some(true), Some(false)],
+            ),
+            (
+                NullEquality::Equal,
+                [
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                ],
+            ),
+            (
+                NullEquality::Unequal,
+                [
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                ],
+            ),
+        ] {
+            let mut output = [None; 5];
+            compare_owned_pairs_into(
+                &prepared,
+                &[0, 1, 2, 3, 4],
+                &page,
+                &[0, 1, 2, 3, 4],
+                policy,
+                &mut output,
+                &mut uncontrolled,
+            )
+            .unwrap();
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn owned_pairs_compare_complete_bytes_after_equal_prefixes() {
+        let long = "x".repeat(BYTE_BLOCK * 3 + 1);
+        let array: ArrayRef = Arc::new(StringArray::from(vec![
+            "same prefix but different a",
+            "inline",
+            "",
+            long.as_str(),
+        ]));
+        let input = decoded(&array, ByteLayout::Utf8);
+        let selected = all(4);
+        let prepared = PreparedBytes::new(&input, &selected).unwrap();
+        let page = owned_page(
+            ByteLayout::Utf8View,
+            &[
+                Some(b"same prefix but different b"),
+                Some(b"inline"),
+                Some(b""),
+                Some(long.as_bytes()),
+            ],
+        );
+        let mut output = [None; 4];
+        compare_owned_pairs_into(
+            &prepared,
+            &[0, 1, 2, 3],
+            &page,
+            &[0, 1, 2, 3],
+            NullEquality::Equal,
+            &mut output,
+            &mut uncontrolled,
+        )
+        .unwrap();
+        assert_eq!(output, [Some(false), Some(true), Some(true), Some(true)]);
+        let mut blocks = 0;
+        let failure = compare_owned_pairs_into(
+            &prepared,
+            &[3],
+            &page,
+            &[3],
+            NullEquality::Equal,
+            &mut [None],
+            &mut |units| {
+                if units == BYTE_BLOCK {
+                    blocks += 1;
+                }
+                if blocks == 2 {
+                    Err("original owned comparison cancellation")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(
+            failure,
+            Err(ValueFailure::Caller(
+                "original owned comparison cancellation"
+            ))
+        ));
+        assert_eq!(blocks, 2);
+    }
+
+    #[test]
+    fn owned_pair_domains_and_shapes_are_checked() {
+        let array: ArrayRef = Arc::new(StringArray::from(vec!["a", "hidden", "b"]));
+        let input = decoded(&array, ByteLayout::Utf8);
+        let selected = rows(3, &[0, 2]);
+        let prepared = PreparedBytes::new(&input, &selected).unwrap();
+        let mut builder = ValueBuilder::new(ByteLayout::Utf8View);
+        for value in ["a", "hidden", "b"] {
+            builder
+                .append_str(value, &mut global_growth, &mut uncontrolled)
+                .unwrap();
+        }
+        let page = OwnedBytesPage::new(
+            builder.finish().unwrap(),
+            rows(3, &[0, 2]),
+            &mut global_growth,
+            &mut uncontrolled,
+        )
+        .unwrap();
+        for (left_rows, right_rows) in [(&[1][..], &[0][..]), (&[0], &[1]), (&[0], &[3])] {
+            let failure = compare_owned_pairs_into(
+                &prepared,
+                left_rows,
+                &page,
+                right_rows,
+                NullEquality::Equal,
+                &mut [None],
+                &mut uncontrolled,
+            );
+            assert!(matches!(
+                failure,
+                Err(ValueFailure::Value(ValueError::Invariant(
+                    ValueViolation::UndefinedRow
+                )))
+            ));
+        }
+        assert!(matches!(
+            compare_owned_pairs_into(
+                &prepared,
+                &[0, 2],
+                &page,
+                &[0],
+                NullEquality::Equal,
+                &mut [None; 2],
+                &mut uncontrolled,
+            ),
+            Err(ValueFailure::Value(ValueError::Invariant(
+                ValueViolation::Bounds
+            )))
+        ));
+        assert!(matches!(
+            compare_owned_pairs_into(
+                &prepared,
+                &[0],
+                &page,
+                &[0],
+                NullEquality::Equal,
+                &mut [],
+                &mut uncontrolled,
+            ),
+            Err(ValueFailure::Value(ValueError::Invariant(
+                ValueViolation::Bounds
+            )))
+        ));
+    }
+
+    #[test]
+    fn owned_binary_page_preserves_bytes_and_rejects_string_domain() {
+        let bytes: &[u8] = &[0xff, 0, 0xfe];
+        let array: ArrayRef = Arc::new(BinaryArray::from(vec![Some(bytes), None]));
+        let input = decoded(&array, ByteLayout::Binary);
+        let selected = all(2);
+        let prepared = PreparedBytes::new(&input, &selected).unwrap();
+        let binary = owned_page(ByteLayout::BinaryView, &[Some(bytes), None]);
+        let mut output = [None; 3];
+        compare_owned_pairs_into(
+            &prepared,
+            &[0, 1, 0],
+            &binary,
+            &[0, 1, 1],
+            NullEquality::Unknown,
+            &mut output,
+            &mut uncontrolled,
+        )
+        .unwrap();
+        assert_eq!(output, [Some(true), None, None]);
+        let string = owned_page(ByteLayout::Utf8View, &[Some(b"x"), None]);
+        assert!(matches!(
+            compare_owned_pairs_into(
+                &prepared,
+                &[0],
+                &string,
+                &[0],
+                NullEquality::Equal,
+                &mut [None],
+                &mut uncontrolled,
+            ),
+            Err(ValueFailure::Value(ValueError::Invariant(
+                ValueViolation::Layout
+            )))
+        ));
     }
 
     #[test]

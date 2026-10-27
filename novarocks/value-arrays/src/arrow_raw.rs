@@ -1327,3 +1327,63 @@ impl<'a> BoundView<'a> {
         Ok(ByteView::from(*raw).prefix.to_le_bytes())
     }
 }
+
+/// Immutable view parts retain the actual Arrow backing without a self borrow.
+/// Cloning buffer handles does not copy payload or grant allocation authority.
+pub(crate) struct OwnedView {
+    views: ScalarBuffer<u128>,
+    buffers: Vec<Buffer>,
+    nulls: Option<NullBuffer>,
+    utf8: bool,
+}
+impl OwnedView {
+    pub(crate) fn bind_observed<E, G, W>(
+        array: &dyn Array,
+        growth: &mut G,
+        work: &mut W,
+    ) -> Result<Self, crate::ValueFailure<E>>
+    where
+        G: FnMut(std::alloc::Layout) -> Result<(), E>,
+        W: FnMut(usize) -> Result<(), E>,
+    {
+        let (views, source_buffers) = view_parts(array)?;
+        work(0).map_err(crate::ValueFailure::Caller)?;
+        let mut buffers = Vec::new();
+        let layout = std::alloc::Layout::array::<Buffer>(source_buffers.len())
+            .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
+        if !source_buffers.is_empty() {
+            growth(layout).map_err(crate::ValueFailure::Caller)?;
+            buffers
+                .try_reserve_exact(source_buffers.len())
+                .map_err(|source| ValueError::Allocation {
+                    requested: layout.size(),
+                    source,
+                })?;
+        }
+        // Initialize retained handles in bounded metadata blocks after the
+        // caller admits the complete allocation. Payload is never copied.
+        for block in source_buffers.chunks(1024) {
+            work(std::mem::size_of_val(block)).map_err(crate::ValueFailure::Caller)?;
+            buffers.extend_from_slice(block);
+        }
+        Ok(Self {
+            views: views.clone(),
+            buffers,
+            nulls: array.nulls().cloned(),
+            utf8: matches!(array.data_type(), arrow_schema::DataType::Utf8View),
+        })
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.views.len()
+    }
+    pub(crate) fn is_utf8(&self) -> bool {
+        self.utf8
+    }
+    pub(crate) fn view(&self) -> BoundView<'_> {
+        BoundView {
+            views: &self.views,
+            buffers: &self.buffers,
+            nulls: self.nulls.as_ref(),
+        }
+    }
+}

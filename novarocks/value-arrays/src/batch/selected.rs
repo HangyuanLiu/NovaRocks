@@ -140,4 +140,44 @@ mod tests {
         assert_eq!(visits, 1);
         assert!(matches!(error, ValueFailure::Caller("visitor failure")));
     }
+
+    #[test]
+    fn long_selected_value_observes_cancellation_before_visiting() {
+        let text = "x".repeat(BYTE_BLOCK * 3 + 1);
+        let array: ArrayRef = Arc::new(StringArray::from(vec![text.as_str()]));
+        let decoded = ValueConversionContext::default()
+            .decode(
+                &ByteSource::parse(&array, ByteLayout::Utf8, None).unwrap(),
+                &ReachableRows::all(1),
+            )
+            .unwrap();
+        let mut rows = SelectionSet::try_new(1).unwrap();
+        rows.insert(0).unwrap();
+        let prepared = PreparedBytes::new(&decoded, &rows).unwrap();
+        let mut visits = 0;
+        let mut blocks = 0;
+        let failure = visit_selected(
+            &prepared,
+            &mut |_, _, _| {
+                visits += 1;
+                Ok(())
+            },
+            &mut |units| {
+                if units == BYTE_BLOCK {
+                    blocks += 1;
+                }
+                if blocks == 2 {
+                    Err("original selected cancellation")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(
+            failure,
+            Err(ValueFailure::Caller("original selected cancellation"))
+        ));
+        assert_eq!(blocks, 2);
+        assert_eq!(visits, 0);
+    }
 }

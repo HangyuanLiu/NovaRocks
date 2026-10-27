@@ -366,3 +366,232 @@ fn all_null_and_empty_values_keep_bounded_row_control_without_per_row_callbacks(
         "control is per block, not per row: {calls}"
     );
 }
+
+fn reusable_uniform<H: ByteHashKernel>(
+    input: &PreparedBytes<'_>,
+    kernel: &H,
+    seed: H::Seed,
+    scratch: &mut HashScratch,
+) -> Vec<u64> {
+    let mut output = vec![0; input.len()];
+    hash_into(
+        input,
+        kernel,
+        HashOptions {
+            seeds: HashSeed::Uniform(seed),
+            nulls: NullHash::Value(99),
+        },
+        &mut output,
+        scratch,
+        &mut |_| Ok::<_, Infallible>(()),
+        &mut |_| Ok::<_, Infallible>(()),
+    )
+    .unwrap();
+    output
+}
+
+#[test]
+fn dense_dictionary_generations_avoid_reinitializing_selected_row_sized_storage() {
+    let values: ArrayRef = Arc::new(StringViewArray::from(vec![Some("hello"), None]));
+    let input: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from((0..4096).map(|row| Some(row % 2)).collect::<Vec<_>>()),
+            values,
+        )
+        .unwrap(),
+    );
+    let decoded = decode(&input, ByteLayout::Utf8View);
+    let rows = all(&decoded);
+    let prepared = PreparedBytes::new(&decoded, &rows).unwrap();
+    let mut scratch = HashScratch::new();
+    let calls = Cell::new(0);
+    let actual = reusable_uniform(
+        &prepared,
+        &Counted(&calls),
+        14695981039346656037,
+        &mut scratch,
+    );
+    assert_eq!(scratch.mode, ScratchMode::Dense);
+    assert_eq!(scratch.dense_values.len(), 2);
+    assert!(scratch.slots.is_empty());
+    assert!(
+        actual
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == if i % 2 == 0 { 0xa430d84680aabd0b } else { 99 })
+    );
+    // Preparing a second dense generation performs no all-domain clearing or
+    // allocation. The normal row loop still has its independent work checks.
+    let mut initialized = 0;
+    scratch
+        .prepare(4096, 2, &mut |_| Err("unexpected growth"), &mut |n| {
+            initialized += n;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(initialized, 0);
+    assert_eq!(scratch.cached(0), None);
+    let repeated = reusable_uniform(
+        &prepared,
+        &Counted(&calls),
+        14695981039346656037,
+        &mut scratch,
+    );
+    assert_eq!(repeated, actual);
+    assert_eq!(
+        calls.get(),
+        2,
+        "one computation per reachable non-NULL bottom per call"
+    );
+}
+
+#[test]
+fn scratch_switches_dense_sparse_and_back_without_cross_source_or_algorithm_reuse() {
+    let mut scratch = HashScratch::new();
+    for (bottom_len, value, sparse) in [
+        (2, "hello", false),
+        (100_000, "hello", true),
+        (2, "123456789", false),
+    ] {
+        let values: ArrayRef = Arc::new(StringViewArray::from(vec![value; bottom_len]));
+        let input: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(bottom_len as i32 - 1); 8]),
+                values,
+            )
+            .unwrap(),
+        );
+        let decoded = decode(&input, ByteLayout::Utf8View);
+        let rows = all(&decoded);
+        let prepared = PreparedBytes::new(&decoded, &rows).unwrap();
+        let output = reusable_uniform(&prepared, &Crc32, 0, &mut scratch);
+        let golden = if value == "hello" {
+            0x3610a686
+        } else {
+            0xcbf43926
+        };
+        assert_eq!(output, vec![golden; 8]);
+        assert_eq!(
+            scratch.mode,
+            if sparse {
+                ScratchMode::Sparse
+            } else {
+                ScratchMode::Dense
+            }
+        );
+        // Existing dense capacity may remain, but sparse calls never expand it
+        // to the large dictionary bottom domain.
+        assert_eq!(scratch.dense_stamps.len(), 2);
+        let output = reusable_uniform(&prepared, &Fnv1a64, 14695981039346656037, &mut scratch);
+        let golden = if value == "hello" {
+            0xa430d84680aabd0b
+        } else {
+            0x06d5573923c6cdfc
+        };
+        assert_eq!(output, vec![golden; 8]);
+    }
+}
+
+#[test]
+fn cancelled_dense_wrap_is_recleared_before_generation_one_is_reused() {
+    let mut scratch = HashScratch::new();
+    scratch
+        .prepare(
+            16_384,
+            16_384,
+            &mut |_| Ok::<_, &'static str>(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    scratch.dense_stamps.fill(1);
+    scratch.dense_values.fill(123);
+    scratch.generation = u64::MAX;
+    let mut clear_calls = 0;
+    let failed = scratch.prepare(16_384, 16_384, &mut |_| Ok(()), &mut |n| {
+        if n != 0 {
+            clear_calls += 1;
+        }
+        if clear_calls == 2 {
+            Err("wrap interrupted")
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(
+        failed,
+        Err(ValueFailure::Caller("wrap interrupted"))
+    ));
+    assert_eq!(scratch.generation, 0);
+    assert_eq!(scratch.mode, ScratchMode::Empty);
+    assert_eq!(
+        scratch.dense_stamps[16_383], 1,
+        "cancelled suffix was not cleared"
+    );
+    let mut clear_bytes = 0;
+    scratch
+        .prepare(16_384, 16_384, &mut |_| Ok::<_, Infallible>(()), &mut |n| {
+            assert!(n <= BYTE_BLOCK);
+            clear_bytes += n;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(scratch.generation, 1);
+    assert_eq!(clear_bytes, 16_384 * size_of::<u64>());
+    assert_eq!(scratch.cached(16_383), None);
+    scratch.insert(16_383, 16_383, 42);
+    assert_eq!(scratch.cached(16_383), Some(42));
+}
+
+#[test]
+fn cancelled_hash_call_never_reuses_partial_dense_results_on_retry() {
+    let values: ArrayRef = Arc::new(StringViewArray::from(vec!["hello"]));
+    let input: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![Some(0); 4096]), values)
+            .unwrap(),
+    );
+    let decoded = decode(&input, ByteLayout::Utf8View);
+    let rows = all(&decoded);
+    let prepared = PreparedBytes::new(&decoded, &rows).unwrap();
+    let calls = Cell::new(0);
+    let mut scratch = HashScratch::new();
+    let mut output = vec![0; prepared.len()];
+    let failure = hash_into(
+        &prepared,
+        &Counted(&calls),
+        HashOptions {
+            seeds: HashSeed::Uniform(14695981039346656037),
+            nulls: NullHash::Value(99),
+        },
+        &mut output,
+        &mut scratch,
+        &mut |_| Ok::<_, &'static str>(()),
+        &mut |n| {
+            if n >= 1024 {
+                Err("row block cancelled")
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(
+        failure,
+        Err(ValueFailure::Caller("row block cancelled"))
+    ));
+    assert_eq!(
+        calls.get(),
+        1,
+        "the interrupted call computed one cached value"
+    );
+    let output = reusable_uniform(
+        &prepared,
+        &Counted(&calls),
+        14695981039346656037,
+        &mut scratch,
+    );
+    assert_eq!(output, vec![0xa430d84680aabd0b; 4096]);
+    assert_eq!(
+        calls.get(),
+        2,
+        "retry recomputes rather than trusting interrupted cache"
+    );
+}

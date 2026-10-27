@@ -99,22 +99,53 @@ struct CachedHash {
     occupied: bool,
 }
 
-/// Caller-owned scratch. Every call invalidates previous entries, including
-/// when the algorithm, seed or source changes. Its allocation is bounded by
-/// selected logical rows, not by the original dictionary's bottom length.
-/// Reuse follows the decoded mapping: a flattened dictionary has independent
-/// bottom rows and no longer exposes its original dictionary identities.
+#[derive(Clone, Copy, Default, Eq, PartialEq, Debug)]
+enum ScratchMode {
+    #[default]
+    Empty,
+    Dense,
+    Sparse,
+}
+
+/// Caller-owned scratch. Every call invalidates all previous results, including
+/// when the algorithm, seed or source changes. A small bottom domain uses
+/// generation-stamped direct addressing; sparse domains allocate only in
+/// proportion to the selected logical rows. Retained capacity belongs to the
+/// caller's scratch lifetime and grants no cross-call result reuse.
 #[derive(Default)]
 pub struct HashScratch {
+    dense_values: Vec<u64>,
+    dense_stamps: Vec<u64>,
+    generation: u64,
     slots: Vec<CachedHash>,
+    mode: ScratchMode,
 }
 impl HashScratch {
     pub fn new() -> Self {
         Self::default()
     }
+    fn advance_generation<E, W>(&mut self, work: &mut W) -> Result<(), ValueFailure<E>>
+    where
+        W: FnMut(usize) -> Result<(), E>,
+    {
+        // Zero means a wrap clear is incomplete. If clearing is cancelled the
+        // next call repeats it; it must never revive entries stamped with one.
+        if self.generation == 0 || self.generation == u64::MAX {
+            self.generation = 0;
+            for block in self.dense_stamps.chunks_mut(BYTE_BLOCK / size_of::<u64>()) {
+                work(std::mem::size_of_val(block)).map_err(ValueFailure::Caller)?;
+                block.fill(0);
+            }
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
+        Ok(())
+    }
     fn prepare<E, G, W>(
         &mut self,
         count: usize,
+        bottom_len: usize,
         growth: &mut G,
         work: &mut W,
     ) -> Result<(), ValueFailure<E>>
@@ -122,7 +153,8 @@ impl HashScratch {
         G: FnMut(Layout) -> Result<(), E>,
         W: FnMut(usize) -> Result<(), E>,
     {
-        self.slots.clear();
+        self.mode = ScratchMode::Empty;
+        self.advance_generation(work)?;
         if count == 0 {
             return Ok(());
         }
@@ -130,25 +162,63 @@ impl HashScratch {
             .checked_mul(2)
             .and_then(usize::checked_next_power_of_two)
             .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
-        let layout = Layout::array::<CachedHash>(size)
+        let sparse_layout = Layout::array::<CachedHash>(size)
             .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
-        if self.slots.capacity() < size {
-            growth(layout).map_err(ValueFailure::Caller)?;
-            self.slots
-                .try_reserve_exact(size)
-                .map_err(|source| ValueError::Allocation {
-                    requested: layout.size(),
-                    source,
-                })?;
-        }
-        let rows_per_block = (BYTE_BLOCK / std::mem::size_of::<CachedHash>()).max(1);
-        while self.slots.len() < size {
-            let end = (self.slots.len() + rows_per_block).min(size);
-            work((end - self.slots.len()) * std::mem::size_of::<CachedHash>())
-                .map_err(ValueFailure::Caller)?;
-            self.slots.resize(end, CachedHash::default());
+        // Both the domain/selection ratio and actual active storage cost must
+        // admit dense allocation. This never scans keys to estimate density.
+        let dense_bytes = bottom_len.checked_mul(2 * size_of::<u64>());
+        let dense = bottom_len <= count.saturating_mul(4)
+            && dense_bytes.is_some_and(|bytes| bytes <= sparse_layout.size());
+        if dense {
+            grow_dense(&mut self.dense_values, bottom_len, growth, work)?;
+            grow_dense(&mut self.dense_stamps, bottom_len, growth, work)?;
+            self.mode = ScratchMode::Dense;
+        } else {
+            self.slots.clear();
+            if self.slots.capacity() < size {
+                growth(sparse_layout).map_err(ValueFailure::Caller)?;
+                self.slots
+                    .try_reserve_exact(size)
+                    .map_err(|source| ValueError::Allocation {
+                        requested: sparse_layout.size(),
+                        source,
+                    })?;
+            }
+            let rows_per_block = (BYTE_BLOCK / size_of::<CachedHash>()).max(1);
+            while self.slots.len() < size {
+                let end = (self.slots.len() + rows_per_block).min(size);
+                work((end - self.slots.len()) * size_of::<CachedHash>())
+                    .map_err(ValueFailure::Caller)?;
+                self.slots.resize(end, CachedHash::default());
+            }
+            self.mode = ScratchMode::Sparse;
         }
         Ok(())
+    }
+    fn cached(&self, slot: usize) -> Option<u64> {
+        match self.mode {
+            ScratchMode::Dense => {
+                (self.dense_stamps[slot] == self.generation).then_some(self.dense_values[slot])
+            }
+            ScratchMode::Sparse => self.slots[slot].occupied.then_some(self.slots[slot].hash),
+            ScratchMode::Empty => None,
+        }
+    }
+    fn insert(&mut self, slot: usize, bottom: usize, hash: u64) {
+        match self.mode {
+            ScratchMode::Dense => {
+                self.dense_values[slot] = hash;
+                self.dense_stamps[slot] = self.generation;
+            }
+            ScratchMode::Sparse => {
+                self.slots[slot] = CachedHash {
+                    bottom,
+                    hash,
+                    occupied: true,
+                }
+            }
+            ScratchMode::Empty => unreachable!("uncached calls cannot insert a hash"),
+        }
     }
     fn slot<E, W>(
         &self,
@@ -158,6 +228,13 @@ impl HashScratch {
     where
         W: FnMut(usize) -> Result<(), E>,
     {
+        if self.mode == ScratchMode::Dense {
+            return if bottom < self.dense_stamps.len() {
+                Ok(bottom)
+            } else {
+                Err(ValueError::Invariant(ValueViolation::Bounds).into())
+            };
+        }
         // Mix all original-coordinate bits. Merely multiplying by an odd
         // number preserves low-bit collisions for sparse dictionary strides.
         let mut hash = bottom as u64;
@@ -169,7 +246,6 @@ impl HashScratch {
         let mask = self.slots.len() - 1;
         let mut slot = hash as usize & mask;
         loop {
-            // Even a long collision chain remains synchronously cancellable.
             control.row()?;
             let entry = self.slots[slot];
             if !entry.occupied || entry.bottom == bottom {
@@ -178,6 +254,38 @@ impl HashScratch {
             slot = (slot + 1) & mask;
         }
     }
+}
+
+fn grow_dense<E, G, W>(
+    values: &mut Vec<u64>,
+    len: usize,
+    growth: &mut G,
+    work: &mut W,
+) -> Result<(), ValueFailure<E>>
+where
+    G: FnMut(Layout) -> Result<(), E>,
+    W: FnMut(usize) -> Result<(), E>,
+{
+    if values.len() >= len {
+        return Ok(());
+    }
+    let layout =
+        Layout::array::<u64>(len).map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
+    if values.capacity() < len {
+        growth(layout).map_err(ValueFailure::Caller)?;
+        values
+            .try_reserve_exact(len - values.len())
+            .map_err(|source| ValueError::Allocation {
+                requested: layout.size(),
+                source,
+            })?;
+    }
+    while values.len() < len {
+        let end = (values.len() + BYTE_BLOCK / size_of::<u64>()).min(len);
+        work((end - values.len()) * size_of::<u64>()).map_err(ValueFailure::Caller)?;
+        values.resize(end, 0);
+    }
+    Ok(())
 }
 
 /// Hashes exactly the prepared selection into caller storage. On failure the
@@ -219,7 +327,7 @@ where
     } else {
         input.len()
     };
-    scratch.prepare(cache_entries, growth, work)?;
+    scratch.prepare(cache_entries, input.bottom_len(), growth, work)?;
     let run = HashRun {
         input,
         kernel,
@@ -277,12 +385,8 @@ impl<H: ByteHashKernel, W> HashRun<'_, '_, H, W> {
                     Some(cache) => Some(cache.slot(bottom, &mut self.control)?),
                     None => None,
                 };
-                let cached_hash = cache_slot.and_then(|slot| {
-                    cache.as_deref().and_then(|cache| {
-                        let entry = cache.slots[slot];
-                        entry.occupied.then_some(entry.hash)
-                    })
-                });
+                let cached_hash = cache_slot
+                    .and_then(|slot| cache.as_deref().and_then(|cache| cache.cached(slot)));
                 if let Some(hash) = cached_hash {
                     hash
                 } else {
@@ -291,11 +395,7 @@ impl<H: ByteHashKernel, W> HashRun<'_, '_, H, W> {
                         None => self.null_hash(seed.into()),
                     };
                     if let (Some(cache), Some(slot)) = (cache.as_deref_mut(), cache_slot) {
-                        cache.slots[slot] = CachedHash {
-                            bottom,
-                            hash,
-                            occupied: true,
-                        };
+                        cache.insert(slot, bottom, hash);
                     }
                     hash
                 }
