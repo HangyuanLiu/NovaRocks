@@ -89,6 +89,7 @@ from pathlib import Path
 import re
 import socket
 from socketserver import TCPServer, ThreadingMixIn
+import struct
 import sys
 import tempfile
 import threading
@@ -727,6 +728,7 @@ class ConnectionPair:
         self.thread = None
         self.busy = self.closing = False
         self.idle_timed_out = False
+        self.client_reset = False
         self.position_held = True
         self.upstream_counted = False
 
@@ -783,7 +785,8 @@ class ConnectionPair:
     def close(self):
         try:
             try:
-                if not self.idle_timed_out and self.pending(self.client_reader, self.client):
+                if (not self.idle_timed_out and not self.client_reset
+                        and self.pending(self.client_reader, self.client)):
                     self.server.audit.failure("client bytes remain at connection retirement",
                                               admission=self.closing)
                 if self.pending(self.upstream_reader, self.upstream_socket):
@@ -851,7 +854,15 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 first = self.pair.client_reader.read(1)
             except OSError as error:
                 with self.server.audit.lock:
-                    if not self.pair.closing:
+                    if error.errno == errno.ECONNRESET:
+                        # No first byte was returned and no new RPC owns this
+                        # idle pair. Retire the actual transports, not a request.
+                        self.pair.client_reset = True
+                        self.server.audit.event({
+                            "event": "idle-peer-reset", "phase": self.server.audit.phase,
+                            "generation": self.server.audit.generation,
+                            "diagnostic": forwarding_failure_details("idle-client-read", error, None)})
+                    elif not self.pair.closing:
                         self.server.audit.failure(
                             "idle client transport failed",
                             diagnostic=forwarding_failure_details("idle-client-read", error, None))
@@ -2011,6 +2022,63 @@ class LoopbackTests(unittest.TestCase):
                     self.assertFalse(after["audit"]["valid_observation"])
             finally:
                 dispatch_allowed.set()
+
+    def test_completed_response_idle_reset_retires_actual_pair_without_taint(self):
+        ledger = tempfile.TemporaryFile()
+        self.addCleanup(ledger.close)
+        self.audit.ledger = ledger
+        client = http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)
+        self.addCleanup(client.close)
+        client.request("GET", "/v1/namespaces/ns/tables?keepalive=true")
+        response = client.getresponse()
+        self.assertEqual((response.status, response.read()), (200, self.literal))
+        response.close()
+        self.wait_for(lambda: self.audit.snapshot()["counters"]["completed"] == 1
+                      and self.audit.snapshot()["active_requests"] == 0,
+                      "original response did not complete before the idle reset")
+        with self.audit.lock:
+            pair = next(iter(self.observer.pairs.values()))
+            client_reader, upstream_reader = pair.client_reader, pair.upstream_reader
+            self.assertEqual((self.audit.active, self.audit.upstream_active, self.audit.list_active), (0, 0, 0))
+        client.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        self.wait_for(lambda: self.audit.snapshot()["active_connections"] == 0,
+                      "reset idle pair did not physically exit")
+        result = self.observer.quiesce()
+        self.assert_quiescent(result)
+        self.assertTrue(client_reader.closed)
+        self.assertTrue(upstream_reader.closed)
+        self.assertTrue(self.backend_eof.wait(2), "upstream peer did not observe actual pair exit")
+        self.assertTrue(result["audit"]["valid_observation"])
+        for key in ("requests", "upstream_requests_sent", "completed"):
+            self.assertEqual(result["audit"]["counters"][key], 1)
+        self.assertEqual(len(self.captured), 1)
+        ledger.seek(0)
+        events = [parse_json(line) for line in ledger.read().splitlines()]
+        resets = [event for event in events if event["event"] == "idle-peer-reset"]
+        self.assertEqual(resets, [{"event": "idle-peer-reset", "phase": "synthetic", "generation": 2,
+                                  "diagnostic": {"operation_stage": "idle-client-read",
+                                                 "exception_category": "os-error", "errno": errno.ECONNRESET,
+                                                 "request_sequence": None}}])
+        self.assertFalse(any(event["event"] == "failure" for event in events))
+
+    def test_active_request_client_reset_still_taints_without_retry(self):
+        client = socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)
+        self.addCleanup(client.close)
+        client.sendall(b"GET /v1/namespaces/ns/tables?keepalive=true&slow=true HTTP/1.1\r\nHost: local\r\n\r\n")
+        self.wait_for(lambda: len(self.captured) == 1 and self.audit.snapshot()["active_requests"] == 1,
+                      "original request did not enter its active upstream call")
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        self.wait_for(lambda: self.audit.snapshot()["active_connections"] == 0,
+                      "reset active request did not physically exit")
+        result = self.observer.quiesce()
+        self.assert_quiescent(result)
+        self.assertFalse(result["audit"]["valid_observation"])
+        self.assertEqual(result["audit"]["counters"]["completed"], 0)
+        self.assertEqual(result["audit"]["counters"]["requests"], 1)
+        self.assertEqual(result["audit"]["counters"]["upstream_requests_sent"], 1)
+        self.assertEqual(len(self.captured), 1)
 
     def test_idle_pair_has_no_rpc_timer_and_quiesce_retires_it_without_fake_rpc(self):
         self.restart_observer({"request_absolute_deadline_seconds": 0.05})
