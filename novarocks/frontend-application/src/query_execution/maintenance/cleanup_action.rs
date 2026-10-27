@@ -16,7 +16,10 @@
 // under the License.
 
 //! SQL cleanup borrows the original Root, local result ticket and Product.
-use super::{RequestScopedMaintenanceEngine, io_admission::MetadataIoAdmission};
+use super::{
+    RequestScopedMaintenanceEngine,
+    io_admission::{MetadataIoAdmission, extend_original_dependencies},
+};
 use crate::query_execution::kernels::MaintenanceExecutionKernel;
 use crate::state_store::execution::StateStoreOriginalOwner;
 use novarocks_failure_contract::SharedFailureCause;
@@ -129,16 +132,6 @@ struct Action {
 }
 struct Residual {
     state: State,
-}
-// Keep the selected Provider and actual StateStore routes in the same initial
-// Root capture. No origin is inferred from a scope, vocabulary or provider name.
-pub(super) fn extend_original_dependencies(
-    dependencies: &mut Vec<SharedDependency>,
-    actual: &[SharedDependency],
-) {
-    dependencies.extend_from_slice(actual);
-    dependencies.sort_unstable();
-    dependencies.dedup();
 }
 fn service(error: impl ToString) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())

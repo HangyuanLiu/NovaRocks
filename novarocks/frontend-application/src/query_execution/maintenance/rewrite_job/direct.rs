@@ -119,8 +119,9 @@ pub(crate) fn prepare(
         .typed_connector_control()
         .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
         .map_err(TerminalError::from_original_cause)?;
-    dependencies.extend(
-        write
+    extend_original_dependencies(
+        &mut dependencies,
+        &write
             .session()
             .rewrite_begin_initial_dependencies()
             .map_err(TerminalError::from_original_cause)?,

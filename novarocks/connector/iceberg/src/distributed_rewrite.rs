@@ -1877,6 +1877,15 @@ mod tests {
                 warehouse.path().display().to_string(),
             ),
         ];
+        if catalog_type == "rest" {
+            properties.push((
+                "uri".to_string(),
+                format!(
+                    "http://{}",
+                    listener.local_addr().expect("listener address")
+                ),
+            ));
+        }
         if catalog_type == "hive" {
             properties.push((
                 "hive.metastore.uris".to_string(),
@@ -1906,6 +1915,54 @@ mod tests {
             .expect("control runtime"),
         );
         (executor, warehouse, runtime, listener)
+    }
+
+    #[test]
+    fn same_generation_rewrite_and_write_begin_declare_the_same_original_rest_route() {
+        use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+            NetworkServiceOrigin, SharedDependency,
+        };
+
+        let (_executor, warehouse, runtime, listener) = admission_runtime("rest");
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+        };
+        let incarnation = ProviderBindingEpoch::from_bytes([9; 16]);
+        let provider = Arc::new(IcebergMetadata::new(
+            descriptor.clone(),
+            incarnation,
+            runtime.clone(),
+        ));
+        let rewrite = IcebergDistributedRewriteControl::new(
+            descriptor.clone(),
+            incarnation,
+            runtime.clone(),
+            provider,
+        )
+        .unwrap();
+        let write = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+            descriptor.clone(),
+            incarnation,
+            CatalogHandle::new(descriptor.instance_id, CatalogVersion::from_bytes([3; 32])),
+            runtime.clone(),
+        );
+        assert!(Arc::ptr_eq(write.runtime(), &runtime));
+        assert!(Arc::ptr_eq(&rewrite.runtime, &runtime));
+        assert_eq!(write.binding_key(), &rewrite.key);
+        let planning = rewrite.planning_initial_dependencies().unwrap();
+        let beginning = write.rewrite_begin_initial_dependencies().unwrap();
+        let expected = SharedDependency::Network(
+            NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(planning, vec![expected.clone()]);
+        assert_eq!(beginning, vec![expected]);
+        assert_admission_left_no_io(&warehouse, &listener);
     }
 
     fn admission_context(catalog_type: &str) -> ConnectorRequestContext {

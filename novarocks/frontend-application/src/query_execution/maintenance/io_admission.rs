@@ -516,6 +516,17 @@ impl MetadataIoQuiescence {
     }
 }
 
+// Keep the selected Provider and actual StateStore routes in the same initial
+// Root capture. No origin is inferred from a scope, vocabulary or provider name.
+pub(super) fn extend_original_dependencies(
+    dependencies: &mut Vec<SharedDependency>,
+    actual: &[SharedDependency],
+) {
+    dependencies.extend_from_slice(actual);
+    dependencies.sort_unstable();
+    dependencies.dedup();
+}
+
 impl MetadataIoAdmission {
     pub(crate) const fn request_metadata_bytes() -> u64 {
         std::mem::size_of::<CellBody>() as u64
@@ -1968,8 +1979,8 @@ mod original_governor_tests {
         // from a WorkScope or vocabulary. SQLite's actual declaration has its
         // own factory/instance test; this component exercises Source capture.
         let store_facts = vec![SharedDependency::LocalHost];
-        super::super::cleanup_action::extend_original_dependencies(&mut dependencies, &store_facts);
-        super::super::cleanup_action::extend_original_dependencies(&mut dependencies, &store_facts);
+        extend_original_dependencies(&mut dependencies, &store_facts);
+        extend_original_dependencies(&mut dependencies, &store_facts);
         assert_eq!(dependencies.len(), 2);
         let source = MetadataIoAdmission::for_original_source(&root.owner, dependencies).unwrap();
         let mut ready = false;
@@ -1993,6 +2004,68 @@ mod original_governor_tests {
         }
         assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
         drop(source);
+        root.business.release();
+        root.owner.complete();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn rewrite_initial_union_enters_mio_once_per_exact_fact_and_keeps_distinct_routes() {
+        let (control, mut driver, root) = original_governor();
+        let route = |url| {
+            SharedDependency::Network(
+                novarocks_spi::connector::NetworkServiceOrigin::from_selected_url(
+                    &url::Url::parse(url).unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let catalog = route("https://rewrite-catalog.example.test:8443/root");
+        let other = route("https://rewrite-catalog.example.test:9443/root");
+        let mut dependencies = vec![catalog.clone()];
+        // Real generation authors can declare the same catalog route. The
+        // composition union must also retain any distinct complete fact.
+        let write_dependencies = vec![catalog.clone(), other.clone()];
+        extend_original_dependencies(&mut dependencies, &write_dependencies);
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.contains(&catalog));
+        assert!(dependencies.contains(&other));
+        let retained = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(&root.owner).unwrap();
+        let source = MetadataIoAdmission::for_original_source(&root.owner, dependencies).unwrap();
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source
+                .poll_progress(&root.owner, &mut Context::from_waker(Waker::noop()))
+                .unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(
+            ready,
+            "the original all-New admission must actually install"
+        );
+        let positive = source.root_capacity().unwrap();
+        assert!(
+            retained
+                .window_alias()
+                .shares_capacity_with(&positive.window_alias())
+        );
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            let full = body.full.as_ref().unwrap();
+            for fact in [&catalog, &other, &SharedDependency::LocalHost] {
+                assert_eq!(full.iter().filter(|actual| *actual == fact).count(), 1);
+            }
+            assert_eq!(full.len(), 3);
+        }
+        assert_original_healthy(&source);
+        assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+        drop((positive, retained, source));
         root.business.release();
         root.owner.complete();
         control.close_admission();
