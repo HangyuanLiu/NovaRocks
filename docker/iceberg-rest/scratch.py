@@ -43,7 +43,6 @@ MISSING_CODES = {"NoSuchKey", "NoSuchBucket", "NoSuchUser", "NoSuchPolicy",
 USER_MISSING_CODES = {"NoSuchUser", "XMinioAdminNoSuchUser"}
 POLICY_MISSING_CODES = {"NoSuchPolicy", "XMinioAdminNoSuchPolicy"}
 MAX_REST_BYTES = 8 * 1024 * 1024
-MAX_MC_BYTES = 16 * 1024 * 1024
 MAX_PREFIX_VISITS = 2048
 MAX_PREFIX_DEPTH = 32
 MAX_PENDING_PREFIXES = 10000
@@ -435,8 +434,6 @@ class ScratchSweeper:
             output = getattr(error, "stdout", None)
             if output is None:
                 raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch mc deadline expired after confirmed cleanup") from error
-        if len(output.encode()) > MAX_MC_BYTES:
-            raise runtime.RuntimeFailure("InvalidMcResponse", "mc response exceeds byte limit")
         lines = output.splitlines()
         has_status = bool(lines and re.fullmatch(r"NOVA_SCRATCH_MC_EXIT=[0-9]+", lines[-1]))
         if not has_status and not timed_out:
@@ -445,10 +442,12 @@ class ScratchSweeper:
         records, missing = [], False
         body = "\n".join(lines).strip()
         decoder = json.JSONDecoder()
-        while body:
+        cursor = 0
+        while cursor < len(body):
             try:
-                value, consumed = decoder.raw_decode(body)
-                body = body[consumed:].lstrip()
+                value, cursor = decoder.raw_decode(body, cursor)
+                while cursor < len(body) and body[cursor].isspace():
+                    cursor += 1
             except (TypeError, ValueError) as error:
                 if timed_out and not has_status:
                     # A deadline may truncate the final JSON object. Complete
@@ -525,7 +524,7 @@ class ScratchSweeper:
         # Read every controllable policy before inferring an orphan's identity;
         # a successfully read subset never proves a unique reverse mapping.
         facts, candidates, failed_policies = {}, {}, set()
-        inventory_complete, fact_bytes, names = True, 0, set()
+        inventory_complete, names = True, set()
         try:
             items = self._mc(["admin", "policy", "list", "store"], deadline)
         except runtime.RuntimeFailure as error:
@@ -552,9 +551,6 @@ class ScratchSweeper:
                 if identity is None:
                     continue
                 self._expired(created_ms(identity.run_id), False)
-                fact_bytes += len(name.encode()) + len(identity.scope_root.encode())
-                if len(facts) >= MAX_PENDING_PREFIXES or fact_bytes > MAX_MC_BYTES:
-                    raise runtime.RuntimeFailure("InvalidMcResponse", "IAM policy inventory exceeds its input bound")
                 facts[name] = identity, purpose
                 if self.collecting:
                     group = self._identity_fact(identity)
@@ -572,8 +568,6 @@ class ScratchSweeper:
                 self._error(report, "inspect-policy", name if isinstance(name, str) else "unknown", error)
                 if error.code == "ScratchSweepTimeout":
                     raise
-                if fact_bytes > MAX_MC_BYTES or len(facts) >= MAX_PENDING_PREFIXES:
-                    break
         for item in self._mc(["admin", "user", "list", "store"], deadline):
             self._check(deadline)
             name = item.get("accessKey")

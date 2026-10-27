@@ -521,16 +521,20 @@ class SweepTests(unittest.TestCase):
                 self.assertEqual(self.backend.policies,{policy,bound_policy})
                 self.assertFalse(any(c[:3]==("admin","policy","rm") for c in self.backend.calls))
 
-    def test_bounded_policy_inventory_does_not_infer_uniqueness_from_retained_subset(self):
+    def test_s3_pending_prefix_bound_does_not_truncate_complete_iam_inventory(self):
         user,policy=self.backend.provision(self.old)
         self.backend.user_info[user]["policyName"]=""
         _,other=self.backend.provision(identity(604801,token="c"*32))
         self.backend.users={user}
         with patch.object(scratch,"MAX_PENDING_PREFIXES",1):
             result=self.sweep()
-        self.assertFalse(result["complete"])
-        self.assertEqual(self.backend.users,{user})
-        self.assertEqual(self.backend.policies,{policy,other})
+        self.assertTrue(result["complete"],result)
+        self.assertTrue(result["enumeration_complete"])
+        self.assertEqual(self.backend.users,set())
+        self.assertEqual(self.backend.policies,set())
+        inspected={call[-1] for call in self.backend.calls
+                   if call[:3]==("admin","policy","info")}
+        self.assertEqual(inspected,{policy,other})
 
     def test_scratch_shaped_unmapped_user_is_preserved_not_guessed(self):
         user = self.old.iam_name("init")
@@ -995,6 +999,41 @@ class SweepTests(unittest.TestCase):
                 self.assertFalse(result["complete"])
                 self.assertEqual(result["errors"][-1]["code"], expected)
                 self.assertNotIn("SECRET", json.dumps(result))
+
+    @staticmethod
+    def large_success_mc_body():
+        # The observed cleanup returned 51,744 legitimate per-object receipts.
+        # Distinct normal-size keys keep the fixture representative without
+        # requiring a native object store or a timing/performance assertion.
+        return "\n".join(json.dumps(dict(status="success", key=f"object-{index:05d}-" + "x" * 300))
+                         for index in range(51744))
+
+    def test_complete_native_mc_receipts_over_sixteen_mib_are_not_rejected(self):
+        body=self.large_success_mc_body()
+        self.assertGreater(len(body.encode()),16 * 1024 * 1024)
+        self.backend.raw=body + "\nNOVA_SCRATCH_MC_EXIT=0\n"
+        rows=self.sweeper._mc(["ls","store"],self.clock.mono()+1)
+        self.assertEqual(len(rows),51744)
+        self.assertEqual(rows[0],dict(status="success",key="object-00000-" + "x" * 300))
+        self.assertEqual(rows[-1],dict(status="success",key="object-51743-" + "x" * 300))
+        self.assertEqual(self.backend.calls,[("ls","store")])
+
+    def test_large_captured_native_failure_keeps_priority_over_timeout(self):
+        body=self.large_success_mc_body()
+        self.assertGreater(len(body.encode()),16 * 1024 * 1024)
+        native_error='{"status":"error","error":{"cause":{"error":{"Code":"AccessDenied","Message":"SECRET"}}}}'
+        for timed_out in (False,True):
+            with self.subTest(timed_out=timed_out):
+                # A timed-out native command may retain a truncated tail, but
+                # its preceding complete native error remains authoritative.
+                output=body + "\n" + native_error + ("\n{\"truncated\":" if timed_out else "\nNOVA_SCRATCH_MC_EXIT=17\n")
+                failure=runtime.RuntimeFailure("DockerOperationTimeout","cleanup confirmed")
+                failure.stdout=output
+                with patch.object(self.backend,"run_mc",side_effect=failure) if timed_out else patch.object(self.backend,"run_mc",return_value=output):
+                    with self.assertRaises(runtime.RuntimeFailure) as caught:
+                        self.sweeper._mc(["rm","--recursive","--force","store/exact/"],self.clock.mono()+1)
+                self.assertEqual(caught.exception.code,"ScratchAccessDenied")
+                self.assertNotIn("SECRET",str(caught.exception))
 
     def test_malformed_native_response_cannot_become_empty_success(self):
         for output in ("not json\nNOVA_SCRATCH_MC_EXIT=0", "{}", "\nNOVA_SCRATCH_MC_EXIT=2",
