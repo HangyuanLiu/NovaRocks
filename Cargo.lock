@@ -4038,7 +4038,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
- "async-trait",
  "bytes",
  "crc32c",
  "futures",
@@ -4781,7 +4780,6 @@ dependencies = [
 name = "novarocks-table-maintenance"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "hex",
  "novarocks-coordination-contract",

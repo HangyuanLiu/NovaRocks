@@ -12,7 +12,6 @@ novarocks-failure-contract.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-coordination-contract.workspace = true
 novarocks-workload-control.workspace = true
-async-trait.workspace = true
 hex.workspace = true
 novarocks-query-application.workspace = true
 novarocks-state-store-api.workspace = true
