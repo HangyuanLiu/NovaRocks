@@ -30,8 +30,8 @@ use novarocks_spi::connector::{
 };
 use novarocks_workload_control::joint_admission::{
     AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, JointLane, JointProposalSlotWait,
-    JointTryBegin, RetainedPayloadGrant, RootDomainBinding, RootDomainInitialAdmission,
-    RootDomainInitialSource, RootPayloadAdmission, RootPayloadReady,
+    JointTryBegin, RetainedPayloadAlias, RetainedPayloadGrant, RootDomainBinding,
+    RootDomainInitialAdmission, RootDomainInitialSource, RootPayloadAdmission, RootPayloadReady,
 };
 use novarocks_workload_control::{WorkError, WorkOwner, WorkScope};
 use std::{
@@ -40,7 +40,10 @@ use std::{
     num::NonZeroU64,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     task::{Context, Poll},
 };
 
@@ -74,6 +77,11 @@ impl std::task::Wake for MetadataWake {
 pub(crate) struct MetadataIoAdmission {
     wake: Arc<MetadataWake>,
     original: Mutex<Option<Body>>,
+    // One retention-only pin to the installed original payload. CPU creators
+    // can borrow it while the same Source's progress Body is on loan.
+    payload_retention: OnceLock<RetainedPayloadAlias>,
+    // Publication is an original journal fact, not permission minted by a loan.
+    settlement: AtomicBool,
     cleanup: Mutex<CleanupReceipt>,
 }
 type MetadataCleanupCompletion = (Result<(), ConnectorError>, Option<Box<dyn Any + Send>>);
@@ -156,7 +164,6 @@ struct Body {
     unstarted_withdrawn: bool,
     adopted_initial: bool,
     first_ready: bool,
-    settlement: bool,
     failure: Option<WorkError>,
     changed: bool,
     reobserve: bool,
@@ -562,21 +569,23 @@ impl MetadataIoAdmission {
         let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(owner)?;
         let configured_bytes = NonZeroU64::new(capacity.window_alias().payload_capacity_bytes())
             .ok_or(WorkError::NotReady)?;
-        // This records the original configured budget and real inline Source
-        // header only. Neither quantity reserves backing or adds a quota;
-        // actual result allocations still require their original byte receipt.
-        let header_bytes = Self::source_header_bytes()?;
+        // Carry the original configured payload budget and fixed Body
+        // responsibility declaration. Source/header/F storage remains with
+        // the original per-root process backing, not another allocation quota.
+        // Actual result allocations still require their original byte receipt.
+        let body_bytes = Self::body_metadata_bytes()?;
         Self::from_original_facts(
             owner.scope(),
             initial_dependencies,
-            header_bytes,
+            body_bytes,
             configured_bytes,
         )
     }
 
-    // Shared by this actual Source constructor and finite admission fixtures.
-    // This is the inline header declaration, not a quote of requests or domains.
-    fn source_header_bytes() -> Result<u64, WorkError> {
+    // Fixed loaned-Body responsibility only, shared with finite fixtures.
+    // This is not the full Arc<Self> or its pointees' allocation footprint.
+    // Stable inline fields remain in that same Source's per-root backing.
+    fn body_metadata_bytes() -> Result<u64, WorkError> {
         u64::try_from(std::mem::size_of::<Body>()).map_err(|_| WorkError::ArithmeticOverflow)
     }
 
@@ -597,6 +606,8 @@ impl MetadataIoAdmission {
         let provider_owned_floor = initial_owned_bytes.get();
         Ok(Arc::new(Self {
             wake,
+            payload_retention: OnceLock::new(),
+            settlement: AtomicBool::new(false),
             cleanup: Mutex::new(CleanupReceipt::default()),
             original: Mutex::new(Some(Body {
                 root,
@@ -623,7 +634,6 @@ impl MetadataIoAdmission {
                 unstarted_withdrawn: false,
                 adopted_initial: false,
                 first_ready: false,
-                settlement: false,
                 failure: None,
                 changed: false,
                 reobserve: false,
@@ -654,6 +664,7 @@ impl MetadataIoAdmission {
         // are responsibility facts, never a qualification of actual capacity.
         drop(payload.root_domain_source(&body.root, JointLane::Foreground)?);
         body.provider_owned_floor = payload.capacity_bytes().map_err(|_| WorkError::Released)?;
+        Self::publish_payload_retention(&self.payload_retention, payload)?;
         body.bound.push(SharedDependency::LocalHost);
         body.full = Some(body.bound.clone().into());
         body.payload = source.take();
@@ -661,6 +672,19 @@ impl MetadataIoAdmission {
         body.adopted_initial = true;
         body.changed = true;
         Ok(())
+    }
+    fn publish_payload_retention(
+        target: &OnceLock<RetainedPayloadAlias>,
+        payload: &RetainedPayloadGrant,
+    ) -> Result<(), WorkError> {
+        let alias = payload.retain_alias().map_err(|cause| match cause {
+            novarocks_resource_contract::RetentionPinError::Released => WorkError::Released,
+            novarocks_resource_contract::RetentionPinError::Conflict => WorkError::Conflict,
+            novarocks_resource_contract::RetentionPinError::Overflow => {
+                WorkError::ArithmeticOverflow
+            }
+        })?;
+        target.set(alias).map_err(|_| WorkError::Conflict)
     }
     fn receive_cleanup_completion(&self, cell: &RequestCell) -> bool {
         if self
@@ -771,7 +795,14 @@ impl MetadataIoAdmission {
             let body = original.body.as_mut().unwrap();
             body.changed = false;
             body.reobserve = false;
-            let mut result = Self::progress(body, owner, cx, observation);
+            let mut result = Self::progress(
+                body,
+                &self.payload_retention,
+                &self.settlement,
+                owner,
+                cx,
+                observation,
+            );
             if let Err(error) = &result {
                 body.failure.get_or_insert_with(|| error.clone());
                 // Once physical requests exist, refusal stops new admission;
@@ -804,6 +835,8 @@ impl MetadataIoAdmission {
     }
     fn progress(
         body: &mut Body,
+        payload_retention: &OnceLock<RetainedPayloadAlias>,
+        settlement: &AtomicBool,
         owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
         observation: ProgressObservation,
@@ -873,6 +906,7 @@ impl MetadataIoAdmission {
                 Poll::Pending => return Ok(false),
                 Poll::Ready(r) => r.map_err(|e| e.error)?,
             };
+            Self::publish_payload_retention(payload_retention, body.payload.as_ref().unwrap())?;
             // The positive payload is already stable in the original field.
             // Retire the completed admission's empty batch, not that payload.
             drop(body.initial.take());
@@ -1078,7 +1112,7 @@ impl MetadataIoAdmission {
                         drop(source.source.take());
                     }
                 }
-                let lane = if body.settlement {
+                let lane = if settlement.load(AtomicOrdering::Acquire) {
                     JointLane::Settlement
                 } else {
                     JointLane::Foreground
@@ -1145,13 +1179,13 @@ impl MetadataIoAdmission {
             if requested.is_none() || cell.owned.is_some() || cell.grant.is_some() {
                 continue;
             }
-            if body.failure.is_some() && !body.settlement {
+            if body.failure.is_some() && !settlement.load(AtomicOrdering::Acquire) {
                 cell.failure = body.failure.clone();
                 body.changed = true;
                 continue;
             }
             if cell.admission.is_none() {
-                let lane = if body.settlement {
+                let lane = if settlement.load(AtomicOrdering::Acquire) {
                     JointLane::Settlement
                 } else {
                     JointLane::Foreground
@@ -1302,7 +1336,7 @@ impl MetadataIoAdmission {
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
         }
-        if !body.first_ready || !body.settlement {
+        if !body.first_ready || !self.settlement.load(AtomicOrdering::Acquire) {
             return Err(WorkError::NotReady);
         }
         let payload = body.payload.as_ref().ok_or(WorkError::NotReady)?;
@@ -1343,7 +1377,7 @@ impl MetadataIoAdmission {
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
         }
-        if !body.first_ready || !body.settlement {
+        if !body.first_ready || !self.settlement.load(AtomicOrdering::Acquire) {
             return Err(WorkError::NotReady);
         }
         body.payload
@@ -1668,7 +1702,7 @@ impl MetadataIoAdmission {
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(error(&WorkError::Released));
         }
-        if !body.settlement
+        if !self.settlement.load(AtomicOrdering::Acquire)
             && let Some(failure) = &body.failure
         {
             return Err(error(failure));
@@ -1762,7 +1796,7 @@ impl ConnectorIoAdmissionPort for MetadataIoAdmission {
         // request/poll_admitted still install each exact selected dependency
         // into this same Root before a Provider can start that request.
         let _ = profile;
-        if !body.settlement {
+        if !self.settlement.load(AtomicOrdering::Acquire) {
             body.root.check().map_err(|failure| error(&failure))?;
             if let Some(failure) = &body.failure {
                 return Err(error(failure));
@@ -1796,24 +1830,22 @@ impl ConnectorIoAdmissionPort for MetadataIoAdmission {
         self.request_in(None, Some(additional))
     }
     fn publication_obligation_started(&self) {
-        if let Some(body) = self
-            .original
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_mut()
-        {
-            body.settlement = true;
-        }
+        self.settlement.store(true, AtomicOrdering::Release);
+        self.wake.wake();
     }
     fn retain_payload(&self) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
-        let original = self.original.lock().unwrap_or_else(|p| p.into_inner());
-        let body = original.as_ref().ok_or_else(busy)?;
-        let alias = body
-            .payload
-            .as_ref()
-            .ok_or_else(busy)?
-            .retain_alias()
-            .map_err(|_| busy())?;
+        let installed = self.payload_retention.get().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "original metadata payload is not installed",
+            )
+        })?;
+        let alias = installed.try_clone().map_err(|cause| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("original metadata payload retention refused: {cause}"),
+            )
+        })?;
         Ok(ConnectorPayloadRetentionGuard::from_existing_lease(
             alias.into_retention(),
         ))
@@ -1915,6 +1947,138 @@ mod original_governor_tests {
                     .unwrap()
                     .failure
                     .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_retention_and_publication_fact_survive_the_original_progress_loan() {
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        for adopted in [false, true] {
+            let (control, mut driver, root) = original_governor();
+            let scope = root.owner.scope();
+            let bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
+            let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(bytes).unwrap(),
+                NonZeroU64::new(128).unwrap(),
+                vec![SharedDependency::LocalHost],
+            )
+            .unwrap();
+            let source = MetadataIoAdmission::new(scope.clone(), profile, bytes).unwrap();
+            let stop = ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+                stop.view(),
+                1024,
+                4096,
+            )
+            .unwrap()
+            .with_io_admission(source.clone());
+            assert!(
+                context.retain_owned_metadata().is_err(),
+                "no pin before actual install"
+            );
+            let mut cx = Context::from_waker(Waker::noop());
+            if adopted {
+                let domains = scope.prepare_root_domains().unwrap();
+                let initial = domains
+                    .initial_payload_source(&scope, JointLane::Custody)
+                    .unwrap();
+                let JointTryBegin::Started(mut proposal) = initial
+                    .try_begin(
+                        NonZeroU64::new(bytes).unwrap(),
+                        NonZeroU64::new(128).unwrap(),
+                    )
+                    .unwrap()
+                else {
+                    panic!("original queued proposal");
+                };
+                proposal
+                    .push_dependency(&SharedDependency::LocalHost)
+                    .unwrap();
+                let mut admission = proposal.submit().unwrap();
+                let mut payload = None;
+                drive_original(&mut driver);
+                let Poll::Ready(Ok(notice)) =
+                    admission.poll_install_in(&mut cx, &scope, &mut payload)
+                else {
+                    panic!("actual queued payload install");
+                };
+                notice.notify();
+                drop(admission);
+                source.adopt_original_payload_in(&mut payload).unwrap();
+                assert!(payload.is_none());
+            }
+            let mut ready = false;
+            for _ in 0..256 {
+                ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+                if ready {
+                    break;
+                }
+                drive_original(&mut driver);
+            }
+            assert!(ready);
+            assert!(matches!(
+                source.check_existing_metadata_obligation(&scope),
+                Err(WorkError::NotReady)
+            ));
+            let borrowed = loan(&source.original).unwrap();
+            // The CPU creator is concurrent with the original progress turn;
+            // it does not poll that turn or borrow its admission authority.
+            let retained = std::thread::scope(|threads| {
+                threads
+                    .spawn(|| context.retain_owned_metadata().unwrap().unwrap())
+                    .join()
+                    .unwrap()
+            });
+            context.publication_obligation_started().unwrap();
+            drop(borrowed);
+            assert!(
+                source.check_existing_metadata_obligation(&scope).is_ok(),
+                "the original journal fact was not lost during the loan"
+            );
+            root.owner
+                .cancel(novarocks_workload_control::CancellationReason::ServerShutdown);
+            control.close_admission();
+            assert!(
+                source.root_capacity().is_err(),
+                "retention does not grant new business"
+            );
+            let closed = match source.poll_actual_quiescent_continuing(&mut cx) {
+                Poll::Ready(Ok(closed)) => closed,
+                _ => panic!("the positive retention header cannot wait on its own Source"),
+            };
+            assert!(closed.into_ordinary_failure().is_none());
+            assert!(source.health_failure().is_none());
+            assert!(source.check_existing_metadata_obligation(&scope).is_ok());
+            let cleanup_alias = context.retain_owned_metadata().unwrap().unwrap();
+            drop(cleanup_alias);
+            drop(source);
+            assert!(
+                context.retain_owned_metadata().is_err(),
+                "a guard cannot recreate the Source"
+            );
+            let final_alias = retained.try_clone().unwrap();
+            drop(retained);
+            drop(context);
+            drop(scope);
+            root.business.release();
+            root.owner.complete_after_terminal_cancel_settled();
+            drive_original(&mut driver);
+            let failure = control
+                .shutdown()
+                .expect_err("the last actual payload pin remains");
+            let (error, control) = failure.into_parts();
+            assert_eq!(
+                error,
+                novarocks_workload_control::WorkloadShutdownError::NotDrained
+            );
+            drop(final_alias);
+            drive_original(&mut driver);
+            assert!(
+                control.shutdown().is_ok(),
+                "the last original pin actually retired"
             );
         }
     }
@@ -2235,7 +2399,7 @@ mod original_governor_tests {
     #[test]
     fn original_root_responsibility_growth_does_not_change_the_actual_result_budget() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2333,7 +2497,7 @@ mod original_governor_tests {
     #[test]
     fn retired_formation_preserves_admitted_provider_peak_and_actual_request_exit() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2465,7 +2629,7 @@ mod original_governor_tests {
     fn queued_root_payload_is_adopted_and_provider_domains_are_proved_before_ready() {
         let (control, mut driver, root) = original_governor();
         let scope = root.owner.scope();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let route = SharedDependency::Network(
             novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
                 &url::Url::parse("https://statistics-rebind.invalid").unwrap(),
@@ -2567,7 +2731,7 @@ mod original_governor_tests {
     #[test]
     fn reused_bootstrap_grant_cannot_dispatch_a_new_route_before_full_domain_install() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2645,7 +2809,7 @@ mod original_governor_tests {
     #[test]
     fn covered_owned_peak_retains_positive_domains_and_proves_each_new_route() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2760,7 +2924,7 @@ mod original_governor_tests {
         }
 
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -2901,7 +3065,7 @@ mod original_governor_tests {
         use novarocks_workload_control::CancellationReason;
 
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),
@@ -3071,7 +3235,7 @@ mod original_governor_tests {
     #[test]
     fn eight_original_requests_exceed_a_one_request_profile_and_all_exit() {
         let (control, mut driver, root) = original_governor();
-        let source_bytes = MetadataIoAdmission::source_header_bytes().unwrap();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(source_bytes).unwrap(),

@@ -66,6 +66,8 @@ pub(in crate::query_execution::maintenance) fn two_failures(
     let source = Arc::new(MetadataIoAdmission {
         wake: Arc::clone(&wake),
         original: Mutex::new(None),
+        payload_retention: OnceLock::new(),
+        settlement: AtomicBool::new(false),
         cleanup: Mutex::new(CleanupReceipt::default()),
     });
     let mut cell = Arc::new(RequestCell {
