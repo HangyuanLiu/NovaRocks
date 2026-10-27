@@ -41,11 +41,95 @@ run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run)
 
 
+def start_controlling_shell(terminal, case, command):
+    # Install the original parent's exit receipt before its one foreground job.
+    # Source a private file: a long interactive input line can block on PTY echo.
+    script = case.parent / (case.name + ".shell.sh")
+    jobs = shlex.quote(str(case / "shell-jobs-before-wait.txt"))
+    remaining = shlex.quote(str(case / "shell-jobs-after-wait.txt"))
+    receipt = shlex.quote(str(case / "shell-child-wait.tsv"))
+    contents = ("umask 077\n"
+        "original_child_exit() {\n"
+        " trap '' HUP\n"
+        " jobs -p > " + jobs + "\n"
+        " if [ -s " + jobs + " ]; then kill -HUP %1; kill -CONT %1; fi\n"
+        " owner_count=0; owner_status=0\n"
+        " while IFS= read -r original_pid; do\n"
+        "  owner_count=$((owner_count + 1))\n"
+        "  wait \"$original_pid\"\n"
+        "  owner_status=$?\n"
+        " done < " + jobs + "\n"
+        " jobs -p > " + remaining + "\n"
+        " if [ ! -s " + remaining + " ]; then owner_empty=true; else owner_empty=false; fi\n"
+        " printf '%s\\t%s\\t%s\\t%s\\n' \"$$\" \"$owner_status\" \"$owner_empty\" \"$owner_count\" > " + receipt + "\n"
+        "}\n"
+        "trap original_child_exit EXIT\n" + command + "\n")
+    with os.fdopen(os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+        output.write(contents)
+    os.write(terminal, ("source " + shlex.quote(str(script)) + "\n").encode())
+
+
 def exit_controlling_shell(terminal):
-    # Every case has a fresh shell with exactly one owned job. Reconcile that
-    # job through Bash before exit: a wrapper receipt does not reap its owner.
-    # Keep the normal stopped-job warning and the original bounded shell wait.
+    # The installed EXIT trap performs the real parent wait for this same job.
     os.write(terminal, b"fg %1\nexit\n")
+
+
+def finish_controlling_shell(test, case, trace, shell, terminal, waited, deadline):
+    # Close our master first and bound observation by the original five seconds.
+    # The Bash EXIT trap owns child wait; this parent owns only shell wait.
+    deadline = deadline if deadline is not None else time.monotonic() + 5
+    primary_active = sys.exc_info()[0] is not None
+    cleanup = dict(shell_pid=shell, shell_reaped=waited, shell_wait_status=None,
+                   terminal_closed=terminal < 0, errors=[], owner_wait=None)
+    try:
+        if terminal >= 0:
+            try:
+                os.close(terminal)
+                cleanup["terminal_closed"] = True
+            except OSError as error:
+                cleanup["errors"].append("close original PTY master: " + str(error))
+            terminal = -1
+        while not waited and time.monotonic() < deadline:
+            try:
+                child, status = os.waitpid(shell, os.WNOHANG)
+            except OSError as error:
+                cleanup["errors"].append("wait original shell: " + str(error))
+                break
+            if child:
+                waited = True
+                cleanup["shell_wait_status"] = status
+                break
+            time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+        cleanup["shell_reaped"] = waited
+        receipt = case / "shell-child-wait.tsv"
+        if receipt.is_file():
+            try:
+                fields = receipt.read_text().strip().split("\t")
+                if len(fields) != 4 or int(fields[0]) != shell or fields[2] not in ("true", "false"):
+                    raise ValueError("original shell child-wait receipt differs")
+                count = int(fields[3])
+                if count not in (0, 1):
+                    raise ValueError("original controlling shell had more than its one job")
+                cleanup["owner_wait"] = dict(shell_pid=int(fields[0]), wait_command_status=int(fields[1]),
+                                              jobs_empty=fields[2] == "true", waited_job_count=count)
+            except (OSError, ValueError) as error:
+                cleanup["errors"].append("original child-wait receipt: " + str(error))
+        cleanup["owner_exit_confirmed"] = bool(
+            waited and cleanup["owner_wait"] and cleanup["owner_wait"]["jobs_empty"])
+        if not cleanup["owner_exit_confirmed"]:
+            cleanup["errors"].append("original shell child exit remains unconfirmed")
+        if not waited:
+            cleanup["errors"].append("original shell exit remains unobserved at cleanup deadline")
+    finally:
+        cleanup["original_root_retained"] = bool(cleanup["errors"])
+        if cleanup["original_root_retained"]:
+            test.retain_original_root = True
+        retain_pty_observation(case, trace, shell, terminal, waited)
+        (case / "pty-cleanup.json").write_text(json.dumps(cleanup, indent=2) + "\n")
+    # A cleanup refusal must not hide the first assertion. Retain the same root
+    # rather than deleting or moving input files still owned by unresolved work.
+    if cleanup["errors"] and not primary_active:
+        raise AssertionError("original controlling shell cleanup remained unresolved: " + "; ".join(cleanup["errors"]))
 
 
 def retain_pty_observation(case, trace, shell, terminal, waited):
@@ -59,10 +143,14 @@ def retain_pty_observation(case, trace, shell, terminal, waited):
 class Materials(unittest.TestCase):
     def setUp(self):
         (REPO / "target").mkdir(exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(prefix="test-run-tests-", dir=REPO / "target")
-        self.root = Path(self.temporary.name)
+        self.root = Path(tempfile.mkdtemp(prefix="test-run-tests-", dir=REPO / "target"))
+        self.retain_original_root = False
 
     def tearDown(self):
+        if self.retain_original_root:
+            (self.root / "retained-original-root.json").write_text(json.dumps(dict(
+                original_root=str(self.root), reason="original PTY cleanup remained unresolved"),
+                indent=2) + "\n")
         evidence = os.environ.get("NOVA_CI_TEST_EVIDENCE_ROOT")
         if evidence:
             destination = Path(evidence) / self.id()
@@ -75,7 +163,8 @@ class Materials(unittest.TestCase):
                         target = destination / source.relative_to(self.root)
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, target)
-        self.temporary.cleanup()
+        if not self.retain_original_root:
+            shutil.rmtree(self.root)
 
 
     def test_controlling_shell_reaps_its_stopped_owner_after_wrapper_exit(self):
@@ -96,6 +185,7 @@ class Materials(unittest.TestCase):
             os.execl("/bin/bash", "bash", "--noprofile", "--norc", "-i")
         trace = bytearray()
         waited = False
+        cleanup_deadline = None
         def turn():
             readable, _, _ = select.select([terminal], [], [], 0.02)
             if readable:
@@ -105,7 +195,7 @@ class Materials(unittest.TestCase):
                     pass
         try:
             command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(case)])
-            os.write(terminal, (command + "\n").encode())
+            start_controlling_shell(terminal, case, command)
             receipt = case / "actual-wrapper-exit.json"
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
@@ -119,8 +209,8 @@ class Materials(unittest.TestCase):
             self.assertEqual(os.WEXITSTATUS(actual["wait_status"]), 0)
             self.assertFalse((case / "owner-continued.json").exists())
             exit_controlling_shell(terminal)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+            cleanup_deadline = time.monotonic() + 5
+            while time.monotonic() < cleanup_deadline:
                 child, status = os.waitpid(shell, os.WNOHANG)
                 if child:
                     waited = True
@@ -131,17 +221,7 @@ class Materials(unittest.TestCase):
             self.assertEqual(os.WEXITSTATUS(status), 0)
             self.assertTrue((case / "owner-continued.json").is_file())
         finally:
-            try:
-                retain_pty_observation(case, trace, shell, terminal, waited)
-            finally:
-                if not waited:
-                    try:
-                        os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
-                        os.kill(shell, signal.SIGHUP)
-                    except (OSError, ProcessLookupError):
-                        pass
-                    os.waitpid(shell, 0)
-                os.close(terminal)
+            finish_controlling_shell(self, case, trace, shell, terminal, waited, cleanup_deadline)
 
     def context(self, name="run"):
         root = self.root / name
@@ -911,9 +991,10 @@ while True:
                         turn()
                     self.fail("PTY did not reach expected state: " + trace.decode(errors="replace")[-3000:])
                 waited = False
+                cleanup_deadline = None
                 try:
                     command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(helper), str(case), str(argv_file), adapter])
-                    os.write(terminal, (command + "\n").encode())
+                    start_controlling_shell(terminal, case, command)
                     until(ready.exists)
                     pid = int((case / "wrapper.pid").read_text())
                     if event in ("pause", "TTIN", "TTOU", "pause-TERM", "doc-pause"):
@@ -959,8 +1040,8 @@ while True:
                         self.assertEqual(result["cancelled"], [getattr(signal, "SIG" + event.removeprefix("doc-"))])
                     if terminal >= 0:
                         exit_controlling_shell(terminal)
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
+                    cleanup_deadline = time.monotonic() + 5
+                    while time.monotonic() < cleanup_deadline:
                         child, status = os.waitpid(shell, os.WNOHANG)
                         if child:
                             waited = True
@@ -968,18 +1049,9 @@ while True:
                         turn()
                     self.assertTrue(waited, "controlling shell did not exit")
                 finally:
-                    try:
-                        retain_pty_observation(case, trace, shell, terminal, waited)
-                    finally:
-                        if not waited:
-                            try:
-                                os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
-                                os.kill(shell, signal.SIGHUP)
-                            except (OSError, ProcessLookupError):
-                                pass
-                            os.waitpid(shell, 0)
-                        if terminal >= 0:
-                            os.close(terminal)
+                    finish_controlling_shell(self, case, trace, shell, terminal, waited, cleanup_deadline)
+            if self.retain_original_root:
+                break
 
 
 if __name__ == "__main__":

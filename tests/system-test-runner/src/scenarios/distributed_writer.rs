@@ -2829,8 +2829,10 @@ impl Scenario for DistributedWriterFaults {
                 anyhow::ensure!(
                     error.code == 1317
                         && error.state == "70100"
-                        && error.message
-                            == "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
+                        && exact_uncommitted_write_publication_message(
+                            &error.message,
+                            "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
+                        ),
                     "{case} lost its original deadline descriptor, errno, SQLSTATE or safe detail: {error:?}"
                 );
             }
@@ -3551,6 +3553,7 @@ mod controlled_writer_tests {
         for public in [
             "[query.execution.unexpected] Unexpected failure (reason 4:10)",
             "[query.execution.invalid_data] Invalid data (reason 4:9)",
+            "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
         ] {
             let complete = format!(
                 "{public} (lake publication id={id} family=write disposition=KnownUncommitted)"
