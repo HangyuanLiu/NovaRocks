@@ -1036,7 +1036,7 @@ impl TableWriterOperator {
                 self.writer.request_finish()?;
                 self.writer_finish_requested = true;
             }
-            if let Some(completion) = self.writer.take_output() {
+            if let std::task::Poll::Ready(completion) = self.writer.poll_output()? {
                 if completion.accepted_rows != self.physical_rows {
                     return Err(WriterFailure::RowCountDrift {
                         expected: self.physical_rows,
@@ -1046,11 +1046,6 @@ impl TableWriterOperator {
                 }
                 self.writer_completion = Some(completion);
                 self.state = TableWriterState::Producing;
-            } else if self.writer.is_done() {
-                return Err(
-                    crate::exec::pipeline::writer_failure::WriterFailure::MissingTerminalOutcome
-                        .into(),
-                );
             }
         }
         let output = if self.state == TableWriterState::Producing {
