@@ -105,9 +105,35 @@ FREEZE_KEYS = {"schema_version", "frozen_before_execution", "observer_sha256",
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailer", "transfer-encoding", "upgrade"}
 
+FORWARD_STAGES = frozenset({
+    "request-validate", "request-body", "upstream-open", "upstream-connect",
+    "upstream-send", "upstream-response", "client-send", "request-completion",
+    "unknown-operation",
+})
+
 
 class Refusal(Exception):
     """Only static safe reason strings may be passed to this exception."""
+
+
+def forwarding_failure_details(stage, error, sequence):
+    """Closed diagnostic facts; exception names/messages/arguments never escape."""
+    if isinstance(error, Refusal):
+        category = "refusal"
+    elif isinstance(error, OSError):
+        category = "os-error"
+    elif isinstance(error, http.client.HTTPException):
+        category = "http-error"
+    elif isinstance(error, ValueError):
+        category = "value-error"
+    else:
+        category = "other-error"
+    native_errno = error.errno if isinstance(error, OSError) else None
+    return {"operation_stage": stage if stage in FORWARD_STAGES else "unknown-operation",
+            "exception_category": category,
+            "errno": native_errno if type(native_errno) is int else None,
+            "request_sequence": sequence if type(sequence) is int and sequence > 0 else None}
+
 
 
 def need(condition, reason):
@@ -344,7 +370,7 @@ class Audit:
             self.upstream_connections -= 1
             need(self.upstream_connections >= 0, "upstream socket ownership underflow")
 
-    def failure(self, reason, admission=False, *, operation=None, error=None):
+    def failure(self, reason, admission=False, *, operation=None, error=None, diagnostic=None):
         with self.lock:
             self.counters["failures"] += 1
             self.total_failures += 1
@@ -356,6 +382,8 @@ class Audit:
                 event["error"] = {"type": type(error).__name__,
                                   "errno": error.errno if isinstance(error, OSError) else None,
                                   "operation": operation}
+            if diagnostic is not None:
+                event["diagnostic"] = diagnostic
             self.event(event)
 
     def begin(self, method, target, category, peer):
@@ -634,6 +662,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
         observation_complete = True
         category = "other"
         operation = "validate_request"
+        stage = "request-validate"
         try:
             self.check()
             self.rfile.header_mode = False
@@ -651,6 +680,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             need(length + len(self.path.encode()) <= self.server.bounds["max_request_bytes"], "request bytes exceed cap")
             record = audit.begin(self.command, self.path, category, self.client_address)
             operation = "read_request_body"
+            stage = "request-body"
             body = self.rfile.read(length)
             need(len(body) == length, "truncated request body")
             self.check()
@@ -658,6 +688,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             record["request_body_sha256"] = sha(body)
             upstream = self.server.downstream
             operation = "connect_upstream"
+            stage = "upstream-open"
             connection = self.upstream_connection
             if connection is None:
                 connection = http.client.HTTPConnection(upstream.hostname, upstream.port,
@@ -668,18 +699,21 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 self.upstream_connection = connection
                 connection.response_class = lambda *a, **kw: BoundedResponse(
                     *a, header_cap=self.server.bounds["max_header_bytes"], **kw)
+                stage = "upstream-connect"
                 connection.connect()
                 with self.socket_lock:
                     self.upstream_socket = connection.sock
                 audit.upstream_open()
                 self.upstream_counted = True
             else:
+                stage = "upstream-connect"
                 need(connection.sock is not None, "retained upstream socket is closed")
                 connection.sock.settimeout(max(0.001, self.deadline - time.monotonic()))
             self.check()
             audit.upstream_begin(category)
             upstream_held = True
             operation = "send_upstream_headers"
+            stage = "upstream-send"
             connection.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
             for name, value in headers:
                 if name.lower() not in hop and name.lower() != "host":
@@ -691,6 +725,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             record["upstream_request_sent"] = True
             audit.sent(self.command)
             operation = "receive_upstream_headers"
+            stage = "upstream-response"
             response = connection.getresponse()
             record["status"] = response.status
             if 300 <= response.status < 400:
@@ -706,6 +741,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             if self.command != "HEAD" and declared is not None:
                 need(declared <= self.server.bounds["max_response_bytes"], "declared response body exceeds cap")
             operation = "receive_upstream_body"
+            stage = "upstream-response"
             raw = response.read(self.server.bounds["max_response_bytes"] + 1)
             self.check()
             need(len(raw) <= self.server.bounds["max_response_bytes"], "response body exceeds cap")
@@ -750,8 +786,10 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 lines.append("Connection: close\r\n")
             lines.append("\r\n")
             operation = "send_client_headers"
+            stage = "client-send"
             self.connection.sendall("".join(lines).encode("latin-1"))
             operation = "send_client_body"
+            stage = "client-send"
             remaining = memoryview(raw)
             while remaining:
                 self.check()
@@ -760,6 +798,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 record["emitted_body_bytes"] += sent
                 audit.emitted(sent)
                 remaining = remaining[sent:]
+            stage = "request-completion"
             self.check()
             record["outcome"] = "actual-response-forwarded"
             audit.complete()
@@ -767,7 +806,9 @@ class ObserverHandler(BaseHTTPRequestHandler):
             reusable = False
             self.close_connection = True
             audit.failure("bounded forwarding failed; no substitute response or retry",
-                          operation=operation, error=error)
+                          operation=operation, error=error,
+                          diagnostic=forwarding_failure_details(
+                              stage, error, record["sequence"] if record is not None else None))
         finally:
             if upstream_held:
                 audit.upstream_end(category)
@@ -907,6 +948,38 @@ class PureTests(unittest.TestCase):
         self.assertFalse(audit.snapshot()["valid_observation"])
         for private in (b"private-token", b"private-message", b"private-filename", b"Authorization"):
             self.assertNotIn(private, recorded)
+
+    def test_forward_failure_diagnostics_are_closed_and_never_render_exception_text(self):
+        private = "PRIVATE Authorization=secret http://private/path?token=secret body=secret"
+        cases = [(OSError(errno.EADDRNOTAVAIL, private), "os-error", errno.EADDRNOTAVAIL),
+                 (Refusal(private), "refusal", None),
+                 (http.client.HTTPException(private), "http-error", None),
+                 (ValueError(private), "value-error", None),
+                 (RuntimeError(private), "other-error", None)]
+        for error, category, number in cases:
+            with self.subTest(category=category):
+                details = forwarding_failure_details("upstream-connect", error, 7)
+                self.assertEqual(details, {"operation_stage": "upstream-connect",
+                                          "exception_category": category, "errno": number,
+                                          "request_sequence": 7})
+                self.assertNotIn(private.encode(), encode(details))
+                ledger = io.BytesIO()
+                audit = Audit(ledger)
+                audit.failure("bounded forwarding failed; no substitute response or retry",
+                              diagnostic=details)
+                self.assertNotIn(private.encode(), ledger.getvalue())
+                audit.ledger = None
+                snapshot = audit.snapshot()
+                self.assertFalse(snapshot["valid_observation"])
+                self.assertEqual(snapshot["lifetime_failures"], 1)
+                self.assertEqual(snapshot["counters"]["completed"], 0)
+        error = OSError(errno.EIO, private)
+        error.errno = private
+        details = forwarding_failure_details(private, error, True)
+        self.assertEqual(details, {"operation_stage": "unknown-operation",
+                                  "exception_category": "os-error", "errno": None,
+                                  "request_sequence": None})
+        self.assertNotIn(private.encode(), encode(details))
 
 
 class LoopbackTests(unittest.TestCase):
@@ -1069,6 +1142,51 @@ class LoopbackTests(unittest.TestCase):
             self.call("GET", "/v1/namespaces/ns/tables")
         self.assertGreater(self.audit.snapshot()["lifetime_failures"], 0)
         self.assertEqual(self.audit.snapshot()["counters"]["completed"], 0)
+
+    def test_connect_errno_is_correlated_and_taints_without_response_or_retry(self):
+        ledger = tempfile.TemporaryFile()
+        self.addCleanup(ledger.close)
+        self.audit.ledger = ledger
+        private = "PRIVATE native URL Authorization password body"
+        original_connect = http.client.HTTPConnection.connect
+        attempts = []
+
+        def connect(connection):
+            if connection.port == self.backend.server_port:
+                attempts.append(1)
+                raise OSError(errno.EADDRNOTAVAIL, private)
+            return original_connect(connection)
+
+        with mock.patch.object(http.client.HTTPConnection, "connect", connect):
+            with socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2) as client:
+                client.sendall(b"GET /v1/namespaces/ns/tables/PRIVATE_TARGET HTTP/1.1\r\n"
+                               b"Host: 127.0.0.1\r\nAuthorization: PRIVATE_CREDENTIAL\r\n"
+                               b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                self.assertEqual(client.recv(65536), b"", "failure cannot synthesize an HTTP response")
+        deadline = time.monotonic() + 2
+        while self.audit.snapshot()["active_connections"]:
+            need(time.monotonic() < deadline, "failed observer connection did not exit")
+            time.sleep(0.001)
+        snapshot = self.audit.snapshot()
+        self.assertFalse(snapshot["valid_observation"])
+        self.assertEqual(snapshot["counters"]["failures"], 1)
+        self.assertEqual(snapshot["counters"]["upstream_requests_sent"], 0)
+        self.assertEqual(snapshot["counters"]["completed"], 0)
+        self.assertEqual(attempts, [1])
+        self.assertFalse(self.captured)
+        ledger.seek(0)
+        raw = ledger.read()
+        for value in (private, "PRIVATE_TARGET", "PRIVATE_CREDENTIAL"):
+            self.assertNotIn(value.encode(), raw)
+        events = [parse_json(line) for line in raw.splitlines()]
+        failure = next(event for event in events if event["event"] == "failure")
+        request = next(event for event in events if event["event"] == "request")
+        self.assertEqual(failure["diagnostic"], {"operation_stage": "upstream-connect",
+                                               "exception_category": "os-error",
+                                               "errno": errno.EADDRNOTAVAIL,
+                                               "request_sequence": request["sequence"]})
+        self.assertEqual(request["outcome"], "incomplete")
+        self.assertIsNone(request["status"])
 
     def test_absolute_deadline_closes_without_retry(self):
         self.restart_observer({"request_absolute_deadline_seconds": 0.05})
