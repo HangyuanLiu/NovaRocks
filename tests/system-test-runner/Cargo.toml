@@ -59,6 +59,7 @@ novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
+parquet.workspace = true
 prost.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

@@ -2464,6 +2464,10 @@ enum WriteFault {
     /// writer append. Cancellation must abort those provider writers and must
     /// not publish a successful Root EOF.
     DeadlineAbort,
+    /// All writer inputs reached Root EOS, but its first real Data never leaves BE.
+    SealedBeforeRootData,
+    /// FE consumed the real first Root segment, but receives no second Data/End.
+    SealedAfterRootPrefix,
 }
 
 /// The task protocol's evidence that one task really failed on the backend the
@@ -2525,7 +2529,9 @@ impl WriteFault {
             | Self::PartialAggregateUpdate
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
-            | Self::FinalAggregateFinalize => InjectionEvidence::NativeFault,
+            | Self::FinalAggregateFinalize
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => InjectionEvidence::NativeFault,
             Self::SeveredWriterStream => {
                 // The exact held Task is checked before reentry below; its
                 // backend is selected from the original frozen writer graph.
@@ -2550,7 +2556,11 @@ impl WriteFault {
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize => (FailureClass::Unexpected, 10),
-            Self::SeveredWriterStream | Self::FetchAbort | Self::DeadlineAbort => return None,
+            Self::SeveredWriterStream
+            | Self::FetchAbort
+            | Self::DeadlineAbort
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => return None,
         };
         Some(FailureFact::new(
             class,
@@ -2569,7 +2579,9 @@ impl WriteFault {
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize
             | Self::SeveredWriterStream
-            | Self::DeadlineAbort => statements.full,
+            | Self::DeadlineAbort
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => statements.full,
         }
     }
 
@@ -2644,7 +2656,9 @@ impl WriteFault {
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize
-            | Self::FetchAbort => Ok(()),
+            | Self::FetchAbort
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => Ok(()),
         }
     }
 
@@ -2659,6 +2673,10 @@ impl WriteFault {
             Self::SeveredWriterStream => "a writer stream that never reaches the root aggregation",
             Self::FetchAbort => "an aborted attempt that never fetches the root's result",
             Self::DeadlineAbort => "a deadline that fires after provider writers enter append",
+            Self::SealedBeforeRootData => "sealed objects before the first Root Data is offered",
+            Self::SealedAfterRootPrefix => {
+                "sealed objects after an accepted Root prefix without End"
+            }
         }
     }
 }
@@ -2788,6 +2806,7 @@ impl Scenario for DistributedWriterFaults {
 
         // A committed row would prove the frontend committed despite a broken
         // write, so seed nothing into the target and require it to stay empty.
+        let mut retained_objects = Vec::new();
         for (ordinal, fault) in WRITE_FAULTS.into_iter().enumerate() {
             let case = fault.case();
             let selected = self.intent.take(ordinal)?;
@@ -2816,6 +2835,28 @@ impl Scenario for DistributedWriterFaults {
             )?;
             if let Some(expected) = fault.originating_connector_fact() {
                 assert_connector_failure(context, &outcome, accepted.as_ref(), expected, case)?;
+            }
+            if matches!(
+                fault,
+                WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix
+            ) {
+                let root =
+                    assert_sealed_root_read_failure(context, &fault, &outcome, accepted.as_ref())?;
+                let table_root = hadoop_table_root(
+                    &context
+                        .runtime_dir()
+                        .join("warehouses/distributed-writer-faults"),
+                    DATABASE,
+                    TABLE,
+                );
+                // The original statement's binding has drained and its worker
+                // contexts exited. Only its own sealed execution directory is
+                // observed; old cases and later successful writes cannot stand in.
+                retained_objects.push(capture_sealed_root_objects(
+                    context,
+                    &table_root,
+                    root.query_execution_id(),
+                )?);
             }
             let Err(error) = outcome else {
                 bail!("{case} did not fail the write");
@@ -2911,6 +2952,16 @@ impl Scenario for DistributedWriterFaults {
         }
 
         await_resource_convergence(context, &baseline, "distributed writer faults")?;
+        for objects in retained_objects {
+            for object in objects {
+                context.remaining("recheck the original sealed objects after native close")?;
+                anyhow::ensure!(
+                    sealed_object_digest(&object.path)? == (object.bytes, object.sha256),
+                    "sealed output disappeared or changed after original abort/Task/context retirement: {}",
+                    object.path.display()
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -3263,6 +3314,224 @@ fn run_faulted_write(
     }
 }
 
+/// Both actions are ordinary original Root read failures, not Task failures.
+/// Their exact role hit is separately required by the matrix below.
+fn assert_sealed_root_read_failure(
+    context: &mut ScenarioContext,
+    fault: &WriteFault,
+    outcome: &mysql::Result<()>,
+    snapshot: Option<&QueryLifecycleStructuredSnapshot>,
+) -> Result<novarocks_execution_contract::TaskIdentity> {
+    let detail = match fault {
+        WriteFault::SealedBeforeRootData => "injected write Root read failure before first Data",
+        WriteFault::SealedAfterRootPrefix => {
+            "injected write Root read failure after accepted prefix"
+        }
+        _ => bail!("object oracle requires its original Root read action"),
+    };
+    let snapshot = snapshot.context("Root read action has no original statement snapshot")?;
+    let Some(QueryLifecycleFailureSite::RootRead { root }) = snapshot.failure_site.as_ref() else {
+        bail!("sealed object action lost its actual Root read site: {snapshot:?}");
+    };
+    let execution = root.query_execution_id();
+    anyhow::ensure!(
+        snapshot.attempt_id == 1
+            && snapshot.worker_contexts_converged
+            && snapshot.process_namespace
+                == u64::from_ne_bytes(execution.query_id().high().to_ne_bytes())
+            && snapshot.local_sequence == execution.query_id().low() as u64
+            && snapshot.execution_id.as_deref()
+                == Some(
+                    format!(
+                        "{}:{}:{}",
+                        execution.query_id().high(),
+                        execution.query_id().low(),
+                        execution.attempt_id().get()
+                    )
+                    .as_str()
+                )
+            && snapshot.failure_fact
+                == Some(FailureFact::new(
+                    FailureClass::Unexpected,
+                    FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(20).unwrap())
+                ))
+            && snapshot.failure_detail.as_deref() == Some(detail),
+        "original Root failure, identity or context exit changed: {snapshot:?}"
+    );
+    let processes = (0..context.handle().be_count())
+        .map(|index| context.handle().backend_process_id(index))
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        processes.contains(&root.backend_process_id()),
+        "Root read belongs to another backend"
+    );
+    let Err(mysql::Error::MySqlError(error)) = outcome else {
+        bail!("Root read action did not return its original SQL error");
+    };
+    anyhow::ensure!(
+        error.code == 1105
+            && error.state == "HY000"
+            && exact_uncommitted_write_publication_message(
+                &error.message,
+                &format!("[query.execution.unexpected] {detail}")
+            ),
+        "Root read failure lost its exact public error/KnownUncommitted publication: {error:?}"
+    );
+    Ok(*root)
+}
+
+struct SealedRootObject {
+    path: std::path::PathBuf,
+    bytes: u64,
+    sha256: [u8; 32],
+}
+
+impl SealedRootObject {
+    fn observe(path: std::path::PathBuf) -> Result<Self> {
+        let (bytes, sha256) = sealed_object_digest(&path)?;
+        Ok(Self {
+            path,
+            bytes,
+            sha256,
+        })
+    }
+}
+
+fn sealed_object_digest(path: &Path) -> Result<(u64, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file() && metadata.len() != 0,
+        "sealed output is not an existing nonempty regular file: {}",
+        path.display()
+    );
+    let bytes = std::fs::read(path)?;
+    Ok((metadata.len(), Sha256::digest(bytes).into()))
+}
+
+fn capture_sealed_root_objects(
+    context: &mut ScenarioContext,
+    table_root: &Path,
+    execution: novarocks_types::QueryExecutionId,
+) -> Result<Vec<SealedRootObject>> {
+    let version = hadoop_metadata_version(table_root)?;
+    let metadata: TableMetadata = serde_json::from_slice(&std::fs::read(
+        table_root
+            .join("metadata")
+            .join(format!("v{version}.metadata.json")),
+    )?)?;
+    // Read the actual metadata's existing output location, as the Provider's
+    // iceberg_data_location author does. This creates no storage authority.
+    let data = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let data = Path::new(data.strip_prefix("file://").unwrap_or(&data));
+    let owned = table_root.canonicalize()?;
+    let data = data.canonicalize()?;
+    anyhow::ensure!(
+        data.starts_with(&owned),
+        "object oracle refuses data outside its original local table"
+    );
+    // Exact physical writer author: compiled_writer_binding::uuid_bytes uses
+    // query high/low big-endian bytes; ICE staging uses their canonical UUID.
+    let hex = format!(
+        "{:016x}{:016x}",
+        execution.query_id().high() as u64,
+        execution.query_id().low() as u64
+    );
+    let query = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    let staged = data.join("_staging").join(query);
+    let mut pending = vec![staged];
+    let mut objects = Vec::new();
+    while let Some(directory) = pending.pop() {
+        context.remaining("observe the original sealed writer objects")?;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&directory)?.file_type().is_dir(),
+            "object oracle refuses a redirected directory"
+        );
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            anyhow::ensure!(
+                !kind.is_symlink(),
+                "object oracle refuses a redirected object"
+            );
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else {
+                anyhow::ensure!(
+                    entry.path().extension().is_some_and(|ext| ext == "parquet"),
+                    "unexpected object in original data-writer staging directory"
+                );
+                objects.push(SealedRootObject::observe(entry.path())?);
+            }
+        }
+    }
+    anyhow::ensure!(
+        !objects.is_empty(),
+        "real sealed writer collection has no surviving objects"
+    );
+    objects.sort_by(|left, right| left.path.cmp(&right.path));
+    assert_sealed_root_row_bag(&objects)?;
+    Ok(objects)
+}
+
+/// Independent original input: seed_source_files writes each integer in
+/// 1..=SEED_ROWS exactly once. Nonempty files alone could hide a deleted peer.
+fn assert_sealed_root_row_bag(objects: &[SealedRootObject]) -> Result<()> {
+    use arrow_array::{Array, Int64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut values = Vec::new();
+    for object in objects {
+        let path = &object.path;
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?.build()?;
+        let mut file_rows = 0;
+        for batch in reader {
+            let batch = batch?;
+            anyhow::ensure!(
+                batch.num_columns() == 1 && batch.schema().field(0).name() == "v",
+                "sealed data file lost the original single v column: {}",
+                path.display()
+            );
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("sealed original v column is not BIGINT")?;
+            anyhow::ensure!(
+                column.null_count() == 0,
+                "sealed original v column acquired NULLs: {}",
+                path.display()
+            );
+            file_rows += column.len();
+            values.extend(column.values().iter().copied());
+        }
+        anyhow::ensure!(
+            file_rows > 0,
+            "sealed original data file has no data rows: {}",
+            path.display()
+        );
+    }
+    values.sort_unstable();
+    let expected = (1..=SEED_ROWS).collect::<Vec<_>>();
+    anyhow::ensure!(
+        values == expected,
+        "sealed original object collection lost, duplicated or changed the complete seeded row bag: rows={}",
+        values.len()
+    );
+    Ok(())
+}
+
 // SQL receives the Task owner's neutral summary, never Connector Display.
 // The optional suffix is exactly the original driver-owned operator location.
 fn connector_neutral_detail(detail: &str, expected: FailureFact) -> bool {
@@ -3378,7 +3647,7 @@ fn assert_connector_failure(
     Ok(())
 }
 
-const WRITE_FAULTS: [WriteFault; 9] = [
+const WRITE_FAULTS: [WriteFault; 11] = [
     WriteFault::WriterEgress,
     WriteFault::RootValidation,
     WriteFault::PartialAggregateUpdate,
@@ -3388,6 +3657,8 @@ const WRITE_FAULTS: [WriteFault; 9] = [
     WriteFault::SeveredWriterStream,
     WriteFault::FetchAbort,
     WriteFault::DeadlineAbort,
+    WriteFault::SealedBeforeRootData,
+    WriteFault::SealedAfterRootPrefix,
 ];
 
 fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
@@ -3409,6 +3680,12 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
             let kind = match fault {
                 WriteFault::WriterEgress => Some("connector-write-writer-failure"),
                 WriteFault::RootValidation => Some("connector-write-root-failure"),
+                WriteFault::SealedBeforeRootData => {
+                    Some("connector-write-root-read-before-data-failure")
+                }
+                WriteFault::SealedAfterRootPrefix => {
+                    Some("connector-write-root-read-after-prefix-failure")
+                }
                 WriteFault::PartialAggregateUpdate => {
                     Some("connector-write-partial-update-failure")
                 }
@@ -3548,6 +3825,47 @@ mod controlled_writer_tests {
     use super::*;
 
     #[test]
+    fn original_parquet_row_bag_rejects_a_missing_or_changed_sealed_peer() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        fn write(path: &Path, values: &[i64]) {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .unwrap();
+            let mut writer =
+                ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.parquet");
+        let right = directory.path().join("right.parquet");
+        let rows = (1..=SEED_ROWS).collect::<Vec<_>>();
+        let split = rows.len() / 2;
+        write(&left, &rows[..split]);
+        write(&right, &rows[split..]);
+        let objects = vec![
+            SealedRootObject::observe(left.clone()).unwrap(),
+            SealedRootObject::observe(right.clone()).unwrap(),
+        ];
+        assert_sealed_root_row_bag(&objects).unwrap();
+        // The directory stays nonempty and every surviving file is real.
+        // Neither condition may stand in for the complete original inputs.
+        assert!(assert_sealed_root_row_bag(&objects[..1]).is_err());
+        let mut changed = rows[split..].to_vec();
+        changed[0] = rows[0];
+        write(&right, &changed);
+        assert!(assert_sealed_root_row_bag(&objects).is_err());
+        write(&right, &[]);
+        assert!(assert_sealed_root_row_bag(&objects).is_err());
+    }
+
+    #[test]
     fn connector_failure_requires_the_complete_canonical_publication_message() {
         let id = "018f1f07-1234-7000-8000-00000000000a";
         for public in [
@@ -3627,7 +3945,7 @@ mod controlled_writer_tests {
     #[test]
     fn fault_matrix_has_only_targeted_write_permissions() {
         let specs = writer_fault_specs(3);
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 11);
         assert!(specs.iter().all(|spec| {
             spec.sql
                 .starts_with("INSERT INTO distributed_writer_faults.")
@@ -3639,7 +3957,7 @@ mod controlled_writer_tests {
         }));
         assert_eq!(
             specs.iter().map(|spec| spec.faults.len()).sum::<usize>(),
-            27
+            33
         );
         assert_eq!(
             specs
@@ -3662,7 +3980,7 @@ mod controlled_writer_tests {
         assert!(specs.iter().flat_map(|spec| &spec.faults).all(|(_, kind)| {
             novarocks_failpoint::QueryLifecycleFaultKind::parse(kind).is_some()
         }));
-        // This is 31 FE grants: the statement owner plus 27 binds and three
+        // This is 37 FE grants: the statement owner plus 33 binds and three
         // Task observations. Seed/setup and the healthy post-matrix write
         // deliberately receive no permission.
         assert_eq!(
@@ -3670,7 +3988,7 @@ mod controlled_writer_tests {
                 .iter()
                 .map(|spec| spec.faults.len() + spec.observations.len())
                 .sum::<usize>(),
-            31
+            37
         );
     }
 }
