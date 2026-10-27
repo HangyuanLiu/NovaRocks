@@ -181,6 +181,43 @@ impl NativeRootResultReader {
         self
     }
 
+    /// Observe only the outcome already settled by the original root owner.
+    /// A finite diagnostic grant cannot change the read or mint an EOS fact.
+    #[cfg(novarocks_dev_controls)]
+    fn observe_read(&self, request: &RootResultRead, response: &NativeRootReadResponse) {
+        let Some(controls) = &self.observation_controls else {
+            return;
+        };
+        let identity = request.root_task();
+        if !controls.owns_backend(identity.backend_process_id()) {
+            return;
+        }
+        let observer =
+            match controls.observation_for("grpc-fragment", identity.query_execution_id()) {
+                Ok(Some(observer)) => observer,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%error, task = %identity, "root read observation refused");
+                    return;
+                }
+            };
+        if !observer.is_active() {
+            return;
+        }
+        let marker = match response {
+            NativeRootReadResponse::Owned(reply) => root_reply_marker(reply.reply()),
+            NativeRootReadResponse::Refused(_) => Some(root_control_marker(identity, "refused")),
+            NativeRootReadResponse::AwaitTerminalControl { .. } => {
+                Some(root_control_marker(identity, "await-terminal-control"))
+            }
+            NativeRootReadResponse::Deferred(_) => None,
+        };
+        let Some(marker) = marker else {
+            return;
+        };
+        observer.observe(&marker);
+    }
+
     /// A finite original-role action holds only the second read, before any
     /// additional Data offer. The runner enables it after parsing the first
     /// complete client row; that observation does not invent a Backend ACK.
@@ -283,6 +320,19 @@ impl NativeRootResultReader {
         request: &RootResultRead,
         transport_metadata_bytes: usize,
     ) -> NativeRootReadResponse {
+        let response = self
+            .read_owned_with_transport_metadata(request, transport_metadata_bytes)
+            .await;
+        #[cfg(novarocks_dev_controls)]
+        self.observe_read(request, &response);
+        response
+    }
+
+    async fn read_owned_with_transport_metadata(
+        &self,
+        request: &RootResultRead,
+        transport_metadata_bytes: usize,
+    ) -> NativeRootReadResponse {
         let admitted = match self.registry.context_root_result_route(request) {
             ContextRootRoute::Read(read) => read,
             ContextRootRoute::AwaitTerminalControl { accepted_consumed } => {
@@ -381,18 +431,6 @@ impl NativeRootResultReader {
             }
             reply
         };
-        #[cfg(novarocks_dev_controls)]
-        if crate::task_result_diagnostics::emit_root_read_marker(
-            self.observation_controls.as_deref(),
-            request.root_task(),
-            &reply.outcome,
-        )
-        .is_err()
-        {
-            // Missing observation remains missing evidence; it cannot change
-            // the original channel's settled business result or mint a fact.
-            tracing::warn!("authorized root read observation could not be recorded");
-        }
         NativeRootReadResponse::Owned(NativeRootResultReply {
             reply,
             ownership: NativeRootSendOwnership {
@@ -403,6 +441,76 @@ impl NativeRootResultReader {
                 })),
             },
         })
+    }
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+fn root_marker_identity(
+    identity: novarocks_execution_contract::task_execution::identity::TaskIdentity,
+) -> String {
+    let execution = identity.query_execution_id();
+    format!(
+        "NOVAROCKS_GRPC_FETCH_TYPED query_hi={} query_lo={} attempt={} stage={} task={} backend={} protocol=root-v1",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        identity.backend_process_id(),
+    )
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+fn root_control_marker(
+    identity: novarocks_execution_contract::task_execution::identity::TaskIdentity,
+    outcome: &str,
+) -> String {
+    format!(
+        "{} outcome={outcome} eos=false",
+        root_marker_identity(identity)
+    )
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+fn root_reply_marker(reply: &RootResultReply) -> Option<String> {
+    use novarocks_execution_contract::root_result::RootReadOutcome;
+    let prefix = || root_marker_identity(reply.root_task);
+    match &reply.outcome {
+        RootReadOutcome::Data(data)
+            if data.sequence().get() == 1 || data.end_after_data().is_some() =>
+        {
+            let mut marker = format!(
+                "{} outcome=data sequence={} eos={} payload_bytes={}",
+                prefix(),
+                data.sequence(),
+                data.end_after_data().is_some(),
+                data.body().len(),
+            );
+            if let Some(end) = data.end_after_data() {
+                use std::fmt::Write;
+                write!(
+                    marker,
+                    " end_sequence={} output_rows={}",
+                    end.sequence, end.output_rows
+                )
+                .expect("writing to String cannot fail");
+            }
+            Some(marker)
+        }
+        RootReadOutcome::End(end) => Some(format!(
+            "{} outcome=end sequence={} eos=true output_rows={} payload_bytes=0",
+            prefix(),
+            end.sequence,
+            end.output_rows,
+        )),
+        RootReadOutcome::AwaitTerminalControl => Some(root_control_marker(
+            reply.root_task,
+            "await-terminal-control",
+        )),
+        RootReadOutcome::AckOnly
+        | RootReadOutcome::NotReady
+        | RootReadOutcome::Retired
+        | RootReadOutcome::Data(_) => None,
     }
 }
 
@@ -692,5 +800,112 @@ mod write_prefix_tests {
         assert!(write_root_read_fault(Some(&fixture.controls), &request, &mut original).is_err());
         assert_eq!(event_count(&fixture, "claimed"), 1);
         assert_eq!(event_count(&fixture, "hit"), 0);
+    }
+}
+
+#[cfg(test)]
+mod observation_marker_tests {
+    use super::*;
+    use bytes::Bytes;
+    use novarocks_execution_contract::root_result::{
+        RootReadOutcome, RootResultData, RootResultEnd,
+    };
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_result_contract::{RootOutputKind, RootProfileId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::num::NonZeroU64;
+
+    fn sequence(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).unwrap()
+    }
+
+    fn reply(outcome: RootReadOutcome) -> RootResultReply {
+        RootResultReply {
+            root_task: TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(2).unwrap()).unwrap(),
+                StageId::new(3).unwrap(),
+                TaskId::new(4).unwrap(),
+                BackendProcessId::new_v7(),
+            ),
+            profile: RootProfileId::V1,
+            kind: RootOutputKind::ClientRows,
+            accepted_consumed: 0,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn empty_end_observation_retains_exact_root_identity_and_original_row_count() {
+        let reply = reply(RootReadOutcome::End(RootResultEnd {
+            sequence: sequence(1),
+            output_rows: 0,
+        }));
+        let marker = root_reply_marker(&reply).unwrap();
+        assert!(marker.contains("query_hi=7 query_lo=9 attempt=2 stage=3 task=4"));
+        assert!(marker.contains(&format!("backend={}", reply.root_task.backend_process_id())));
+        assert!(marker.contains(
+            "protocol=root-v1 outcome=end sequence=1 eos=true output_rows=0 payload_bytes=0"
+        ));
+        assert!(!marker.contains("packet_seq="));
+        assert!(!marker.contains("status="));
+    }
+
+    #[test]
+    fn data_observation_reports_eos_only_for_an_original_attached_end() {
+        for end in [
+            None,
+            Some(RootResultEnd {
+                sequence: sequence(2),
+                output_rows: 17,
+            }),
+        ] {
+            let reply = reply(RootReadOutcome::Data(
+                RootResultData::try_new(
+                    RootOutputKind::ClientRows,
+                    sequence(1),
+                    Bytes::from_static(b"original rows"),
+                    end,
+                )
+                .unwrap(),
+            ));
+            let marker = root_reply_marker(&reply).unwrap();
+            assert!(marker.contains("outcome=data sequence=1"));
+            assert!(marker.contains("payload_bytes=13"));
+            assert_eq!(marker.contains("eos=true"), end.is_some());
+            assert_eq!(marker.contains("eos=false"), end.is_none());
+            assert_eq!(
+                marker.contains("end_sequence=2 output_rows=17"),
+                end.is_some()
+            );
+        }
+        let later = reply(RootReadOutcome::Data(
+            RootResultData::try_new(
+                RootOutputKind::ClientRows,
+                sequence(2),
+                Bytes::from_static(b"later rows"),
+                None,
+            )
+            .unwrap(),
+        ));
+        assert!(root_reply_marker(&later).is_none());
+    }
+
+    #[test]
+    fn control_outcomes_never_synthesize_root_eos() {
+        for outcome in [
+            RootReadOutcome::AckOnly,
+            RootReadOutcome::NotReady,
+            RootReadOutcome::Retired,
+        ] {
+            assert!(root_reply_marker(&reply(outcome)).is_none());
+        }
+        let reply = reply(RootReadOutcome::AwaitTerminalControl);
+        let awaiting = root_reply_marker(&reply).unwrap();
+        assert!(awaiting.contains("outcome=await-terminal-control eos=false"));
+        let refused = root_control_marker(reply.root_task, "refused");
+        assert!(refused.contains("outcome=refused eos=false"));
+        assert!(!refused.contains("output_rows="));
     }
 }
