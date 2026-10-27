@@ -184,7 +184,13 @@ FE 只有收到完整集合并完成 End 解码后，才能在 FE 进程内把�
 
 FE 的未接收责任记录不能虚构完整清单的内存占用，各中间节点只计费实际 buffer。本地传输完成可释放不再使用的缓冲，但不结清 FE 责任。未接收记录仅在完整接收、全体相关写出已证明退出且精确清理结清，或已有充分 Provider 处置证明后结清。
 
-凭据保管随实际业务 holder 延续：begin 使用已准入收集器和 retained generation 的准确 catalog properties，保持原 stop/deadline；终结阶段不向已冻结 descriptor 集补项。publication/安全清理仍需的 vended storage 与访问 resolver 不能因原计算或提交终态而提前释放。
+凭据保管随实际业务 holder 延续：每个真实写入段保留独立 execution、已准入收集器和 retained generation 的准确 catalog properties，保持原 stop/deadline。同一 Session 只登记来自原始计算凭据的 typed resolver；先确认其既有 Weak 关系指向同一 Session，再登记原件，不接受任意 resolver 替换已有作者。同 execution、同原件重复登记幂等且不改变首次登记顺序；同 execution 换原件被拒绝。
+
+原 terminal Context 前沿关闭全部已登记 collection 并冻结选择快照；即使前段普通验证失败，也继续关闭后段 collection，稳定保留首个原验证错误，不能在后续读取时变成成功。成功段沿已交给 Native 的原冻结表，未启动失败段只关闭原 collection 的启动与贡献权限；这些转换不证明 publication、物理 worker 或原 Future 已退出。冻结后拒绝新段，原段幂等登记不改变快照；终结阶段不向已冻结 descriptor 集补项。
+
+访问先匹配准确 owner，再取最长 prefix；相同准确 scope 选择首次登记顺序最新的真实不同段授权，旧段重试不提升顺序。同 attempt 的重复响应规则保持原样。选择不依材料是否过期或解析是否失败，也不在选中作者拒绝后尝试更宽或较早授权；选定 token 固定原收集器和准确 lease，后续登记不能改换它的作者，续期仍沿该原 lease 的既有能力。
+
+Session 终态一次构建本地冻结 scope 索引，重复准确 scope 只折叠选择项，全部原件仍保管。每次访问只固定同一 Arc 快照并扫描 distinct scopes，不逐对象复制或扫描全部写入段；登记与冻结使用真实元数据分配，不授予额外资源或声称已测性能。选中原件在锁外解析。publication/安全清理仍需的 vended storage 与访问 resolver 不能因原计算或提交终态而提前释放；缓存 Context、后继 Context 与 Unknown 保管同一组原件，直到实际最后 alias 退出。
 
 CTAS 的 staged seal 与最终 catalog CREATE 是两个实际阶段。后续绑定借用同一份 seal receipt，只有必要 finalization 为 Complete 才能据此继续最终 publication；seal 的 KnownCommitted/NoOp 不制造 catalog 已发布事实。必要 finalization 失败时保留已观察事实并拒绝下一步，不能靠复制或重造 receipt 绕过该屏障。
 

@@ -189,24 +189,38 @@ impl WriteReceivingPort {
 }
 
 impl ConnectorWriteSession {
-    /// Until the P04 multi-segment router is installed, refuse replacing an
-    /// existing original capability. A failed later seed cannot erase it.
-    pub(crate) fn retain_computation_storage_resolver(
-        &self,
-        resolver: Arc<dyn ConnectorStorageResolver>,
+    /// Register this actual stage without replacing any previous stage's
+    /// terminal capability. Publication still belongs to this one Session.
+    pub(crate) fn retain_computation_credentials(
+        self: &Arc<Self>,
+        credentials: &crate::query_execution::logical_execution::InitialComputationCredentials,
     ) -> Result<(), ConnectorError> {
-        let mut storage = self.lock_terminal_storage()?;
-        match storage.as_ref() {
-            Some(original) if !Arc::ptr_eq(original, &resolver) => Err(ConnectorError::new(
+        if credentials
+            .write_production_session()
+            .is_none_or(|original| !original.ptr_eq(&Arc::downgrade(self)))
+        {
+            return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "write receiving requires its original terminal storage capability",
-            )),
-            Some(_) => Ok(()),
-            None => {
-                *storage = Some(resolver);
-                Ok(())
-            }
+                "terminal credentials do not belong to this original write session",
+            ));
         }
+        let terminal = self.lock_terminal()?;
+        if terminal.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "terminal write session refuses another credential registration",
+            ));
+        }
+        let mut storage = self.lock_terminal_storage()?;
+        if let Some(router) = storage.as_ref() {
+            return router.register(credentials);
+        }
+        let router = Arc::new(
+            crate::query_execution::lifecycle_plan::SessionTerminalCredentialRouter::default(),
+        );
+        router.register(credentials)?;
+        *storage = Some(router);
+        Ok(())
     }
     pub(crate) fn computation_decode(
         &self,

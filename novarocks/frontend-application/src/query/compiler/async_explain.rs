@@ -20,10 +20,17 @@
 
 use super::*;
 use crate::query_execution::completion_facts::{
-    CompletedReadCpuInput, FrontendCompletionPorts, FrontendPlanningCpuSource, LogicalFinishInput,
-    ReadEncodingInput, ReadEncodingPurpose,
+    CompletedReadCpuInput, FrontendPlanningCpuSource, LogicalFinishInput, ReadEncodingInput,
+    ReadEncodingPurpose,
 };
 use novarocks_query_application::api::StatementNativeHealthFailure;
+
+pub(crate) struct ExplainPreparationPorts<'a> {
+    pub(crate) provider: &'a crate::query_execution::completion_facts::FrontendCompletionCustody,
+    pub(crate) cpu: &'a FrontendPlanningCpuSource,
+    pub(crate) io: Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
+    pub(crate) state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
+}
 
 pub(crate) enum PreparedAsyncExplain {
     Lines(Vec<String>),
@@ -44,12 +51,12 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
-        provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
-        planning_cpu: &FrontendPlanningCpuSource,
+        ports: ExplainPreparationPorts<'_>,
     ) -> Result<
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
     > {
+        let planning_cpu = ports.cpu;
         let execution = context.execution();
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
@@ -59,6 +66,14 @@ impl FrontendQueryCompiler {
                 query_options.as_ref(),
                 context.execution().cancellation().clone(),
             )?;
+            let connector_planning_context =
+                novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
+                    connector_planning_context
+                        .request()
+                        .clone()
+                        .with_io_admission(Arc::clone(&ports.io)),
+                )
+                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
             let connector_context = connector_planning_context.request();
             let mut query = explain.query.as_ref().clone();
             self.view
@@ -104,10 +119,7 @@ impl FrontendQueryCompiler {
                     execution,
                     scope,
                     std::time::Instant::now(),
-                    FrontendCompletionPorts {
-                        provider: provider_source,
-                        cpu: planning_cpu,
-                    },
+                    ports,
                 )
                 .await;
         }
@@ -136,7 +148,7 @@ impl FrontendQueryCompiler {
                         .map_err(FrontendQueryCompilerError::Engine)?,
                 );
                 let scope =
-                    crate::query_execution::completion_facts::StatementFactScope::binding_only(
+                    crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
                         bindings,
                         connector_context.clone(),
                         current_catalog,
@@ -146,6 +158,7 @@ impl FrontendQueryCompiler {
                                 "logical EXPLAIN requires the admitted result capacity".to_owned(),
                             )
                         })?,
+                        ports.state_store.clone(),
                     )
                     .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
                 let catalog = crate::query_execution::completion_facts::FrontendCatalogFacts::new(
@@ -187,10 +200,7 @@ impl FrontendQueryCompiler {
             execution,
             scope,
             level,
-            FrontendCompletionPorts {
-                provider: provider_source,
-                cpu: planning_cpu,
-            },
+            ports,
         )
         .await
     }
@@ -205,14 +215,16 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         level: ExplainLevel,
-        ports: FrontendCompletionPorts<'_>,
+        ports: ExplainPreparationPorts<'_>,
     ) -> Result<
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
     > {
-        let FrontendCompletionPorts {
+        let ExplainPreparationPorts {
             provider: provider_source,
             cpu: planning_cpu,
+            state_store,
+            ..
         } = ports;
         let request: Result<
             novarocks_sql::compiler::SqlFinalPlanCompileRequest,
@@ -226,7 +238,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
-                crate::query_execution::completion_facts::StatementFactScope::binding_only(
+                crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
                     Arc::clone(&bindings),
                     connector_context.clone(),
                     current_catalog,
@@ -236,6 +248,7 @@ impl FrontendQueryCompiler {
                             "completion facts require the admitted result capacity".to_owned(),
                         )
                     })?,
+                    state_store,
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
                 crate::query_execution::compiler::typed_connector_session()
@@ -302,14 +315,16 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
-        ports: FrontendCompletionPorts<'_>,
+        ports: ExplainPreparationPorts<'_>,
     ) -> Result<
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
     > {
-        let FrontendCompletionPorts {
+        let ExplainPreparationPorts {
             provider: provider_source,
             cpu: planning_cpu,
+            state_store,
+            ..
         } = ports;
         let request: Result<
             (
@@ -325,7 +340,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
-                crate::query_execution::completion_facts::StatementFactScope::binding_only(
+                crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
                     Arc::clone(&bindings),
                     connector_planning_context.request().clone(),
                     current_catalog,
@@ -335,6 +350,7 @@ impl FrontendQueryCompiler {
                             "completion facts require the admitted result capacity".to_owned(),
                         )
                     })?,
+                    state_store,
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
                 crate::query_execution::compiler::typed_connector_session()

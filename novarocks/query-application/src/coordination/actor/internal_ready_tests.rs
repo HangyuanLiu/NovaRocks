@@ -1597,6 +1597,7 @@ async fn original_old_and_successor_consumers_keep_distinct_causes_after_their_r
         }),
         activation: old,
         exit: old_exit,
+        activity: None,
     });
     old_record.start_consumer_in(&mut old_input);
     old_entry.await.unwrap();
@@ -1619,6 +1620,7 @@ async fn original_old_and_successor_consumers_keep_distinct_causes_after_their_r
         }),
         activation: next,
         exit: next_exit,
+        activity: None,
     });
     next_record.start_consumer_in(&mut next_input);
     next_entry.await.unwrap();
@@ -1697,6 +1699,7 @@ async fn actual_consumer_join_keeps_the_opaque_receipt_tail_cause_in_its_origina
         consumer: Arc::new(ExitTailPanicConsumer(Arc::clone(&drops))),
         activation,
         exit,
+        activity: None,
     });
     record.start_consumer_in(&mut input);
     drop(ack);
@@ -1712,4 +1715,224 @@ async fn actual_consumer_join_keeps_the_opaque_receipt_tail_cause_in_its_origina
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     record.dispose_for_process_exit();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn owned_consumer_cleanup_releases_p1_but_keeps_opaque_join_cause_until_process_exit() {
+    use crate::admitted_query_context::QueryResultCapacityBinding;
+    use crate::coordination::native_active_custody::{
+        OriginalConsumerStart, root_ack_test_fixture,
+    };
+    use novarocks_workload_control::{
+        ControlStorageConfig, ResultCapacityConfig, WorkClass, WorkOwner, WorkRequest,
+        WorkloadConfig, WorkloadControl,
+        joint_admission::{
+            InternalComputationGrant, JointLane, JointProgress, JointProgressDriver, JointResource,
+            JointResources, ResponsibilityConfig, RetainedPayloadGrant,
+        },
+    };
+    // Drive the real admission author, not a mirror selector or synthetic grant.
+    fn resolve<F: Future + Unpin>(driver: &mut JointProgressDriver, future: &mut F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let Poll::Ready(value) = std::pin::Pin::new(&mut *future).poll(&mut cx) {
+                return value;
+            }
+            if matches!(driver.step(), JointProgress::Idle(_)) {
+                if let Poll::Ready(value) = std::pin::Pin::new(&mut *future).poll(&mut cx) {
+                    return value;
+                }
+                panic!("original finite admission unexpectedly remained pending at idle");
+            }
+        }
+    }
+    fn child(
+        driver: &mut JointProgressDriver,
+        root: &novarocks_workload_control::WorkScope,
+    ) -> WorkOwner {
+        let mut request = root.request_joint_child().unwrap();
+        let mut ready = resolve(driver, &mut request).unwrap();
+        let mut child = None;
+        ready
+            .adjustment
+            .as_mut()
+            .unwrap()
+            .install_child_in(root, &mut child)
+            .unwrap()
+            .notify();
+        child.unwrap()
+    }
+    let count = 64;
+    let workload = WorkloadControl::try_new_counted(WorkloadConfig {
+        root_limit: count,
+        business_limit: count,
+        query_concurrency_limit: count,
+        scope_records_limit: count,
+        ..WorkloadConfig::default()
+    })
+    .unwrap()
+    .owner;
+    let mut config = ResultCapacityConfig::V1;
+    config.positions[2] = 1;
+    let result_capacity = workload.configure_result_capacity(config).unwrap();
+    let (admission, mut driver) = workload
+        .configure_responsibility(ResponsibilityConfig {
+            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+        })
+        .unwrap();
+    workload
+        .configure_control_storage(ControlStorageConfig::new(count, &[]))
+        .unwrap();
+    workload.mark_ready().unwrap();
+    let root = workload
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = root.owner.scope();
+    let mut first_bind = admission.begin_paid_proposal(&root.owner).unwrap();
+    first_bind
+        .begin_first_bind(root.owner.control_claim_view().unwrap())
+        .unwrap();
+    first_bind
+        .push_dependency(&novarocks_resource_contract::SharedDependency::LocalHost)
+        .unwrap();
+    first_bind.end_change().unwrap();
+    let mut first_request = first_bind.submit().unwrap();
+    let mut first_ready = resolve(&mut driver, &mut first_request).unwrap();
+    first_ready
+        .adjustment
+        .take()
+        .unwrap()
+        .install_control(&root.owner, &[])
+        .unwrap();
+    drop((first_ready, first_request));
+    let mut builder = admission.begin_paid_proposal(&root.owner).unwrap();
+    builder
+        .begin_new(
+            JointLane::Custody,
+            JointResources::ZERO
+                .with(JointResource::ClaimRecords, 1)
+                .with(JointResource::PayloadBytes, 8 * 1024 * 1024),
+        )
+        .unwrap();
+    builder
+        .push_dependency(&novarocks_resource_contract::SharedDependency::LocalHost)
+        .unwrap();
+    builder.end_change().unwrap();
+    let mut request = builder.submit().unwrap();
+    let mut ready = resolve(&mut driver, &mut request).unwrap();
+    let mut raw = ready.new_claims.pop();
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    drop((ready, request));
+    let payload = payload.unwrap();
+    let stage = child(&mut driver, &scope);
+    let next_stage = child(&mut driver, &scope);
+    let source = payload.root_stage_source(&scope, &stage).unwrap();
+    let mut builder = source
+        .begin(8 * 1024 * 1024, JointLane::Foreground)
+        .unwrap();
+    builder.end_payload().unwrap();
+    builder.end_stage().unwrap();
+    let mut stage_request = builder.submit().unwrap();
+    let mut ready = resolve(&mut driver, &mut stage_request).unwrap();
+    let mut compute: Option<InternalComputationGrant> = None;
+    ready
+        .install_in(&scope, &payload, &stage, &mut compute)
+        .unwrap()
+        .notify();
+    drop((ready, stage_request));
+    let mut capacity = None;
+    QueryResultCapacityBinding::from_owned_internal_computation_in(
+        &scope,
+        &stage,
+        &payload,
+        &mut compute,
+        &mut capacity,
+    )
+    .unwrap();
+    assert!(compute.is_none());
+    let capacity = capacity.unwrap();
+    let cut = capacity.streamed_computation_cut_handle().unwrap();
+    let activity = cut.begin_consumer_activity().unwrap();
+    let InternalFixture {
+        owner,
+        running,
+        observer,
+        activation,
+        _output,
+    } = InternalFixture::new(12_601).await;
+    let exit = activation.supervise_exit().await.unwrap();
+    let (record, ack) = root_ack_test_fixture(running.identity(), observer.root);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut input = Some(OriginalConsumerStart {
+        consumer: Arc::new(ExitTailPanicConsumer(Arc::clone(&drops))),
+        activation,
+        exit,
+        activity: Some(activity),
+    });
+    // Before the consumer task can receive its first poll, a real second
+    // request must wait for the original P=1 computation.
+    let source = payload.root_stage_source(&scope, &next_stage).unwrap();
+    let mut builder = source
+        .begin(8 * 1024 * 1024, JointLane::Foreground)
+        .unwrap();
+    builder.end_payload().unwrap();
+    builder.end_stage().unwrap();
+    let mut next = builder.submit().unwrap();
+    while matches!(driver.step(), JointProgress::More) {}
+    assert!(
+        std::pin::Pin::new(&mut next)
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    record.start_consumer_in(&mut input);
+    assert!(input.is_none());
+    // No Native producer was launched in this component fixture. Remove the
+    // unused creator views: the actual consumer slot now owns the sole activity.
+    // This does not fabricate a pump token or call native_body_exited.
+    drop((capacity, cut));
+    drop(ack);
+    record.close_native();
+    record.join_consumer().await;
+    wait_for_conclusion(owner.actor(), LogicalConclusion::Failed).await;
+    drop((running, observer, _output));
+    join_original_internal_actor(owner).await;
+    assert!(record.consumer_join_panicked());
+    assert!(record.consumer_failed());
+    assert!(record.retained());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    // The original F/Join finished and its cleanup cut is stable. No Native
+    // producer was issued here; this proves only this component's local cut.
+    driver.recheck_retired_backing();
+    let mut ready = resolve(&mut driver, &mut next).unwrap();
+    let mut next_compute = None;
+    ready
+        .install_in(&scope, &payload, &next_stage, &mut next_compute)
+        .unwrap()
+        .notify();
+    assert_eq!(
+        result_capacity.snapshot().held_positions[2],
+        1,
+        "the same waiting P=1 request reuses the position before raw cause disposal"
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(record.consumer_failed() && record.retained());
+    record.dispose_for_process_exit();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop((ready, next, next_compute, payload));
+    stage.complete();
+    next_stage.complete();
+    root.business.release();
+    root.owner.complete();
+    drop(scope);
+    workload.close_admission();
+    driver.recheck_retired_backing();
+    while matches!(driver.step(), JointProgress::More) {}
+    assert_eq!(result_capacity.snapshot().held_positions, [0; 4]);
+    drop((result_capacity, driver, admission));
+    workload
+        .shutdown()
+        .unwrap_or_else(|failure| panic!("actual fixture shutdown failed: {:?}", failure.error()));
 }

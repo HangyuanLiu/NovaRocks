@@ -1015,8 +1015,8 @@ type DeliveryFuture<'a> =
 type ReadFuture =
     Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>;
 
-/// Minted only after this original streaming Rows pump consumed Root End, drained its
-/// real delivery/read slots and obtained its final actor success. Moving this
+/// Minted only after this original pump consumed Root End, drained its
+/// real delivery/read slots and obtained its final actor success or exact Internal Ready. Moving this
 /// token out is not P retirement: the supervisor consumes it after the pump
 /// and its driver frame have returned normally.
 pub(crate) struct StreamedRowsComputedCut {
@@ -1099,7 +1099,7 @@ pub(crate) async fn run_root_relay(
 
 /// Relays provisional internal output while retaining the original attempt
 /// authority until the registered domain proof establishes its computation cut.
-pub(crate) async fn run_internal_root_relay(
+pub(super) async fn run_internal_root_relay(
     permit: RunningAttemptPermit,
     root: TaskIdentity,
     scope: WorkScope,
@@ -1108,7 +1108,8 @@ pub(crate) async fn run_internal_root_relay(
     native_terminal: NativeAttemptTerminalSource,
     root_ack: super::RootAckTailReservation,
     ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
-) -> Result<LogicalConclusion, ResultPumpFailure> {
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
+) -> Result<RootPumpDecision, ResultPumpFailure> {
     run_root_relay_core(
         permit,
         root,
@@ -1118,10 +1119,9 @@ pub(crate) async fn run_internal_root_relay(
         native_terminal,
         root_ack,
         Some(ready),
-        None,
+        streamed,
     )
     .await
-    .map(|decision| decision.conclusion)
 }
 
 async fn run_root_relay_core(
@@ -1389,11 +1389,27 @@ async fn run_root_relay_core(
         .await);
     }
     if let Some(ready) = ready {
+        let activation = permit.identity();
         return finish_internal_relay(&mut runtime, &observer_owner, permit, root, end, ready)
             .await
-            .map(|conclusion| RootPumpDecision {
-                conclusion,
-                streamed_cut: None,
+            .map(|conclusion| {
+                let streamed_cut = if conclusion == LogicalConclusion::ComputationReady {
+                    streamed.map(|source| {
+                        let sealing = source.seal_producer();
+                        StreamedRowsComputedCut {
+                            source,
+                            _activation: activation,
+                            _root: root,
+                            sealing,
+                        }
+                    })
+                } else {
+                    None
+                };
+                RootPumpDecision {
+                    conclusion,
+                    streamed_cut,
+                }
             });
     }
     if !runtime.success_sealed {

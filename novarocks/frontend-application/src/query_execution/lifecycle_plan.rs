@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -619,6 +619,24 @@ impl AttemptTerminalCredentialResolver {
     ) -> Result<Arc<AttemptCredentialStorage>, DistributedQueryError> {
         self.collector.seal_for_terminal()
     }
+
+    fn resolve_scope(
+        &self,
+        request: &StorageAccessRequest,
+        selection: &TerminalScopeSelection,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        let state = self
+            .collector
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if state.phase == AttemptCredentialCollectionPhase::Collecting {
+            return resolve_terminal_scope(&state.leases, request, selection);
+        }
+        let frozen = Arc::clone(self.collector.frozen.get().expect("retired original table"));
+        drop(state);
+        resolve_terminal_scope(&frozen.leases, request, selection)
+    }
 }
 
 impl ConnectorStorageResolver for AttemptTerminalCredentialResolver {
@@ -630,16 +648,288 @@ impl ConnectorStorageResolver for AttemptTerminalCredentialResolver {
     }
 }
 
+// A scope token pins its original collector and exact lease, not an index in
+// the collecting Vec that canonicalization may later reorder.
+struct TerminalScopeSelection {
+    lease_id: CredentialLeaseId,
+    prefix: StorageCredentialScopePrefix,
+}
+struct SelectedTerminalScope {
+    resolver: Arc<AttemptTerminalCredentialResolver>,
+    selection: TerminalScopeSelection,
+}
+impl SelectedTerminalScope {
+    fn resolve(
+        self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        self.resolver.resolve_scope(request, &self.selection)
+    }
+}
+
+struct IndexedTerminalScope {
+    owner: novarocks_spi::connector::CatalogHandle,
+    original: SelectedTerminalScope,
+}
+#[derive(Default)]
+struct SessionTerminalCredentials {
+    entries: Vec<Arc<AttemptTerminalCredentialResolver>>,
+    by_execution: HashMap<QueryExecutionId, usize>,
+    frozen: Option<Result<Arc<[IndexedTerminalScope]>, ConnectorError>>,
+}
+
+#[derive(Debug)]
+struct TerminalCredentialSealFailure {
+    original: DistributedQueryError,
+    fact: novarocks_failure_contract::FailureFact,
+}
+impl std::fmt::Display for TerminalCredentialSealFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.original, f)
+    }
+}
+impl std::error::Error for TerminalCredentialSealFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for TerminalCredentialSealFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.fact
+    }
+}
+
+/// One Session keeps all original stage capabilities until its real terminal
+/// holders exit. Selection grants no Native startup or computation position.
+#[derive(Default)]
+pub(crate) struct SessionTerminalCredentialRouter {
+    original: Mutex<SessionTerminalCredentials>,
+    #[cfg(test)]
+    test_resolver: Option<Arc<dyn ConnectorStorageResolver>>,
+}
+impl SessionTerminalCredentialRouter {
+    pub(crate) fn register(
+        &self,
+        credentials: &super::logical_execution::InitialComputationCredentials,
+    ) -> Result<(), ConnectorError> {
+        self.register_original(
+            credentials.execution(),
+            credentials.terminal_storage_resolver(),
+        )
+    }
+
+    fn register_original(
+        &self,
+        execution: QueryExecutionId,
+        resolver: Arc<AttemptTerminalCredentialResolver>,
+    ) -> Result<(), ConnectorError> {
+        if resolver.collector.execution_id != execution {
+            return Err(collector_error(
+                "terminal credentials have a foreign original execution",
+            ));
+        }
+        let mut state = self
+            .original
+            .lock()
+            .map_err(|_| collector_error("terminal credential router is poisoned"))?;
+        if let Some(index) = state.by_execution.get(&execution) {
+            return if Arc::ptr_eq(&state.entries[*index], &resolver) {
+                Ok(())
+            } else {
+                Err(collector_error(
+                    "terminal credentials changed within one original execution",
+                ))
+            };
+        }
+        if state.frozen.is_some() {
+            return Err(collector_error(
+                "terminal credential registration is already frozen",
+            ));
+        }
+        let index = state.entries.len();
+        state.entries.push(resolver);
+        state.by_execution.insert(execution, index);
+        Ok(())
+    }
+
+    /// Only the original terminal Context frontier invokes this. Successful
+    /// stages already drained their table for Native; a failed unstarted stage
+    /// closes collection through the same terminal-only author. Neither proves
+    /// a worker exit or admits another Native start.
+    pub(crate) fn freeze(&self) -> Result<(), ConnectorError> {
+        #[cfg(test)]
+        if self.test_resolver.is_some() {
+            return Ok(());
+        }
+        let mut state = self
+            .original
+            .lock()
+            .map_err(|_| collector_error("terminal credential router is poisoned"))?;
+        if let Some(frozen) = &state.frozen {
+            return frozen.as_ref().map(|_| ()).map_err(Clone::clone);
+        }
+        // Local original transition locks only: no Provider or dyn resolver
+        // callback runs while registration and its scope snapshot are frozen.
+        let frozen = Self::freeze_entries(&state.entries);
+        let result = frozen.as_ref().map(|_| ()).map_err(Clone::clone);
+        state.frozen = Some(frozen);
+        result
+    }
+
+    fn freeze_entries(
+        entries: &[Arc<AttemptTerminalCredentialResolver>],
+    ) -> Result<Arc<[IndexedTerminalScope]>, ConnectorError> {
+        let mut scopes = BTreeMap::new();
+        let mut failure = None;
+        for entry in entries {
+            let storage = match entry.seal_for_terminal() {
+                Ok(storage) => storage,
+                Err(original) => {
+                    if failure.is_none() {
+                        let fact = original.clone().into_execution_failure_input().fact();
+                        failure = Some(ConnectorError::from_domain(
+                            ConnectorErrorKind::Internal,
+                            TerminalCredentialSealFailure { original, fact },
+                        ));
+                    }
+                    // Close every original collection even after the first
+                    // ordinary validation refusal. This is not physical exit.
+                    continue;
+                }
+            };
+            if failure.is_some() {
+                continue;
+            }
+            for lease in &storage.leases {
+                let descriptor = lease.descriptor();
+                if descriptor.provider() != CredentialLeaseProvider::S3 {
+                    continue;
+                }
+                for prefix in descriptor.prefixes() {
+                    // Same attempt responses already deduplicated their exact
+                    // scope. Across real stages, latest authorization wins an
+                    // equal scope, without inspecting expiry or failure.
+                    scopes.insert(
+                        (descriptor.owner().clone(), prefix.clone()),
+                        IndexedTerminalScope {
+                            owner: descriptor.owner().clone(),
+                            original: SelectedTerminalScope {
+                                resolver: Arc::clone(entry),
+                                selection: TerminalScopeSelection {
+                                    lease_id: descriptor.lease_id(),
+                                    prefix: prefix.clone(),
+                                },
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        Ok(scopes.into_values().collect::<Vec<_>>().into())
+    }
+
+    fn select(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<SelectedTerminalScope, ConnectorError> {
+        let scopes = {
+            let state = self
+                .original
+                .lock()
+                .map_err(|_| collector_error("terminal credential router is poisoned"))?;
+            state
+                .frozen
+                .as_ref()
+                .ok_or_else(|| collector_error("terminal credential scopes are not frozen"))?
+                .as_ref()
+                .map(Arc::clone)
+                .map_err(Clone::clone)?
+        };
+        // One O(1) snapshot pin and a scan of distinct scopes, not a Vec clone
+        // and collector scan for every stage on every object-store request.
+        let mut selected: Option<&IndexedTerminalScope> = None;
+        for scope in scopes.iter() {
+            let prefix = &scope.original.selection.prefix;
+            if &scope.owner == request.owner()
+                && request.location().starts_with(prefix.as_str())
+                && selected.is_none_or(|old| {
+                    prefix.as_str().len() > old.original.selection.prefix.as_str().len()
+                })
+            {
+                selected = Some(scope);
+            }
+        }
+        let selected = selected.ok_or_else(vended_storage_access_denied)?;
+        Ok(SelectedTerminalScope {
+            resolver: Arc::clone(&selected.original.resolver),
+            selection: TerminalScopeSelection {
+                lease_id: selected.original.selection.lease_id,
+                prefix: selected.original.selection.prefix.clone(),
+            },
+        })
+    }
+
+    // The original terminal lifetime fixtures deliberately supply their own
+    // finite observer. Production registration never accepts a dyn resolver.
+    #[cfg(test)]
+    pub(crate) fn for_test(resolver: Arc<dyn ConnectorStorageResolver>) -> Self {
+        Self {
+            original: Mutex::new(SessionTerminalCredentials::default()),
+            test_resolver: Some(resolver),
+        }
+    }
+}
+impl ConnectorStorageResolver for SessionTerminalCredentialRouter {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        #[cfg(test)]
+        if let Some(resolver) = &self.test_resolver {
+            return resolver.resolve_vended_s3(request);
+        }
+        self.select(request)?.resolve(request)
+    }
+}
+
+fn resolve_terminal_scope(
+    leases: &[QueryCredentialLease],
+    request: &StorageAccessRequest,
+    selection: &TerminalScopeSelection,
+) -> Result<ResolvedVendedS3Access, ConnectorError> {
+    let mut exact = leases
+        .iter()
+        .filter(|lease| lease.descriptor().lease_id() == selection.lease_id);
+    let lease = exact.next().ok_or_else(vended_storage_access_denied)?;
+    if exact.next().is_some()
+        || lease.descriptor().provider() != CredentialLeaseProvider::S3
+        || lease.descriptor().owner() != request.owner()
+        || !lease.descriptor().prefixes().contains(&selection.prefix)
+        || !request.location().starts_with(selection.prefix.as_str())
+    {
+        return Err(vended_storage_access_denied());
+    }
+    Ok(resolve_original_vended_lease(lease, &selection.prefix))
+}
+
 pub(crate) fn resolve_vended_s3_access(
     leases: &[QueryCredentialLease],
     request: &StorageAccessRequest,
 ) -> Result<ResolvedVendedS3Access, ConnectorError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
+    let (lease, matched_prefix) =
+        select_vended_scope(leases, request).ok_or_else(vended_storage_access_denied)?;
+    Ok(resolve_original_vended_lease(lease, matched_prefix))
+}
+
+// Both ordinary attempt lookup and the terminal router use this exact scope
+// author. Expiry never influences which original lease is selected.
+fn select_vended_scope<'a>(
+    leases: &'a [QueryCredentialLease],
+    request: &StorageAccessRequest,
+) -> Option<(&'a QueryCredentialLease, &'a StorageCredentialScopePrefix)> {
     let mut selected: Option<(&QueryCredentialLease, &StorageCredentialScopePrefix)> = None;
     for lease in leases {
         let descriptor = lease.descriptor();
@@ -649,15 +939,27 @@ pub(crate) fn resolve_vended_s3_access(
             continue;
         }
         for prefix in descriptor.prefixes() {
-            if !request.location().starts_with(prefix.as_str()) {
-                continue;
-            }
-            if selected.is_none_or(|(_, current)| prefix.as_str().len() > current.as_str().len()) {
+            if request.location().starts_with(prefix.as_str())
+                && selected
+                    .is_none_or(|(_, current)| prefix.as_str().len() > current.as_str().len())
+            {
                 selected = Some((lease, prefix));
             }
         }
     }
-    let (lease, matched_prefix) = selected.ok_or_else(vended_storage_access_denied)?;
+    selected
+}
+
+fn resolve_original_vended_lease(
+    lease: &QueryCredentialLease,
+    matched_prefix: &StorageCredentialScopePrefix,
+) -> ResolvedVendedS3Access {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let selected = ResolvedVendedS3Access::new(
         lease.descriptor().storage_access_domain_id(),
         lease.descriptor().lease_id(),
@@ -680,11 +982,10 @@ pub(crate) fn resolve_vended_s3_access(
     // ... and it renews through that same provider rather than waiting for the
     // rotation the pump drives, so removing the pump takes nothing away from
     // this side (CAD-1 C13).
-    let selected = match lease.provider() {
+    match lease.provider() {
         Some(provider) => selected.with_provider(provider.clone()),
         None => selected,
-    };
-    Ok(selected)
+    }
 }
 
 fn vended_storage_access_denied() -> ConnectorError {
@@ -1069,6 +1370,320 @@ mod tests {
                 &terminal.seal_for_terminal().unwrap()
             ));
         }
+    }
+
+    fn terminal_stage(
+        attempt: u64,
+    ) -> (
+        super::QueryExecutionId,
+        Arc<AttemptCredentialLeaseCollector>,
+    ) {
+        let execution =
+            QueryExecutionId::new(QueryId::new(41, 73), AttemptId::new(attempt).unwrap()).unwrap();
+        (execution, AttemptCredentialLeaseCollector::new(execution))
+    }
+
+    fn offer_terminal_scope(
+        collector: &AttemptCredentialLeaseCollector,
+        prefix: &str,
+        expiration: u64,
+    ) {
+        collector
+            .offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                VendedS3CredentialLeaseContribution::try_new(
+                    vec![
+                        VendedS3CredentialLeaseEntry::try_new(
+                            StorageCredentialScopePrefix::try_from_normalized(prefix).unwrap(),
+                            expiration,
+                            SecretValue::new("router-access"),
+                            SecretValue::new("router-secret"),
+                            SecretValue::new("router-token"),
+                        )
+                        .unwrap(),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn session_terminal_router_retains_distinct_stages_and_rejects_changed_original() {
+        let router = super::SessionTerminalCredentialRouter::default();
+        let (first_id, first) = terminal_stage(41);
+        let (second_id, second) = terminal_stage(42);
+        offer_terminal_scope(&first, "s3://warehouse/data", u64::MAX);
+        offer_terminal_scope(&second, "s3://warehouse/other", u64::MAX);
+        let first_terminal = first.terminal_storage_resolver();
+        let second_terminal = second.terminal_storage_resolver();
+        let weak_first = Arc::downgrade(&first);
+        let weak_second = Arc::downgrade(&second);
+        router
+            .register_original(first_id, first_terminal.clone())
+            .unwrap();
+        router
+            .register_original(first_id, first_terminal.clone())
+            .unwrap();
+        router
+            .register_original(second_id, second_terminal.clone())
+            .unwrap();
+        assert!(
+            router
+                .register_original(first_id, first.terminal_storage_resolver())
+                .is_err()
+        );
+        assert!(
+            router
+                .register_original(second_id, first_terminal.clone())
+                .is_err()
+        );
+        let request = |location| {
+            StorageAccessRequest::try_new(vended_catalog_properties().handle().clone(), location)
+                .unwrap()
+        };
+        let expected_first = first_terminal
+            .resolve_vended_s3(&request("s3://warehouse/data/file"))
+            .unwrap();
+        let expected_second = second_terminal
+            .resolve_vended_s3(&request("s3://warehouse/other/file"))
+            .unwrap();
+        router.freeze().unwrap();
+        router
+            .register_original(first_id, first_terminal.clone())
+            .unwrap();
+        let (late_id, late) = terminal_stage(43);
+        offer_terminal_scope(&late, "s3://warehouse/data", u64::MAX);
+        assert!(
+            router
+                .register_original(late_id, late.terminal_storage_resolver())
+                .is_err()
+        );
+        drop((first_terminal, second_terminal, first, second));
+        assert!(weak_first.upgrade().is_some());
+        assert!(weak_second.upgrade().is_some());
+        assert_eq!(
+            router
+                .resolve_vended_s3(&request("s3://warehouse/data/file"))
+                .unwrap()
+                .lease_id(),
+            expected_first.lease_id()
+        );
+        assert_eq!(
+            router
+                .resolve_vended_s3(&request("s3://warehouse/other/file"))
+                .unwrap()
+                .lease_id(),
+            expected_second.lease_id()
+        );
+        let foreign_owner = CatalogHandle::new(
+            ConnectorInstanceId::parse("foreign").unwrap(),
+            CatalogVersion::from_bytes([2; 32]),
+        );
+        let foreign =
+            StorageAccessRequest::try_new(foreign_owner, "s3://warehouse/data/file").unwrap();
+        assert!(router.resolve_vended_s3(&foreign).is_err());
+        drop(router);
+        assert!(weak_first.upgrade().is_none());
+        assert!(weak_second.upgrade().is_none());
+    }
+
+    #[test]
+    fn session_terminal_router_selects_latest_exact_scope_without_expiry_fallback() {
+        let request = StorageAccessRequest::try_new(
+            vended_catalog_properties().handle().clone(),
+            "s3://warehouse/data/file",
+        )
+        .unwrap();
+        for (old_expiration, latest_expiration) in [(1, u64::MAX), (u64::MAX, 1)] {
+            let router = super::SessionTerminalCredentialRouter::default();
+            let (old_id, old) = terminal_stage(51);
+            let (new_id, new) = terminal_stage(52);
+            offer_terminal_scope(&old, "s3://warehouse/data", old_expiration);
+            offer_terminal_scope(&new, "s3://warehouse/data", latest_expiration);
+            // Same-attempt first response remains the sole original value.
+            offer_terminal_scope(&new, "s3://warehouse/data", old_expiration);
+            let old_terminal = old.terminal_storage_resolver();
+            let new_terminal = new.terminal_storage_resolver();
+            let old_lease = old_terminal.resolve_vended_s3(&request).unwrap();
+            let newest_lease = new_terminal.resolve_vended_s3(&request).unwrap();
+            router
+                .register_original(old_id, old_terminal.clone())
+                .unwrap();
+            router.register_original(new_id, new_terminal).unwrap();
+            // Retrying the old registration cannot promote it behind a new stage.
+            router
+                .register_original(old_id, old_terminal.clone())
+                .unwrap();
+            router.freeze().unwrap();
+            router.register_original(old_id, old_terminal).unwrap();
+            let token = router.select(&request).unwrap();
+            let (late_id, late) = terminal_stage(53);
+            offer_terminal_scope(&late, "s3://warehouse/data", u64::MAX);
+            assert!(
+                router
+                    .register_original(late_id, late.terminal_storage_resolver())
+                    .is_err()
+            );
+            let actual = token.resolve(&request).unwrap();
+            assert_eq!(actual.lease_id(), newest_lease.lease_id());
+            assert_ne!(actual.lease_id(), old_lease.lease_id());
+            assert_eq!(actual.seed_grant(), newest_lease.seed_grant());
+            assert_eq!(actual.seed().is_some(), latest_expiration == u64::MAX);
+            assert!(actual.provider().is_none());
+            assert!(
+                actual.renewal_path().is_none(),
+                "an expired selection never falls back to an older valid seed"
+            );
+        }
+    }
+
+    #[test]
+    fn session_terminal_router_keeps_longest_prefix_and_exact_lease_across_freeze() {
+        let router = super::SessionTerminalCredentialRouter::default();
+        let (old_id, old) = terminal_stage(61);
+        let owner = vended_catalog_properties();
+        let mut prefixes = ["s3://warehouse/data/exact", "s3://warehouse/unrelated"];
+        prefixes.sort_by_key(|prefix| {
+            std::cmp::Reverse(
+                super::credential_lease_id(
+                    old_id,
+                    owner.handle(),
+                    &StorageCredentialScopePrefix::try_from_normalized(prefix).unwrap(),
+                )
+                .unwrap(),
+            )
+        });
+        for prefix in prefixes {
+            offer_terminal_scope(&old, prefix, 1);
+        }
+        let old_terminal = old.terminal_storage_resolver();
+        router
+            .register_original(old_id, old_terminal.clone())
+            .unwrap();
+        let request =
+            StorageAccessRequest::try_new(owner.handle().clone(), "s3://warehouse/data/exact/file")
+                .unwrap();
+        let collecting = old_terminal.resolve_vended_s3(&request).unwrap();
+        let before_order = old
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .iter()
+            .map(|lease| lease.descriptor().lease_id())
+            .collect::<Vec<_>>();
+        let storage = old.drain_credential_leases().unwrap().into_storage();
+        let after_order = storage
+            .leases
+            .iter()
+            .map(|lease| lease.descriptor().lease_id())
+            .collect::<Vec<_>>();
+        assert_ne!(
+            before_order, after_order,
+            "real canonical sorting changes indices"
+        );
+        let (new_id, new) = terminal_stage(62);
+        offer_terminal_scope(&new, "s3://warehouse/data", u64::MAX);
+        router
+            .register_original(new_id, new.terminal_storage_resolver())
+            .unwrap();
+        router.freeze().unwrap();
+        old_terminal
+            .verify_native_storage(old_id, &storage)
+            .unwrap();
+        let actual = router.resolve_vended_s3(&request).unwrap();
+        assert_eq!(actual.lease_id(), collecting.lease_id());
+        assert_eq!(actual.seed_grant(), collecting.seed_grant());
+        assert_eq!(
+            actual.matched_prefix().as_str(),
+            "s3://warehouse/data/exact"
+        );
+        assert!(
+            actual.seed().is_none(),
+            "a newer broader valid seed cannot replace a longer original scope"
+        );
+    }
+
+    #[test]
+    fn session_terminal_router_caches_the_original_freeze_failure() {
+        use novarocks_failure_contract::FailureProjection;
+        let router = Arc::new(super::SessionTerminalCredentialRouter::default());
+        let (execution, original) = terminal_stage(71);
+        let duplicate = AttemptCredentialLeaseCollector::new(execution);
+        for collector in [&original, &duplicate] {
+            offer_terminal_scope(collector, "s3://warehouse/data", u64::MAX);
+        }
+        let material = duplicate.drain_credential_leases().unwrap();
+        drop(duplicate);
+        let mut material = Arc::try_unwrap(material.storage)
+            .ok()
+            .expect("one original table");
+        original
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .append(&mut material.leases);
+        router
+            .register_original(execution, original.terminal_storage_resolver())
+            .unwrap();
+        let (later_execution, later) = terminal_stage(72);
+        offer_terminal_scope(&later, "s3://warehouse/other", u64::MAX);
+        let later_sink = later.sink();
+        let weak_first = Arc::downgrade(&original);
+        let weak_later = Arc::downgrade(&later);
+        router
+            .register_original(later_execution, later.terminal_storage_resolver())
+            .unwrap();
+        let first = router.freeze().unwrap_err();
+        let late = later_sink
+            .offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                vended_contribution("later-cannot-contribute"),
+            )
+            .unwrap_err();
+        assert!(
+            late.message()
+                .contains("after attempt collector consumption")
+        );
+        assert!(
+            later.drain_credential_leases().is_err(),
+            "the later valid stage must not retain a Native transfer right"
+        );
+        let repeated = router.freeze().unwrap_err();
+        assert_eq!(
+            first, repeated,
+            "the same cached original cause survives an idempotent table getter"
+        );
+        assert_eq!(first.failure_fact(), repeated.failure_fact());
+        assert!(
+            original.seal_for_terminal().is_ok(),
+            "the original getter is now idempotent, not renewed validation"
+        );
+        let request = StorageAccessRequest::try_new(
+            vended_catalog_properties().handle().clone(),
+            "s3://warehouse/data/file",
+        )
+        .unwrap();
+        assert_eq!(router.resolve_vended_s3(&request).unwrap_err(), first);
+        assert!(
+            original
+                .sink()
+                .offer_vended_s3_credential_lease(
+                    &vended_catalog_properties(),
+                    vended_contribution("late")
+                )
+                .is_err()
+        );
+        let last_alias = Arc::clone(&router);
+        drop((original, later, router));
+        assert!(weak_first.upgrade().is_some());
+        assert!(weak_later.upgrade().is_some());
+        drop(last_alias);
+        assert!(weak_first.upgrade().is_none());
+        assert!(weak_later.upgrade().is_none());
     }
 
     #[test]

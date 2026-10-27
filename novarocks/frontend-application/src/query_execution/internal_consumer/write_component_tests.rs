@@ -243,8 +243,9 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
         // starting Native writers; production from_frozen always binds a source.
         production_execution: None,
     };
+    credentials.bind_write_production_session(&session).unwrap();
     session
-        .retain_computation_storage_resolver(credentials.terminal_storage_resolver())
+        .retain_computation_credentials(&credentials)
         .unwrap();
     let (consumer, offers, mut output) = write_computation_consumer(
         &description,
@@ -867,4 +868,219 @@ async fn accepted_ready_then_expired_context_vetoes_only_the_original_publicatio
         ControlCut::AfterReady,
     )
     .await;
+}
+
+#[tokio::test]
+async fn distinct_stage_credentials_keep_one_write_union_through_terminal_context_exit() {
+    use crate::query_execution::write_session::tests::{commit_unknown, fragment_bytes};
+    use novarocks_secret::SecretValue;
+    use novarocks_spi::connector::{
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
+        CatalogProperties, ConnectorStorageResolver, CredentialConsumerRole, StorageAccessRequest,
+        StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry,
+    };
+    for unknown in [false, true] {
+        let (mut identity_owner, client) =
+            crate::query_execution::logical_execution_test_profile::process(
+                tokio::runtime::Handle::current(),
+                Arc::new(ReservationOnly),
+                QueryProcessNamespace::new(0x9b8),
+                FrontendProcessId::new_v7(),
+                LogicalExecutionSupervisorConfig::new(
+                    NonZeroUsize::new(8).unwrap(),
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::MIN,
+                    LogicalExecutionRowsConfig::new(
+                        NonZeroUsize::MIN,
+                        NonZeroU32::MIN,
+                        Duration::from_secs(1),
+                    ),
+                ),
+            );
+        let fixture = fixture_with_outcome(
+            1,
+            16,
+            if unknown {
+                commit_unknown()
+            } else {
+                known_committed()
+            },
+        );
+        let session = Arc::clone(&fixture.session);
+        let properties = CatalogProperties::new(
+            session.catalog_properties().handle().clone(),
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            1,
+            vec![],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                    CatalogCredentialMode::Vended,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/db/t/metadata/v2.metadata.json",
+        )
+        .unwrap();
+        let target = novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0).unwrap();
+        let mut originals = Vec::new();
+        let mut selected_lease = None;
+        for stage in 0..2 {
+            let initial =
+                InitialComputationReservation::new(client.reserve_identity().unwrap()).unwrap();
+            let credentials = initial.credentials();
+            let context = initial
+                .connector_request_context(request_context(), None)
+                .unwrap();
+            context
+                .vended_credential_lease_sink()
+                .unwrap()
+                .offer_vended_s3_credential_lease(
+                    &properties,
+                    VendedS3CredentialLeaseContribution::try_new(
+                        vec![
+                            VendedS3CredentialLeaseEntry::try_new(
+                                StorageCredentialScopePrefix::try_from_normalized(
+                                    "s3://warehouse/db/t",
+                                )
+                                .unwrap(),
+                                u64::MAX,
+                                SecretValue::new("stage-access"),
+                                SecretValue::new("stage-secret"),
+                                SecretValue::new("stage-token"),
+                            )
+                            .unwrap(),
+                        ],
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            credentials.bind_write_production_session(&session).unwrap();
+            session
+                .retain_computation_credentials(&credentials)
+                .unwrap();
+            session
+                .retain_computation_credentials(&credentials)
+                .unwrap();
+            // The original first-party relation cannot be overwritten by a
+            // different Session before or after typed registration.
+            let foreign = fixture_with_outcome(1, 16, known_committed());
+            assert!(
+                credentials
+                    .bind_write_production_session(&foreign.session)
+                    .is_err()
+            );
+            assert!(
+                foreign
+                    .session
+                    .retain_computation_credentials(&credentials)
+                    .is_err()
+            );
+            assert!(
+                foreign
+                    .session
+                    .following_terminal_context(request_context())
+                    .unwrap()
+                    .storage_resolver()
+                    .is_none()
+            );
+            assert!(
+                credentials
+                    .write_production_session()
+                    .unwrap()
+                    .ptr_eq(&Arc::downgrade(&session))
+            );
+            let terminal = credentials.terminal_storage_resolver();
+            selected_lease = Some(terminal.resolve_vended_s3(&request).unwrap().lease_id());
+            originals.push(Arc::downgrade(&terminal));
+            let source = credentials.take_source(credentials.execution()).unwrap();
+            let storage = source.test_into_credential_leases().unwrap().into_storage();
+            credentials.verify_native_storage(&storage).unwrap();
+            // Real Session decode/accept/union, with unique canonical fragments.
+            // This finite relation fixture does not claim Native execution.
+            let decoded = session
+                .computation_decode(&[target])
+                .unwrap()
+                .interpret(
+                    crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(
+                        3 + stage,
+                        vec![(
+                            target,
+                            fragment_bytes(&format!(
+                                "s3://warehouse/db/t/data/stage-{stage}.parquet"
+                            )),
+                        )],
+                    ),
+                )
+                .unwrap();
+            session.receiving_port().accept(decoded).unwrap();
+            drop((storage, terminal, credentials, initial, context));
+            assert!(
+                originals
+                    .iter()
+                    .all(|original| original.upgrade().is_some())
+            );
+        }
+        assert_eq!(session.accumulated_row_count().unwrap(), 7);
+        let following = session
+            .following_terminal_context(request_context())
+            .unwrap();
+        assert_eq!(
+            following
+                .storage_resolver()
+                .unwrap()
+                .resolve_vended_s3(&request)
+                .unwrap()
+                .lease_id(),
+            selected_lease.unwrap()
+        );
+        let completion = session.publish_for_test(request_context()).unwrap();
+        assert_eq!(matches!(&completion, novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { .. }), unknown);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        assert_eq!(fixture.recorded.lock().unwrap().finish_rows, 7);
+        assert_eq!(
+            fixture.recorded.lock().unwrap().terminal_storage,
+            Some(Ok("s3://warehouse/db/t".into()))
+        );
+        assert!(
+            originals
+                .iter()
+                .all(|original| original.upgrade().is_some())
+        );
+        drop((completion, session, fixture));
+        assert!(
+            originals
+                .iter()
+                .all(|original| original.upgrade().is_some()),
+            "the following Context is the actual last router holder"
+        );
+        assert_eq!(
+            following
+                .storage_resolver()
+                .unwrap()
+                .resolve_vended_s3(&request)
+                .unwrap()
+                .lease_id(),
+            selected_lease.unwrap()
+        );
+        drop(following);
+        assert!(
+            originals
+                .iter()
+                .all(|original| original.upgrade().is_none())
+        );
+        watchdog(
+            "two-reservation QA owner actual exit",
+            identity_owner.shutdown_until(Instant::now() + Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    }
 }

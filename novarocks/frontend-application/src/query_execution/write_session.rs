@@ -126,8 +126,8 @@ pub(crate) struct ConnectorWriteSession {
     publication_input: Mutex<Option<Arc<publication_call::PublicationInput>>>,
     terminal: Mutex<Option<TerminalDecision>>,
     finish_invocations: AtomicUsize,
-    /// The frontend-local, terminal-only storage capability of the query
-    /// attempt whose fragments this session commits.
+    /// The frontend-local terminal router retains every original computation
+    /// stage's storage capability through this Session's single publication.
     ///
     /// A distributed write reaches its external effect *after* its lifecycle
     /// attempt finalizes: the commit reloads table metadata and writes
@@ -140,7 +140,8 @@ pub(crate) struct ConnectorWriteSession {
     /// It is cleared as soon as no further external decision can need storage,
     /// and dropping the session clears it too, so a write that neither commits
     /// nor reconciles cannot pin credential material.
-    terminal_storage: Mutex<Option<Arc<dyn ConnectorStorageResolver>>>,
+    terminal_storage:
+        Mutex<Option<Arc<crate::query_execution::lifecycle_plan::SessionTerminalCredentialRouter>>>,
     // Last holder retires after every session-owned plan and storage field.
     cow_original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
@@ -857,10 +858,38 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ConnectorRequestContext, ConnectorError> {
         let context = context.without_vended_credential_lease_sink();
-        Ok(match self.lock_terminal_storage()?.as_ref() {
-            Some(resolver) => context.with_storage_resolver(Arc::clone(resolver)),
-            None => context,
-        })
+        let router = self.lock_terminal_storage()?.clone();
+        match router {
+            Some(router) => {
+                // All callers are at the actual terminal Context frontier.
+                // Close original collection once and retain the same immutable
+                // scope snapshot through cached and following contexts.
+                router.freeze()?;
+                let resolver: Arc<dyn ConnectorStorageResolver> = router;
+                Ok(context.with_storage_resolver(resolver))
+            }
+            None => Ok(context),
+        }
+    }
+
+    #[cfg(test)]
+    fn retain_terminal_storage_for_test(
+        &self,
+        resolver: Arc<dyn ConnectorStorageResolver>,
+    ) -> Result<(), ConnectorError> {
+        let mut storage = self.lock_terminal_storage()?;
+        if storage.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "terminal test observer is occupied",
+            ));
+        }
+        *storage = Some(Arc::new(
+            crate::query_execution::lifecycle_plan::SessionTerminalCredentialRouter::for_test(
+                resolver,
+            ),
+        ));
+        Ok(())
     }
 
     /// Drop the retained capability, releasing the hold that deferred the
@@ -876,8 +905,13 @@ impl ConnectorWriteSession {
 
     fn lock_terminal_storage(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<Arc<dyn ConnectorStorageResolver>>>, ConnectorError>
-    {
+    ) -> Result<
+        std::sync::MutexGuard<
+            '_,
+            Option<Arc<crate::query_execution::lifecycle_plan::SessionTerminalCredentialRouter>>,
+        >,
+        ConnectorError,
+    > {
         self.terminal_storage.lock().map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::Internal,
@@ -2474,7 +2508,7 @@ pub(crate) mod tests {
     ) -> Arc<TerminalCredentialAccounting> {
         let accounting = Arc::new(TerminalCredentialAccounting::default());
         session
-            .retain_computation_storage_resolver(accounting.retain_capability())
+            .retain_terminal_storage_for_test(accounting.retain_capability())
             .unwrap();
         accounting.finalize();
         accounting
@@ -2482,7 +2516,7 @@ pub(crate) mod tests {
 
     /// A canonical provider-neutral commit-fragment envelope. The fake provider
     /// owns the private payload and the session exercises the real outer codec.
-    fn fragment_bytes(path: &str) -> Vec<u8> {
+    pub(crate) fn fragment_bytes(path: &str) -> Vec<u8> {
         use prost::Message;
         write_dto::ConnectorCommitFragment {
             provider_payload: Some(encode_connector_payload_message(&encoded_payload(

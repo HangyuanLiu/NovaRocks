@@ -156,15 +156,16 @@ pub(super) async fn prepare_read(
         .await?;
     Ok(result.map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql))))
 }
-async fn close_provider(
+pub(super) async fn close_provider(
     source: Arc<FrontendCompletionCustody>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
 ) -> Result<(), StatementNativeHealthFailure> {
     source.close().await?;
     planning_cpu.close().await
 }
-type ProviderClose = Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send>>;
-fn poll_provider_close(
+pub(super) type ProviderClose =
+    Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send>>;
+pub(super) fn poll_provider_close(
     future: &mut Option<ProviderClose>,
     result: &mut Option<Result<(), StatementNativeHealthFailure>>,
     cx: &mut Context<'_>,
@@ -427,10 +428,10 @@ impl ReadNativeStageTail {
 
 /// The single Read composes these same packets; their declaration order keeps
 /// the original StateStore/I/O/stage/observer/receipt/health Drop sequence.
-struct ReadNativeTail {
-    services: ReadNativeServices,
-    native: ReadNativeStageTail,
-    health: Option<StatementNativeHealthFailure>,
+pub(super) struct ReadNativeTail {
+    pub(super) services: ReadNativeServices,
+    pub(super) native: ReadNativeStageTail,
+    pub(super) health: Option<StatementNativeHealthFailure>,
 }
 impl ReadNativeTail {
     // Native and MIO retain the same actual-exit order at both original cuts.
@@ -461,7 +462,7 @@ impl ReadNativeTail {
         }
         Poll::Ready(Ok(()))
     }
-    fn poll_business_exit(
+    pub(super) fn poll_business_exit(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), StatementNativeHealthFailure>> {

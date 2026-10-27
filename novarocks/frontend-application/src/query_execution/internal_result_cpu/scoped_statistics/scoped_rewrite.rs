@@ -24,6 +24,18 @@ type RewriteCpuPorts = (
     Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
 );
 
+fn trace_rewrite_cpu_work_refusal(site: &'static str, error: &WorkError) {
+    // WorkError has a closed first-party projection; never format the cause.
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(error);
+    tracing::debug!(
+        target: "novarocks_frontend_application::maintenance_error",
+        site,
+        failure_domain = fact.reason().domain(),
+        failure_reason = fact.reason().code(),
+        "Original Rewrite work admission refused"
+    );
+}
+
 impl InternalResultCpu {
     /// Two typed facades, one original serial slot. Metadata accepts only the
     /// selected first-party binding input; Rewrite accepts only its selected
@@ -39,10 +51,15 @@ impl InternalResultCpu {
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Result<RewriteCpuPorts, WorkError> {
         if !window.is_for_scope(scope) || window.class() != ResultWindowClass::Internal {
+            trace_rewrite_cpu_work_refusal("tm.cpu_ports.window", &WorkError::Conflict);
             return Err(WorkError::Conflict);
         }
-        scope.check()?;
-        let _ = self.provider_creator_source(scope)?;
+        scope.check().inspect_err(|error| {
+            trace_rewrite_cpu_work_refusal("tm.cpu_ports.scope", error);
+        })?;
+        let _ = self.provider_creator_source(scope).inspect_err(|error| {
+            trace_rewrite_cpu_work_refusal("tm.cpu_ports.creator_source", error);
+        })?;
         let provider = lease
             .scoped_cpu_source_type_id()
             .map_err(|_| WorkError::InvalidConfig("selected Rewrite CPU source is unsupported"))?;
@@ -59,6 +76,7 @@ impl InternalResultCpu {
         if write_key.instance_id != lease.descriptor().instance_id
             || write_key.incarnation != lease.incarnation()
         {
+            trace_rewrite_cpu_work_refusal("tm.cpu_ports.write_author", &WorkError::Conflict);
             return Err(WorkError::Conflict);
         }
         let source = Arc::new(ScopedProviderCreatorCpu {

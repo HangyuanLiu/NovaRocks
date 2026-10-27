@@ -921,7 +921,7 @@ impl Body {
                 self.session
                     .as_ref()
                     .unwrap()
-                    .retain_computation_storage_resolver(credentials.terminal_storage_resolver())
+                    .retain_computation_credentials(&credentials)
                     .map_err(connector_error)?;
                 let turn = self.turn(&source.io);
                 self.write = Some(self.input.activation.prepare_write_source(

@@ -17,8 +17,14 @@
 
 //! EXPLAIN runs in the original registered statement, not a second Work role.
 
+use super::read_action::io_source::ReadMetadataIoSource;
+use super::read_action::{
+    ProviderClose, ReadNativeServices, ReadNativeStageTail, ReadNativeTail, close_provider,
+    poll_provider_close,
+};
+use super::statement_computation::StatementStageAdmission;
 use super::*;
-use crate::query::compiler::{PreparedAsyncExplain, PreparedAsyncProfile};
+use crate::query::compiler::{ExplainPreparationPorts, PreparedAsyncExplain, PreparedAsyncProfile};
 use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
@@ -26,8 +32,13 @@ use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_query_application::api::{ExecutionHandle, LocalResultProducer, OwnedLocalResult};
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
-    StatementActionValue,
+    GovernedStatementResidual, StatementActionValue,
 };
+use novarocks_spi::connector::{
+    ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoProfile, SharedDependency,
+};
+use novarocks_state_store_api::StateStoreExecutionRequests;
+use novarocks_workload_control::WorkError;
 use std::task::{Context, Poll};
 
 type PreparationFuture = Pin<
@@ -57,12 +68,13 @@ struct ExplainPreparationInput {
     window: ResultWindowAlias,
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
+    io: Arc<ReadMetadataIoSource>,
+    state_store: Option<Arc<dyn StateStoreExecutionRequests>>,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 struct PreparedExplain {
     value: PreparedAsyncExplain,
-    capacity: QueryResultCapacityBinding,
 }
 async fn make_explain_preparation(
     input: ExplainPreparationInput,
@@ -130,10 +142,10 @@ async fn make_explain_preparation(
                 .map_err(internal_error)?,
             None => context,
         };
-        Ok((context, options, capacity))
+        Ok((context, options))
     }
     .await;
-    let (context, options, capacity) = match prepared {
+    let (context, options) = match prepared {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -144,12 +156,16 @@ async fn make_explain_preparation(
             &context,
             Some(options),
             &input.scope,
-            &input.provider_source,
-            input.planning_cpu.as_ref(),
+            ExplainPreparationPorts {
+                provider: &input.provider_source,
+                cpu: input.planning_cpu.as_ref(),
+                io: input.io,
+                state_store: input.state_store,
+            },
         )
         .await?;
     Ok(value
-        .map(|value| PreparedExplain { value, capacity })
+        .map(|value| PreparedExplain { value })
         .map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql))))
 }
 struct ProfileDiagnosticInput {
@@ -171,6 +187,12 @@ struct ExplainStatementAction {
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
     preparation_health: Option<StatementNativeHealthFailure>,
+    provider_close: Option<ProviderClose>,
+    provider_close_result: Option<Result<(), StatementNativeHealthFailure>>,
+    tail: Option<Box<ReadNativeTail>>,
+    bootstrap_ready: bool,
+    result_transferred: bool,
+    error: Option<QueryServiceError>,
     preparation: Option<PreparationFuture>,
     preparation_started: bool,
     prepared: Option<Result<PreparedExplain, QueryServiceError>>,
@@ -193,13 +215,51 @@ impl GovernedStatementAction for ExplainStatementAction {
             .clone()
             .or_else(|| self.planning_cpu.local_health_failure())
             .or_else(|| self.provider_source.local_health_failure())
+            .or_else(|| {
+                self.provider_close_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err().cloned())
+            })
+            .or_else(|| {
+                self.tail.as_ref().and_then(|tail| {
+                    tail.health
+                        .clone()
+                        .or_else(|| tail.services.io().health_failure())
+                        .or_else(|| tail.native.stage.local_health_failure())
+                })
+            })
+    }
+    fn handoff_residual_in(
+        &mut self,
+        target: &mut Option<Box<dyn GovernedStatementResidual>>,
+    ) -> Result<(), StatementNativeHealthFailure> {
+        if self.result_transferred && self.tail.is_some() {
+            if target.is_some() {
+                return Err(StatementNativeHealthFailure::actual_exit_unproven(
+                    "EXPLAIN residual receiver is occupied",
+                    Arc::new(WorkError::Conflict),
+                ));
+            }
+            *target = self
+                .tail
+                .take()
+                .map(|tail| tail as Box<dyn GovernedStatementResidual>);
+        }
+        Ok(())
     }
     fn poll_action(
         &mut self,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
-        let result = match self.poll_explain(owner, cx) {
+        if let Some(tail) = self.tail.as_mut() {
+            tail.services.poll_state_store(cx, &mut tail.health);
+        }
+        let polled = self.poll_explain(owner, cx);
+        if let Some(tail) = self.tail.as_mut() {
+            tail.services.poll_state_store(cx, &mut tail.health);
+        }
+        let result = match polled {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => result,
         };
@@ -228,18 +288,42 @@ impl ExplainStatementAction {
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
-        if self.preparation_health.is_some() {
+        if self.local_health_failure().is_some() {
             return Poll::Pending;
         }
-        if !self.preparation_started {
-            if owner.cancellation().reason().is_some() {
-                return Poll::Ready(Err(internal_error(
+        if !self.preparation_started && owner.cancellation().reason().is_some() {
+            self.error.get_or_insert_with(|| {
+                internal_error(
                     "typed statement was cancelled before prepared query execution began",
-                )));
+                )
+            });
+        }
+        if let Some(tail) = self.tail.as_mut() {
+            let work = owner
+                .execution_owner_slot()
+                .as_ref()
+                .expect("EXPLAIN retains its original Root");
+            match tail.services.io().poll_progress(work, cx) {
+                Ok(ready) => self.bootstrap_ready |= ready,
+                Err(error) => {
+                    self.error.get_or_insert_with(|| {
+                        QueryServiceError::from_failure_cause(
+                            novarocks_failure_contract::SharedFailureCause::new(error),
+                        )
+                    });
+                }
             }
-            self.preparation_started = true;
+        }
+        if !self.bootstrap_ready && self.error.is_none() {
+            return Poll::Pending;
+        }
+        // Once polled, preparation remains in this Source through its actual
+        // return and completed-F Drop, including cancellation and business Err.
+        if self.error.is_some() && !self.preparation_started {
+            drop(self.preparation.take());
         }
         if let Some(future) = self.preparation.as_mut() {
+            self.preparation_started = true;
             match future.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(value)) => self.prepared = Some(value),
@@ -248,25 +332,26 @@ impl ExplainStatementAction {
                     return Poll::Pending;
                 }
             }
-            // A failed close is already in the outside source. Let QA first
-            // receive that typed health while this same completed F remains
-            // retained; a secondary F destructor cannot replace the health cut.
             if self.provider_source.local_health_failure().is_some() {
                 return Poll::Pending;
             }
-            // Original output is stable before destroying the completed F.
             drop(self.preparation.take());
         }
-        match self.planning_cpu.poll_closed(cx) {
+        match poll_provider_close(
+            &mut self.provider_close,
+            &mut self.provider_close_result,
+            cx,
+        ) {
             Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
             Poll::Ready(Ok(())) => {}
         }
         if let Some(prepared) = self.prepared.take() {
             match prepared {
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(error) => {
+                    self.error.get_or_insert(error);
+                }
                 Ok(PreparedExplain {
                     value: PreparedAsyncExplain::Lines(lines),
-                    ..
                 }) => {
                     self.raw_result = Some(
                         build_string_query_result("Explain String", lines).map_err(internal_error),
@@ -274,36 +359,87 @@ impl ExplainStatementAction {
                 }
                 Ok(PreparedExplain {
                     value: PreparedAsyncExplain::Profile(profile),
-                    capacity,
                 }) => {
                     self.profile = Some(profile);
-                    self.capacity = Some(capacity);
                 }
             }
         }
-        if self
-            .profile
-            .as_ref()
-            .is_some_and(|p| p.computation.is_some())
+        if self.error.is_none()
+            && let Some(error) = self
+                .tail
+                .as_ref()
+                .and_then(|tail| tail.services.io().original())
+                .and_then(|io| io.failure())
+        {
+            self.error = Some(QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            ));
+        }
+        if self.error.is_none()
+            && self
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile.computation.is_some())
         {
             if owner.cancellation().reason().is_some() {
-                return Poll::Ready(Err(internal_error(
+                self.error = Some(internal_error(
                     "typed statement was cancelled before prepared query execution began",
-                )));
-            }
-            let tail = match self.launcher.start_computation_in(
-                &mut self.profile.as_mut().expect("original profile").computation,
-                owner.execution_owner_slot(),
-                self.capacity.as_ref().expect("original capacity"),
-                &mut self.original,
-                #[cfg(novarocks_dev_controls)]
-                self.observation.clone(),
-            ) {
-                Ok(tail) => tail,
-                Err(e) => return Poll::Ready(Err(governed_query_execution_error(e))),
-            };
-            if let Err(e) = tail.finish() {
-                return Poll::Ready(Err(governed_query_execution_error(e)));
+                ));
+            } else {
+                let tail = self
+                    .tail
+                    .as_mut()
+                    .expect("Profile has its original metadata and stage Source");
+                if !tail.services.state_store_quiescent(cx, &mut tail.health) {
+                    return Poll::Pending;
+                }
+                let io = tail
+                    .services
+                    .io()
+                    .original()
+                    .expect("EXPLAIN preparation installed original metadata source");
+                let work = owner
+                    .execution_owner_slot()
+                    .as_ref()
+                    .expect("same EXPLAIN Root");
+                match tail.native.stage.poll_admit(&io, work, cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => self.error = Some(error),
+                    Poll::Ready(Ok(())) => {}
+                }
+                if self.error.is_none()
+                    && self.capacity.is_none()
+                    && let Err(error) = tail
+                        .native
+                        .stage
+                        .install_internal_read_capacity_in(&io, &mut self.capacity)
+                {
+                    self.error = Some(error);
+                }
+                if self.error.is_none() {
+                    match self.launcher.start_computation_in(
+                        &mut self.profile.as_mut().expect("original Profile").computation,
+                        tail.native.stage.owner_slot(),
+                        self.capacity
+                            .as_ref()
+                            .expect("original positive Internal stage capacity"),
+                        &mut self.original,
+                        #[cfg(novarocks_dev_controls)]
+                        self.observation.clone(),
+                    ) {
+                        Err(error) => self.error = Some(governed_query_execution_error(error)),
+                        Ok(notification) => {
+                            tail.native.observe_start_in(
+                                &notification,
+                                &mut self.original.exit,
+                                &mut tail.health,
+                            );
+                            if let Err(error) = notification.finish() {
+                                self.error = Some(governed_query_execution_error(error));
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(future) = self.original.ready.as_mut() {
@@ -314,29 +450,41 @@ impl ExplainStatementAction {
             drop(self.original.ready.take());
         }
         if let Some(execution) = self.execution.take() {
-            let execution = match execution {
-                Ok(execution) => execution,
-                Err(e) => return Poll::Ready(Err(governed_query_execution_error(e))),
-            };
-            let token = match execution.ready_token() {
-                Some(token) => *token,
-                None => {
-                    return Poll::Ready(Err(internal_error(
-                        "Profile has no computation Ready token",
-                    )));
+            match execution {
+                Err(error) => {
+                    self.error
+                        .get_or_insert_with(|| governed_query_execution_error(error));
                 }
-            };
-            let profile = self.profile.as_mut().expect("started Profile");
-            let ready = match profile.output.take_ready(token) {
-                Ok(ready) => ready,
-                Err(e) => return Poll::Ready(Err(governed_query_execution_error(e))),
-            };
-            let profile = *self.profile.take().expect("same ready profile");
-            self.diagnostics = Some(Box::pin(make_profile_diagnostics(ProfileDiagnosticInput {
-                ready,
-                completion: profile.completion,
-            })));
-            drop(execution);
+                Ok(execution) => {
+                    let ready = match execution
+                        .ready_token()
+                        .copied()
+                        .ok_or_else(|| internal_error("Profile has no computation Ready token"))
+                        .and_then(|token| {
+                            self.profile
+                                .as_mut()
+                                .expect("started Profile")
+                                .output
+                                .take_ready(token)
+                                .map_err(governed_query_execution_error)
+                        }) {
+                        Ok(ready) => Some(ready),
+                        Err(error) => {
+                            self.error.get_or_insert(error);
+                            None
+                        }
+                    };
+                    if let Some(ready) = ready {
+                        let profile = *self.profile.take().expect("same ready Profile");
+                        self.diagnostics =
+                            Some(Box::pin(make_profile_diagnostics(ProfileDiagnosticInput {
+                                ready,
+                                completion: profile.completion,
+                            })));
+                    }
+                    drop(execution);
+                }
+            }
         }
         if let Some(future) = self.diagnostics.as_mut() {
             match future.as_mut().poll(cx) {
@@ -345,31 +493,59 @@ impl ExplainStatementAction {
             }
             drop(self.diagnostics.take());
         }
-        if self.local.is_none() {
-            let result = match self.raw_result.take().expect("completed EXPLAIN result") {
-                Ok(result) => result,
-                Err(e) => return Poll::Ready(Err(e)),
-            };
-            let window = match owner.result_window_alias() {
-                Some(window) => window,
-                None => {
-                    return Poll::Ready(Err(internal_error(
-                        "EXPLAIN has no original result window",
-                    )));
+        if self.error.is_none()
+            && self.local.is_none()
+            && let Some(result) = self.raw_result.take()
+        {
+            match result {
+                Err(error) => self.error = Some(error),
+                Ok(result) => {
+                    let local = owner
+                        .result_window_alias()
+                        .ok_or_else(|| internal_error("EXPLAIN has no original result window"))
+                        .and_then(|window| {
+                            LocalResultProducer::try_new(owner.scope(), window)
+                                .map_err(internal_error)
+                        })
+                        .and_then(|producer| {
+                            producer.produce(|| Ok(result)).map_err(internal_error)
+                        });
+                    match local {
+                        Ok(local) => self.local = Some(local),
+                        Err(error) => self.error = Some(error),
+                    }
                 }
-            };
-            let producer = match LocalResultProducer::try_new(owner.scope(), window) {
-                Ok(producer) => producer,
-                Err(e) => return Poll::Ready(Err(internal_error(e))),
-            };
-            match producer.produce(|| Ok(result)) {
-                Ok(local) => self.local = Some(local),
-                Err(e) => return Poll::Ready(Err(internal_error(e))),
             }
         }
-        Poll::Ready(Ok(StatementActionValue::Local(
-            self.local.take().expect("sealed original graph"),
-        )))
+        if self.error.is_some() || self.local.is_some() {
+            if let Some(tail) = self.tail.as_mut() {
+                if !tail.native.is_launched() {
+                    drop(self.original.input.take());
+                    drop(self.original.request.take());
+                    drop(self.profile.take());
+                }
+                drop(self.capacity.take());
+                match tail.poll_business_exit(cx) {
+                    Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {}
+                }
+                if let Some(error) = tail.services.io().original().and_then(|io| io.failure()) {
+                    self.error.get_or_insert_with(|| {
+                        QueryServiceError::from_failure_cause(
+                            novarocks_failure_contract::SharedFailureCause::new(error),
+                        )
+                    });
+                }
+            }
+            self.result_transferred = true;
+            if let Some(error) = self.error.take() {
+                return Poll::Ready(Err(error));
+            }
+            return Poll::Ready(Ok(StatementActionValue::Local(
+                self.local.take().expect("sealed original EXPLAIN graph"),
+            )));
+        }
+        Poll::Pending
     }
 }
 
@@ -394,6 +570,44 @@ impl FrontendQuerySession {
                 ));
             }
         };
+        self.service
+            .query_compiler
+            .validate_original_read_runtime()
+            .map_err(|error| internal_error(error.to_string()))?;
+        let cancellation = QueryCancellationView::governed(
+            statement.cancellation().clone(),
+            statement.timeout_ms(),
+        );
+        let state_store = self
+            .service
+            .state_store
+            .as_ref()
+            .map(|binding| {
+                let owner = binding.for_root(statement.scope().clone())?;
+                let requests: Arc<dyn StateStoreExecutionRequests> =
+                    Arc::new(owner.execution_requests(binding.transaction_deadline, deadline)?);
+                Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
+            })
+            .transpose()
+            .map_err(|cause| {
+                QueryServiceError::from_failure_cause(cause)
+                    .reconcile_local_stop_observation(&cancellation)
+            })?;
+        let dependencies = self
+            .service
+            .state_store
+            .as_ref()
+            .map_or(&[][..], |binding| binding.blocking_dependency_facts());
+        let profile = explain_preparation_profile(dependencies)
+            .map_err(|error| internal_error(error.to_string()))?;
+        let io = ReadMetadataIoSource::new(statement.scope().clone(), profile.clone());
+        io.configure_read_source(&profile)
+            .map_err(|error| internal_error(error.to_string()))?;
+        let (state_store_owner, state_store_requests) = match state_store {
+            Some((owner, requests)) => (Some(owner), Some(requests)),
+            None => (None, None),
+        };
+        let stage = StatementStageAdmission::new(statement.scope().clone(), 0);
         let provider_source =
             crate::query_execution::completion_facts::FrontendCompletionCustody::new();
         let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
@@ -414,13 +628,29 @@ impl FrontendQuerySession {
             window,
             provider_source: Arc::clone(&provider_source),
             planning_cpu: Arc::clone(&planning_cpu),
+            io: Arc::clone(&io),
+            state_store: state_store_requests,
             #[cfg(novarocks_dev_controls)]
             observation: observation.clone(),
         };
+        let provider_close = Some(Box::pin(close_provider(
+            Arc::clone(&provider_source),
+            Arc::clone(&planning_cpu),
+        )) as ProviderClose);
         let action = Box::new(ExplainStatementAction {
             provider_source,
             planning_cpu,
             preparation_health: None,
+            provider_close,
+            provider_close_result: None,
+            tail: Some(Box::new(ReadNativeTail {
+                services: ReadNativeServices::new(state_store_owner, io),
+                native: ReadNativeStageTail::new(stage),
+                health: None,
+            })),
+            bootstrap_ready: false,
+            result_transferred: false,
+            error: None,
             preparation: Some(Box::pin(make_explain_preparation(input))),
             preparation_started: false,
             prepared: None,
@@ -438,6 +668,23 @@ impl FrontendQuerySession {
         self.execute_observed_statement_action(statement, action)
             .await
     }
+}
+
+fn explain_preparation_profile(
+    dependencies: &[SharedDependency],
+) -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
+    let mut dependencies = dependencies.to_vec();
+    if !dependencies.contains(&SharedDependency::LocalHost) {
+        dependencies.push(SharedDependency::LocalHost);
+    }
+    ConnectorMetadataMaintenanceIoProfile::try_new(
+        std::num::NonZeroUsize::new(1).unwrap(),
+        std::num::NonZeroU64::new(crate::query_execution::maintenance::io_admission::MetadataIoAdmission::request_metadata_bytes())
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        std::num::NonZeroU64::new(std::mem::size_of::<ExplainPreparationInput>() as u64)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        dependencies,
+    ).map_err(|_| WorkError::InvalidConfig("local EXPLAIN preparation source declaration"))
 }
 
 #[cfg(test)]
@@ -539,6 +786,12 @@ mod tests {
                 ),
             ),
             preparation_health: None,
+            provider_close: None,
+            provider_close_result: Some(Ok(())),
+            tail: None,
+            bootstrap_ready: true,
+            result_transferred: false,
+            error: None,
             preparation: Some(preparation),
             preparation_started: false,
             prepared: None,
@@ -558,17 +811,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn prepared_explain_wait_leaves_native_runtime_free_to_poll_first_send() {
         let (_workload, capacity, mut owner, _session) = statement().await;
-        let binding = QueryResultCapacityBinding::try_new(
-            owner.scope(),
-            owner.result_window_alias().unwrap(),
-        )
-        .unwrap();
         let (send, receive) = futures::channel::oneshot::channel();
         let mut action = action(Box::pin(async move {
             receive.await.unwrap();
             Ok(Ok(PreparedExplain {
                 value: PreparedAsyncExplain::Lines(vec!["observed".into()]),
-                capacity: binding,
             }))
         }));
         let produce = futures::future::poll_fn(|cx| {

@@ -139,6 +139,7 @@ mod client_computation_tests {
         window: TestWindow,
         signals: Arc<Signals>,
         scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
+        count_only: bool,
     }
     impl NativeAttemptPreparationPort for Preparation {
         fn prepare_in<'a>(
@@ -150,6 +151,7 @@ mod client_computation_tests {
                 window: self.window.clone(),
                 signals: Arc::clone(&self.signals),
                 scalar_schema: self.scalar_schema.clone(),
+                count_only: self.count_only,
             });
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(request);
@@ -163,6 +165,7 @@ mod client_computation_tests {
         window: TestWindow,
         signals: Arc<Signals>,
         scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
+        count_only: bool,
     }
     impl DormantNativeAttemptOwner for Dormant {
         fn poll_bind_qualification(
@@ -186,6 +189,7 @@ mod client_computation_tests {
             let window = self.window.clone();
             let signals = Arc::clone(&self.signals);
             let scalar_schema = self.scalar_schema.clone();
+            let count_only = self.count_only;
             Box::pin(async move {
                 let control = Arc::new(SealPort {
                     sender: std::sync::Mutex::new(None),
@@ -211,7 +215,15 @@ mod client_computation_tests {
                     .unwrap();
                 *control.sender.lock().unwrap() = Some(sender);
                 let mut binding = test_root_binding(root, window.0.try_clone().unwrap(), None);
-                if scalar_schema.is_some() {
+                if count_only {
+                    binding.frontier = super::super::super::RootRelayFrontier::new(
+                        root,
+                        novarocks_result_contract::RootProfileId::V1,
+                        novarocks_result_contract::RootOutputKind::CountOnly,
+                        None,
+                    )
+                    .unwrap();
+                } else if scalar_schema.is_some() {
                     binding.frontier = super::super::super::RootRelayFrontier::new(
                         root,
                         novarocks_result_contract::RootProfileId::V1,
@@ -336,10 +348,121 @@ mod client_computation_tests {
             .notify();
         compute.unwrap()
     }
+    pub(super) async fn owned_internal_stage<F: Future>(
+        control: &TestGovernance<F>,
+        root: &WorkOwner,
+    ) -> (WorkOwner, RetainedPayloadGrant, QueryResultCapacityBinding) {
+        let scope = root.scope();
+        let mut builder = control.admission.begin_paid_proposal(root).unwrap();
+        builder
+            .begin_new(
+                JointLane::Custody,
+                JointResources::ZERO
+                    .with(JointResource::ClaimRecords, 1)
+                    .with(JointResource::PayloadBytes, 8 * 1024 * 1024),
+            )
+            .unwrap();
+        builder
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        builder.end_change().unwrap();
+        let mut pending = builder.submit().unwrap();
+        let mut ready = tokio::time::timeout(Duration::from_secs(2), &mut pending)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut raw = ready.new_claims.pop();
+        let mut payload = None;
+        RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+            .unwrap()
+            .notify();
+        drop((ready, pending));
+        let payload = payload.unwrap();
+        let child = child(&scope).await;
+        let mut compute = Some(stage(&payload, &scope, &child, None).await);
+        let mut capacity = None;
+        QueryResultCapacityBinding::from_owned_internal_computation_in(
+            &scope,
+            &child,
+            &payload,
+            &mut compute,
+            &mut capacity,
+        )
+        .unwrap();
+        assert!(compute.is_none());
+        (child, payload, capacity.unwrap())
+    }
+    #[derive(Debug, Default)]
+    struct CountConsumerSignals {
+        accepted: AtomicBool,
+        frame_dropped: AtomicBool,
+        release: tokio::sync::Notify,
+    }
+    struct CountConsumerFrame(Arc<CountConsumerSignals>);
+    impl Drop for CountConsumerFrame {
+        fn drop(&mut self) {
+            self.0.frame_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug)]
+    struct HeldCountConsumer {
+        signals: Arc<CountConsumerSignals>,
+        domain_error: bool,
+    }
+    impl crate::api::InternalComputationConsumer for HeldCountConsumer {
+        fn begin_local_close(&self) {}
+        fn poll_local_closed(
+            &self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+            // This CountOnly consumer submits no local CPU work.
+            Poll::Ready(Ok(()))
+        }
+        fn consume(
+            &self,
+            activation: crate::api::InternalConsumerActivation,
+        ) -> crate::api::InternalConsumerFuture {
+            let signals = Arc::clone(&self.signals);
+            let domain_error = self.domain_error;
+            Box::pin(async move {
+                let _frame = CountConsumerFrame(Arc::clone(&signals));
+                let (mut stream, source) = activation.into_parts();
+                assert_eq!(
+                    stream.carrier(),
+                    crate::api::ResultRowCarrier::relayed(
+                        novarocks_result_contract::RootOutputKind::CountOnly,
+                        None
+                    )
+                    .unwrap()
+                );
+                let crate::api::InternalResultDelivery::End(end) =
+                    stream.next().await?.expect("actual CountOnly End")
+                else {
+                    panic!("CountOnly cannot deliver a data segment")
+                };
+                let decoded = end.complete().await?;
+                let activation = source.activation();
+                let ready = source.accept(decoded).await?;
+                assert_eq!(ready.activation(), activation);
+                signals.accepted.store(true, Ordering::SeqCst);
+                signals.release.notified().await;
+                if domain_error {
+                    Err(QueryExecutionError::from_execution(
+                        fixture_execution_input(
+                            "ordinary fixture domain error after accepted Ready",
+                        ),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
     async fn request(
         capacity: QueryResultCapacityBinding,
         mut attempts: Preparation,
         internal: bool,
+        count: Option<Arc<dyn crate::api::InternalComputationConsumer>>,
     ) -> QueryExecutionRequest {
         use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
         let plan = if internal {
@@ -351,7 +474,9 @@ mod client_computation_tests {
         } else {
             crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version())
         };
-        let root_output = if internal {
+        let root_output = if count.is_some() {
+            FrozenRootOutput::CountOnly
+        } else if internal {
             FrozenRootOutput::ScalarValue(
                 plan.candidate()
                     .original_public_result_port()
@@ -391,14 +516,24 @@ mod client_computation_tests {
         )
         .unwrap();
         attempts.scalar_schema = description.scalar_schema().cloned();
-        QueryExecutionRequest::bind_native(
+        attempts.count_only = count.is_some();
+        let description = if count.is_some() {
+            description.into_internal_computation().unwrap()
+        } else {
+            description
+        };
+        let request = QueryExecutionRequest::bind_native(
             description,
             PermanentlyBackpressuredAbortEffectPort::shared(),
             None,
             attempts,
         )
         .with_result_capacity(capacity)
-        .unwrap()
+        .unwrap();
+        match count {
+            Some(consumer) => request.with_internal_consumer(consumer).unwrap(),
+            None => request,
+        }
     }
     enum ClientObservationFailure {
         Check(&'static str),
@@ -437,6 +572,14 @@ mod client_computation_tests {
         streamed_success_cut(hold_activity, false).await;
     }
     async fn streamed_success_cut(hold_activity: bool, internal: bool) {
+        streamed_success_cut_with_count_consumer(hold_activity, internal, None).await;
+    }
+    async fn streamed_success_cut_with_count_consumer(
+        hold_activity: bool,
+        internal: bool,
+        count_error: Option<bool>,
+    ) {
+        let count_signals = count_error.map(|_| Arc::new(CountConsumerSignals::default()));
         let mut control = governance_with_result_positions(!internal, None, internal.then_some(1));
         let (observations, cleanup, shutdown) = {
             let root = control.begin_root().await;
@@ -553,6 +696,7 @@ mod client_computation_tests {
                 window: TestWindow(capacity.try_window_alias().unwrap()),
                 signals: Arc::clone(&signals),
                 scalar_schema: None,
+                count_only: false,
             };
             let (mut supervisor, client) = test_supervisor(
                 &control,
@@ -565,7 +709,13 @@ mod client_computation_tests {
             let second = child(&scope).await;
             let mut second_compute = None;
             let observations: Result<(), ClientObservationFailure> = async {
-                let request = request(capacity, attempts, internal).await;
+                let consumer = count_signals.as_ref().map(|signals| {
+                    Arc::new(HeldCountConsumer {
+                        signals: Arc::clone(signals),
+                        domain_error: count_error.unwrap(),
+                    }) as Arc<dyn crate::api::InternalComputationConsumer>
+                });
+                let request = request(capacity, attempts, internal, consumer).await;
                 let scalar_schema = request.description().scalar_schema().cloned();
                 let mut execution =
                     tokio::time::timeout(Duration::from_secs(2), client.start(request, first))
@@ -578,61 +728,73 @@ mod client_computation_tests {
                 let mut exit = execution
                     .take_exit_observer()
                     .ok_or("original exit observer missing")?;
-                let Some(crate::api::ExecutionOutput::Rows(mut rows)) = execution.take_output()
-                else {
-                    return Err("Rows output missing".into());
-                };
-                rows.begin_schema()
-                    .ok_or("Client schema delivery missing")?
-                    .complete();
-                if internal {
-                    use novarocks_result_contract::{BorrowedScalarLeaf, BorrowedScalarRecord};
-                    let Some(crate::api::ResultDelivery::Segment(segment)) =
-                        tokio::time::timeout(Duration::from_secs(2), rows.next())
-                            .await
-                            .map_err(|_| "actual Internal scalar record timeout")?
-                            .map_err(|error| ClientObservationFailure::Execution {
-                                phase: "Internal scalar record",
-                                error,
-                            })?
+                let rows = if let Some(count) = count_signals.as_ref() {
+                    if execution.ready_token().is_none() || execution.take_output().is_some() {
+                        return Err("CountOnly must return its real computation Ready".into());
+                    }
+                    wait_preparation_exit_fact(&count.accepted).await?;
+                    None
+                } else {
+                    let Some(crate::api::ExecutionOutput::Rows(mut rows)) = execution.take_output()
                     else {
-                        return Err(
-                            "ScalarValue requires its explicit original NoRows record".into()
-                        );
+                        return Err("Rows output missing".into());
                     };
-                    let frozen = scalar_schema
-                        .as_ref()
-                        .expect("the actual frozen Internal scalar schema");
-                    let record = BorrowedScalarRecord::try_decode(frozen, segment.body())
-                        .map_err(|_| "the actual scalar record must match its frozen contract")?;
-                    if record.rows() != 0 || segment.rows() != record.rows() {
-                        return Err(
-                            "the original scalar NoRows record must retain zero rows".into()
-                        );
+                    rows.begin_schema()
+                        .ok_or("Client schema delivery missing")?
+                        .complete();
+                    if internal {
+                        use novarocks_result_contract::{BorrowedScalarLeaf, BorrowedScalarRecord};
+                        let Some(crate::api::ResultDelivery::Segment(segment)) =
+                            tokio::time::timeout(Duration::from_secs(2), rows.next())
+                                .await
+                                .map_err(|_| "actual Internal scalar record timeout")?
+                                .map_err(|error| ClientObservationFailure::Execution {
+                                    phase: "Internal scalar record",
+                                    error,
+                                })?
+                        else {
+                            return Err(
+                                "ScalarValue requires its explicit original NoRows record".into()
+                            );
+                        };
+                        let frozen = scalar_schema
+                            .as_ref()
+                            .expect("the actual frozen Internal scalar schema");
+                        let record = BorrowedScalarRecord::try_decode(frozen, segment.body())
+                            .map_err(
+                                |_| "the actual scalar record must match its frozen contract",
+                            )?;
+                        if record.rows() != 0 || segment.rows() != record.rows() {
+                            return Err(
+                                "the original scalar NoRows record must retain zero rows".into()
+                            );
+                        }
+                        if !matches!(
+                            BorrowedScalarLeaf::decode(frozen, segment.body()),
+                            Ok(BorrowedScalarLeaf::NoRows)
+                        ) {
+                            return Err("the original scalar record must represent NoRows".into());
+                        }
+                        segment.complete();
                     }
-                    if !matches!(
-                        BorrowedScalarLeaf::decode(frozen, segment.body()),
-                        Ok(BorrowedScalarLeaf::NoRows)
-                    ) {
-                        return Err("the original scalar record must represent NoRows".into());
+                    let delivery = tokio::time::timeout(Duration::from_secs(2), rows.next())
+                        .await
+                        .map_err(|_| "actual Client EOF timeout")?
+                        .map_err(|error| ClientObservationFailure::Execution {
+                            phase: "Client EOF",
+                            error,
+                        })?;
+                    let Some(crate::api::ResultDelivery::End(end)) = delivery else {
+                        return Err("empty root must deliver its actual success EOF".into());
+                    };
+                    if end.root_output_rows() != Some(0) {
+                        return Err("empty root EOF must retain its actual zero row count".into());
                     }
-                    segment.complete();
-                }
-                let delivery = tokio::time::timeout(Duration::from_secs(2), rows.next())
-                    .await
-                    .map_err(|_| "actual Client EOF timeout")?
-                    .map_err(|error| ClientObservationFailure::Execution {
-                        phase: "Client EOF",
-                        error,
-                    })?;
-                let Some(crate::api::ResultDelivery::End(end)) = delivery else {
-                    return Err("empty root must deliver its actual success EOF".into());
+                    end.complete();
+
+                    wait_preparation_exit_fact(&signals.sealed).await?;
+                    Some(rows)
                 };
-                if end.root_output_rows() != Some(0) {
-                    return Err("empty root EOF must retain its actual zero row count".into());
-                }
-                end.complete();
-                wait_preparation_exit_fact(&signals.sealed).await?;
                 let source = payload.root_stage_source(&scope, &second).unwrap();
                 let source = match stage_window.as_ref() {
                     Some(window) => source.for_client_window(window).unwrap(),
@@ -644,8 +806,8 @@ mod client_computation_tests {
                 builder.end_payload().unwrap();
                 builder.end_stage().unwrap();
                 let mut next = builder.submit().unwrap();
-                if hold_activity {
-                    // The actual Client position remains busy. The SAME
+                if hold_activity || count_signals.is_some() {
+                    // The actual computation position remains busy. The SAME
                     // request waits fairly and must not receive a quota error.
                     if tokio::time::timeout(Duration::from_millis(20), &mut next)
                         .await
@@ -658,6 +820,14 @@ mod client_computation_tests {
                     if signals.cleanup_entered.load(Ordering::SeqCst) {
                         return Err("cleanup passed held activity".into());
                     }
+                }
+                if let Some(count) = count_signals.as_ref() {
+                    assert!(
+                        !count.frame_dropped.load(Ordering::SeqCst),
+                        "Ready cannot retire a live consumer F"
+                    );
+                    count.release.notify_one();
+                    wait_preparation_exit_fact(&count.frame_dropped).await?;
                 }
                 drop(activity.take());
                 // The real local producer/activity cut retires its position;
@@ -723,6 +893,9 @@ mod client_computation_tests {
                 signals.cleanup_entered.load(Ordering::SeqCst),
                 signals.cleanup_exited.load(Ordering::SeqCst),
             );
+            if let Some(count) = count_signals.as_ref() {
+                count.release.notify_one();
+            }
             drop(activity.take());
             signals.release_cleanup.notify_one();
             let cleanup = wait_preparation_exit_fact(&signals.cleanup_exited).await;
@@ -763,5 +936,13 @@ mod client_computation_tests {
     #[tokio::test]
     async fn internal_read_success_cut_waits_actual_activity_before_p1_reuse() {
         streamed_success_cut(true, true).await;
+    }
+    #[tokio::test]
+    async fn count_only_ready_retains_p1_until_actual_consumer_and_pump_exit() {
+        streamed_success_cut_with_count_consumer(false, true, Some(false)).await;
+    }
+    #[tokio::test]
+    async fn count_only_late_domain_error_releases_p1_after_actual_consumer_exit() {
+        streamed_success_cut_with_count_consumer(false, true, Some(true)).await;
     }
 }

@@ -199,6 +199,18 @@ fn select_product_terminal(
     }
 }
 
+fn trace_original_work_refusal(site: &'static str, error: &WorkError) {
+    // WorkError has a closed first-party projection; never format the cause.
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(error);
+    tracing::debug!(
+        target: "novarocks_frontend_application::maintenance_error",
+        site,
+        failure_domain = fact.reason().domain(),
+        failure_reason = fact.reason().code(),
+        "Original Rewrite work admission refused"
+    );
+}
+
 fn service(error: impl ToString) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())
 }
@@ -688,11 +700,15 @@ fn form_original_domain(
     let runtime = engine
         .kernel
         .rewrite_runtime()
-        .map_err(TerminalError::from_original_cause)?
+        .map_err(|error| {
+            trace_original_work_refusal("tm.domain.runtime", &error);
+            TerminalError::from_original_cause(error)
+        })?
         .clone();
-    let capacity = io
-        .root_capacity()
-        .map_err(TerminalError::from_original_cause)?;
+    let capacity = io.root_capacity().map_err(|error| {
+        trace_original_work_refusal("tm.domain.capacity", &error);
+        TerminalError::from_original_cause(error)
+    })?;
     if !capacity.window_alias().is_for_scope(&root) {
         return Err(TerminalError::pre_dispatch_failed(
             "Rewrite MIO belongs to another original Root",
@@ -706,7 +722,10 @@ fn form_original_domain(
             .clone()
             .with_result_capacity(capacity.clone())
     }
-    .map_err(TerminalError::from_original_cause)?;
+    .map_err(|error| {
+        trace_original_work_refusal("tm.domain.retention", &error);
+        TerminalError::from_original_cause(error)
+    })?;
     let context = engine
         .connector_context
         .clone()
@@ -721,7 +740,10 @@ fn form_original_domain(
         .execution
         .0
         .provider_creator_cpu()
-        .map_err(TerminalError::from_original_cause)?;
+        .map_err(|error| {
+            trace_original_work_refusal("tm.domain.cpu_runtime", &error);
+            TerminalError::from_original_cause(error)
+        })?;
     let write_stack = engine
         .kernel
         .typed_connector_control()
@@ -737,7 +759,10 @@ fn form_original_domain(
             runtime.execution.0.runtime().clone(),
             wake.clone(),
         )
-        .map_err(TerminalError::from_original_cause)?;
+        .map_err(|error| {
+            trace_original_work_refusal("tm.domain.cpu_ports", &error);
+            TerminalError::from_original_cause(error)
+        })?;
     let original_write = Arc::new(std::sync::Mutex::new(None));
     let begin =
         crate::query_execution::write_session::WriteBeginReceiving::new(original_write.clone());

@@ -85,14 +85,12 @@ impl WriteComputationSeed {
             .map_err(domain_error_with_source)?;
         // Install before Native effects or consumer scheduling. A failed or
         // never-claimed attempt still has its original terminal capability.
-        let resolver: Arc<dyn novarocks_spi::connector::ConnectorStorageResolver> =
-            initial.terminal_storage_resolver();
-        session
-            .retain_computation_storage_resolver(resolver)
-            .map_err(domain_error_with_source)?;
         initial
             .bind_write_production_session(&session)
             .map_err(domain_error)?;
+        session
+            .retain_computation_credentials(&initial)
+            .map_err(domain_error_with_source)?;
         let production_execution = Some((
             initial.execution(),
             template.native_manifest_template().plan(),

@@ -44,6 +44,10 @@ mod internal_supervisor_tests {
 
     #[derive(Debug, Default)]
     struct InternalAttemptSignals {
+        // Only the consumer factory-failure fixture issues no Native commands.
+        factory_failure_before_native: bool,
+        unissued_run_created: AtomicBool,
+        unissued_run_dropped: AtomicBool,
         run_entered: AtomicBool,
         run_returned: AtomicBool,
         cleanup_entered: AtomicBool,
@@ -373,12 +377,32 @@ mod internal_supervisor_tests {
         }
     }
 
+    struct UnissuedCountRunFrame(Arc<InternalAttemptSignals>);
+    impl Drop for UnissuedCountRunFrame {
+        fn drop(&mut self) {
+            self.0.unissued_run_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
     impl ActiveNativeAttemptOwner for InternalCountActive {
         fn run<'a>(
             &'a mut self,
             drive: &'a NativeAttemptDrive,
             cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptRunFuture<'a> {
+            if self.signals.factory_failure_before_native {
+                // The consumer may fail before this factory is ever called.
+                // If called, retain and actually drop its original F; never
+                // issue admission/Establish after the actor's terminal cut.
+                self.signals
+                    .unissued_run_created
+                    .store(true, Ordering::SeqCst);
+                let frame = UnissuedCountRunFrame(Arc::clone(&self.signals));
+                return Box::pin(async move {
+                    let _frame = frame;
+                    std::future::pending::<NativeAttemptTerminal>().await
+                });
+            }
             Box::pin(async move {
                 let mut admissions = SuccessfulCompletionActiveOwner {
                     contexts: self.contexts.clone(),
@@ -440,12 +464,29 @@ mod internal_supervisor_tests {
                     }
                     *deadline = Some(request.remote_observation_deadline());
                 }
+                if self.signals.factory_failure_before_native
+                    && self.signals.unissued_run_created.load(Ordering::SeqCst)
+                {
+                    assert!(
+                        self.signals.unissued_run_dropped.load(Ordering::SeqCst),
+                        "the actual unissued Native run F must exit before cleanup"
+                    );
+                }
                 self.signals.cleanup_entered.store(true, Ordering::SeqCst);
                 self.signals.release_cleanup.notified().await;
                 self.signals.cleanup_completed.store(true, Ordering::SeqCst);
-                Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
-                ))
+                let evidence = if self.signals.factory_failure_before_native {
+                    NativeAttemptConvergence::contexts(
+                        self.contexts
+                            .iter()
+                            .copied()
+                            .map(crate::api::NativeContextConvergence::never_established)
+                            .collect::<Box<[_]>>(),
+                    )
+                } else {
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                };
+                Ok(NativeActiveConvergenceClosure::Evidence(evidence))
             })
         }
     }
@@ -1113,6 +1154,9 @@ mod internal_supervisor_tests {
     enum RegisteredConsumerOutcome {
         Error(Box<ExecutionFailureInput>),
         Panic,
+        PollPanic,
+        FactoryPanic,
+        DropPanic(Box<ExecutionFailureInput>),
     }
 
     #[derive(Debug)]
@@ -1167,13 +1211,22 @@ mod internal_supervisor_tests {
         }
 
         fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
+            if matches!(&self.outcome, RegisteredConsumerOutcome::FactoryPanic) {
+                std::panic::panic_any(RegisteredConsumerPanic {
+                    drops: Arc::clone(&self.primary_drops),
+                    _window: Some(self.window.clone()),
+                });
+            }
             let (mut stream, source) = activation.into_parts();
             let outcome = self.outcome.clone();
             let end_seen = Arc::clone(&self.end_seen);
             let primary_drops = Arc::clone(&self.primary_drops);
             let cleanup_drops = Arc::clone(&self.cleanup_drops);
             let window = self.window.clone();
-            let panics = matches!(&outcome, RegisteredConsumerOutcome::Panic);
+            let panics = matches!(
+                &outcome,
+                RegisteredConsumerOutcome::Panic | RegisteredConsumerOutcome::DropPanic(_)
+            );
             let future: InternalConsumerFuture = Box::pin(async move {
                 // Keep both source and original End owned until the actual
                 // future outcome unwinds them. No CPU receipt or Ready is sent.
@@ -1188,10 +1241,14 @@ mod internal_supervisor_tests {
                 assert_eq!(end.end().output_rows, INTERNAL_ROWS);
                 end_seen.store(true, Ordering::SeqCst);
                 match outcome {
-                    RegisteredConsumerOutcome::Error(input) => {
+                    RegisteredConsumerOutcome::Error(input)
+                    | RegisteredConsumerOutcome::DropPanic(input) => {
                         Err(QueryExecutionError::from_execution(*input))
                     }
-                    RegisteredConsumerOutcome::Panic => {
+                    RegisteredConsumerOutcome::FactoryPanic => {
+                        unreachable!("factory already exited with its original cause")
+                    }
+                    RegisteredConsumerOutcome::Panic | RegisteredConsumerOutcome::PollPanic => {
                         std::panic::panic_any(RegisteredConsumerPanic {
                             drops: primary_drops,
                             _window: Some(window),
@@ -1215,26 +1272,77 @@ mod internal_supervisor_tests {
         expected: ExecutionFailureInput,
         namespace: u64,
     ) {
-        let is_panic = matches!(&outcome, RegisteredConsumerOutcome::Panic);
+        assert_registered_consumer_failure_with_capacity(outcome, expected, namespace, false).await;
+    }
+    async fn assert_registered_consumer_failure_with_capacity(
+        outcome: RegisteredConsumerOutcome,
+        expected: ExecutionFailureInput,
+        namespace: u64,
+        owned: bool,
+    ) {
+        let is_panic = !matches!(&outcome, RegisteredConsumerOutcome::Error(_));
+        let factory_panic = matches!(&outcome, RegisteredConsumerOutcome::FactoryPanic);
+        let cleanup_unproven = matches!(
+            &outcome,
+            RegisteredConsumerOutcome::Panic | RegisteredConsumerOutcome::DropPanic(_)
+        );
+        let primary_count = u64::from(matches!(
+            &outcome,
+            RegisteredConsumerOutcome::Panic
+                | RegisteredConsumerOutcome::PollPanic
+                | RegisteredConsumerOutcome::FactoryPanic
+        ));
+        let cleanup_count = u64::from(matches!(
+            &outcome,
+            RegisteredConsumerOutcome::Panic | RegisteredConsumerOutcome::DropPanic(_)
+        ));
         let mut control = {
-            let (control, root) = governance().await;
+            let control = governance_with_result_positions(false, None, owned.then_some(1));
+            let root = control.begin_root().await;
             let scope = root.owner.scope();
-            let window = scope
-                .result_capacity()
-                .unwrap()
-                .try_acquire(
-                    &scope,
-                    novarocks_workload_control::ResultWindowClass::Internal,
+            let mut root_owner = Some(root.owner);
+            let (stage, payload, capacity) = if owned {
+                let (stage, payload, capacity) =
+                    super::client_computation_tests::owned_internal_stage(
+                        &control,
+                        root_owner.as_ref().unwrap(),
+                    )
+                    .await;
+                (Some(stage), Some(payload), Some(capacity))
+            } else {
+                (None, None, None)
+            };
+            let mut stage = stage;
+            let original_window = if owned {
+                None
+            } else {
+                Some(
+                    scope
+                        .result_capacity()
+                        .unwrap()
+                        .try_acquire(
+                            &scope,
+                            novarocks_workload_control::ResultWindowClass::Internal,
+                        )
+                        .unwrap(),
                 )
-                .unwrap();
-            let signals = Arc::new(InternalAttemptSignals::default());
+            };
+            let window = if let Some(capacity) = capacity.as_ref() {
+                capacity.try_window_alias().unwrap()
+            } else {
+                original_window.as_ref().unwrap().retain_alias()
+            };
+            let signals = Arc::new(InternalAttemptSignals {
+                factory_failure_before_native: factory_panic,
+                ..InternalAttemptSignals::default()
+            });
             let end_seen = Arc::new(AtomicBool::new(false));
-            let panics = matches!(&outcome, RegisteredConsumerOutcome::Panic);
+            let panics = is_panic;
             let primary_drops = Arc::new(AtomicU64::new(0));
             let cleanup_drops = Arc::new(AtomicU64::new(0));
             let request = internal_count_request(InternalCountPreparation {
                 backend: BackendProcessId::new_v7(),
-                window: TestWindow(window.retain_alias()),
+                window: TestWindow(window.try_clone().unwrap()),
                 signals: Arc::clone(&signals),
             })
             .with_internal_consumer(Arc::new(FailingRegisteredConsumer {
@@ -1242,10 +1350,14 @@ mod internal_supervisor_tests {
                 end_seen: Arc::clone(&end_seen),
                 primary_drops: Arc::clone(&primary_drops),
                 cleanup_drops: Arc::clone(&cleanup_drops),
-                window: TestWindow(window.retain_alias()),
+                window: TestWindow(window.try_clone().unwrap()),
             }))
             .unwrap();
-            drop(window);
+            let request = match capacity {
+                Some(capacity) => request.with_result_capacity(capacity).unwrap(),
+                None => request,
+            };
+            drop((window, original_window));
             let (mut supervisor, client) = test_supervisor_with_clock(
                 &control,
                 Handle::current(),
@@ -1262,7 +1374,7 @@ mod internal_supervisor_tests {
                     .prepare_observed_start(request, None)
                     .unwrap_or_else(|original| std::panic::panic_any(original)),
             );
-            let mut work = Some(root.owner);
+            let mut work = Some(stage.take().unwrap_or_else(|| root_owner.take().unwrap()));
             let (mut ready, mut original_exit) = (None, None);
             client
                 .start_observed_in(&mut source_input, &mut work, &mut ready, &mut original_exit)
@@ -1277,9 +1389,16 @@ mod internal_supervisor_tests {
                 Ok(_) => panic!("failed registered computation consumer cannot produce Ready"),
             };
             assert_eq!(error.execution_failure(), Some(&expected));
-            assert!(end_seen.load(Ordering::SeqCst));
+            assert_eq!(end_seen.load(Ordering::SeqCst), !factory_panic);
             assert_eq!(signals.preparations.load(Ordering::SeqCst), 1);
-            assert!(signals.run_entered.load(Ordering::SeqCst));
+            if factory_panic {
+                assert!(
+                    !signals.run_entered.load(Ordering::SeqCst),
+                    "this factory-failure fixture never issues Native admission"
+                );
+            } else {
+                assert!(signals.run_entered.load(Ordering::SeqCst));
+            }
             assert!(!signals.run_returned.load(Ordering::SeqCst));
             assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
             assert!(!signals.active_dropped.load(Ordering::SeqCst));
@@ -1287,23 +1406,62 @@ mod internal_supervisor_tests {
 
             signals.release_cleanup.notify_one();
             root.business.release();
-            let shutdown = supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(5))
-                .await;
-            assert!(signals.cleanup_entered.load(Ordering::SeqCst));
-            assert!(signals.cleanup_completed.load(Ordering::SeqCst));
-            assert!(signals.active_dropped.load(Ordering::SeqCst));
-            let exit = original_exit.take().expect("the same actual Source");
-            let view = exit.view().unwrap();
-            assert!(view.native_preparation_exited());
-            assert_eq!(
-                view.pending_native_returns(),
-                0,
-                "ACK, Native and consumer actual joins returned once"
-            );
-            assert!(!view.role_failed());
-            assert_eq!(view.internal_consumer_failed(), panics);
-            drop(view);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let exit = tokio::time::timeout_at(deadline.into(), async {
+                let mut observer = original_exit.take().expect("the same actual Source");
+                let exit = std::future::poll_fn(|cx| observer.poll_exit(cx))
+                    .await
+                    .expect("the same original Source returns its actual exit receipt");
+                assert!(signals.cleanup_entered.load(Ordering::SeqCst));
+                assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+                if factory_panic && signals.unissued_run_created.load(Ordering::SeqCst) {
+                    assert!(signals.unissued_run_dropped.load(Ordering::SeqCst));
+                }
+                assert!(signals.active_dropped.load(Ordering::SeqCst));
+                let view = exit.view();
+                assert!(view.native_preparation_exited());
+                assert_eq!(
+                    view.pending_native_returns(),
+                    0,
+                    "ACK, Native and consumer actual joins returned once"
+                );
+                assert!(!view.role_failed());
+                assert_eq!(view.internal_consumer_failed(), panics);
+                drop(view);
+                if owned {
+                    assert_eq!(
+                        scope.result_capacity().unwrap().snapshot().held_positions[2],
+                        usize::from(cleanup_unproven),
+                        "only an unproven original cleanup retains the consumer activity"
+                    );
+                    if !cleanup_unproven {
+                        let next_root = control.begin_root().await;
+                        let (next, next_payload, next_capacity) =
+                            super::client_computation_tests::owned_internal_stage(
+                                &control,
+                                &next_root.owner,
+                            )
+                            .await;
+                        assert_eq!(
+                            scope.result_capacity().unwrap().snapshot().held_positions[2],
+                            1,
+                            "the real next computation can reuse P before raw health disposal"
+                        );
+                        drop((next_capacity, next_payload));
+                        next.complete();
+                        next_root.business.release();
+                        next_root.owner.complete();
+                    }
+                }
+                exit
+            })
+            .await
+            .expect("actual Source exit and next Root reuse fit the original close deadline");
+            let shutdown = supervisor.shutdown_until(deadline).await;
+            drop(payload);
+            if let Some(owner) = root_owner {
+                owner.complete();
+            }
             if panics {
                 assert!(matches!(
                     shutdown,
@@ -1321,8 +1479,8 @@ mod internal_supervisor_tests {
                 assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
                 drop(exit);
                 supervisor.abandon_for_process_exit();
-                assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
-                assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(primary_drops.load(Ordering::SeqCst), primary_count);
+                assert_eq!(cleanup_drops.load(Ordering::SeqCst), cleanup_count);
             } else {
                 shutdown.unwrap();
                 assert_eq!(supervisor.registry.active_native_custody_count(), 0);
@@ -1343,6 +1501,75 @@ mod internal_supervisor_tests {
         }
     }
 
+    #[tokio::test]
+    async fn owned_internal_consumer_factory_panic_releases_activity_but_retains_raw_cause() {
+        let expected = ExecutionFailureInput::new(
+            QueryFailureReason::InternalConsumerPanicked.failure_fact(),
+            SafeDetail::truncating("internal computation consumer panicked"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_registered_consumer_failure_with_capacity(
+            RegisteredConsumerOutcome::FactoryPanic,
+            expected,
+            0x793,
+            true,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn owned_internal_consumer_poll_panic_releases_activity_after_normal_future_drop() {
+        let expected = ExecutionFailureInput::new(
+            QueryFailureReason::InternalConsumerPanicked.failure_fact(),
+            SafeDetail::truncating("internal computation consumer panicked"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_registered_consumer_failure_with_capacity(
+            RegisteredConsumerOutcome::PollPanic,
+            expected,
+            0x795,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn owned_internal_consumer_drop_panic_keeps_domain_verdict_and_original_activity() {
+        let expected =
+            fixture_execution_input("original returned domain error before F Drop panic");
+        assert_registered_consumer_failure_with_capacity(
+            RegisteredConsumerOutcome::DropPanic(Box::new(expected.clone())),
+            expected,
+            0x794,
+            true,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn owned_internal_consumer_domain_error_releases_its_actual_position() {
+        let expected = fixture_execution_input("injected owned CountOnly domain failure");
+        assert_registered_consumer_failure_with_capacity(
+            RegisteredConsumerOutcome::Error(Box::new(expected.clone())),
+            expected,
+            0x791,
+            true,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn owned_internal_consumer_poll_and_drop_panic_retain_original_activity() {
+        let expected = ExecutionFailureInput::new(
+            QueryFailureReason::InternalConsumerPanicked.failure_fact(),
+            SafeDetail::truncating("internal computation consumer panicked"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_registered_consumer_failure_with_capacity(
+            RegisteredConsumerOutcome::Panic,
+            expected,
+            0x792,
+            true,
+        )
+        .await;
+    }
     #[tokio::test]
     async fn registered_consumer_error_preserves_original_input_before_cleanup() {
         let expected = fixture_execution_input("injected registered computation consumer failure");

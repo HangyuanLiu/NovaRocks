@@ -2658,10 +2658,28 @@ async fn drive_rows_attempt_until_pump_decision(
                 );
             }
         };
+        let activity = match streamed
+            .as_ref()
+            .map(|source| source.begin_consumer_activity())
+            .transpose()
+        {
+            Ok(activity) => activity,
+            Err(error) => {
+                drop(activation);
+                return (
+                    Err(super::result_pump::pump_failure(
+                        running,
+                        super::result_pump::contract_failure(work_error(error)),
+                    )),
+                    None,
+                );
+            }
+        };
         let mut input = Some(super::native_active_custody::OriginalConsumerStart {
             consumer: Arc::clone(&internal.consumer),
             activation,
             exit,
+            activity,
         });
         if let Err(error) = active.start_consumer_in(&mut input) {
             // Refusal has not moved any original input, and no factory was called.
@@ -2694,12 +2712,9 @@ async fn drive_rows_attempt_until_pump_decision(
                 terminal_source,
                 root_ack,
                 ready,
+                streamed,
             )
             .await
-            .map(|conclusion| super::result_pump::RootPumpDecision {
-                conclusion,
-                streamed_cut: None,
-            })
         } else {
             super::result_pump::run_streamed_root_relay(
                 running,

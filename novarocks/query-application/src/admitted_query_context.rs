@@ -251,6 +251,28 @@ impl StreamedComputationCutHandle {
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         std::sync::Weak::ptr_eq(&self.activity, &other.activity)
     }
+    /// Retain this SAME owned computation while its original registered
+    /// consumer factory/F/Join is live. No window, alias or position is minted.
+    pub(crate) fn begin_consumer_activity(&self) -> Result<ResultCapacityActivityLease, WorkError> {
+        self.scope.check()?;
+        let activity = self.activity.upgrade().ok_or(WorkError::Released)?;
+        {
+            let mut state = activity.state.lock().expect("result activity lock");
+            let streamed = state.streamed.as_ref().ok_or(WorkError::Conflict)?;
+            if streamed.sealed || streamed.grant.is_none() {
+                return Err(WorkError::Conflict);
+            }
+            state.count = state
+                .count
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+        }
+        Ok(ResultCapacityActivityLease {
+            activity,
+            window: None,
+            computation: None,
+        })
+    }
     pub(crate) fn seal_producer(&self) -> Result<(), WorkError> {
         let activity = self.activity.upgrade().ok_or(WorkError::Released)?;
         let mut state = activity.state.lock().expect("result activity lock");

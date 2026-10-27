@@ -203,6 +203,7 @@ impl DirectRewriteAction {
             self.io = Some(
                 MetadataIoAdmission::for_original_source(work, starting.dependencies.clone())
                     .map_err(|error| {
+                        trace_original_work_refusal("tm.direct.mio_create", &error);
                         computation_service_error(TerminalError::from_original_cause(error))
                     })?,
             );
@@ -210,6 +211,7 @@ impl DirectRewriteAction {
         let io = self.io.as_ref().unwrap().clone();
         match io.poll_progress(work, cx) {
             Err(error) => {
+                trace_original_work_refusal("tm.direct.mio_progress", &error);
                 return Poll::Ready(Err(computation_service_error(
                     TerminalError::from_original_cause(error),
                 )));
@@ -224,7 +226,10 @@ impl DirectRewriteAction {
                 .scope()
                 .result_capacity()
                 .and_then(|h| h.try_acquire(owner.scope(), ResultWindowClass::Local))
-                .map_err(|e| computation_service_error(TerminalError::from_original_cause(e)))?;
+                .map_err(|e| {
+                    trace_original_work_refusal("tm.direct.local", &e);
+                    computation_service_error(TerminalError::from_original_cause(e))
+                })?;
             self.local = Some(
                 LocalResultProducer::try_new(owner.scope(), grant.retain_alias())
                     .map_err(service)?,

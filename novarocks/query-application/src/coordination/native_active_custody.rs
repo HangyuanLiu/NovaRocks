@@ -163,11 +163,19 @@ pub(super) struct OriginalConsumerStart {
     pub(super) consumer: Arc<dyn crate::api::InternalComputationConsumer>,
     pub(super) activation: crate::api::InternalConsumerActivation,
     pub(super) exit: crate::api::InternalConsumerExitReporter,
+    pub(super) activity: Option<crate::admitted_query_context::ResultCapacityActivityLease>,
 }
 #[derive(Default)]
 struct ConsumerTailState {
     phase: ConsumerTailPhase,
     input: Option<OriginalConsumerStart>,
+    // Outside the destructible factory/F, until its actual cleanup cut.
+    activity: Option<crate::admitted_query_context::ResultCapacityActivityLease>,
+    // The original factory returned no F, or explicit F destruction returned.
+    // Raw primary/notification/Join health is independent of this actual cut.
+    cleanup_returned: bool,
+    // Joined is not settled while its completed handle/lease is loaned outside.
+    finishing: bool,
     panic: Option<Box<dyn std::any::Any + Send>>,
     cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
     // The SAME task's join owns an uncaught receipt/outer-tail panic or cancellation.
@@ -183,10 +191,11 @@ enum ConsumerTailPhase {
 }
 impl ConsumerTailState {
     fn pending(&self) -> bool {
-        matches!(
-            self.phase,
-            ConsumerTailPhase::Reserved | ConsumerTailPhase::Running(_)
-        )
+        self.finishing
+            || matches!(
+                self.phase,
+                ConsumerTailPhase::Reserved | ConsumerTailPhase::Running(_)
+            )
     }
     fn failed(&self) -> bool {
         self.panic.is_some() || self.cleanup_panic.is_some() || self.join_failure.is_some()
@@ -237,6 +246,7 @@ async fn run_original_consumer(slot: Weak<ActiveSlot>) -> Result<(), QueryExecut
         consumer,
         activation,
         exit,
+        activity,
     } = {
         let original = slot
             .upgrade()
@@ -247,11 +257,15 @@ async fn run_original_consumer(slot: Weak<ActiveSlot>) -> Result<(), QueryExecut
             .take()
             .expect("the original reserved consumer input")
     };
+    // start_consumer_in moved the lease to the original slot before spawn.
+    assert!(activity.is_none());
+    let mut cleanup_returned = false;
     let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         consumer.consume(activation)
     })) {
         Err(payload) => {
             retain_original_consumer_panic(&slot, payload, false);
+            cleanup_returned = true;
             Err(super::supervisor::internal_consumer_panicked(
                 "internal computation consumer panicked",
             ))
@@ -272,15 +286,22 @@ async fn run_original_consumer(slot: Weak<ActiveSlot>) -> Result<(), QueryExecut
                 }
             })
             .await;
-            if let Err(payload) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(future)))
-            {
-                retain_original_consumer_panic(&slot, payload, true);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(future))) {
+                Ok(()) => cleanup_returned = true,
+                Err(payload) => retain_original_consumer_panic(&slot, payload, true),
             }
             // A cleanup panic is health; it cannot overwrite a returned domain verdict.
             outcome
         }
     };
+    if cleanup_returned {
+        slot.upgrade()
+            .expect("canonical consumer slot remains until its actual join")
+            .consumer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cleanup_returned = true;
+    }
     // A notification panic here is kept by the original slot's actual JoinError.
     // The two raw slots already own any earlier factory/poll and F-Drop causes.
     exit.complete(outcome.clone());
@@ -623,7 +644,9 @@ impl NativeActiveCustodyRegistry {
                 ));
             }
             state.phase = ConsumerTailPhase::Reserved;
-            state.input = incoming.take();
+            let mut input = incoming.take().expect("validated original consumer input");
+            state.activity = input.activity.take();
+            state.input = Some(input);
         }
         // The original slot already owns input/causes before any task or factory runs.
         let join = tokio::spawn(run_original_consumer(Arc::downgrade(slot)));
@@ -687,6 +710,7 @@ impl NativeActiveCustodyRegistry {
                     match Pin::new(join).poll(&mut cx) {
                         Poll::Pending => (false, None, None),
                         Poll::Ready(outcome) => {
+                            state.finishing = true;
                             let completed =
                                 std::mem::replace(&mut state.phase, ConsumerTailPhase::Joined);
                             let domain_error = match outcome {
@@ -715,8 +739,37 @@ impl NativeActiveCustodyRegistry {
                     slot.mark_consumer_failure();
                 }
             }
-            // The exact completed handle/frame drops after every slot lock.
-            drop(completed_consumer_join);
+            // Keep finishing=true through every actual completed-handle and
+            // activity destructor. Another poll cannot settle/remove this slot.
+            if consumer_joined {
+                let completed_handle_dropped =
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(completed_consumer_join);
+                    })) {
+                        Ok(()) => true,
+                        Err(payload) => {
+                            slot.retain_consumer_panic(payload, true);
+                            false
+                        }
+                    };
+                let activity = {
+                    let mut state = slot.consumer.lock().unwrap_or_else(|e| e.into_inner());
+                    if completed_handle_dropped && state.cleanup_returned {
+                        state.activity.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(activity);
+                })) {
+                    slot.retain_consumer_panic(payload, true);
+                }
+                slot.consumer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finishing = false;
+            }
             if let Some((activation, root, outcome)) = ack_joined {
                 match outcome {
                     Ok(Ok(())) => {}

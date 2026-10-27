@@ -185,7 +185,9 @@ pub(crate) struct FrontendQueryCompiler {
 
 mod async_explain;
 mod async_read;
-pub(crate) use async_explain::{PreparedAsyncExplain, PreparedAsyncProfile};
+pub(crate) use async_explain::{
+    ExplainPreparationPorts, PreparedAsyncExplain, PreparedAsyncProfile,
+};
 
 impl FrontendQueryCompiler {
     pub(crate) fn validate_original_read_runtime(
