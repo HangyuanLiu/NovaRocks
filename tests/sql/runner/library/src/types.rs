@@ -291,6 +291,8 @@ pub struct QueryMeta {
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
     /// Optional exact REST target, resolved with this case's original namespace mapping.
     pub publication_catalog_fault_target: Option<PublicationCatalogFaultTarget>,
+    /// Optional arm cut; absence retains the original before-statement timing.
+    pub publication_catalog_fault_timing: Option<PublicationCatalogFaultTiming>,
     /// Exact REST table and actor for a server-side post-requirements hold.
     pub publication_service_hold: Option<PublicationServiceHoldDirective>,
     /// One cross-engine shell command executed after a runner proxy or real
@@ -507,6 +509,12 @@ pub struct PublicationCatalogFaultDirective {
 pub struct PublicationCatalogFaultTarget {
     pub namespace: String,
     pub table: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationCatalogFaultTiming {
+    BeforeStatement,
+    AfterFrontendExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

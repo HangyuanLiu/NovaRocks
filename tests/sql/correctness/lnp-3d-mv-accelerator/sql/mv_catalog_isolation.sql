@@ -54,6 +54,7 @@ REFRESH MATERIALIZED VIEW a_mv;
 -- does not determine which table reaches the proxy first.
 -- @publication_catalog_fault=table-load,corrupt-package
 -- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv
+-- @publication_catalog_fault_timing=after-frontend-exit
 -- @restart_fe_after_step=true
 -- @skip_result_check=true
 SELECT 1;

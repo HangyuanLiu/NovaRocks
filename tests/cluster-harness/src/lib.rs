@@ -2676,6 +2676,37 @@ pub trait ServerHandle: Send {
         bail!("finite MV scheduler observation requires an authenticated role session")
     }
 
+    fn role_launch_progress(
+        &self,
+        _role: RoleSlot,
+        _reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<test_sessions::RoleLaunchProgress> {
+        bail!("role launch progress requires the original cross-process test-session owner")
+    }
+    fn retire_unissued_role_launch(
+        &mut self,
+        _role: RoleSlot,
+        _reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<()> {
+        bail!("role launch retirement requires the original cross-process test-session owner")
+    }
+
+    /// Settle a skipped original intent without revoking any issued credential.
+    fn retire_unissued_role_launch_if_reserved(
+        &mut self,
+        role: RoleSlot,
+        reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<bool> {
+        match self.role_launch_progress(role, reference)? {
+            test_sessions::RoleLaunchProgress::Reserved => {
+                self.retire_unissued_role_launch(role, reference)?;
+                Ok(true)
+            }
+            test_sessions::RoleLaunchProgress::Issued
+            | test_sessions::RoleLaunchProgress::RetiredUnissued => Ok(false),
+        }
+    }
+
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
     fn process_resource_identities(
@@ -2772,6 +2803,14 @@ pub trait ServerHandle: Send {
     }
     fn restart_fe_until(&mut self, _deadline: Instant) -> Result<()> {
         self.restart_fe()
+    }
+    /// Invoke once only after the original FE and role session actually exit,
+    /// before preparing or starting their successor. Unsupported owners reject.
+    fn restart_fe_with_after_exit_hook(
+        &mut self,
+        _after_exit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        bail!("an after-exit restart hook requires the original cross-process owner")
     }
     fn kill_query(&mut self, connection_id: u32) -> Result<()> {
         bail!("KILL QUERY is unsupported by this server mode (connection_id={connection_id})")
@@ -5059,6 +5098,113 @@ impl CrossProcessServerHandle {
     }
 }
 
+impl CrossProcessServerHandle {
+    fn restart_frontend_until(
+        &mut self,
+        deadline: Instant,
+        after_exit: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<()> {
+        let deadline = self
+            .test_sessions
+            .as_ref()
+            .map_or(deadline, |plan| deadline.min(plan.deadline()));
+        let deadline = self
+            .fixture_budget
+            .as_ref()
+            .map_or(deadline, |budget| deadline.min(budget.work_deadline()));
+        let controller_cleanup = self
+            .test_sessions
+            .as_mut()
+            .map(|plan| plan.end_role(RoleSlot::Frontend))
+            .transpose();
+        let prior_log = self
+            .fe_process
+            .log_contents()
+            .context("preserve cross-process FE log before restart");
+        let stopped = self
+            .fe_process
+            .stop()
+            .context("reap old cross-process FE before new role session");
+        let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
+        let prior_log = combine_restart_evidence(prior_log, exited)?;
+        self.fe_log_history.push_str(&prior_log);
+        self.fe_process.release_diagnostics()?;
+        if let Some(after_exit) = after_exit {
+            let _ = remaining_until(deadline, "after-exit restart hook")?;
+            after_exit()
+                .context("after the original frontend exit, before its successor launch")?;
+        }
+        let marker = "NOVAROCKS_READY mysql_port=";
+        let binary = self.test_sessions.as_ref().map_or_else(
+            || Ok(self.fe_binary.clone()),
+            |plan| plan.binary_for_next_launch(RoleSlot::Frontend, &self.fe_binary),
+        )?;
+        let mut command = build_novarocks_command_with_profile(
+            &binary,
+            "fe",
+            &self.fe_config_path,
+            self.launch_profile,
+        );
+        let evidence = self.runtime_dir.join(format!(
+            "fe-restart-{}.build-info.json",
+            next_fragment_failure_token(0)
+        ));
+        let previous_unconfirmed_launch = self.unconfirmed_role_launch;
+        self.unconfirmed_role_launch = true;
+        self.role_sessions_joined = false;
+        if let Some(plan) = &mut self.test_sessions {
+            if let Some(declaration) =
+                plan.prepare_launch(RoleSlot::Frontend, &binary, &evidence, deadline)?
+            {
+                command.arg("--test-session").arg(declaration);
+            }
+        } else {
+            test_sessions::check_binary(&binary, false, &[], deadline, &evidence)?;
+        }
+        apply_child_environment(&mut command, &self.fe_environment);
+        apply_launch_profile(&mut command, self.launch_profile);
+        if let Some((work, complete)) =
+            role_payload_lifetime(self.fixture_budget.as_ref(), self.test_sessions.as_ref())
+        {
+            command.terminate_at(work, complete);
+        }
+        self.fe_process
+            .restart(
+                command,
+                ReadyMarker::StdoutContains(marker.to_string()),
+                remaining_until(deadline, "FE readiness")?,
+                self.runtime_dir.join("fe.log"),
+            )
+            .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
+            .context("restart cross-process FE")?;
+        self.unconfirmed_role_launch = previous_unconfirmed_launch;
+        self.fe_launch_identity =
+            process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
+                .context("capture FE process identity after restart")?;
+        println!(
+            "restarted cross-process FE pid={} config={}",
+            self.fe_process.pid(),
+            self.fe_config_path.display()
+        );
+        self.native_fault_proxies.disconnect_all();
+        wait_for_live_backend_topology(
+            LiveBackendTopologyWait {
+                mysql_user: &self.mysql_user,
+                runtime: &self.runtime,
+                expected_ports: &self.be_grpc_ports,
+                expected_eligible_backend_count: self.expected_eligible_backend_count,
+                fe_config_path: &self.fe_config_path,
+                be_config_paths: &self.be_config_paths,
+                timeout: remaining_until(deadline, "FE topology barrier")?,
+            },
+            &mut self.fe_process,
+            &mut self.be_processes,
+        )
+        .context("cross-process backend topology barrier after FE restart")?;
+        Ok(())
+    }
+}
+
 impl ServerHandle for CrossProcessServerHandle {
     fn retain_runtime_artifacts(&mut self) {
         CrossProcessServerHandle::retain_runtime_artifacts(self);
@@ -5079,6 +5225,27 @@ impl ServerHandle for CrossProcessServerHandle {
             .as_ref()
             .context("MV scheduler observation requires the current FE role session")?
             .mv_scheduler_outcome_binding(grant_id, catalog, namespace, mv, directory)
+    }
+
+    fn role_launch_progress(
+        &self,
+        role: RoleSlot,
+        reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<test_sessions::RoleLaunchProgress> {
+        self.test_sessions
+            .as_ref()
+            .context("role launch progress requires the original frozen test-session plan")?
+            .role_launch_progress(role, reference)
+    }
+    fn retire_unissued_role_launch(
+        &mut self,
+        role: RoleSlot,
+        reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<()> {
+        self.test_sessions
+            .as_mut()
+            .context("role launch retirement requires the original frozen test-session plan")?
+            .retire_unissued_role_launch(role, reference)
     }
 
     fn target_host(&self) -> Option<&str> {
@@ -6004,99 +6171,14 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn restart_fe_until(&mut self, deadline: Instant) -> Result<()> {
-        let deadline = self
-            .test_sessions
-            .as_ref()
-            .map_or(deadline, |plan| deadline.min(plan.deadline()));
-        let deadline = self
-            .fixture_budget
-            .as_ref()
-            .map_or(deadline, |budget| deadline.min(budget.work_deadline()));
-        let controller_cleanup = self
-            .test_sessions
-            .as_mut()
-            .map(|plan| plan.end_role(RoleSlot::Frontend))
-            .transpose();
-        let prior_log = self
-            .fe_process
-            .log_contents()
-            .context("preserve cross-process FE log before restart");
-        let stopped = self
-            .fe_process
-            .stop()
-            .context("reap old cross-process FE before new role session");
-        let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
-        let prior_log = combine_restart_evidence(prior_log, exited)?;
-        self.fe_log_history.push_str(&prior_log);
-        self.fe_process.release_diagnostics()?;
-        let marker = "NOVAROCKS_READY mysql_port=";
-        let binary = self.test_sessions.as_ref().map_or_else(
-            || Ok(self.fe_binary.clone()),
-            |plan| plan.binary_for_next_launch(RoleSlot::Frontend, &self.fe_binary),
-        )?;
-        let mut command = build_novarocks_command_with_profile(
-            &binary,
-            "fe",
-            &self.fe_config_path,
-            self.launch_profile,
-        );
-        let evidence = self.runtime_dir.join(format!(
-            "fe-restart-{}.build-info.json",
-            next_fragment_failure_token(0)
-        ));
-        let previous_unconfirmed_launch = self.unconfirmed_role_launch;
-        self.unconfirmed_role_launch = true;
-        self.role_sessions_joined = false;
-        if let Some(plan) = &mut self.test_sessions {
-            if let Some(declaration) =
-                plan.prepare_launch(RoleSlot::Frontend, &binary, &evidence, deadline)?
-            {
-                command.arg("--test-session").arg(declaration);
-            }
-        } else {
-            test_sessions::check_binary(&binary, false, &[], deadline, &evidence)?;
-        }
-        apply_child_environment(&mut command, &self.fe_environment);
-        apply_launch_profile(&mut command, self.launch_profile);
-        if let Some((work, complete)) =
-            role_payload_lifetime(self.fixture_budget.as_ref(), self.test_sessions.as_ref())
-        {
-            command.terminate_at(work, complete);
-        }
-        self.fe_process
-            .restart(
-                command,
-                ReadyMarker::StdoutContains(marker.to_string()),
-                remaining_until(deadline, "FE readiness")?,
-                self.runtime_dir.join("fe.log"),
-            )
-            .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
-            .context("restart cross-process FE")?;
-        self.unconfirmed_role_launch = previous_unconfirmed_launch;
-        self.fe_launch_identity =
-            process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
-                .context("capture FE process identity after restart")?;
-        println!(
-            "restarted cross-process FE pid={} config={}",
-            self.fe_process.pid(),
-            self.fe_config_path.display()
-        );
-        self.native_fault_proxies.disconnect_all();
-        wait_for_live_backend_topology(
-            LiveBackendTopologyWait {
-                mysql_user: &self.mysql_user,
-                runtime: &self.runtime,
-                expected_ports: &self.be_grpc_ports,
-                expected_eligible_backend_count: self.expected_eligible_backend_count,
-                fe_config_path: &self.fe_config_path,
-                be_config_paths: &self.be_config_paths,
-                timeout: remaining_until(deadline, "FE topology barrier")?,
-            },
-            &mut self.fe_process,
-            &mut self.be_processes,
-        )
-        .context("cross-process backend topology barrier after FE restart")?;
-        Ok(())
+        self.restart_frontend_until(deadline, None)
+    }
+
+    fn restart_fe_with_after_exit_hook(
+        &mut self,
+        after_exit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.restart_frontend_until(Instant::now() + self.startup_timeout, Some(after_exit))
     }
 
     fn kill_query(&mut self, connection_id: u32) -> Result<()> {

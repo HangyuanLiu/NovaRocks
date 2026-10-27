@@ -86,7 +86,9 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
             let (key, value) = body.split_once('=')?;
             return (matches!(
                 key.trim().to_ascii_lowercase().as_str(),
-                "native_observation_attempts" | "publication_catalog_fault_target"
+                "native_observation_attempts"
+                    | "publication_catalog_fault_target"
+                    | "publication_catalog_fault_timing"
             ) && value.trim().is_empty())
             .then(|| (key.trim().to_ascii_lowercase(), String::new()));
         }
@@ -602,6 +604,16 @@ fn parse_meta_with_sql_error_descriptors(
                 meta.publication_catalog_fault_target =
                     Some(parse_publication_catalog_fault_target(&raw_value)?);
             }
+            "publication_catalog_fault_timing" => {
+                if meta.publication_catalog_fault_timing.is_some() {
+                    bail!("duplicate publication_catalog_fault_timing");
+                }
+                meta.publication_catalog_fault_timing = Some(match raw_value.as_str() {
+                    "before-statement" => PublicationCatalogFaultTiming::BeforeStatement,
+                    "after-frontend-exit" => PublicationCatalogFaultTiming::AfterFrontendExit,
+                    _ => bail!("invalid publication_catalog_fault_timing"),
+                });
+            }
             "publication_service_hold" => {
                 meta.publication_service_hold = Some(parse_publication_service_hold(&raw_value)?);
             }
@@ -1037,6 +1049,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .publication_catalog_fault_target
             .clone()
             .or_else(|| base.publication_catalog_fault_target.clone()),
+        publication_catalog_fault_timing: override_meta
+            .publication_catalog_fault_timing
+            .or(base.publication_catalog_fault_timing),
         publication_service_hold: override_meta
             .publication_service_hold
             .clone()
@@ -1537,6 +1552,57 @@ mod opt5_directive_tests {
         let lines = vec!["-- @normalize_explain_timing=true".to_string()];
         let meta = parse_meta(&lines, &re).expect("parse ok");
         assert!(meta.normalize_explain_timing);
+    }
+
+    #[test]
+    fn publication_fault_timing_preserves_default_and_rejects_empty_unknown_or_duplicate() {
+        let re = meta_re();
+        assert!(
+            parse_meta(&[], &re)
+                .unwrap()
+                .publication_catalog_fault_timing
+                .is_none()
+        );
+        for (name, expected) in [
+            (
+                "before-statement",
+                PublicationCatalogFaultTiming::BeforeStatement,
+            ),
+            (
+                "after-frontend-exit",
+                PublicationCatalogFaultTiming::AfterFrontendExit,
+            ),
+        ] {
+            let meta = parse_meta(
+                &[format!("-- @publication_catalog_fault_timing={name}")],
+                &re,
+            )
+            .unwrap();
+            assert_eq!(meta.publication_catalog_fault_timing, Some(expected));
+            assert_eq!(
+                merge_meta(&meta, &QueryMeta::default()).publication_catalog_fault_timing,
+                Some(expected)
+            );
+        }
+        for raw in ["", "after-restart", "before-start"] {
+            assert!(
+                parse_meta(
+                    &[format!("-- @publication_catalog_fault_timing={raw}")],
+                    &re
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse_meta(
+                &[
+                    "-- @publication_catalog_fault_timing=before-statement".into(),
+                    "-- @publication_catalog_fault_timing=after-frontend-exit".into(),
+                ],
+                &re
+            )
+            .is_err()
+        );
     }
 
     #[test]

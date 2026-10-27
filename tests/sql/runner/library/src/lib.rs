@@ -2441,9 +2441,132 @@ fn preserve_suite_failure_snapshot(ctx: &SuiteRunContext, phase: &str, stdout_lo
     }
 }
 
+fn arm_publication_catalog_fault(
+    step: &SqlStep,
+    ctx: &SuiteRunContext,
+) -> Result<publication_catalog::FixtureFaultGuard> {
+    let directive = step
+        .meta
+        .publication_catalog_fault
+        .context("publication fault arm requires its original directive")?;
+    let control = ctx
+        .publication_catalog_control
+        .as_ref()
+        .context("publication fault arm requires its original fixture")?;
+    match &step.meta.publication_catalog_fault_target {
+        Some(target) => control.arm_next_for_table(
+            directive.action.as_str(),
+            directive.fault.as_str(),
+            &target.namespace,
+            &target.table,
+        ),
+        None => control.arm_next(directive.action.as_str(), directive.fault.as_str()),
+    }
+}
+
+fn finish_publication_catalog_fault(
+    guard: &mut Option<publication_catalog::FixtureFaultGuard>,
+    query: usize,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> bool {
+    let Some(guard) = guard.take() else {
+        return true;
+    };
+    let trace_before_finish = guard.trace();
+    match guard.finish() {
+        Ok(evidence) => {
+            let _ = writeln!(
+                log,
+                "    @publication_catalog_fault consumed and cleared trace={} details={}",
+                evidence.summary(),
+                evidence.trace()
+            );
+            true
+        }
+        Err(error) => {
+            evidence.record_case_cleanup_failure(
+                Some(query),
+                format!("publication catalog fault cleanup: {error:#}"),
+            );
+            let _ = writeln!(
+                log,
+                "    ❌ publication catalog fault cleanup: {error:#}; trace_before_finish={trace_before_finish}"
+            );
+            false
+        }
+    }
+}
+
+/// Retire only this step's original frozen launch slots that this case did not issue.
+/// This neither stops a role nor transfers an unused grant to another launch.
+fn retire_unissued_case_role_launches(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    query: Option<usize>,
+    log: &mut String,
+) -> Result<()> {
+    let Some(controls) = &ctx.controls else {
+        return Ok(());
+    };
+    for ((suite, case_id, step), launches) in &controls.step_role_launches {
+        if suite != &ctx.suite_name
+            || case_id != &case.case_id
+            || query.is_some_and(|query| query != *step)
+        {
+            continue;
+        }
+        for (role, reference) in launches {
+            let mut server = ctx
+                .server_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+            if server.retire_unissued_role_launch_if_reserved(*role, reference)? {
+                let _ = writeln!(
+                    log,
+                    "    retired unissued step {role:?} launch for step {step}: {}",
+                    reference.session_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Complete one step's unused exact launches before another step can restart a role.
+fn retire_unissued_step_role_launches(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    query: usize,
+    abort: &AtomicBool,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> bool {
+    if let Err(error) = retire_unissued_case_role_launches(ctx, case, Some(query), log) {
+        abort.store(true, Ordering::Relaxed);
+        evidence.record_independent_failure(
+            Some(query),
+            format!("retire unissued role launch: {error:#}"),
+        );
+        let _ = writeln!(log, "    ❌ retire unissued role launch: {error:#}");
+        return false;
+    }
+    true
+}
+
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
     let mut evidence = results_record::CaseEvidence::default();
-    let outcome = run_case_observed(ctx, case, abort, &mut evidence);
+    let mut outcome = run_case_observed(ctx, case, abort, &mut evidence);
+    // Covers setup failures and early breaks, as well as the ordinary cleanup
+    // path. Issued and already retired originals are observed, never retired again.
+    if let Err(error) = retire_unissued_case_role_launches(ctx, case, None, &mut outcome.log) {
+        outcome.status = CaseStatus::Fail;
+        abort.store(true, Ordering::Relaxed);
+        evidence
+            .record_independent_failure(None, format!("retire unissued role launch: {error:#}"));
+        let _ = writeln!(outcome.log, "    ❌ retire unissued role launch: {error:#}");
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut outcome.log);
+    }
     evidence.finish_case(outcome.status == CaseStatus::Fail);
     if let Some(recorder) = &ctx.results {
         recorder.case(case, &outcome, &evidence);
@@ -2844,6 +2967,18 @@ fn run_case_observed(
     let mut cleanup_transport = false;
     for step in &case.steps {
         if cleanup_only && !step.meta.cleanup {
+            if let Err(error) =
+                retire_unissued_case_role_launches(ctx, case, Some(step.query_number), &mut log)
+            {
+                case_failed = true;
+                abort.store(true, Ordering::Relaxed);
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    format!("retire skipped role launch: {error:#}"),
+                );
+                let _ = writeln!(log, "    ❌ retire skipped role launch: {error:#}");
+                break;
+            }
             continue;
         }
         let step_deadline = if step.meta.cleanup {
@@ -2879,6 +3014,17 @@ fn run_case_observed(
                 "    original fixture work deadline expired before step {}",
                 step.query_number
             );
+            if let Err(error) =
+                retire_unissued_case_role_launches(ctx, case, Some(step.query_number), &mut log)
+            {
+                abort.store(true, Ordering::Relaxed);
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    format!("retire skipped role launch: {error:#}"),
+                );
+                let _ = writeln!(log, "    ❌ retire skipped role launch: {error:#}");
+                break;
+            }
             continue;
         }
         evidence.begin_step(step.query_number, case_failed);
@@ -3026,63 +3172,32 @@ fn run_case_observed(
             }
             None => None,
         };
-        let mut publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
-            Some(directive) => match ctx.publication_catalog_control.as_ref() {
-                Some(control) => {
-                    match step
-                        .meta
-                        .publication_catalog_fault_target
-                        .as_ref()
-                        .map_or_else(
-                            || {
-                                control
-                                    .arm_next(directive.action.as_str(), directive.fault.as_str())
-                            },
-                            |target| {
-                                control.arm_next_for_table(
-                                    directive.action.as_str(),
-                                    directive.fault.as_str(),
-                                    &target.namespace,
-                                    &target.table,
-                                )
-                            },
-                        ) {
-                        Ok(guard) => {
-                            let _ = writeln!(
-                                log,
-                                "    @publication_catalog_fault armed action={} fault={}",
-                                directive.action.as_str(),
-                                directive.fault.as_str()
-                            );
-                            Some(guard)
-                        }
-                        Err(error) => {
-                            case_failed = true;
-                            evidence.record_independent_failure(
-                                Some(step.query_number),
-                                format!("arm publication catalog fault: {error:#}"),
-                            );
-                            let _ =
-                                writeln!(log, "    ❌ arm publication catalog fault: {error:#}");
-                            break;
-                        }
-                    }
+        let mut publication_catalog_fault_guard = None;
+        if let Some(directive) = step.meta.publication_catalog_fault
+            && step.meta.publication_catalog_fault_timing
+                != Some(PublicationCatalogFaultTiming::AfterFrontendExit)
+        {
+            match arm_publication_catalog_fault(step, ctx) {
+                Ok(guard) => {
+                    let _ = writeln!(
+                        log,
+                        "    @publication_catalog_fault armed action={} fault={}",
+                        directive.action.as_str(),
+                        directive.fault.as_str()
+                    );
+                    publication_catalog_fault_guard = Some(guard);
                 }
-                None => {
+                Err(error) => {
                     case_failed = true;
                     evidence.record_independent_failure(
                         Some(step.query_number),
-                        "@publication_catalog_fault requires the runner-owned publication catalog fixture".into(),
+                        format!("arm publication catalog fault: {error:#}"),
                     );
-                    let _ = writeln!(
-                        log,
-                        "    ❌ @publication_catalog_fault requires the runner-owned publication catalog fixture"
-                    );
+                    let _ = writeln!(log, "    ❌ arm publication catalog fault: {error:#}");
                     break;
                 }
-            },
-            None => None,
-        };
+            }
+        }
         let mut publication_service_hold = match step.meta.publication_service_hold.as_ref() {
             Some(directive) => match ctx.publication_service_control.as_ref() {
                 Some(control) => match control.arm(&directive.table) {
@@ -3094,6 +3209,12 @@ fn run_case_observed(
                             format!("arm REST service hold: {error:#}"),
                         );
                         let _ = writeln!(log, "    ❌ arm REST service hold: {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
+                        );
                         break;
                     }
                 },
@@ -3104,6 +3225,12 @@ fn run_case_observed(
                         "REST service hold requires the V11 fixture".into(),
                     );
                     let _ = writeln!(log, "    ❌ REST service hold requires the V11 fixture");
+                    finish_publication_catalog_fault(
+                        &mut publication_catalog_fault_guard,
+                        step.query_number,
+                        evidence,
+                        &mut log,
+                    );
                     break;
                 }
             },
@@ -3134,6 +3261,12 @@ fn run_case_observed(
                     log,
                     "    ❌ failed to snapshot BE log evidence before step {}: {error:#}",
                     step.query_number
+                );
+                finish_publication_catalog_fault(
+                    &mut publication_catalog_fault_guard,
+                    step.query_number,
+                    evidence,
+                    &mut log,
                 );
                 break;
             }
@@ -3438,8 +3571,9 @@ fn run_case_observed(
                         // returning the expected client error.
                         if let Err(error) = run_post_step_server_actions(
                             step,
-                            &ctx.server_handle,
+                            ctx,
                             &mut target_session,
+                            &mut publication_catalog_fault_guard,
                             &mut log,
                         ) {
                             case_failed = true;
@@ -3448,6 +3582,23 @@ fn run_case_observed(
                                 format!("post-step server action failed: {error:#}"),
                             );
                             let _ = writeln!(log, "    ❌ {error:#}");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         }
                         if step.meta.iceberg_orphan_fixture_absent {
@@ -3459,6 +3610,23 @@ fn run_case_observed(
                                         .into(),
                                 );
                                 let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                                finish_publication_catalog_fault(
+                                    &mut publication_catalog_fault_guard,
+                                    step.query_number,
+                                    evidence,
+                                    &mut log,
+                                );
+                                if !retire_unissued_step_role_launches(
+                                    ctx,
+                                    case,
+                                    step.query_number,
+                                    abort,
+                                    evidence,
+                                    &mut log,
+                                ) {
+                                    break;
+                                }
+                                cleanup_only = true;
                                 continue;
                             };
                             let absent_result = fixture.assert_absent();
@@ -3471,6 +3639,23 @@ fn run_case_observed(
                             if let Err(error) = absent_result {
                                 case_failed = true;
                                 let _ = writeln!(log, "    ❌ {error:#}");
+                                finish_publication_catalog_fault(
+                                    &mut publication_catalog_fault_guard,
+                                    step.query_number,
+                                    evidence,
+                                    &mut log,
+                                );
+                                if !retire_unissued_step_role_launches(
+                                    ctx,
+                                    case,
+                                    step.query_number,
+                                    abort,
+                                    evidence,
+                                    &mut log,
+                                ) {
+                                    break;
+                                }
+                                cleanup_only = true;
                                 continue;
                             }
                             let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
@@ -3490,8 +3675,9 @@ fn run_case_observed(
                 } else if let Some(execution) = passed_execution {
                     if let Err(error) = run_post_step_server_actions(
                         step,
-                        &ctx.server_handle,
+                        ctx,
                         &mut target_session,
+                        &mut publication_catalog_fault_guard,
                         &mut log,
                     ) {
                         case_failed = true;
@@ -3500,6 +3686,23 @@ fn run_case_observed(
                             format!("post-step server action failed: {error:#}"),
                         );
                         let _ = writeln!(log, "    ❌ {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
+                        );
+                        if !retire_unissued_step_role_launches(
+                            ctx,
+                            case,
+                            step.query_number,
+                            abort,
+                            evidence,
+                            &mut log,
+                        ) {
+                            break;
+                        }
+                        cleanup_only = true;
                         continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
@@ -3510,6 +3713,23 @@ fn run_case_observed(
                                 "orphan fixture was not installed before the absence check".into(),
                             );
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         };
                         let absent_result = fixture.assert_absent();
@@ -3522,6 +3742,23 @@ fn run_case_observed(
                         if let Err(error) = absent_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         }
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
@@ -3969,8 +4206,9 @@ fn run_case_observed(
                     if ctx.record_from == RecordFrom::Target
                         && let Err(error) = run_post_step_server_actions(
                             step,
-                            &ctx.server_handle,
+                            ctx,
                             &mut target_session,
+                            &mut publication_catalog_fault_guard,
                             &mut log,
                         )
                     {
@@ -3980,6 +4218,23 @@ fn run_case_observed(
                             format!("post-step server action failed: {error:#}"),
                         );
                         let _ = writeln!(log, "    ❌ {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
+                        );
+                        if !retire_unissued_step_role_launches(
+                            ctx,
+                            case,
+                            step.query_number,
+                            abort,
+                            evidence,
+                            &mut log,
+                        ) {
+                            break;
+                        }
+                        cleanup_only = true;
                         continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
@@ -3990,6 +4245,23 @@ fn run_case_observed(
                                 "orphan fixture was not installed before the absence check".into(),
                             );
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         };
                         let absent_result = fixture.assert_absent();
@@ -4002,6 +4274,23 @@ fn run_case_observed(
                         if let Err(error) = absent_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         }
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
@@ -4372,29 +4661,13 @@ fn run_case_observed(
             preserve_case_failure_snapshot(ctx, &case.case_id, Some(step.query_number), &mut log);
         }
 
-        if let Some(guard) = publication_catalog_fault_guard {
-            let trace_before_finish = guard.trace();
-            match guard.finish() {
-                Ok(evidence) => {
-                    let _ = writeln!(
-                        log,
-                        "    @publication_catalog_fault consumed and cleared trace={} details={}",
-                        evidence.summary(),
-                        evidence.trace()
-                    );
-                }
-                Err(error) => {
-                    case_failed = true;
-                    evidence.record_case_cleanup_failure(
-                        Some(step.query_number),
-                        format!("publication catalog fault cleanup: {error:#}"),
-                    );
-                    let _ = writeln!(
-                        log,
-                        "    ❌ publication catalog fault cleanup: {error:#}; trace_before_finish={trace_before_finish}"
-                    );
-                }
-            }
+        if !finish_publication_catalog_fault(
+            &mut publication_catalog_fault_guard,
+            step.query_number,
+            evidence,
+            &mut log,
+        ) {
+            case_failed = true;
         }
 
         for (action, result) in [
@@ -4506,6 +4779,19 @@ fn run_case_observed(
             case_failed = true;
             evidence.record_failure(serde_json::json!({"class":"error", "error":"original SQL invocation work deadline expired", "statement_index":step.query_number}));
             let _ = writeln!(log, "    ❌ original SQL invocation work deadline expired");
+        }
+        // This step is over even if its selected mode never ran a restart.
+        // Any remaining original slot belongs to this step, never its successor.
+        if !retire_unissued_step_role_launches(
+            ctx,
+            case,
+            step.query_number,
+            abort,
+            evidence,
+            &mut log,
+        ) {
+            case_failed = true;
+            break;
         }
         if case_failed && !cleanup_only {
             cleanup_only = true;
@@ -4720,7 +5006,7 @@ fn run_suite_with_hooks(
             recorder.load_failure(failure);
         }
     }
-    let result =
+    let mut result =
         run_suite_with_hooks_observed(ps, abort, stdout_lock, |conn, timeout, hook, role| {
             let result = execute_hook(conn, timeout, hook, role);
             if ps
@@ -4736,6 +5022,30 @@ fn run_suite_with_hooks(
             }
             result
         });
+    if !init_errors.is_empty() {
+        // Init failure bypasses run_case entirely; none of these step
+        // launches ran. Retire their exact originals before a later suite.
+        for case in &ps.cases {
+            let mut log = String::new();
+            if let Err(error) = retire_unissued_case_role_launches(&ps.ctx, case, None, &mut log) {
+                abort.store(true, Ordering::Relaxed);
+                result.cleanup_errors.push(format!(
+                    "retire unissued role launch after suite init failure: {error:#}"
+                ));
+                let _ = writeln!(
+                    log,
+                    "    ❌ retire unissued role launch after suite init failure: {error:#}"
+                );
+            }
+            if let Some(outcome) = result
+                .outcomes
+                .iter_mut()
+                .find(|outcome| outcome.case_id == case.case_id)
+            {
+                outcome.log.push_str(&log);
+            }
+        }
+    }
     if let Some(recorder) = &ps.ctx.results {
         recorder.finish(ps, &result, abort.load(Ordering::Relaxed), &init_errors);
     }
@@ -5089,11 +5399,55 @@ fn validate_dml_cluster_jobs(cases: &[SqlCase], jobs: usize, mode: ClusterMode) 
 /// declaration that retires a restart barrier.
 fn run_post_step_server_actions(
     step: &SqlStep,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    ctx: &SuiteRunContext,
     session: &mut MysqlSession,
+    publication_fault: &mut Option<publication_catalog::FixtureFaultGuard>,
     log: &mut String,
 ) -> Result<()> {
-    restart_frontend_after_step(step, server_handle, session, log)?;
+    if step.meta.publication_catalog_fault_timing
+        == Some(PublicationCatalogFaultTiming::AfterFrontendExit)
+    {
+        ensure!(
+            step.meta.restart_fe_after_step && step.meta.imv_accelerator_wipe_restart.is_none(),
+            "after-frontend-exit timing requires the original explicit frontend restart"
+        );
+        let mut called = false;
+        let result = {
+            let mut after_exit = || {
+                ensure!(
+                    !called,
+                    "after-frontend-exit hook was invoked more than once"
+                );
+                called = true;
+                ensure!(
+                    publication_fault.is_none(),
+                    "publication fault is already armed"
+                );
+                *publication_fault = Some(arm_publication_catalog_fault(step, ctx)?);
+                Ok(())
+            };
+            restart_frontend_after_step(
+                step,
+                &ctx.server_handle,
+                session,
+                Some(&mut after_exit),
+                log,
+            )
+        };
+        if publication_fault.is_some() {
+            let _ = writeln!(
+                log,
+                "    @publication_catalog_fault armed after original frontend exit"
+            );
+        }
+        result?;
+        ensure!(
+            called,
+            "frontend restart did not invoke its required after-exit hook"
+        );
+    } else {
+        restart_frontend_after_step(step, &ctx.server_handle, session, None, log)?;
+    }
     resume_mv_management_after_step(step, session, log)
 }
 
@@ -5173,6 +5527,7 @@ fn restart_frontend_after_step(
     step: &SqlStep,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
     session: &mut MysqlSession,
+    after_exit: Option<&mut dyn FnMut() -> Result<()>>,
     log: &mut String,
 ) -> Result<()> {
     let Some(wipe) = step.meta.imv_accelerator_wipe_restart.as_ref() else {
@@ -5185,9 +5540,11 @@ fn restart_frontend_after_step(
         if server.be_count() == 0 {
             bail!("@restart_fe_after_step requires a runner-owned cross-process frontend");
         }
-        server
-            .restart_fe()
-            .context("restart frontend after successful SQL step")?;
+        match after_exit {
+            Some(after_exit) => server.restart_fe_with_after_exit_hook(after_exit),
+            None => server.restart_fe(),
+        }
+        .context("restart frontend after successful SQL step")?;
         drop(server);
         session
             .reconnect()
@@ -5218,9 +5575,11 @@ fn restart_frontend_after_step(
     if server.be_count() == 0 {
         bail!("@imv_accelerator_wipe_restart requires a runner-owned cross-process frontend");
     }
-    server
-        .restart_fe()
-        .context("restart frontend after Accelerator wipe")?;
+    match after_exit {
+        Some(after_exit) => server.restart_fe_with_after_exit_hook(after_exit),
+        None => server.restart_fe(),
+    }
+    .context("restart frontend after Accelerator wipe")?;
     drop(server);
     session
         .reconnect()
@@ -5367,11 +5726,35 @@ fn validate_publication_catalog_directives(
     for case in cases {
         for step in &case.steps {
             if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_catalog_fault_timing.is_none()
                 && step.meta.publication_catalog_fault_target.is_none()
                 && step.meta.publication_service_hold.is_none()
                 && step.meta.publication_catalog_concurrent_shell.is_none()
             {
                 continue;
+            }
+            if step.meta.publication_catalog_fault_timing.is_some()
+                && step.meta.publication_catalog_fault.is_none()
+            {
+                bail!("publication_catalog_fault_timing requires its original fault directive");
+            }
+            if step.meta.publication_catalog_fault_timing
+                == Some(PublicationCatalogFaultTiming::AfterFrontendExit)
+                && (!matches!(
+                    step.meta.publication_catalog_fault,
+                    Some(PublicationCatalogFaultDirective {
+                        action: PublicationCatalogAction::TableLoad,
+                        fault: PublicationCatalogFault::CorruptPackage,
+                    })
+                ) || step.meta.publication_catalog_fault_target.is_none()
+                    || !step.meta.restart_fe_after_step
+                    || step.meta.imv_accelerator_wipe_restart.is_some()
+                    || mode != Mode::Verify
+                    || cluster_mode != ClusterMode::CrossProcess)
+            {
+                bail!(
+                    "after-frontend-exit timing requires an exact table-load,corrupt-package fault and explicit cross-process frontend restart in verify mode"
+                );
             }
             if step.meta.publication_catalog_fault_target.is_some()
                 && !matches!(
@@ -7136,6 +7519,105 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn publication_fault_after_exit_timing_rejects_orphan_and_wrong_restart_shapes() {
+        use crate::types::PublicationCatalogFaultTiming;
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault_timing: Some(
+                PublicationCatalogFaultTiming::AfterFrontendExit,
+            ),
+            ..Default::default()
+        });
+        case.sequential = true;
+        let valid = |case: &SqlCase, cluster_mode, mode| {
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(case),
+                true,
+                cluster_mode,
+                mode,
+            )
+        };
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        case.steps[0].meta.publication_catalog_fault = Some(PublicationCatalogFaultDirective {
+            action: PublicationCatalogAction::TableLoad,
+            fault: PublicationCatalogFault::CorruptPackage,
+        });
+        case.steps[0].meta.publication_catalog_fault_target = Some(PublicationCatalogFaultTarget {
+            namespace: "owned_ns".into(),
+            table: "a_mv".into(),
+        });
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        case.steps[0].meta.restart_fe_after_step = true;
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_ok());
+        assert!(valid(&case, ClusterMode::AllInOne, Mode::Verify).is_err());
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Record).is_err());
+        let mut no_target = case.clone();
+        no_target.steps[0].meta.publication_catalog_fault_target = None;
+        assert!(valid(&no_target, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        let mut wrong_fault = case.clone();
+        wrong_fault.steps[0].meta.publication_catalog_fault =
+            Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::AfterCommitBeforeResponse,
+            });
+        assert!(valid(&wrong_fault, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        case.steps[0].meta.publication_catalog_fault_timing = None;
+        case.steps[0].meta.restart_fe_after_step = false;
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_ok());
+    }
+
+    #[test]
+    fn unsupported_restart_owner_never_arms_an_after_exit_fault() {
+        let mut server = ArtifactCapableServer;
+        let mut called = false;
+        let mut after_exit = || {
+            called = true;
+            Ok(())
+        };
+        assert!(
+            crate::cluster::ServerHandle::restart_fe_with_after_exit_hook(
+                &mut server,
+                &mut after_exit,
+            )
+            .is_err()
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn actual_unconsumed_fault_finish_retains_restart_failure_and_releases_the_arm() {
+        let mut fixture =
+            super::publication_catalog::FixtureHandle::start("http://127.0.0.1:9".into()).unwrap();
+        let control = fixture.control().unwrap();
+        let mut guard = Some(
+            control
+                .arm_next_for_table("table-load", "corrupt-package", "owned_ns", "a_mv")
+                .unwrap(),
+        );
+        let mut evidence = crate::results_record::CaseEvidence::default();
+        evidence.record_independent_failure(Some(2), "original restart failure".into());
+        let mut log = String::new();
+        assert!(!super::finish_publication_catalog_fault(
+            &mut guard,
+            2,
+            &mut evidence,
+            &mut log,
+        ));
+        assert!(guard.is_none());
+        let failure = evidence.failure.as_ref().unwrap();
+        assert_eq!(
+            failure["primary_failure"]["error"],
+            "original restart failure"
+        );
+        assert_eq!(failure["additional_failures"][0]["cleanup"], true);
+        assert!(log.contains("publication catalog fault cleanup"));
+        // A failed match oracle still completed the original control release.
+        let unused = control.arm_next("table-load", "corrupt-package").unwrap();
+        assert!(unused.finish().is_err());
+        fixture.shutdown().unwrap();
+    }
 
     #[test]
     fn compiled_execution_identity_manifest_is_exact_and_rejects_bad_entries() {
