@@ -524,7 +524,7 @@ impl Scenario for IcebergDeleteApplicability {
                 .context("scale snapshot missing")?;
             let query = scale_read_sql(case)?;
             let selected = self.intent.take(index)?;
-            let _observation = selected.arm(context, connection.connection_id(), &query)?;
+            let observation = selected.arm(context, connection.connection_id(), &query)?;
             let mut hash = Sha256::new();
             let mut count = 0_i64;
             let mut sums = [0_i64; 4];
@@ -548,6 +548,9 @@ impl Scenario for IcebergDeleteApplicability {
                 observed == case["independent_oracle"],
                 "native exact scale bag differs for {name}: {observed}"
             );
+            context
+                .handle()
+                .drain_query_lifecycle_statement_binding(&observation, selected.deadline)?;
             observations.push(json!({"case":name,"snapshot":snapshot,"metadata":case["metadata"],"exact_bag":observed}));
         }
         await_resource_convergence(context, &baseline, "native delete applicability reads")?;
