@@ -21,6 +21,7 @@ use super::connector::{
     await_resource_convergence, connector_reader_environment, require_three_backends,
     resource_baseline,
 };
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
@@ -35,7 +36,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MANIFEST_ENV: &str = "NOVAROCKS_UEA4G_NATIVE_MANIFEST";
 const ACCESS_ENV: &str = "NOVAROCKS_UEA4G_FIXTURE_ACCESS";
@@ -78,6 +79,7 @@ pub(super) struct Fixture {
 #[derive(Default)]
 pub(super) struct IcebergDeleteApplicability {
     pub(super) fixture: Mutex<Option<Fixture>>,
+    intent: SqlIntentOwner,
 }
 
 fn checked_json(path: &Path, expected: &str) -> Result<Value> {
@@ -146,6 +148,16 @@ fn row_bag(case: &Value) -> Result<Vec<ExpectedRow>> {
     Ok(serde_json::from_value(
         case["independent_expected_rows"].clone(),
     )?)
+}
+
+fn scale_read_sql(case: &Value) -> Result<String> {
+    let table = table_name(case["table"].as_str().context("scale table missing")?)?;
+    let snapshot = case["snapshot"]
+        .as_i64()
+        .context("scale snapshot missing")?;
+    Ok(format!(
+        "SELECT row_id,eq_key,partition_key,payload FROM {table} FOR VERSION AS OF {snapshot} ORDER BY row_id"
+    ))
 }
 
 pub(super) async fn immutable_artifacts(
@@ -396,6 +408,49 @@ impl Scenario for IcebergDeleteApplicability {
         })
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?;
+        let fixture = slot.as_ref().context("missing prepared fixture")?;
+        let cases = fixture.scale["cases"]
+            .as_array()
+            .context("missing scale cases")?;
+        let specs = fixture
+            .manifest
+            .scale_cases
+            .iter()
+            .map(|name| {
+                let case = cases
+                    .iter()
+                    .find(|case| case["case"] == name.as_str())
+                    .context("missing selected scale case")?;
+                Ok(StatementSpec {
+                    sql: scale_read_sql(case)?,
+                    faults: vec![],
+                    observations: (0..cluster_size)
+                        .map(|index| (index, "reader-marker", None))
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(self.intent.freeze(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
@@ -457,20 +512,19 @@ impl Scenario for IcebergDeleteApplicability {
         let before_logs = (0..3)
             .map(|i| context.handle().be_current_log_contents(i))
             .collect::<Result<Vec<_>>>()?;
-        for name in &fixture.manifest.scale_cases {
+        for (index, name) in fixture.manifest.scale_cases.iter().enumerate() {
             let case = fixture.scale["cases"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|c| c["case"] == name.as_str())
                 .unwrap();
-            let table = table_name(case["table"].as_str().context("scale table missing")?)?;
             let snapshot = case["snapshot"]
                 .as_i64()
                 .context("scale snapshot missing")?;
-            let query = format!(
-                "SELECT row_id,eq_key,partition_key,payload FROM {table} FOR VERSION AS OF {snapshot} ORDER BY row_id"
-            );
+            let query = scale_read_sql(case)?;
+            let selected = self.intent.take(index)?;
+            let _observation = selected.arm(context, connection.connection_id(), &query)?;
             let mut hash = Sha256::new();
             let mut count = 0_i64;
             let mut sums = [0_i64; 4];
