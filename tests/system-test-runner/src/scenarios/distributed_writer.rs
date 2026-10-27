@@ -2491,6 +2491,16 @@ const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
 const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
 
 impl WriteFault {
+    /// Incomplete delivery cuts own exclusive targets; the recovery matrix
+    /// and its healthy write share the base target.
+    const fn target_table(&self) -> &'static str {
+        match self {
+            Self::SealedBeforeRootData => "distributed_writer_fault_before_root_data",
+            Self::SealedAfterRootPrefix => "distributed_writer_fault_after_root_prefix",
+            _ => "distributed_writer_fault_data",
+        }
+    }
+
     /// How many times this fault has left evidence in a backend process.
     ///
     /// A fault that is nominated but never hit by its exact owner is inert, and an
@@ -2810,6 +2820,44 @@ impl Scenario for DistributedWriterFaults {
         for (ordinal, fault) in WRITE_FAULTS.into_iter().enumerate() {
             let case = fault.case();
             let selected = self.intent.take(ordinal)?;
+            let case_target = format!("{CATALOG}.{DATABASE}.{}", fault.target_table());
+            let sealed_cut = matches!(
+                fault,
+                WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix
+            );
+            let case_snapshots_before = if sealed_cut {
+                // This owned table has exactly one future writer, the frozen
+                // original INSERT below. No old case can contribute a file.
+                control
+                    .query_drop(format!(
+                        "CREATE TABLE {case_target} (v BIGINT) \
+                     TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
+                    ))
+                    .context("create the original isolated sealed-object target")?;
+                let table_root = hadoop_table_root(
+                    &context
+                        .runtime_dir()
+                        .join("warehouses/distributed-writer-faults"),
+                    DATABASE,
+                    fault.target_table(),
+                );
+                anyhow::ensure!(
+                    owned_root_parquet_paths(context, &table_root)?.is_empty(),
+                    "fresh sealed-object target already contains data files"
+                );
+                snapshot_count(&mut control, &case_target)?
+            } else {
+                snapshots_before
+            };
+            let case_insert = if sealed_cut {
+                format!("INSERT INTO {case_target} SELECT v FROM {CATALOG}.{DATABASE}.{SOURCE}")
+            } else {
+                insert.clone()
+            };
+            let case_statements = WriteStatements {
+                full: &case_insert,
+                delayed: statements.delayed,
+            };
             context.action(format!("inject {case} and require no snapshot"));
             // Select the original finite grants before reading their hit baseline.
             // The SQL execution remains unbound until selected.arm below.
@@ -2829,7 +2877,7 @@ impl Scenario for DistributedWriterFaults {
                 &fault,
                 &user,
                 port,
-                &statements,
+                &case_statements,
                 selected.clone(),
                 capture_original_write_window,
             )?;
@@ -2840,23 +2888,24 @@ impl Scenario for DistributedWriterFaults {
                 fault,
                 WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix
             ) {
-                let root =
-                    assert_sealed_root_read_failure(context, &fault, &outcome, accepted.as_ref())?;
+                assert_sealed_root_read_failure(
+                    context,
+                    &fault,
+                    &outcome,
+                    accepted.as_ref(),
+                    &selected,
+                )?;
                 let table_root = hadoop_table_root(
                     &context
                         .runtime_dir()
                         .join("warehouses/distributed-writer-faults"),
                     DATABASE,
-                    TABLE,
+                    fault.target_table(),
                 );
                 // The original statement's binding has drained and its worker
-                // contexts exited. Only its own sealed execution directory is
-                // observed; old cases and later successful writes cannot stand in.
-                retained_objects.push(capture_sealed_root_objects(
-                    context,
-                    &table_root,
-                    root.query_execution_id(),
-                )?);
+                // contexts exited. Only its fresh owned target's actual data
+                // location is observed; other cases cannot contribute files.
+                retained_objects.push(capture_sealed_root_objects(context, &table_root)?);
             }
             let Err(error) = outcome else {
                 bail!("{case} did not fail the write");
@@ -2926,14 +2975,14 @@ impl Scenario for DistributedWriterFaults {
             }
             fault.assert_case_evidence(&delta, case)?;
 
-            let rows = row_count(&mut control, &target)?;
+            let rows = row_count(&mut control, &case_target)?;
             if rows != 0 {
                 bail!("{case} left {rows} committed rows; expected none");
             }
-            let snapshots = snapshot_count(&mut control, &target)?;
-            if snapshots != snapshots_before {
+            let snapshots = snapshot_count(&mut control, &case_target)?;
+            if snapshots != case_snapshots_before {
                 bail!(
-                    "{case} moved {target} from {snapshots_before} to {snapshots} snapshots; a \
+                    "{case} moved {case_target} from {case_snapshots_before} to {snapshots} snapshots; a \
                      failed write must publish none"
                 );
             }
@@ -3321,52 +3370,24 @@ fn assert_sealed_root_read_failure(
     fault: &WriteFault,
     outcome: &mysql::Result<()>,
     snapshot: Option<&QueryLifecycleStructuredSnapshot>,
-) -> Result<novarocks_execution_contract::TaskIdentity> {
-    let detail = match fault {
-        WriteFault::SealedBeforeRootData => "injected write Root read failure before first Data",
-        WriteFault::SealedAfterRootPrefix => {
-            "injected write Root read failure after accepted prefix"
-        }
+    selected: &SelectedStatement,
+) -> Result<()> {
+    let (detail, action) = match fault {
+        WriteFault::SealedBeforeRootData => (
+            "injected write Root read failure before first Data",
+            "connector-write-root-read-before-data-failure",
+        ),
+        WriteFault::SealedAfterRootPrefix => (
+            "injected write Root read failure after accepted prefix",
+            "connector-write-root-read-after-prefix-failure",
+        ),
         _ => bail!("object oracle requires its original Root read action"),
     };
-    let snapshot = snapshot.context("Root read action has no original statement snapshot")?;
-    let Some(QueryLifecycleFailureSite::RootRead { root }) = snapshot.failure_site.as_ref() else {
-        bail!("sealed object action lost its actual Root read site: {snapshot:?}");
-    };
-    let execution = root.query_execution_id();
-    anyhow::ensure!(
-        snapshot.attempt_id == 1
-            && snapshot.worker_contexts_converged
-            && snapshot.process_namespace
-                == u64::from_ne_bytes(execution.query_id().high().to_ne_bytes())
-            && snapshot.local_sequence == execution.query_id().low() as u64
-            && snapshot.execution_id.as_deref()
-                == Some(
-                    format!(
-                        "{}:{}:{}",
-                        execution.query_id().high(),
-                        execution.query_id().low(),
-                        execution.attempt_id().get()
-                    )
-                    .as_str()
-                )
-            && snapshot.failure_fact
-                == Some(FailureFact::new(
-                    FailureClass::Unexpected,
-                    FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(20).unwrap())
-                ))
-            && snapshot.failure_detail.as_deref() == Some(detail),
-        "original Root failure, identity or context exit changed: {snapshot:?}"
-    );
-    let processes = (0..context.handle().be_count())
-        .map(|index| context.handle().backend_process_id(index))
-        .collect::<Result<Vec<_>>>()?;
-    anyhow::ensure!(
-        processes.contains(&root.backend_process_id()),
-        "Root read belongs to another backend"
-    );
+    // The native convergence snapshot observes only the Task protocol's
+    // terminal, not the logical actor's independent Root read failure. Check
+    // that failure at its actual public boundary before inspecting the snapshot.
     let Err(mysql::Error::MySqlError(error)) = outcome else {
-        bail!("Root read action did not return its original SQL error");
+        bail!("Root read action did not return its original SQL error: {outcome:?}");
     };
     anyhow::ensure!(
         error.code == 1105
@@ -3377,7 +3398,52 @@ fn assert_sealed_root_read_failure(
             ),
         "Root read failure lost its exact public error/KnownUncommitted publication: {error:?}"
     );
-    Ok(*root)
+    let snapshot =
+        snapshot.context("Root read action has no original Native convergence snapshot")?;
+    let execution = novarocks_types::QueryExecutionId::new(
+        novarocks_types::QueryId::new(
+            i64::from_ne_bytes(snapshot.process_namespace.to_ne_bytes()),
+            i64::from_ne_bytes(snapshot.local_sequence.to_ne_bytes()),
+        ),
+        novarocks_types::AttemptId::new(snapshot.attempt_id)
+            .map_err(|_| anyhow!("original statement has an invalid attempt identity"))?,
+    )
+    .map_err(|_| anyhow!("original statement has an invalid execution identity"))?;
+    anyhow::ensure!(
+        snapshot.attempt_id == 1
+            && snapshot.worker_contexts_converged
+            && snapshot.execution_id.as_deref()
+                == Some(
+                    format!(
+                        "{}:{}:{}",
+                        execution.query_id().high(),
+                        execution.query_id().low(),
+                        execution.attempt_id().get()
+                    )
+                    .as_str()
+                ),
+        "Root read action changed its original execution or physical context exit: {snapshot:?}"
+    );
+    // Only the actual Root reader can hit either action. The existing owner
+    // validates its immutable binding against this statement's original grant,
+    // backend process and launch; do not invent a Task site from a read refusal.
+    let mut hits = 0;
+    for &(index, kind) in &selected.faults {
+        anyhow::ensure!(
+            kind == action,
+            "sealed Root read has a foreign finite action"
+        );
+        hits += usize::from(context.handle().selected_query_lifecycle_fault_hit(
+            index,
+            kind,
+            &selected.token,
+        )?);
+    }
+    anyhow::ensure!(
+        hits == 1,
+        "sealed Root read requires its one actual Root-role hit, got {hits}"
+    );
+    Ok(())
 }
 
 struct SealedRootObject {
@@ -3409,48 +3475,47 @@ fn sealed_object_digest(path: &Path) -> Result<(u64, [u8; 32])> {
     Ok((metadata.len(), Sha256::digest(bytes).into()))
 }
 
-fn capture_sealed_root_objects(
+fn owned_root_parquet_paths(
     context: &mut ScenarioContext,
     table_root: &Path,
-    execution: novarocks_types::QueryExecutionId,
-) -> Result<Vec<SealedRootObject>> {
+) -> Result<Vec<std::path::PathBuf>> {
+    // Hadoop publishes a canonical absolute location even when the runner's
+    // artifact root is relative or uses a filesystem alias.
+    let owned = table_root.canonicalize()?;
+    let table_root = owned.as_path();
     let version = hadoop_metadata_version(table_root)?;
     let metadata: TableMetadata = serde_json::from_slice(&std::fs::read(
         table_root
             .join("metadata")
             .join(format!("v{version}.metadata.json")),
     )?)?;
-    // Read the actual metadata's existing output location, as the Provider's
-    // iceberg_data_location author does. This creates no storage authority.
+    // Follow the actual table metadata, not a guessed SDK filename or a
+    // deletion-writer staging path. Each new target belongs to this one run.
     let data = metadata
         .properties()
         .get("write.data.path")
         .cloned()
         .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
     let data = Path::new(data.strip_prefix("file://").unwrap_or(&data));
-    let owned = table_root.canonicalize()?;
+    anyhow::ensure!(
+        data.is_absolute() && data.starts_with(table_root),
+        "object oracle refuses data outside its original local table"
+    );
+    // Fresh CREATE need not create a data directory before any append.
+    match std::fs::symlink_metadata(data) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "object oracle refuses a redirected data directory"
+        ),
+    }
     let data = data.canonicalize()?;
     anyhow::ensure!(
         data.starts_with(&owned),
-        "object oracle refuses data outside its original local table"
+        "object oracle refuses a redirected data root"
     );
-    // Exact physical writer author: compiled_writer_binding::uuid_bytes uses
-    // query high/low big-endian bytes; ICE staging uses their canonical UUID.
-    let hex = format!(
-        "{:016x}{:016x}",
-        execution.query_id().high() as u64,
-        execution.query_id().low() as u64
-    );
-    let query = format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    );
-    let staged = data.join("_staging").join(query);
-    let mut pending = vec![staged];
+    let mut pending = vec![data];
     let mut objects = Vec::new();
     while let Some(directory) = pending.pop() {
         context.remaining("observe the original sealed writer objects")?;
@@ -3467,20 +3532,29 @@ fn capture_sealed_root_objects(
             );
             if kind.is_dir() {
                 pending.push(entry.path());
-            } else {
-                anyhow::ensure!(
-                    entry.path().extension().is_some_and(|ext| ext == "parquet"),
-                    "unexpected object in original data-writer staging directory"
-                );
-                objects.push(SealedRootObject::observe(entry.path())?);
+            } else if entry.path().extension().is_some_and(|ext| ext == "parquet") {
+                anyhow::ensure!(kind.is_file(), "original data object is not a regular file");
+                objects.push(entry.path());
             }
         }
     }
+    objects.sort();
+    Ok(objects)
+}
+
+fn capture_sealed_root_objects(
+    context: &mut ScenarioContext,
+    table_root: &Path,
+) -> Result<Vec<SealedRootObject>> {
+    let paths = owned_root_parquet_paths(context, table_root)?;
     anyhow::ensure!(
-        !objects.is_empty(),
+        !paths.is_empty(),
         "real sealed writer collection has no surviving objects"
     );
-    objects.sort_by(|left, right| left.path.cmp(&right.path));
+    let objects = paths
+        .into_iter()
+        .map(SealedRootObject::observe)
+        .collect::<Result<Vec<_>>>()?;
     assert_sealed_root_row_bag(&objects)?;
     Ok(objects)
 }
@@ -3670,13 +3744,13 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
     let delayed = format!(
         "INSERT INTO {target} SELECT v FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_delay WHERE sleep(delay_s)"
     );
-    let statements = WriteStatements {
-        full: &full,
-        delayed: &delayed,
-    };
     WRITE_FAULTS
         .into_iter()
         .map(|fault| {
+            let case_full = if matches!(fault, WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix) {
+                format!("INSERT INTO distributed_writer_faults.distributed_writer_fault_db.{} SELECT v FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_source", fault.target_table())
+            } else { full.clone() };
+            let statements = WriteStatements { full: &case_full, delayed: &delayed };
             let kind = match fault {
                 WriteFault::WriterEgress => Some("connector-write-writer-failure"),
                 WriteFault::RootValidation => Some("connector-write-root-failure"),
