@@ -31,6 +31,7 @@ use axum::routing::{any, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -228,6 +229,7 @@ struct ArmedNextFault {
     arm_id: String,
     action: PublicationAction,
     fault: PublicationFault,
+    target: Option<ExactTableTarget>,
     release: Arc<tokio::sync::Notify>,
     released: Arc<AtomicBool>,
 }
@@ -240,10 +242,18 @@ struct ConsumedNextFault {
     released: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ExactTableTarget {
+    namespace: String,
+    table: String,
+}
+
 #[derive(Deserialize, Serialize)]
 struct ArmNextFaultRequest {
     action: PublicationAction,
     fault: PublicationFault,
+    #[serde(default)]
+    target: Option<ExactTableTarget>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -383,12 +393,42 @@ impl FixtureControl {
     }
 
     pub fn arm_next(&self, action: &str, fault: &str) -> Result<FixtureFaultGuard> {
+        self.arm_next_target(action, fault, None)
+    }
+
+    pub fn arm_next_for_table(
+        &self,
+        action: &str,
+        fault: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<FixtureFaultGuard> {
+        self.arm_next_target(
+            action,
+            fault,
+            Some(ExactTableTarget {
+                namespace: namespace.to_owned(),
+                table: table.to_owned(),
+            }),
+        )
+    }
+
+    fn arm_next_target(
+        &self,
+        action: &str,
+        fault: &str,
+        target: Option<ExactTableTarget>,
+    ) -> Result<FixtureFaultGuard> {
         let action = parse_action(action)?;
         let fault = parse_fault(fault)?;
         let response: ArmNextFaultResponse = self
             .client
             .post(format!("{}/_fixture/publication-faults/next", self.uri))
-            .json(&ArmNextFaultRequest { action, fault })
+            .json(&ArmNextFaultRequest {
+                action,
+                fault,
+                target,
+            })
             .send()
             .context("arm publication catalog next-action fault")?
             .error_for_status()
@@ -648,6 +688,20 @@ async fn arm_next_fault(
     State(state): State<AppState>,
     Json(request): Json<ArmNextFaultRequest>,
 ) -> Response {
+    if let Some(target) = &request.target
+        && (request.action != PublicationAction::TableLoad
+            || request.fault != PublicationFault::CorruptPackage
+            || target.namespace.is_empty()
+            || target.table.is_empty()
+            || target.namespace.contains('/')
+            || target.table.contains('/'))
+    {
+        return wire_error(
+            StatusCode::BAD_REQUEST,
+            "fixture-target",
+            "invalid exact table-load fault target",
+        );
+    }
     let arm_id = format!(
         "publication-fault-{}",
         state.next_fault_sequence.fetch_add(1, Ordering::Relaxed)
@@ -664,6 +718,7 @@ async fn arm_next_fault(
         arm_id: arm_id.clone(),
         action: request.action,
         fault: request.fault,
+        target: request.target,
         release: Arc::new(tokio::sync::Notify::new()),
         released: Arc::new(AtomicBool::new(false)),
     });
@@ -734,15 +789,25 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
             counts.table_load_while_commit_pending += 1;
         }
     }
-    let fault = action.and_then(|action| {
-        take_matching_fault(
+    let fault = match action {
+        Some(action) => match take_matching_fault(
             &state,
             action,
             &parts.method,
             parts.uri.path(),
             entered_unix_nanos,
-        )
-    });
+        ) {
+            Ok(fault) => fault,
+            Err(_) => {
+                return wire_error(
+                    StatusCode::BAD_REQUEST,
+                    "fixture-target",
+                    "invalid encoded REST table target",
+                );
+            }
+        },
+        None => None,
+    };
     if let Some(armed) = fault.as_ref()
         && armed.fault == PublicationFault::BeforeDispatch
     {
@@ -961,6 +1026,34 @@ fn exact_table_target(path: &str) -> Option<(&str, &str)> {
     Some((namespace, table))
 }
 
+/// Split the wire path first, then decode each component exactly once.
+fn decoded_exact_table_target(path: &str) -> Result<Option<(Cow<'_, str>, Cow<'_, str>)>> {
+    let Some((namespace, table)) = exact_table_target(path) else {
+        return Ok(None);
+    };
+    fn decode(component: &str) -> Result<Cow<'_, str>> {
+        // percent-encoding preserves malformed escapes literally. Refuse those
+        // before using its strict UTF-8 decoder; this loop performs no decoding.
+        let bytes = component.as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'%'
+                && !(bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                    && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit))
+            {
+                anyhow::bail!("invalid REST target percent escape");
+            }
+        }
+        let value = percent_encoding::percent_decode_str(component)
+            .decode_utf8()
+            .context("REST target is not UTF-8")?;
+        if value.contains('/') {
+            anyhow::bail!("encoded REST target separator is not a name component");
+        }
+        Ok(value)
+    }
+    Ok(Some((decode(namespace)?, decode(table)?)))
+}
+
 fn mutation_target(
     method: &Method,
     action: Option<PublicationAction>,
@@ -1032,11 +1125,23 @@ fn take_matching_fault(
     method: &Method,
     path: &str,
     entered_unix_nanos: Option<u64>,
-) -> Option<ArmedNextFault> {
+) -> Result<Option<ArmedNextFault>> {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
-    let armed = next.armed.as_ref()?;
+    let Some(armed) = next.armed.as_ref() else {
+        return Ok(None);
+    };
     if armed.action != action {
-        return None;
+        return Ok(None);
+    }
+    if let Some(target) = &armed.target {
+        let Some((namespace, table)) = decoded_exact_table_target(path)? else {
+            return Ok(None);
+        };
+        if namespace.as_ref() != target.namespace.as_str()
+            || table.as_ref() != target.table.as_str()
+        {
+            return Ok(None);
+        }
     }
     let matched_unix_nanos = observed_unix_nanos();
     // Consume the arm before the request is dispatched. In particular, a
@@ -1062,7 +1167,7 @@ fn take_matching_fault(
         entered_unix_nanos,
         matched_unix_nanos,
     });
-    Some(armed)
+    Ok(Some(armed))
 }
 
 fn record_fault_event(state: &AppState, armed: &ArmedNextFault, event: &str) {
@@ -1348,6 +1453,7 @@ mod tests {
                     arm_id: "one".to_string(),
                     action: PublicationAction::TableCommit,
                     fault: PublicationFault::AfterCommitBeforeResponse,
+                    target: None,
                     release: Arc::new(tokio::sync::Notify::new()),
                     released: Arc::new(AtomicBool::new(false)),
                 }),
@@ -1366,6 +1472,7 @@ mod tests {
                 "/v1/namespaces/ns/tables/t",
                 None
             )
+            .unwrap()
             .is_none()
         );
         let consumed = take_matching_fault(
@@ -1375,6 +1482,7 @@ mod tests {
             "/v1/namespaces/ns/tables/t",
             None,
         )
+        .unwrap()
         .expect("matching fault is consumed");
         assert_eq!(consumed.arm_id, "one");
         assert_eq!(consumed.fault, PublicationFault::AfterCommitBeforeResponse);
@@ -1386,12 +1494,241 @@ mod tests {
                 "/v1/namespaces/ns/tables/t",
                 None
             )
+            .unwrap()
             .is_none()
         );
         let trace = &state.next_fault.lock().unwrap().trace;
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].sequence, 1);
         assert_eq!(trace[0].event, "matched");
+    }
+
+    #[test]
+    fn exact_path_components_decode_once_and_reject_invalid_encoding_or_separators() {
+        let target = decoded_exact_table_target("/v1/namespaces/owned%20ns/tables/a%20b")
+            .unwrap()
+            .unwrap();
+        assert_eq!((target.0.as_ref(), target.1.as_ref()), ("owned ns", "a b"));
+        let percent = decoded_exact_table_target("/v1/namespaces/ns/tables/a%2520b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(percent.1, "a%20b");
+        let plus = decoded_exact_table_target("/v1/namespaces/ns/tables/a+b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plus.1, "a+b");
+        for path in [
+            "/v1/namespaces/ns/tables/a%",
+            "/v1/namespaces/ns/tables/a%2",
+            "/v1/namespaces/ns/tables/a%GG",
+            "/v1/namespaces/ns/tables/a%FF",
+            "/v1/namespaces/ns/tables/a%2Fb",
+            "/v1/namespaces/ns%2Fforeign/tables/a",
+        ] {
+            assert!(
+                decoded_exact_table_target(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_proxy_distinguishes_space_from_literal_percent_and_keeps_arm_after_bad_wire_names()
+    {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let downstream = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                consume_downstream_request(&mut socket);
+                let body = r#"{"metadata":"original"}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let base = format!("{}/v1/namespaces/owned_ns/tables", fixture.uri());
+        let space = control
+            .arm_next_for_table("table-load", "corrupt-package", "owned_ns", "a b")
+            .unwrap();
+        assert_eq!(
+            client
+                .get(format!("{base}/a%2520b"))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            r#"{"metadata":"original"}"#
+        );
+        assert!(
+            !space
+                .trace()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "matched")
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/a%20b"))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "{corrupt-package"
+        );
+        assert_eq!(
+            space.finish().unwrap().summary(),
+            "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> package-response-corrupted -> control-release"
+        );
+        let percent = control
+            .arm_next_for_table("table-load", "corrupt-package", "owned_ns", "a%20b")
+            .unwrap();
+        for malformed in ["a%", "a%GG", "a%FF", "a%2Fb"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}/{malformed}"))
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert!(
+                !percent
+                    .trace()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["event"] == "matched")
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/a%20b"))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            r#"{"metadata":"original"}"#
+        );
+        assert!(
+            !percent
+                .trace()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "matched")
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/a%2520b"))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "{corrupt-package"
+        );
+        assert_eq!(
+            percent.finish().unwrap().summary(),
+            "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> package-response-corrupted -> control-release"
+        );
+        assert_eq!(control.traffic_snapshot().requests, 4);
+        fixture.shutdown().unwrap();
+        downstream.join().unwrap();
+    }
+
+    #[test]
+    fn targeted_read_fault_forwards_other_tables_and_namespaces_without_consuming_arm() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let downstream = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                consume_downstream_request(&mut socket);
+                let body = r#"{"metadata":"original"}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let guard = control
+            .arm_next_for_table("table-load", "corrupt-package", "owned_ns", "a_mv")
+            .unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for path in [
+            "/v1/namespaces/owned_ns/tables/z_source",
+            "/v1/namespaces/foreign_ns/tables/a_mv",
+        ] {
+            let response = client
+                .get(format!("{}{path}", fixture.uri()))
+                .send()
+                .unwrap();
+            assert_eq!(response.text().unwrap(), r#"{"metadata":"original"}"#);
+            let trace = guard.trace();
+            assert!(
+                !trace
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["event"] == "matched")
+            );
+        }
+        let exact = format!("{}/v1/namespaces/owned_ns/tables/a_mv", fixture.uri());
+        assert_eq!(
+            client.get(&exact).send().unwrap().text().unwrap(),
+            "{corrupt-package"
+        );
+        assert_eq!(
+            client.get(&exact).send().unwrap().text().unwrap(),
+            r#"{"metadata":"original"}"#
+        );
+        let evidence = guard.finish().unwrap();
+        assert_eq!(
+            evidence.summary(),
+            "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> package-response-corrupted -> control-release"
+        );
+        let trace = evidence.trace();
+        let matched = trace
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "matched")
+            .collect::<Vec<_>>();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["request"]["namespace"], "owned_ns");
+        assert_eq!(matched[0]["request"]["table"], "a_mv");
+        assert_eq!(control.traffic_snapshot().requests, 4);
+        fixture.shutdown().unwrap();
+        downstream.join().unwrap();
     }
 
     #[test]

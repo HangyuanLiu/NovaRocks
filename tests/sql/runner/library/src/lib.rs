@@ -3029,7 +3029,24 @@ fn run_case_observed(
         let mut publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
             Some(directive) => match ctx.publication_catalog_control.as_ref() {
                 Some(control) => {
-                    match control.arm_next(directive.action.as_str(), directive.fault.as_str()) {
+                    match step
+                        .meta
+                        .publication_catalog_fault_target
+                        .as_ref()
+                        .map_or_else(
+                            || {
+                                control
+                                    .arm_next(directive.action.as_str(), directive.fault.as_str())
+                            },
+                            |target| {
+                                control.arm_next_for_table(
+                                    directive.action.as_str(),
+                                    directive.fault.as_str(),
+                                    &target.namespace,
+                                    &target.table,
+                                )
+                            },
+                        ) {
                         Ok(guard) => {
                             let _ = writeln!(
                                 log,
@@ -5350,10 +5367,22 @@ fn validate_publication_catalog_directives(
     for case in cases {
         for step in &case.steps {
             if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_catalog_fault_target.is_none()
                 && step.meta.publication_service_hold.is_none()
                 && step.meta.publication_catalog_concurrent_shell.is_none()
             {
                 continue;
+            }
+            if step.meta.publication_catalog_fault_target.is_some()
+                && !matches!(
+                    step.meta.publication_catalog_fault,
+                    Some(PublicationCatalogFaultDirective {
+                        action: PublicationCatalogAction::TableLoad,
+                        fault: PublicationCatalogFault::CorruptPackage,
+                    })
+                )
+            {
+                bail!("publication_catalog_fault_target requires table-load,corrupt-package");
             }
             if !publication_catalog_fixture_suite(suite_name) {
                 bail!(
@@ -7082,9 +7111,10 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
-        ConnectionConfig, QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
-        RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep,
-        SuiteHook,
+        ConnectionConfig, PublicationCatalogAction, PublicationCatalogFault,
+        PublicationCatalogFaultDirective, PublicationCatalogFaultTarget, QueryExecution,
+        QueryLifecycleStructuredAssertion, QueryMeta, ResultSet, RuntimeFilterDetailExpectation,
+        SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep, SuiteHook,
     };
     use crate::{
         AlterJobPollState, CaseStatus, Cli, Mode, RecordFrom,
@@ -7095,7 +7125,8 @@ mod tests {
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
         validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
-        validate_selected_suite_cluster, verify_runtime_filter_structured_assertion,
+        validate_publication_catalog_directives, validate_selected_suite_cluster,
+        verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
     use regex::Regex;
@@ -7226,6 +7257,66 @@ mod tests {
             case_dbs: vec![],
             sequential: false,
         }
+    }
+
+    #[test]
+    fn exact_publication_target_requires_the_original_table_load_fault() {
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault_target: Some(PublicationCatalogFaultTarget {
+                namespace: "owned_ns".into(),
+                table: "a_mv".into(),
+            }),
+            ..QueryMeta::default()
+        });
+        case.sequential = true;
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_err()
+        );
+        case.steps[0].meta.publication_catalog_fault = Some(PublicationCatalogFaultDirective {
+            action: PublicationCatalogAction::TableCommit,
+            fault: PublicationCatalogFault::AfterCommitBeforeResponse,
+        });
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_err()
+        );
+        case.steps[0].meta.publication_catalog_fault = Some(PublicationCatalogFaultDirective {
+            action: PublicationCatalogAction::TableLoad,
+            fault: PublicationCatalogFault::CorruptPackage,
+        });
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                false,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -3714,6 +3714,7 @@ dependencies = [
  "novarocks-task-codec",
  "novarocks-test-support",
  "novarocks-types",
+ "percent-encoding",
  "prost 0.13.5",
  "rcgen",
  "reqwest",
