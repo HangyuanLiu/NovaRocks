@@ -417,7 +417,16 @@ impl Scenario for CatalogListingCancellation {
         true
     }
     fn launch_config(&self, root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        CatalogListing.launch_config(root)
+        let mut config = CatalogListing.launch_config(root)?;
+        // One synchronous SQL worker serializes SHOW VIEWS before the eight
+        // actors can reach the catalog generation's listing admission.
+        config
+            .config_overlay
+            .fe
+            .as_mut()
+            .context("listing cancellation requires the FE fixture overlay")?
+            .push_str("\n[runtime]\nquery_blocking_worker_threads = 8\n");
+        Ok(config)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
