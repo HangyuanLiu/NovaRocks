@@ -1090,6 +1090,10 @@ Use the generic skills-only plugin under `.agents/skills/workbench/`:
 - `dev-workflow-write-spec`: write the accepted design into project docs;
 - `dev-workflow-plan`: write and iterate the plan directly in project docs,
   then mark the persisted version approved after explicit user approval;
+- `dev-workflow-review-spec-plan`: read-only, open-ended review of a spec,
+  umbrella or plan's direction against mature industry practice and long-term
+  architecture, performance, availability and extensibility; it requires a
+  stated basis for every new hard limit and allows no new vendor patches;
 - `dev-workflow-execute`: create a goal and execute continuously through
   verification;
 - `dev-workflow-finish`: publish and archive only when authorized;
