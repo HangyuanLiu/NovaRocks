@@ -2459,6 +2459,13 @@ trait RetainedAttemptInputs: std::fmt::Debug + Send + 'static {
         schedule: &AttemptSchedule,
     ) -> Result<(), NativeAttemptActivationFailure>;
 
+    #[cfg(novarocks_dev_controls)]
+    fn publish_fault_task_selection(
+        manifest: &Self::Manifest,
+        controls: &novarocks_native_adapter::test_controls::NativeTestControls,
+        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
+    ) -> Result<(), NativeAttemptActivationFailure>;
+
     fn bind_manifest(
         self,
         schedule: &AttemptSchedule,
@@ -2467,6 +2474,34 @@ trait RetainedAttemptInputs: std::fmt::Debug + Send + 'static {
 
 impl RetainedAttemptInputs for SnapshotBoundDormantAttemptInputs {
     type Manifest = ManifestBoundNativeAttemptInputs;
+
+    #[cfg(novarocks_dev_controls)]
+    fn publish_fault_task_selection(
+        inputs: &Self::Manifest,
+        controls: &novarocks_native_adapter::test_controls::NativeTestControls,
+        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
+    ) -> Result<(), NativeAttemptActivationFailure> {
+        let publish = || -> Result<(), String> {
+            if controls.needs_remote_writer_selection(nomination)? {
+                let manifest = inputs.manifest();
+                let task = manifest.remote_writer_sender().ok_or(
+                    "selected original manifest has no remote writer sender into its Root",
+                )?;
+                controls.publish_nominated_writer_task(
+                    nomination,
+                    task,
+                    manifest.root().backend_process_id(),
+                )?;
+            }
+            Ok(())
+        };
+        publish().map_err(|detail| {
+            NativeAttemptActivationFailure::new(attempt_runtime_failure(
+                QueryFailureReason::PreparationProtocol,
+                detail,
+            ))
+        })
+    }
 
     fn validate_bound_schedule(
         manifest: &Self::Manifest,
@@ -2601,6 +2636,14 @@ where
             .take()
             .expect("Query Application activates a dormant Native attempt only once");
         self.manifest_inputs = Some(inputs.bind_manifest(schedule)?);
+        #[cfg(novarocks_dev_controls)]
+        if let Some((controls, nomination)) = &self.test_placement {
+            I::publish_fault_task_selection(
+                self.manifest_inputs.as_ref().unwrap(),
+                controls,
+                nomination,
+            )?;
+        }
         Ok(())
     }
 
@@ -3642,6 +3685,15 @@ mod tests {
 
     impl RetainedAttemptInputs for CapturedInputs {
         type Manifest = TestManifest;
+
+        #[cfg(novarocks_dev_controls)]
+        fn publish_fault_task_selection(
+            _: &Self::Manifest,
+            _: &novarocks_native_adapter::test_controls::NativeTestControls,
+            _: &novarocks_failpoint::target_binding::StatementWorkNomination,
+        ) -> Result<(), NativeAttemptActivationFailure> {
+            panic!("eligibility-only fixture cannot publish writer Task selection")
+        }
 
         fn validate_bound_schedule(
             _manifest: &Self::Manifest,

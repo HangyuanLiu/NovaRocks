@@ -2,6 +2,8 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [l.id, l.score, payload] stats={rows=5}
   1:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
@@ -11,6 +13,8 @@ PLAN FRAGMENT 0
       5:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 4
@@ -22,6 +26,8 @@ PLAN FRAGMENT 1
        min-max stats
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5

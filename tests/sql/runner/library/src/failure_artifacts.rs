@@ -82,6 +82,26 @@ pub(crate) struct StagedRunFailure {
     captured: CapturedFailureLogs,
 }
 
+/// Recovery material defaults to retention, including unwinding or controller
+/// exit. Possessing these bytes proves neither writer exit nor cleanup rights.
+pub(crate) struct OriginalFixtureRunArtifact {
+    artifact: PendingArtifactDir,
+}
+impl OriginalFixtureRunArtifact {
+    pub(crate) fn path(&self) -> &Path {
+        &self.artifact.path
+    }
+
+    /// Release only this private leaf after the original run cleanup succeeds.
+    /// Reuse the artifact owner's existing best-effort local disposal policy.
+    pub(crate) fn release_after_cleanup(mut self) -> bool {
+        let path = self.artifact.path.clone();
+        self.artifact.committed = false;
+        drop(self);
+        path.try_exists().is_ok_and(|present| !present)
+    }
+}
+
 impl FailureArtifactRecorder {
     pub(crate) fn new(context: FailureArtifactContext) -> Self {
         let timestamp = SystemTime::now()
@@ -102,6 +122,40 @@ impl FailureArtifactRecorder {
             provenance: Mutex::new(provenance),
             case_artifact_root: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn persist_original_fixture_run(
+        &self,
+        context: &str,
+        storage: &str,
+        env_file: &Path,
+        owns_fixture_run: bool,
+    ) -> Result<OriginalFixtureRunArtifact> {
+        let attempt = self
+            .provenance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get("attempt")
+            .cloned()
+            .context("original SQL attempt provenance absent")?;
+        let mut artifact = PendingArtifactDir::create(&self.context.root, "original-fixture-run")?;
+        artifact.write_file("context.json", context)?;
+        artifact.write_file("storage.json", storage)?;
+        artifact.write_file(
+            "origin.json",
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "attempt": attempt, "env_file": env_file, "owns_fixture_run": owns_fixture_run,
+                "authority_note": "original bytes do not prove writer exit or grant cleanup rights"
+            }))?,
+        )?;
+        // A completed write must survive later ordinary errors and unwinding.
+        // Case-diagnostic provenance is not frozen early by this separate leaf.
+        artifact.committed = true;
+        self.record_provenance(
+            "original-fixture-run-material".into(),
+            serde_json::json!({"directory": artifact.path, "owns_fixture_run": owns_fixture_run}),
+        );
+        Ok(OriginalFixtureRunArtifact { artifact })
     }
 
     pub(crate) fn persist_terminal_outcome(
@@ -763,6 +817,121 @@ mod tests {
             lane: "Correctness Lane".to_string(),
             suites: vec!["analytic".to_string()],
         }
+    }
+
+    fn original_fixture_material() -> (String, String) {
+        use novarocks_cluster_harness::fixture_run::{
+            FixturePolicy, RunBudget, RunStorageScope, ScratchIdentity,
+        };
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let identity: ScratchIdentity =
+            serde_json::from_value(vectors["identity"].clone()).unwrap();
+        let budget = RunBudget::admit_at(
+            FixturePolicy::default(),
+            identity,
+            600,
+            None,
+            1_800_000_000_000,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let storage = RunStorageScope::from_record(budget.identity(), &vectors["record"]).unwrap();
+        (budget.to_json().unwrap(), storage.to_json().unwrap())
+    }
+
+    #[test]
+    fn original_run_bytes_survive_controller_unwind_in_private_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let recorder = FailureArtifactRecorder::new(context(temp.path()));
+        let (original_context, original_storage) = original_fixture_material();
+        let saved = recorder
+            .persist_original_fixture_run(
+                &original_context,
+                &original_storage,
+                Path::new("/original/publication/env.sh"),
+                false,
+            )
+            .unwrap();
+        let path = saved.path().to_path_buf();
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _original = saved;
+            panic!("controller stopped after the original material was saved")
+        }));
+        assert!(stopped.is_err());
+        assert_eq!(
+            fs::read_to_string(path.join("context.json")).unwrap(),
+            original_context
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("storage.json")).unwrap(),
+            original_storage
+        );
+        let origin: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("origin.json")).unwrap()).unwrap();
+        assert_eq!(origin["owns_fixture_run"], false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for name in ["context.json", "storage.json", "origin.json"] {
+                assert_eq!(
+                    fs::metadata(path.join(name)).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        let provenance = recorder.provenance_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&provenance).unwrap();
+        assert_eq!(origin["attempt"], value["attempt"]);
+        assert_eq!(
+            value["original-fixture-run-material"],
+            serde_json::json!({"directory": path, "owns_fixture_run": false})
+        );
+        assert!(!provenance.contains("deadline_unix_ms"));
+        assert!(!provenance.contains("storage_owner"));
+    }
+
+    #[test]
+    fn successful_original_cleanup_releases_only_its_material_leaf() {
+        let temp = TempDir::new().unwrap();
+        let recorder = FailureArtifactRecorder::new(context(temp.path()));
+        let (original_context, original_storage) = original_fixture_material();
+        let kept = recorder
+            .persist_original_fixture_run(
+                &original_context,
+                &original_storage,
+                Path::new("/original/publication/env.sh"),
+                true,
+            )
+            .unwrap();
+        let kept_path = kept.path().to_path_buf();
+        drop(kept);
+        assert_eq!(
+            fs::read_to_string(kept_path.join("context.json")).unwrap(),
+            original_context
+        );
+        let retired = recorder
+            .persist_original_fixture_run(
+                &original_context,
+                &original_storage,
+                Path::new("/original/publication/env.sh"),
+                true,
+            )
+            .unwrap();
+        let retired_path = retired.path().to_path_buf();
+        assert!(retired.release_after_cleanup());
+        assert!(!retired_path.exists());
+        assert_eq!(
+            fs::read_to_string(kept_path.join("storage.json")).unwrap(),
+            original_storage
+        );
+        assert!(temp.path().is_dir());
     }
 
     #[test]

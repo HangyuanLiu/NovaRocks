@@ -2466,10 +2466,6 @@ enum WriteFault {
     DeadlineAbort,
 }
 
-/// The backend the severed-stream case arms. Fixed so the scenario can name
-/// the process its evidence must come from; a backend index, never a count.
-const SEVERED_BACKEND: usize = 2;
-
 /// The task protocol's evidence that one task really failed on the backend the
 /// fault was armed on.
 ///
@@ -2513,10 +2509,6 @@ impl WriteFault {
                         )?))
                 })
             }
-            InjectionEvidence::Backend(index, marker) => context
-                .handle()
-                .be_log_count(index, marker)
-                .with_context(|| format!("count {marker} on BE[{index}]")),
             InjectionEvidence::EveryBackend(marker) => backend_marker_total(context, marker),
             InjectionEvidence::AppendHolds => Ok(all_write_counters(context)?
                 .iter()
@@ -2535,7 +2527,9 @@ impl WriteFault {
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize => InjectionEvidence::NativeFault,
             Self::SeveredWriterStream => {
-                InjectionEvidence::Backend(SEVERED_BACKEND, TASK_EXECUTION_FAILURE_INJECTED)
+                // The exact held Task is checked before reentry below; its
+                // backend is selected from the original frozen writer graph.
+                InjectionEvidence::EveryBackend(TASK_EXECUTION_FAILURE_INJECTED)
             }
             // Summed across the cluster rather than pinned to one backend: an
             // abort reaches the backends the scheduler placed this attempt on,
@@ -2673,8 +2667,6 @@ impl WriteFault {
 enum InjectionEvidence {
     /// Actual owner hit for this selected SQL, separately from nomination.
     NativeFault,
-    /// On the one backend the fault was armed on.
-    Backend(usize, &'static str),
     /// Anywhere across the backends, summed, because which backends the
     /// marker reaches is a property of the plan rather than of the cluster.
     EveryBackend(&'static str),
@@ -2737,9 +2729,13 @@ impl Scenario for DistributedWriterFaults {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        Ok(Some(self.intent.freeze(
+        let selected = WRITE_FAULTS
+            .iter()
+            .position(|fault| matches!(fault, WriteFault::SeveredWriterStream))
+            .context("writer fault matrix has no remote sender case")?;
+        Ok(Some(self.intent.freeze_remote_writer_sender(
             writer_fault_specs(cluster_size),
-            &[],
+            selected,
             cluster_size,
             binary,
             deadline,
@@ -2924,6 +2920,7 @@ struct SeveredWriterRendezvous<'a> {
     listener: Option<crate::scenarios::native_create_hold::HoldListener>,
     held: Vec<crate::scenarios::native_create_hold::HeldCreate>,
     token: String,
+    hold_backends: Vec<usize>,
     closed: bool,
 }
 impl SeveredWriterRendezvous<'_> {
@@ -2937,24 +2934,28 @@ impl SeveredWriterRendezvous<'_> {
         }
         // End only the hold, keeping this query's task failure active. A
         // replay or late connection cannot park after the observed releases.
-        let ended = match self
-            .context
-            .handle()
-            .armed_query_lifecycle_fault_token(SEVERED_BACKEND, "create-task-before-worker-hold")
-        {
-            Ok(Some(token)) if token == self.token => {
-                self.context.handle().end_selected_query_lifecycle_fault(
-                    SEVERED_BACKEND,
-                    "create-task-before-worker-hold",
-                    &self.token,
-                )
-            }
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(anyhow::anyhow!(
-                "severed writer cleanup encountered a foreign hold token"
-            )),
-            Err(error) => Err(error),
-        };
+        let mut ended = Ok(());
+        for &backend in &self.hold_backends {
+            let result = match self
+                .context
+                .handle()
+                .armed_query_lifecycle_fault_token(backend, "create-task-before-worker-hold")
+            {
+                Ok(Some(token)) if token == self.token => {
+                    self.context.handle().end_selected_query_lifecycle_fault(
+                        backend,
+                        "create-task-before-worker-hold",
+                        &self.token,
+                    )
+                }
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err(anyhow::anyhow!(
+                    "severed writer cleanup encountered a foreign hold token"
+                )),
+                Err(error) => Err(error),
+            };
+            ended = writer_statement_actor::combine(ended, result);
+        }
         self.closed = ended.is_ok();
         drop(self.listener.take());
         writer_statement_actor::combine(released, ended)
@@ -3046,6 +3047,13 @@ fn run_faulted_write(
                 listener: Some(listener),
                 held: Vec::new(),
                 token: selected.token.clone(),
+                hold_backends: selected
+                    .faults
+                    .iter()
+                    .filter_map(|&(backend, kind)| {
+                        (kind == "create-task-before-worker-hold").then_some(backend)
+                    })
+                    .collect(),
                 closed: false,
             };
             let primary = (|| {
@@ -3057,18 +3065,19 @@ fn run_faulted_write(
                         .try_receive(&selected.token, gate.context.deadline())?
                     {
                         anyhow::ensure!(
-                            create.backend == SEVERED_BACKEND
-                                && create.outbound_edges > 0
+                            create.outbound_edges > 0
                                 && create.process
                                     == gate
                                         .context
                                         .handle()
-                                        .backend_process_id(SEVERED_BACKEND)?
+                                        .backend_process_id(create.backend)?
                                         .to_string()
                                 && create.execution.ends_with(":1")
                                 && gate.held.iter().all(|old| old.execution == create.execution
                                     && old.stage == create.stage
-                                    && old.task == create.task),
+                                    && old.task == create.task
+                                    && old.backend == create.backend
+                                    && old.process == create.process),
                             "severed writer hold is not its exact original remote sender: {}",
                             create.payload
                         );
@@ -3076,11 +3085,13 @@ fn run_faulted_write(
                     }
                     let current = all_write_counters(gate.context)?;
                     let delta = write_delta(&baseline, &current);
-                    let healthy = delta
-                        .writing_backends
-                        .iter()
-                        .filter(|index| **index != SEVERED_BACKEND)
-                        .count();
+                    let healthy = gate.held.first().map_or(0, |sender| {
+                        delta
+                            .writing_backends
+                            .iter()
+                            .filter(|index| **index != sender.backend)
+                            .count()
+                    });
                     if !gate.held.is_empty() && healthy >= required_healthy {
                         gate.context.action(format!("{healthy} healthy writer backends opened before releasing original sender {}", gate.held[0].identity_marker()));
                         break;
@@ -3103,10 +3114,33 @@ fn run_faulted_write(
                     );
                 }
                 gate.close()?;
-                write
+                let result = write
                     .done
                     .recv_timeout(gate.context.remaining("await the severed writer result")?)
-                    .context("severed writer session did not finish")
+                    .context("severed writer session did not finish")?;
+                let sender = gate
+                    .held
+                    .first()
+                    .context("original remote sender was not held")?;
+                let exact = format!(
+                    "{TASK_EXECUTION_FAILURE_INJECTED} {} backend_index={} token={}",
+                    sender.identity_marker(),
+                    sender.backend,
+                    selected.token
+                );
+                anyhow::ensure!(
+                    gate.context.handle().be_log_count(sender.backend, &exact)? == 1,
+                    "selected remote writer Task did not supply its exact once failure: {exact}"
+                );
+                let execution = format!(
+                    "{TASK_EXECUTION_FAILURE_INJECTED} execution_id={} ",
+                    sender.execution
+                );
+                anyhow::ensure!(
+                    backend_marker_total(gate.context, &execution)? == 1,
+                    "another Task of the same original execution also received the selected failure"
+                );
+                Ok(result)
             })();
             let cleanup = gate.close();
             drop(gate);
@@ -3392,10 +3426,11 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
                 faults: kind
                     .map(|kind| {
                         if matches!(fault, WriteFault::SeveredWriterStream) {
-                            vec![
-                                (SEVERED_BACKEND, kind),
-                                (SEVERED_BACKEND, "create-task-before-worker-hold"),
-                            ]
+                            (0..cluster_size)
+                                .flat_map(|index| {
+                                    [(index, kind), (index, "create-task-before-worker-hold")]
+                                })
+                                .collect()
                         } else {
                             (0..cluster_size).map(|index| (index, kind)).collect()
                         }
@@ -3601,7 +3636,7 @@ mod controlled_writer_tests {
         }));
         assert_eq!(
             specs.iter().map(|spec| spec.faults.len()).sum::<usize>(),
-            23
+            27
         );
         assert_eq!(
             specs
@@ -3612,17 +3647,19 @@ mod controlled_writer_tests {
         );
         assert_eq!(
             specs[6].faults,
-            vec![
-                (SEVERED_BACKEND, TASK_EXECUTION_FAILURE),
-                (SEVERED_BACKEND, "create-task-before-worker-hold")
-            ]
+            (0..3)
+                .flat_map(|index| [
+                    (index, TASK_EXECUTION_FAILURE),
+                    (index, "create-task-before-worker-hold"),
+                ])
+                .collect::<Vec<_>>()
         );
         assert!(specs[7].faults.is_empty());
         assert!(specs[7].sql.ends_with("WHERE sleep(delay_s)"));
         assert!(specs.iter().flat_map(|spec| &spec.faults).all(|(_, kind)| {
             novarocks_failpoint::QueryLifecycleFaultKind::parse(kind).is_some()
         }));
-        // This is 27 FE grants: the statement owner plus 23 binds and three
+        // This is 31 FE grants: the statement owner plus 27 binds and three
         // Task observations. Seed/setup and the healthy post-matrix write
         // deliberately receive no permission.
         assert_eq!(
@@ -3630,7 +3667,7 @@ mod controlled_writer_tests {
                 .iter()
                 .map(|spec| spec.faults.len() + spec.observations.len())
                 .sum::<usize>(),
-            27
+            31
         );
     }
 }

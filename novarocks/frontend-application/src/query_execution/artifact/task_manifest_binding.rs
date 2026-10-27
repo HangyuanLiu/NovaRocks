@@ -883,6 +883,11 @@ impl TaskManifestBinding {
         })
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn remote_writer_sender(&self) -> Option<TaskIdentity> {
+        select_remote_writer_sender(self.writer_cohorts(), self.root, &self.edges)
+    }
+
     pub(crate) fn contexts(&self) -> &[BoundManifestContext] {
         &self.contexts
     }
@@ -894,6 +899,26 @@ impl TaskManifestBinding {
     pub(crate) const fn root(&self) -> TaskIdentity {
         self.root
     }
+}
+
+#[cfg(novarocks_dev_controls)]
+fn select_remote_writer_sender(
+    writers: impl Iterator<Item = BoundWriterCohort>,
+    root: TaskIdentity,
+    edges: &[BoundManifestEdge],
+) -> Option<TaskIdentity> {
+    // A fixture selects one existing original; this is no writer-count policy.
+    writers
+        .map(|writer| writer.task())
+        .filter(|task| {
+            *task != root
+                && task.backend_process_id() != root.backend_process_id()
+                && edges.iter().any(|edge| {
+                    edge.producers().iter().any(|source| source.task() == *task)
+                        && edge.destinations().contains(&root)
+                })
+        })
+        .min()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2830,6 +2855,85 @@ mod tests {
         }
 
         super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>()
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn selected_remote_writer_follows_original_edges_when_root_backend_changes() {
+        let writers = original_writer_occurrences();
+        assert_eq!(writers.len(), 2);
+        let execution = writers[0].task().query_execution_id();
+        for root_backend in [
+            writers[0].task().backend_process_id(),
+            writers[1].task().backend_process_id(),
+        ] {
+            let root = TaskIdentity::new(
+                execution,
+                StageId::new(77).unwrap(),
+                novarocks_types::TaskId::new(91).unwrap(),
+                root_backend,
+            );
+            let edges = writers
+                .iter()
+                .enumerate()
+                .map(|(i, writer)| super::BoundManifestEdge {
+                    edge_id: ExchangeEdgeId::new(i as u32 + 1).unwrap(),
+                    source_fragment_id: writer.fragment(),
+                    target_fragment_id: 77,
+                    target_exchange_node_id: 0,
+                    partition_kind: BoundManifestPartitionKind::Unpartitioned,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    producers: vec![super::BoundManifestProducer {
+                        task: writer.task(),
+                        sender_ordinal: 0,
+                    }]
+                    .into_boxed_slice(),
+                    destinations: vec![root].into_boxed_slice(),
+                    sender_count: NonZeroU32::new(1).unwrap(),
+                })
+                .collect::<Vec<_>>();
+            let expected = writers
+                .iter()
+                .find(|writer| writer.task().backend_process_id() != root_backend)
+                .unwrap()
+                .task();
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied(), root, &edges),
+                Some(expected)
+            );
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied().rev(), root, &edges),
+                Some(expected),
+                "selection is deterministic, independent of writer iteration"
+            );
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied(), root, &[]),
+                None,
+                "writer membership alone proves no remote edge"
+            );
+            assert_eq!(
+                super::select_remote_writer_sender(
+                    writers
+                        .iter()
+                        .copied()
+                        .filter(|writer| writer.task().backend_process_id() == root_backend),
+                    root,
+                    &edges
+                ),
+                None,
+                "a same-backend writer is not a remote sender"
+            );
+            let mut disconnected = edges;
+            for edge in &mut disconnected {
+                edge.destinations = vec![expected].into_boxed_slice();
+            }
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied(), root, &disconnected),
+                None,
+                "an edge to another Task cannot stand in for the Root input"
+            );
+        }
     }
 
     #[test]

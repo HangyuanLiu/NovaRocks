@@ -5734,6 +5734,22 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let fixture_budget =
         fixture_context::admit(&runner_config, &base_dir, cli.fixture_budget_secs)?;
     let fixture_storage = fixture_context::storage_scope(&runner_config, &fixture_budget)?;
+    let mut original_fixture_material = match (&original_fixture_env, &fixture_storage) {
+        (Some(env_file), Some(storage)) => {
+            let material = failure_artifacts.persist_original_fixture_run(
+                &fixture_budget.to_json()?,
+                &storage.to_json()?,
+                env_file,
+                owns_fixture_run,
+            )?;
+            eprintln!(
+                "Original fixture run recovery material: {}",
+                material.path().display()
+            );
+            Some(material)
+        }
+        _ => None,
+    };
     let naming_sources =
         fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
     let mut fixture_names = fixture_context::RunNames::prepare(&fixture_budget, &naming_sources)?;
@@ -6823,8 +6839,24 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 && fixture_failures.is_empty()
             {
                 match fixture_context::cleanup_run(&base_dir, env_file, &fixture_budget, storage) {
-                    Ok(report) => failure_artifacts
-                        .record_provenance("fixture-scratch-cleanup".into(), report),
+                    Ok(report) => {
+                        failure_artifacts
+                            .record_provenance("fixture-scratch-cleanup".into(), report);
+                        if let Some(material) = original_fixture_material.take() {
+                            let path = material.path().to_path_buf();
+                            let removed = material.release_after_cleanup();
+                            failure_artifacts.record_provenance(
+                                "original-fixture-run-material-retirement".into(),
+                                serde_json::json!({"directory": path, "removed": removed}),
+                            );
+                            if !removed {
+                                eprintln!(
+                                    "Original run cleanup succeeded; private recovery material remains at {}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
                     Err(error) => fixture_failures.push(format!("run scratch cleanup: {error:#}")),
                 }
             } else if server_recorded.load(Ordering::Acquire) {
