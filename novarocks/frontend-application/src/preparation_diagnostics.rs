@@ -1199,12 +1199,17 @@ mod session_owner_tests {
             .arm(ObserverFixture::arm("cohorts", 7, "CALL rewrite()"))
             .unwrap();
         let mut statement = fixture.service.begin_statement(session.token()).unwrap();
+        let statement_token = statement.token();
+        assert!(fixture.owner.bound_statement(statement_token).is_none());
         let handle = fixture
             .owner
             .bind_statement(statement.token(), "CALL rewrite()")
             .unwrap()
             .unwrap();
         let nomination = handle.nomination().unwrap();
+        // The command consumer only borrows the already bound original handle.
+        let command_handle = fixture.owner.bound_statement(statement_token).unwrap();
+        assert_eq!(command_handle.nomination(), Some(nomination.clone()));
         // Explicitly submitted background work may bind after SQL returns.
         // Only the finite observation owner and exact journal grant evidence.
         statement.finish();
@@ -1212,7 +1217,7 @@ mod session_owner_tests {
         let other_cohort = execution(42, 1);
         let replacement = execution(41, 2);
         assert!(handle.nomination_for_exact_execution(first).is_none());
-        handle.bind_attempt(first);
+        command_handle.bind_attempt(first);
         assert_eq!(
             handle.nomination_for_exact_execution(first),
             Some(nomination.clone())
@@ -1271,6 +1276,12 @@ mod session_owner_tests {
         // Exact execution refinement leaves the parent nomination available.
         assert_eq!(handle.nomination(), Some(nomination));
         fixture.owner.drain("cohorts").unwrap();
+        assert!(fixture.owner.bound_statement(statement_token).is_none());
+        assert!(
+            command_handle
+                .nomination_for_exact_execution(replacement)
+                .is_none()
+        );
         assert!(handle.nomination_for_exact_execution(replacement).is_none());
     }
 

@@ -407,6 +407,9 @@ struct FrontendMaintenanceCommandConsumer {
     maintenance: MaintenanceCommandExecutor,
     maintenance_read: MaintenanceReadCommandExecutor,
     executor: QueryBlockingExecutor,
+    #[cfg(novarocks_dev_controls)]
+    statement_observation:
+        Option<std::sync::Weak<crate::preparation_diagnostics::StatementObservationOwner>>,
 }
 
 impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
@@ -419,11 +422,19 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         CommandError,
     > {
+        #[cfg(novarocks_dev_controls)]
+        let observation = self
+            .statement_observation
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|owner| owner.bound_statement(command_context.statement_token()));
         maintenance_action::prepare(
             &self.maintenance,
             &command,
             &request_context,
             &command_context,
+            #[cfg(novarocks_dev_controls)]
+            observation,
         )
     }
 
@@ -537,6 +548,9 @@ pub(crate) fn product_command_router(
     maintenance_read: MaintenanceReadCommandExecutor,
     executor: QueryBlockingExecutor,
     state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    #[cfg(novarocks_dev_controls)] statement_observation: Option<
+        Arc<crate::preparation_diagnostics::StatementObservationOwner>,
+    >,
 ) -> ProductCommandRouter {
     ProductCommandRouter::new(
         Arc::new(FrontendCatalogCommandConsumer {
@@ -551,6 +565,8 @@ pub(crate) fn product_command_router(
             maintenance,
             maintenance_read,
             executor,
+            #[cfg(novarocks_dev_controls)]
+            statement_observation: statement_observation.as_ref().map(Arc::downgrade),
         }),
     )
 }

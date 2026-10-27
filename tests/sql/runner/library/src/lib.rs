@@ -2894,10 +2894,8 @@ fn run_case_observed(
             step.query_number, order_sensitive, epsilon
         );
 
-        let be_log_deadline = Some(
-            be_log_directive::step_evidence_deadline(&step.meta)
-                .map_or(step_deadline, |end| end.min(step_deadline)),
-        );
+        let be_log_deadline =
+            be_log_directive::step_evidence_deadline(&step.meta).map(|end| end.min(step_deadline));
         let resource_baseline = if fault_injection::has_fault(&step.meta) {
             match ctx.server_handle.lock() {
                 Ok(mut server_handle)
@@ -3100,6 +3098,7 @@ fn run_case_observed(
                 &step.meta,
                 server_handle.as_ref(),
                 be_log_deadline,
+                Some(step_deadline),
             ),
             Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
         };

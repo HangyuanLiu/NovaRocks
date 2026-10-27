@@ -295,13 +295,11 @@ type DecodedConsumerParts = (
     Arc<Holder>,
 );
 
-fn construct(
+fn validate_contract(
     description: &FrozenExecutionDescription,
     plan: PlanSeal,
     domain: Domain,
-    state: InternalDomainState,
-    runtime: DecodedConsumerRuntime,
-) -> Result<DecodedConsumerParts, QueryExecutionError> {
+) -> Result<(), QueryExecutionError> {
     if description.finish_boundary() != ExecutionFinishBoundary::ComputationReady
         || description.effect() != ExecutionEffect::None
         || description.recovery() != RecoveryMode::NoRecovery
@@ -312,6 +310,17 @@ fn construct(
             "decoded computation requires its exact NoRecovery internal contract",
         ));
     }
+    Ok(())
+}
+
+fn construct(
+    description: &FrozenExecutionDescription,
+    plan: PlanSeal,
+    domain: Domain,
+    state: InternalDomainState,
+    runtime: DecodedConsumerRuntime,
+) -> Result<DecodedConsumerParts, QueryExecutionError> {
+    validate_contract(description, plan, domain)?;
     let cpu = match runtime.computation {
         Some(computation) => DomainCpuCustody::try_new_with_computation(
             state,
@@ -358,6 +367,7 @@ pub(crate) fn cow_computation_consumer(
     ),
     QueryExecutionError,
 > {
+    validate_contract(description, plan, Domain::Cow)?;
     let binding = runtime.binding.clone();
     let original = CowMatchRootConsumer::try_new_declared_with_capacity(
         original.context,
@@ -366,6 +376,7 @@ pub(crate) fn cow_computation_consumer(
         original.contract,
         original.intent,
         &runtime.binding,
+        description.output().fields(),
     )
     .map_err(|error| {
         QueryExecutionError::from_execution(

@@ -585,9 +585,14 @@ fn group_data_files(
                 delete.file_content == IcebergDeleteFileContent::Position
                     && delete.file_format == IcebergDeleteFileFormat::Parquet
             }) {
-                return Err(invalid(
-                    "V2 Parquet position delete rewrite is not supported",
-                ));
+                let error = invalid("V2 Parquet position delete rewrite is not supported");
+                tracing::debug!(
+                    target: "novarocks_connector_iceberg::maintenance_refusal",
+                    site = "rewrite.plan.v2_parquet_position_delete",
+                    refusal = "V2ParquetPositionDeleteRewriteUnsupported",
+                    "Original maintenance capability refused"
+                );
+                return Err(error);
             }
             let mut selected = file
                 .delete_files

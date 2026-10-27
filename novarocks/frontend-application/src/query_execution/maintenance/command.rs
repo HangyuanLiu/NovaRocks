@@ -86,6 +86,9 @@ impl MaintenanceCommandExecutor {
         current_database: &str,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector: &novarocks_spi::connector::ConnectorRequestContext,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
     ) -> Result<
         Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
         novarocks_table_maintenance::runtime::TerminalError,
@@ -119,6 +122,8 @@ impl MaintenanceCommandExecutor {
             },
             execution,
             connector,
+            #[cfg(novarocks_dev_controls)]
+            observation,
         )
         .map(Some)
     }

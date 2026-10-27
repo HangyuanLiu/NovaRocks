@@ -32,6 +32,9 @@ pub(super) fn prepare(
     command: &novarocks_sql::semantic::MaintenanceSqlCommand,
     context: &RequestContext,
     command_context: &CommandContext,
+    #[cfg(novarocks_dev_controls)] observation: Option<
+        crate::preparation_diagnostics::StatementObservationHandle,
+    >,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
     if let Some(action) = executor
         .prepare_optimize_action(
@@ -52,6 +55,8 @@ pub(super) fn prepare(
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
+            #[cfg(novarocks_dev_controls)]
+            observation,
         )
         .map_err(maintenance_command_error)?
     {

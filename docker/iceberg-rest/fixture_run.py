@@ -295,10 +295,13 @@ sys.exit(125)
 '''
 
 
-def communicate(command, *, timeout, data=None, environment=None, capture=False):
+def communicate(command, *, timeout, data=None, environment=None, capture=False,
+                stdout=None, stderr=None, cwd=None):
+    if capture and (stdout is not None or stderr is not None):
+        raise ValueError("capture and explicit output destinations are mutually exclusive")
     process = subprocess.Popen(command, stdin=subprocess.PIPE if data is not None else None,
-        stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None,
-        env=environment, start_new_session=True)
+        stdout=subprocess.PIPE if capture else stdout, stderr=subprocess.PIPE if capture else stderr,
+        env=environment, cwd=cwd, start_new_session=True)
     try:
         output, errors = process.communicate(data, timeout=timeout)
         return subprocess.CompletedProcess(command, process.returncode, output, errors)

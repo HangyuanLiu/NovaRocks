@@ -66,22 +66,32 @@ CALL proc_ice_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0
 
 -- query 4
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
+-- Scanned GC requires Provider safety proof even for an old cutoff.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_ice_${uuid0}.system.remove_orphan_files(table => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2020-01-01 00:00:00');
 
 -- query 5
+-- @db=proc_ice_${uuid0}.ns_${uuid0}
+SELECT id, amount FROM orders ORDER BY id;
+
+-- query 6
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
 -- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_ice_${uuid0}.system.expire_snapshots(table => 'ns_${uuid0}.orders', retain_last => 1);
 
--- query 6
+-- query 7
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @skip_result_check=true
 CALL proc_ice_${uuid0}.system.rewrite_data_files(table => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
 
--- query 7
+-- query 8
 -- @skip_result_check=true
 DROP TABLE proc_ice_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE proc_ice_${uuid0}.ns_${uuid0};

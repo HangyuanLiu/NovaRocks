@@ -32,7 +32,10 @@ mod execution;
 mod tree;
 mod validation;
 use tree::Node;
-pub use validation::validate_required_observed;
+pub use validation::{
+    required_values_satisfied_observed, validate_required_observed,
+    validate_required_with_options_observed,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HydratePathStep {

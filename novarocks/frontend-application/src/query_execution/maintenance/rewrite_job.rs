@@ -117,6 +117,8 @@ pub(crate) struct RewriteDomain {
     health: Option<StatementNativeHealthFailure>,
     stopping: bool,
     stop_reason: Option<TerminalError>,
+    #[cfg(novarocks_dev_controls)]
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 pub(crate) type RewriteDomainAlias = Arc<tokio::sync::Mutex<RewriteDomain>>;
 pub(crate) type RewriteDomainView = Weak<tokio::sync::Mutex<RewriteDomain>>;
@@ -299,7 +301,7 @@ impl RewriteDomain {
                     runtime.launcher.clone(),
                     write.clone(),
                     #[cfg(novarocks_dev_controls)]
-                    None,
+                    self.observation.clone(),
                 ));
             }
             let work = owner
@@ -696,6 +698,9 @@ fn form_original_domain(
     lease: ConnectorDistributedRewriteLease,
     io: Arc<MetadataIoAdmission>,
     target: &MaintenanceTarget,
+    #[cfg(novarocks_dev_controls)] observation: Option<
+        crate::preparation_diagnostics::StatementObservationHandle,
+    >,
 ) -> Result<RewriteDomainAlias, TerminalError> {
     let runtime = engine
         .kernel
@@ -808,6 +813,8 @@ fn form_original_domain(
         health: None,
         stopping: false,
         stop_reason: None,
+        #[cfg(novarocks_dev_controls)]
+        observation,
     }));
     Ok(domain)
 }
@@ -864,7 +871,16 @@ pub(crate) async fn mount_original(
         },
     )
     .await?;
-    let domain = form_original_domain(engine, root.clone(), lease, io.clone(), &job.target)?;
+    let domain = form_original_domain(
+        engine,
+        root.clone(),
+        lease,
+        io.clone(),
+        &job.target,
+        // Background admission has its own job controls, not a SQL observation.
+        #[cfg(novarocks_dev_controls)]
+        None,
+    )?;
     let (capacity, wake, execution) = {
         let source = domain.try_lock().map_err(|_| {
             TerminalError::pre_dispatch_failed("new Rewrite Domain is already borrowed")

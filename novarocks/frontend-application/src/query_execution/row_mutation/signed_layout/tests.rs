@@ -479,6 +479,7 @@ fn normalization_growth_refuses_before_output_and_preserves_paid_dictionary_last
         Some(&guard),
         &declarations,
         &mut conversions,
+        None,
         &mut |_| Ok(()),
     );
     let error = match result {
@@ -589,6 +590,7 @@ fn normalization_pays_old_normalized_and_safe_copy_until_each_actual_backing_exi
         Some(&guard),
         &declarations,
         &mut conversions,
+        None,
         &mut |_| Ok(()),
     )
     .unwrap();

@@ -34,6 +34,8 @@ struct Starting {
     lease: ConnectorDistributedRewriteLease,
     product: Arc<TableMaintenanceProduct>,
     dependencies: Vec<novarocks_spi::connector::SharedDependency>,
+    #[cfg(novarocks_dev_controls)]
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 // The F borrows this exact immutable input; cancellation never moves its
 // unique target/product facts into an otherwise unobserved async frame.
@@ -87,6 +89,9 @@ pub(crate) fn prepare(
     context: MaintenanceRequestContext<'_>,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
+    #[cfg(novarocks_dev_controls)] observation: Option<
+        crate::preparation_diagnostics::StatementObservationHandle,
+    >,
 ) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
     let intent = closed_intent(action)?;
     let engine =
@@ -140,6 +145,8 @@ pub(crate) fn prepare(
             lease,
             product,
             dependencies,
+            #[cfg(novarocks_dev_controls)]
+            observation,
         }),
         input: None,
         state: None,
@@ -255,6 +262,8 @@ impl DirectRewriteAction {
             original.lease.clone(),
             io.clone(),
             &original.target,
+            #[cfg(novarocks_dev_controls)]
+            original.observation.clone(),
         )
         .map_err(computation_service_error)?;
         let retained_engine = domain

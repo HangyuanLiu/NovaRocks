@@ -445,9 +445,13 @@ fn normalize_owned_to_signed_selection(
     retention: Option<&ConnectorPayloadRetentionGuard>,
     declarations: &[novarocks_type_contract::FunctionValueType],
     conversions: &mut novarocks_value_arrays::decode::ValueConversionContext,
+    sql_output: Option<&signed_layout::CowSqlOutput>,
     work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
 ) -> Result<ConnectorRowMutationSourceBatch, ConnectorError> {
-    let input = source.batch();
+    let projected = sql_output
+        .map(|output| output.validate_and_project(source.batch(), declarations, work))
+        .transpose()?;
+    let input = projected.as_deref().unwrap_or_else(|| source.batch());
     let observed_input = ConnectorRowConversionFootprint::retained_batch_bytes(input)?;
     let source_scratch = source.source_bytes().saturating_sub(observed_input);
     // 32 MiB validator + 8 MiB bookkeeping coexist while collecting. The
@@ -533,6 +537,7 @@ pub struct RelayedCowSelectionCollector {
     collector: BoundedRowMutationMatchCollector,
     declarations: Vec<novarocks_type_contract::FunctionValueType>,
     conversions: novarocks_value_arrays::decode::ValueConversionContext,
+    sql_output: Option<signed_layout::CowSqlOutput>,
     #[cfg(test)]
     local_assembly: bool,
     retention: Option<ConnectorPayloadRetentionGuard>,
@@ -580,6 +585,7 @@ impl RelayedCowSelectionCollector {
             local_assembly: false,
             declarations,
             conversions: novarocks_value_arrays::decode::ValueConversionContext::new(0),
+            sql_output: None,
         })
     }
 
@@ -619,6 +625,7 @@ impl RelayedCowSelectionCollector {
             retention,
             declarations,
             conversions,
+            sql_output,
             ..
         } = self;
         let consume = |record: &[u8]| {
@@ -648,6 +655,7 @@ impl RelayedCowSelectionCollector {
                 retention.as_ref(),
                 declarations,
                 conversions,
+                sql_output.as_ref(),
                 &mut |_| collector.check_control(),
             )?;
             collector.push_owned(batch)
@@ -690,6 +698,22 @@ pub(crate) struct CowMatchRootConsumer {
 
 impl CowMatchRootConsumer {
     #[cfg(test)]
+    fn fixture_output(
+        declarations: &[novarocks_type_contract::FunctionValueType],
+    ) -> Vec<novarocks_query_application::api::ResultField> {
+        declarations
+            .iter()
+            .enumerate()
+            .map(|(ordinal, value)| {
+                novarocks_query_application::api::ResultField::new(
+                    format!("__nr_sel_{ordinal}"),
+                    value.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_new(
         context: ConnectorRequestContext,
         schema: SchemaRef,
@@ -697,7 +721,9 @@ impl CowMatchRootConsumer {
         intent: ConnectorRowMutationIntent,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
-        let mut consumer = Self::try_new_declared(context, schema, declarations, contract, intent)?;
+        let output = Self::fixture_output(&declarations);
+        let mut consumer =
+            Self::try_new_declared(context, schema, declarations, contract, intent, &output)?;
         consumer.collector.local_assembly = true;
         Ok(consumer)
     }
@@ -710,6 +736,7 @@ impl CowMatchRootConsumer {
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
+        let output = Self::fixture_output(&declarations);
         Self::try_new_declared_with_capacity(
             context,
             schema,
@@ -717,6 +744,7 @@ impl CowMatchRootConsumer {
             contract,
             intent,
             binding,
+            &output,
         )
     }
 
@@ -726,15 +754,21 @@ impl CowMatchRootConsumer {
         declarations: Vec<novarocks_type_contract::FunctionValueType>,
         contract: ConnectorMutationMatchContract,
         intent: ConnectorRowMutationIntent,
+        output: &[novarocks_query_application::api::ResultField],
     ) -> Result<Self, ConnectorError> {
+        let mut collector =
+            RelayedCowSelectionCollector::try_new_declared(context, None, schema, declarations)?;
+        let validator = RowMutationMatchValidator::try_new(contract, intent)?;
+        let sql_output = signed_layout::CowSqlOutput::try_new(
+            output,
+            &collector.schema,
+            &validator,
+            &mut |_| collector.collector.check_control(),
+        )?;
+        collector.sql_output = Some(sql_output);
         Ok(Self {
-            collector: RelayedCowSelectionCollector::try_new_declared(
-                context,
-                None,
-                schema,
-                declarations,
-            )?,
-            validator: RowMutationMatchValidator::try_new(contract, intent)?,
+            collector,
+            validator,
         })
     }
 
@@ -745,6 +779,7 @@ impl CowMatchRootConsumer {
         contract: ConnectorMutationMatchContract,
         intent: ConnectorRowMutationIntent,
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        output: &[novarocks_query_application::api::ResultField],
     ) -> Result<Self, ConnectorError> {
         let window = binding.window_alias();
         crate::query_execution::internal_result_cpu::require_internal_result_capacity(
@@ -758,7 +793,8 @@ impl CowMatchRootConsumer {
         let guard = retention
             .try_spi_guard()
             .map_err(|error| invalid_match(error.to_string()))?;
-        let mut consumer = Self::try_new_declared(context, schema, declarations, contract, intent)?;
+        let mut consumer =
+            Self::try_new_declared(context, schema, declarations, contract, intent, output)?;
         consumer.collector.collector.retention = Some(guard.clone());
         consumer.collector.retention = Some(guard);
         Ok(consumer)
@@ -867,7 +903,7 @@ impl RowMutationMatchValidator {
     }
 
     pub fn validate_batch(&mut self, batch: &RecordBatch) -> Result<(), ConnectorError> {
-        self.validate_schema(batch)?;
+        self.validate_schema(&batch.schema())?;
         let effect_ordinal = usize::try_from(self.contract.effect_field().target_ordinal())
             .map_err(|_| invalid_match("row-mutation effect ordinal does not fit usize"))?;
         let effects = batch
@@ -944,9 +980,9 @@ impl RowMutationMatchValidator {
         Ok(())
     }
 
-    fn validate_schema(&self, batch: &RecordBatch) -> Result<(), ConnectorError> {
+    fn validate_schema(&self, schema: &SchemaRef) -> Result<(), ConnectorError> {
         for field in self.contract.identity_fields() {
-            validate_schema_field(batch, field.source_ordinal(), field.field())?;
+            validate_schema_field(schema, field.source_ordinal(), field.field())?;
         }
         for field in self
             .contract
@@ -954,10 +990,10 @@ impl RowMutationMatchValidator {
             .iter()
             .chain(self.contract.after_fields())
         {
-            validate_schema_field(batch, field.target_ordinal(), field.field())?;
+            validate_schema_field(schema, field.target_ordinal(), field.field())?;
         }
         validate_schema_field(
-            batch,
+            schema,
             self.contract.effect_field().target_ordinal(),
             self.contract.effect_field().field(),
         )
@@ -1011,13 +1047,12 @@ fn match_field(
 }
 
 fn validate_schema_field(
-    batch: &RecordBatch,
+    schema: &SchemaRef,
     ordinal: u32,
     expected: &arrow::datatypes::Field,
 ) -> Result<(), ConnectorError> {
     let ordinal = usize::try_from(ordinal)
         .map_err(|_| invalid_match("row-mutation field ordinal does not fit usize"))?;
-    let schema = batch.schema();
     let actual = schema
         .fields()
         .get(ordinal)
@@ -1180,6 +1215,318 @@ mod tests {
             Field::new("after", DataType::Int32, true),
             Field::new("effect", DataType::Int8, false),
         ]))
+    }
+
+    fn required_role_contract(before_nullable: bool) -> ConnectorMutationMatchContract {
+        let original = contract();
+        let target = |field: &ConnectorMutationTargetField, nullable| {
+            ConnectorMutationTargetField::try_new_typed(
+                field.token(),
+                field.field().clone().with_nullable(nullable),
+                field.target_ordinal(),
+                field
+                    .execution_type()
+                    .unwrap()
+                    .with_nullable(nullable)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        ConnectorMutationMatchContract::try_new(
+            original.owner().clone(),
+            original.table().clone(),
+            original.base_version().clone(),
+            original.identity_fields().to_vec(),
+            vec![target(&original.before_fields()[0], before_nullable)],
+            vec![target(&original.after_fields()[0], false)],
+            original.uniqueness_tokens().to_vec(),
+            original.effect_field().clone(),
+        )
+        .unwrap()
+    }
+    fn required_role_schema(before_nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("identity", DataType::Int32, false),
+            Field::new("before", DataType::Int32, before_nullable),
+            Field::new("after", DataType::Int32, false),
+            Field::new("effect", DataType::Int8, false),
+        ]))
+    }
+    fn frozen_sql_fields(
+        nullable: [bool; 3],
+    ) -> Vec<novarocks_query_application::api::ResultField> {
+        nullable
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, nullable)| {
+                novarocks_query_application::api::ResultField::new(
+                    format!("__nr_sel_{ordinal}"),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable),
+                )
+            })
+            .chain(std::iter::once(
+                novarocks_query_application::api::ResultField::new(
+                    "__nr_sel_3",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                ),
+            ))
+            .collect()
+    }
+    fn sql_values(values: [Option<i32>; 3]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("sql_identity", DataType::Int32, true),
+                Field::new("sql_before", DataType::Int32, true),
+                Field::new("sql_after", DataType::Int32, true),
+                Field::new("sql_effect", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![values[0]])),
+                Arc::new(Int32Array::from(vec![values[1]])),
+                Arc::new(Int32Array::from(vec![values[2]])),
+                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
+            ],
+        )
+        .unwrap()
+    }
+    fn constrained_cow_consumer(
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> CowMatchRootConsumer {
+        let schema = required_role_schema(false);
+        let declarations = signed_layout::fixture_declarations(&schema);
+        let mut consumer = CowMatchRootConsumer::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1 << 20,
+            ),
+            schema,
+            declarations,
+            required_role_contract(false),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+            output,
+        )
+        .unwrap();
+        consumer.collector.local_assembly = true;
+        consumer
+    }
+
+    #[test]
+    fn nullable_sql_after_null_is_business_data_but_the_sql_promise_remains_strict() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let input = sql_values([Some(1), Some(10), None]);
+        let stream = relayed_stream(std::slice::from_ref(&input));
+        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, true]));
+        let error = consumer.push_body(&stream).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert!(
+            error
+                .to_string()
+                .contains("COW assignment value does not satisfy its required target")
+        );
+        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, false]));
+        let error = consumer.push_body(&stream).unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            ValueError::Invariant(ValueViolation::RequiredNull).failure_fact()
+        );
+        // Complete equality may reuse the middle target check, never the
+        // actual SQL promise above or the original Hydrate/selection authors.
+        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, false]));
+        consumer
+            .push_body(&relayed_stream(&[sql_values([
+                Some(1),
+                Some(10),
+                Some(11),
+            ])]))
+            .unwrap();
+        let selection = consumer.finish().unwrap();
+        assert_eq!(
+            selection.batches()[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11,
+        );
+    }
+
+    #[test]
+    fn required_string_after_rejects_a_valid_sql_null_as_business_data() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let original = required_role_contract(false);
+        let field = &original.after_fields()[0];
+        let contract = ConnectorMutationMatchContract::try_new(
+            original.owner().clone(),
+            original.table().clone(),
+            original.base_version().clone(),
+            original.identity_fields().to_vec(),
+            original.before_fields().to_vec(),
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    field.token(),
+                    Field::new(field.field().name(), DataType::Utf8, false),
+                    field.target_ordinal(),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )
+                .unwrap(),
+            ],
+            original.uniqueness_tokens().to_vec(),
+            original.effect_field().clone(),
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![
+            Field::new("identity", DataType::Int32, false),
+            Field::new("before", DataType::Int32, false),
+            Field::new("after", DataType::Utf8, false),
+            Field::new("effect", DataType::Int8, false),
+        ]));
+        let mut output = frozen_sql_fields([false, false, true]);
+        output[2] = novarocks_query_application::api::ResultField::new(
+            "__nr_sel_2",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let mut consumer = CowMatchRootConsumer::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1 << 20,
+            ),
+            Arc::clone(&target),
+            signed_layout::fixture_declarations(&target),
+            contract,
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+            &output,
+        )
+        .unwrap();
+        consumer.collector.local_assembly = true;
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("sql_identity", DataType::Int32, false),
+                Field::new("sql_before", DataType::Int32, false),
+                Field::new("sql_after", DataType::Utf8, true),
+                Field::new("sql_effect", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(arrow::array::StringArray::from(vec![None::<&str>])),
+                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
+            ],
+        )
+        .unwrap();
+        let error = consumer.push_body(&relayed_stream(&[source])).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        let input =
+            crate::query_execution::internal_consumer::domain_state::InternalDomainFailure::from(
+                error,
+            )
+            .execution_input()
+            .unwrap();
+        assert_eq!(input.fact().class(), FailureClass::Data);
+        assert_eq!(
+            input.detail().as_str(),
+            "statement execution failed in its coordinator"
+        );
+        assert_eq!(
+            input.site(),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator
+        );
+    }
+
+    #[test]
+    fn nullable_sql_identity_and_before_do_not_weaken_required_provider_invariants() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let expected = ValueError::Invariant(ValueViolation::RequiredNull).failure_fact();
+        for values in [[None, Some(10), None], [Some(1), None, None]] {
+            let mut consumer = constrained_cow_consumer(&frozen_sql_fields([true, true, true]));
+            let error = consumer
+                .push_body(&relayed_stream(&[sql_values(values)]))
+                .unwrap_err();
+            assert_eq!(error.failure_fact(), expected);
+        }
+    }
+
+    #[test]
+    fn optional_before_remains_legal_and_frozen_sql_column_order_is_explicit() {
+        let schema = required_role_schema(true);
+        let validator = RowMutationMatchValidator::try_new(
+            required_role_contract(true),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+        )
+        .unwrap();
+        let output = frozen_sql_fields([false, true, true]);
+        let capture =
+            signed_layout::CowSqlOutput::try_new(&output, &schema, &validator, &mut |_| Ok(()))
+                .unwrap();
+        let input = sql_values([Some(1), None, Some(11)]);
+        let projected = capture
+            .validate_and_project(
+                &input,
+                &signed_layout::fixture_declarations(&schema),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert!(projected.column(1).is_null(0));
+        let output = frozen_sql_fields([false, false, true]);
+        let permutation = [2, 1, 0, 3];
+        let frozen = permutation
+            .iter()
+            .map(|&i| output[i].clone())
+            .collect::<Vec<_>>();
+        let input = sql_values([Some(1), Some(10), Some(11)])
+            .project(&permutation)
+            .unwrap();
+        let mut consumer = constrained_cow_consumer(&frozen);
+        consumer.push_body(&relayed_stream(&[input])).unwrap();
+        let selection = consumer.finish().unwrap();
+        let batch = &selection.batches()[0];
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11
+        );
+    }
+
+    #[test]
+    fn malformed_sql_carrier_cannot_be_hidden_by_an_after_target_refusal() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let mut output = frozen_sql_fields([false, false, true]);
+        output[2] = novarocks_query_application::api::ResultField::new(
+            "__nr_sel_2",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let mut consumer = constrained_cow_consumer(&output);
+        let error = consumer
+            .push_body(&relayed_stream(&[sql_values([Some(1), Some(10), None])]))
+            .unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            ValueError::Invariant(ValueViolation::Layout).failure_fact()
+        );
     }
 
     #[test]

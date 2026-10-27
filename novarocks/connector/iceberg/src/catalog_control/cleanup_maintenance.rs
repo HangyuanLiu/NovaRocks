@@ -1068,7 +1068,17 @@ fn plan_loaded(
             // destructively falling through to the object pass.
             (CleanupPhase::OwnedRefRetire, owned_ref_records)
         } else if owned_ref_records.is_empty() {
-            adapter.scan_gc_safety().require_scanned_object_gc()?;
+            adapter
+                .scan_gc_safety()
+                .require_scanned_object_gc()
+                .inspect_err(|_| {
+                    tracing::debug!(
+                        target: "novarocks_connector_iceberg::maintenance_refusal",
+                        site = "cleanup.plan.scanned_gc_safety",
+                        refusal = "ScannedGcSafetyUnproven",
+                        "Original maintenance capability refused"
+                    );
+                })?;
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "scanned orphan cleanup has no admitted Provider safety proof",

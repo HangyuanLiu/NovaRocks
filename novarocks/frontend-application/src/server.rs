@@ -765,6 +765,10 @@ fn build_frontend_query_session_factory_from_role_products(
         maintenance_read_command_executor,
         host.query_blocking_executor(),
         host.state_store_original_binding(),
+        #[cfg(novarocks_dev_controls)]
+        host.test_session
+            .as_ref()
+            .and_then(|session| session.statement.clone()),
     );
     let dml_engines = core_capabilities::dml_engines(
         core_capabilities::DmlEnginePorts::new(
