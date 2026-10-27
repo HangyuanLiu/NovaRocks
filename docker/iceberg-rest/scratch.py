@@ -40,6 +40,8 @@ IAM_RE = re.compile(r"nr([0-9a-f]{8})([0-9a-f]{10})\Z")
 PURPOSE_RE = re.compile(r"[a-z][a-z0-9]{0,11}\Z")
 MISSING_CODES = {"NoSuchKey", "NoSuchBucket", "NoSuchUser", "NoSuchPolicy",
                  "XMinioAdminNoSuchUser", "XMinioAdminNoSuchPolicy"}
+USER_MISSING_CODES = {"NoSuchUser", "XMinioAdminNoSuchUser"}
+POLICY_MISSING_CODES = {"NoSuchPolicy", "XMinioAdminNoSuchPolicy"}
 MAX_REST_BYTES = 8 * 1024 * 1024
 MAX_MC_BYTES = 16 * 1024 * 1024
 MAX_PREFIX_VISITS = 2048
@@ -413,7 +415,7 @@ class ScratchSweeper:
         if not math.isfinite(deadline) or self.monotonic() >= deadline:
             raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch sweep deadline expired")
 
-    def _mc(self, args, deadline, *, absent_ok=False):
+    def _mc(self, args, deadline, *, absent_ok=False, missing_codes=None):
         self._check(deadline)
         command = " ".join(shlex.quote(str(a)) for a in ["mc", "--json", *args])
         # Preserve mc's native exit in the protocol even though the Docker
@@ -461,7 +463,7 @@ class ScratchSweeper:
                 native = cause.get("error") if isinstance(cause, dict) else None
                 code = native.get("Code") if isinstance(native, dict) else None
                 code = code or (detail.get("code") if isinstance(detail, dict) else None)
-                if absent_ok and code in MISSING_CODES:
+                if absent_ok and code in (MISSING_CODES if missing_codes is None else missing_codes):
                     missing = True
                     continue
                 public = "ScratchAccessDenied" if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"} else "ScratchMcFailed"
@@ -469,6 +471,8 @@ class ScratchSweeper:
             records.append(value)
         if status and not (absent_ok and missing and not records):
             raise runtime.RuntimeFailure("ScratchMcFailed", f"mc exited with {status}")
+        if missing_codes is not None and ((missing and records) or (not records and not missing)):
+            raise runtime.RuntimeFailure("InvalidMcResponse", "exact IAM absence needs its native missing response")
         if timed_out:
             raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch mc deadline expired after confirmed cleanup")
         self._check(deadline)
@@ -652,7 +656,8 @@ class ScratchSweeper:
         match = RESOURCE_RE.fullmatch(name)
         if not match or len(name) > 63 or match[2] not in {"init", "rot"}:
             raise runtime.RuntimeFailure("ScratchIamUnmapped", "policy does not identify an admitted IAM purpose")
-        rows = self._mc(["admin", "policy", "info", "store", name], deadline, absent_ok=True)
+        rows = self._mc(["admin", "policy", "info", "store", name], deadline, absent_ok=True,
+                        missing_codes=POLICY_MISSING_CODES)
         if not rows:
             return None, None
         if len(rows) != 1 or rows[0].get("policy") != name:
@@ -833,7 +838,8 @@ class ScratchSweeper:
     def _remove_pairs(self, identity, pairs, policies, deadline, report):
         verified = []
         for pair in pairs:
-            rows = self._mc(["admin", "user", "info", "store", pair["user"]], deadline, absent_ok=True)
+            rows = self._mc(["admin", "user", "info", "store", pair["user"]], deadline, absent_ok=True,
+                            missing_codes=USER_MISSING_CODES)
             if rows and (len(rows) != 1 or rows[0].get("accessKey") != pair["user"] or rows[0].get("memberOf")
                          or not isinstance(rows[0].get("policyName", ""), str)
                          or rows[0].get("policyName", "") not in {"", pair["policy"]}):
@@ -846,10 +852,12 @@ class ScratchSweeper:
         for pair, present in verified:
             if present:
                 for operation in ("disable", "rm"):
-                    self._mc(["admin", "user", operation, "store", pair["user"]], deadline, absent_ok=True)
+                    self._mc(["admin", "user", operation, "store", pair["user"]], deadline, absent_ok=True,
+                             missing_codes=USER_MISSING_CODES)
                     report["removed"].append(dict(kind="user", name=pair["user"], operation=operation))
         for policy in policies:
-            self._mc(["admin", "policy", "rm", "store", policy], deadline, absent_ok=True)
+            self._mc(["admin", "policy", "rm", "store", policy], deadline, absent_ok=True,
+                     missing_codes=POLICY_MISSING_CODES)
             report["removed"].append(dict(kind="policy", name=policy, operation="remove"))
 
     def _remove_prefixes(self, group, deadline, report):
@@ -890,26 +898,59 @@ class ScratchSweeper:
         s3_parts("s3://validation/" + component)
         return component
 
+    def _exact_iam_identity(self, scope, exact_users_and_policies):
+        if not isinstance(scope, RunStorageScope):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup requires a fixed run storage projection")
+        scope.validate_against(scope.identity, self.record)
+        identity = scope.identity
+        if not isinstance(exact_users_and_policies, list):
+            raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup needs predeclared IAM pairs")
+        seen = set()
+        for pair in exact_users_and_policies:
+            if not isinstance(pair, dict) or set(pair) != {"user", "policy"}:
+                raise runtime.RuntimeFailure("ScratchIamUnmapped", "invalid cleanup IAM pair")
+            purpose = next((p for p in ("init", "rot") if pair["policy"] == identity.resource_name(p)
+                            and pair["user"] == identity.iam_name(p)), None)
+            if purpose is None or purpose in seen:
+                raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup pair differs from the original run")
+            seen.add(purpose)
+        return identity
+
+    def check_users_absent(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
+        """Check canonical IAM names without acquiring or mutating their bindings."""
+        report = dict(complete=True, removed=[], errors=[])
+        try:
+            self._check(deadline)
+            self._exact_iam_identity(scope, exact_users_and_policies)
+            for pair in exact_users_and_policies:
+                for kind, name, codes in (("user", pair["user"], USER_MISSING_CODES),
+                                          ("policy", pair["policy"], POLICY_MISSING_CODES)):
+                    rows = self._mc(["admin", kind, "info", "store", name], deadline,
+                                    absent_ok=True, missing_codes=codes)
+                    if rows:
+                        raise runtime.RuntimeFailure("ScratchIamAlreadyExists", "canonical IAM binding already exists")
+        except runtime.RuntimeFailure as error:
+            self._error(report, "check-users-absent", getattr(getattr(scope, "identity", None), "run_id", "invalid-context"), error)
+        return report
+
+    def cleanup_users(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
+        """Retire only the caller's exact IAM pairs; catalogs and data stay live."""
+        report = dict(complete=True, removed=[], errors=[])
+        try:
+            self._check(deadline)
+            identity = self._exact_iam_identity(scope, exact_users_and_policies)
+            self._remove_pairs(identity, exact_users_and_policies,
+                               {pair["policy"] for pair in exact_users_and_policies}, deadline, report)
+        except runtime.RuntimeFailure as error:
+            self._error(report, "cleanup-users", getattr(getattr(scope, "identity", None), "run_id", "invalid-context"), error)
+        return report
+
     def cleanup_run(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
         """The caller confirms actual writer exit and retains its original budget."""
         report = dict(complete=True, removed=[], errors=[], catalog_barrier={})
         try:
             self._check(deadline)
-            if not isinstance(scope, RunStorageScope):
-                raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup requires a fixed run storage projection")
-            scope.validate_against(scope.identity, self.record)
-            identity = scope.identity
-            if not isinstance(exact_users_and_policies, list):
-                raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup needs predeclared IAM pairs")
-            seen = set()
-            for pair in exact_users_and_policies:
-                if not isinstance(pair, dict) or set(pair) != {"user", "policy"}:
-                    raise runtime.RuntimeFailure("ScratchIamUnmapped", "invalid cleanup IAM pair")
-                purpose = next((p for p in ("init", "rot") if pair["policy"] == identity.resource_name(p)
-                                and pair["user"] == identity.iam_name(p)), None)
-                if purpose is None or purpose in seen:
-                    raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup pair differs from the original run")
-                seen.add(purpose)
+            identity = self._exact_iam_identity(scope, exact_users_and_policies)
             self.groups, self.blocked_runs = {}, set()
             group = self._identity_fact(identity)
             inventory = self._catalog_inventory(deadline, report)
