@@ -48,6 +48,14 @@ use crate::query_execution::completion::PreparedLogicalRead;
 pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError>;
 
+    /// Resolve evidence only through the process's already authorized journal.
+    /// A neutral nomination cannot install an observer or keep one alive.
+    #[cfg(novarocks_dev_controls)]
+    fn resolve_statement_observation(
+        &self,
+        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
+    ) -> Option<crate::preparation_diagnostics::StatementObservationHandle>;
+
     fn start_read_in(
         &self,
         read: &mut Option<PreparedLogicalRead>,

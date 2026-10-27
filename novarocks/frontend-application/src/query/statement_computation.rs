@@ -920,6 +920,14 @@ mod tests {
     use novarocks_query_application::cancellation::QueryCancellationSource;
     struct NoNativeLaunch;
     impl LogicalExecutionLauncher for NoNativeLaunch {
+        #[cfg(novarocks_dev_controls)]
+        fn resolve_statement_observation(
+            &self,
+            _: &novarocks_failpoint::target_binding::StatementWorkNomination,
+        ) -> Option<crate::preparation_diagnostics::StatementObservationHandle> {
+            panic!("this fixture cannot resolve a Native statement observation")
+        }
+
         fn start_read_in(
             &self,
             _: &mut Option<crate::query_execution::completion::PreparedLogicalRead>,

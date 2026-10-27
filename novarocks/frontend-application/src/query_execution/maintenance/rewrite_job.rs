@@ -228,6 +228,16 @@ pub(crate) fn computation_service_error(error: TerminalError) -> QueryServiceErr
         _ => service(error.message),
     }
 }
+// Only the Provider's explicit public projection may replace the neutral
+// detail. Reading it invokes no foreign formatter or new failure selection.
+fn from_connector_cause(error: novarocks_spi::connector::ConnectorError) -> TerminalError {
+    let public_detail = error.public_failure_detail().map(str::to_owned);
+    let mut terminal = TerminalError::from_original_cause(error);
+    if let Some(detail) = public_detail {
+        terminal.message = detail;
+    }
+    terminal
+}
 fn health(
     detail: &'static str,
     cause: impl std::error::Error + Send + Sync + 'static,
@@ -1088,7 +1098,7 @@ async fn begin_original(
     // The entire request/source is in the original Action before its first poll.
     lease
         .prepare_plan_source_in(&mut request, &mut original.plan_source)
-        .map_err(TerminalError::from_original_cause)?;
+        .map_err(from_connector_cause)?;
     let capture = super::rewrite_capture::borrow_positive_capture(&original.io, &original.context)
         .map_err(TerminalError::from_original_cause)?;
     let cpu = original.cpu.clone();
@@ -1099,7 +1109,7 @@ async fn begin_original(
         .unwrap()
         .prepare(cpu.as_ref(), &metadata_cpu, &capture)
         .await
-        .map_err(TerminalError::from_original_cause)?;
+        .map_err(from_connector_cause)?;
     let RewriteDomain {
         plan_source,
         prepared,
@@ -1109,7 +1119,7 @@ async fn begin_original(
         .as_mut()
         .unwrap()
         .take_preparation_in(prepared)
-        .map_err(TerminalError::from_original_cause)?;
+        .map_err(from_connector_cause)?;
     let prepared = original.prepared.as_ref().unwrap();
     let plan = prepared.plan.clone();
     let count = plan.cohorts().len();

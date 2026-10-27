@@ -66,6 +66,7 @@ pub struct ConnectorError {
     message: String,
     retryable_before_progress: bool,
     cleanup_context: Option<String>,
+    public_failure_detail: Option<novarocks_failure_contract::BoundedDetail>,
 }
 
 impl ConnectorError {
@@ -75,6 +76,7 @@ impl ConnectorError {
             message: message.into(),
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 
@@ -94,6 +96,7 @@ impl ConnectorError {
             cause: ConnectorErrorCause::Domain { kind, source },
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 
@@ -115,6 +118,7 @@ impl ConnectorError {
             cause: ConnectorErrorCause::Domain { kind, source },
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 
@@ -157,6 +161,7 @@ impl ConnectorError {
             message: message.into(),
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 
@@ -176,6 +181,24 @@ impl ConnectorError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Explicitly publish this producer-owned message as a bounded diagnostic.
+    /// Only an author that knows the message is public may opt in. Kind,
+    /// length, and a foreign error's Display are never evidence of that fact.
+    pub fn with_public_failure_detail(mut self) -> Self {
+        self.public_failure_detail = Some(novarocks_failure_contract::BoundedDetail::truncating(
+            &self.message,
+        ));
+        self
+    }
+
+    /// The original producer's public projection, independent of diagnostic
+    /// context appended later. Absence never authorizes publishing message().
+    pub fn public_failure_detail(&self) -> Option<&str> {
+        self.public_failure_detail
+            .as_ref()
+            .map(novarocks_failure_contract::BoundedDetail::as_str)
     }
 
     /// Extend a diagnostic without rebuilding its classification, retry or
@@ -242,6 +265,7 @@ impl From<ConnectorIdentityError> for ConnectorError {
             cause: ConnectorErrorCause::Identity(error),
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 }
@@ -525,6 +549,57 @@ mod domain_source_tests {
             .unwrap();
         assert!(std::ptr::eq(a, b));
     }
+    #[test]
+    fn public_detail_requires_its_original_author_and_survives_private_context() {
+        for error in [
+            ConnectorError::new(ConnectorErrorKind::Unsupported, "provider refusal"),
+            ConnectorError::from_domain(ConnectorErrorKind::Internal, LocalContractRefusal),
+            ConnectorError::from_domain_static(
+                ConnectorErrorKind::Unavailable,
+                LocalContractRefusal,
+                "fixed internal diagnostic",
+            ),
+            ConnectorError::table_object_binding(
+                ConnectorTableObjectBindingFailure::Replaced,
+                "original table binding refusal",
+            ),
+        ] {
+            assert_eq!(error.public_failure_detail(), None);
+            let fact = error.failure_fact();
+            let original_message = error.message().to_owned();
+            let public = error.with_public_failure_detail();
+            assert_eq!(
+                public.public_failure_detail(),
+                Some(original_message.as_str())
+            );
+            let contextualized = public
+                .clone()
+                .map_message(|_| "private later SDK context".into())
+                .with_cleanup_context("private cleanup context");
+            assert_eq!(contextualized.failure_fact(), fact);
+            assert_eq!(
+                contextualized.public_failure_detail(),
+                public.public_failure_detail()
+            );
+            assert_eq!(contextualized.message(), "private later SDK context");
+        }
+    }
+
+    #[test]
+    fn explicitly_public_detail_uses_the_existing_utf8_diagnostic_bound() {
+        let error = ConnectorError::new(ConnectorErrorKind::Unsupported, "中".repeat(600));
+        assert_eq!(error.public_failure_detail(), None);
+        let fact = error.failure_fact();
+        let public = error.with_public_failure_detail();
+        let expected = novarocks_failure_contract::BoundedDetail::truncating(public.message());
+        assert_eq!(public.public_failure_detail(), Some(expected.as_str()));
+        assert!(
+            public.public_failure_detail().unwrap().len()
+                <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+        );
+        assert_eq!(public.failure_fact(), fact);
+    }
+
     #[test]
     fn fixed_domain_quote_covers_actual_record_and_both_owned_diagnostics() {
         use novarocks_failure_contract::{BoundedDetail, SharedFailureCause};

@@ -2298,8 +2298,11 @@ impl FrontendApplicationHost {
         );
         #[cfg(novarocks_dev_controls)]
         let native_runtime = match &self.test_session {
-            Some(session) => native_runtime
-                .with_test_controls(session.native.clone(), session.observation.clone()),
+            Some(session) => native_runtime.with_test_controls(
+                session.native.clone(),
+                session.observation.clone(),
+                session.statement.as_ref().map(Arc::downgrade),
+            ),
             None => native_runtime,
         };
         Arc::new(FrontendNativeLogicalExecutionLauncher::new(

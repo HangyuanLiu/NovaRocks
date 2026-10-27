@@ -26,6 +26,34 @@ use std::io::{self, Write};
 use std::path::Path;
 
 const MAX_BINDING_BYTES: usize = 4096;
+
+// Both typed writers validate and serialize their own envelope before this I/O.
+fn publish_private_record(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // Publish complete bytes without replacing an existing immutable record.
+    // A reader may observe the canonical path while this publisher is writing.
+    static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let staging = path.with_extension(format!(
+        "private-record-{}-{}",
+        std::process::id(),
+        NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = options.open(&staging)?;
+    let publication = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::hard_link(&staging, path));
+    drop(file);
+    let cleanup = std::fs::remove_file(&staging);
+    publication?;
+    cleanup
+}
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatementExecutionBinding {
@@ -98,16 +126,7 @@ impl StatementExecutionBinding {
         if bytes.len() > MAX_BINDING_BYTES {
             return Err(invalid("exact statement binding exceeds byte bound"));
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
+        publish_private_record(path, &bytes)
     }
     #[cfg(novarocks_dev_controls)]
     pub fn read_private(path: &Path) -> io::Result<Self> {
@@ -192,6 +211,86 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn concurrent_publication_is_complete_private_and_never_clobbers() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::sync::Barrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "g2-target-concurrent-{}",
+            BackendProcessId::new_v7()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let path = root.join("binding.json");
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(3).unwrap()).unwrap();
+        let first = StatementExecutionBinding::new(
+            "first-session".into(),
+            "first-statement".into(),
+            0,
+            BackendProcessId::new_v7(),
+            execution,
+        )
+        .unwrap();
+        let second = StatementExecutionBinding::new(
+            "second-session".into(),
+            "second-statement".into(),
+            0,
+            BackendProcessId::new_v7(),
+            execution,
+        )
+        .unwrap();
+        assert_eq!(
+            StatementExecutionBinding::read_private(&path)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let start = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| {
+                start.wait();
+                first.write_private(&path)
+            });
+            let two = scope.spawn(|| {
+                start.wait();
+                second.write_private(&path)
+            });
+            start.wait();
+            // Observe actual publication; incomplete JSON is never retried.
+            while !one.is_finished() || !two.is_finished() {
+                match StatementExecutionBinding::read_private(&path) {
+                    Ok(binding) => assert!(binding == first || binding == second),
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+                }
+                std::thread::yield_now();
+            }
+            let outcomes = [one.join().unwrap(), two.join().unwrap()];
+            assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+            let loser = outcomes
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap();
+            assert_eq!(loser.kind(), io::ErrorKind::AlreadyExists);
+        });
+        let winner = StatementExecutionBinding::read_private(&path).unwrap();
+        assert!(winner == first || winner == second);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(first.write_private(&path).is_err());
+        assert_eq!(
+            StatementExecutionBinding::read_private(&path).unwrap(),
+            winner
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn malformed_or_foreign_fields_never_turn_into_a_valid_exact_target() {
         let binding = StatementExecutionBinding::new(
@@ -374,16 +473,7 @@ impl RoleProcessReceipt {
         if bytes.len() > MAX_BINDING_BYTES {
             return Err(invalid("authenticated role receipt exceeds its bound"));
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
+        publish_private_record(path, &bytes)
     }
     pub fn read_private(path: &Path) -> io::Result<Self> {
         use std::io::Read;
@@ -450,6 +540,34 @@ mod role_receipt_tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn authenticated_role_receipt_publication_never_replaces_the_original() {
+        let root = PrivateRoot::new();
+        let path = root.0.join("process.json");
+        let first = RoleProcessReceipt {
+            schema_version: 1,
+            session_id: "ordinary-runner-session".into(),
+            launch_id: "original-backend-launch".into(),
+            role: SessionRole::Be,
+            process_id: novarocks_types::BackendProcessId::new_v7().to_string(),
+        };
+        let replacement = RoleProcessReceipt {
+            process_id: novarocks_types::BackendProcessId::new_v7().to_string(),
+            ..first.clone()
+        };
+        first.write_private(&path).unwrap();
+        assert_eq!(
+            replacement.write_private(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(RoleProcessReceipt::read_private(&path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 1);
     }
 
     #[test]

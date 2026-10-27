@@ -305,6 +305,15 @@ impl FrontendStatisticsAttemptExecutor {
         .with_result_capacity(capacity.clone())
         .map_err(Self::scope_error)?;
         #[cfg(novarocks_dev_controls)]
+        let observation = originals
+            .test_statement_nomination
+            .as_deref()
+            .and_then(|nomination| {
+                self.ports
+                    .launcher
+                    .resolve_statement_observation(nomination)
+            });
+        #[cfg(novarocks_dev_controls)]
         if let Some(nomination) = originals.test_statement_nomination.take() {
             execution = execution
                 .with_test_statement_nomination(nomination)
@@ -384,7 +393,7 @@ impl FrontendStatisticsAttemptExecutor {
                         initial,
                         self.ports.launcher.clone(),
                         #[cfg(novarocks_dev_controls)]
-                        None,
+                        observation,
                     ),
                     native_tail: None,
                     selected: false,

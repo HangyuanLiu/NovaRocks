@@ -206,6 +206,14 @@ impl Original for IdleOriginal {
 
 struct NoNativeLaunch;
 impl LogicalExecutionLauncher for NoNativeLaunch {
+    #[cfg(novarocks_dev_controls)]
+    fn resolve_statement_observation(
+        &self,
+        _: &novarocks_failpoint::target_binding::StatementWorkNomination,
+    ) -> Option<crate::preparation_diagnostics::StatementObservationHandle> {
+        panic!("this fixture cannot resolve a Native statement observation")
+    }
+
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
         panic!("Failed Read cannot reserve Native work")
     }

@@ -891,6 +891,9 @@ impl LogicalExecutionNativePort for FrontendLogicalExecutionNativePort {
 /// manifest through these handles and cannot reacquire policy from globals.
 #[derive(Clone)]
 pub(crate) struct FrontendNativeLogicalExecutionRuntime {
+    #[cfg(novarocks_dev_controls)]
+    statement_observation:
+        Option<std::sync::Weak<crate::preparation_diagnostics::StatementObservationOwner>>,
     clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
@@ -935,7 +938,11 @@ impl FrontendNativeLogicalExecutionRuntime {
         observations: Option<
             Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>,
         >,
+        statement_observation: Option<
+            std::sync::Weak<crate::preparation_diagnostics::StatementObservationOwner>,
+        >,
     ) -> Self {
+        self.statement_observation = statement_observation;
         self.test_controls = Some(controls);
         self.observations = observations;
         self
@@ -963,6 +970,8 @@ impl FrontendNativeLogicalExecutionRuntime {
     ) -> Self {
         Self {
             clock,
+            #[cfg(novarocks_dev_controls)]
+            statement_observation: None,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
             #[cfg(novarocks_dev_controls)]
@@ -998,6 +1007,19 @@ impl FrontendNativeLogicalExecutionLauncher {
 }
 
 impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
+    #[cfg(novarocks_dev_controls)]
+    fn resolve_statement_observation(
+        &self,
+        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
+    ) -> Option<crate::preparation_diagnostics::StatementObservationHandle> {
+        let owner = self
+            .runtime
+            .statement_observation
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)?;
+        owner.observation_for_nomination(nomination)
+    }
+
     fn start_read_in(
         &self,
         read: &mut Option<PreparedLogicalRead>,

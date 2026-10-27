@@ -664,3 +664,102 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_job_attach
         assert_eq!(service.clone().failure_cause(), Some(&cause));
     }
 }
+
+#[tokio::test]
+async fn provider_terminal_message_and_original_cause_survive_the_actual_job_record() {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use novarocks_table_maintenance::runtime::ProcessRuntime;
+    for message in [
+        "Iceberg Variant writes are not supported yet: table ice.ns.orders, column v",
+        "the original provider refuses this different exact operation",
+    ] {
+        let error = ConnectorError::new(ConnectorErrorKind::Unsupported, message)
+            .with_public_failure_detail();
+        let fact = error.failure_fact();
+        let terminal = from_connector_cause(error.clone());
+        assert_eq!(terminal.message, message);
+        assert_eq!(terminal.selected_failure_fact(), Some(fact));
+        let cause = terminal.failure_cause.clone().unwrap();
+        assert_eq!(cause.downcast_ref::<ConnectorError>(), Some(&error));
+        assert_eq!(
+            cause.detail(),
+            "table-maintenance original operation failed"
+        );
+        let runtime: ProcessRuntime<String, (), ()> = ProcessRuntime::new();
+        let job = runtime
+            .submit(
+                JobCreate {
+                    target: "orders".into(),
+                    effect_id: None,
+                    object_id: vec![1],
+                    base_snapshot_id: 1,
+                    created_at_ms: 1,
+                },
+                (),
+            )
+            .await
+            .unwrap();
+        runtime.claim_next(2).await.unwrap().unwrap();
+        runtime.finish(job.job_id, Err(terminal), 3).await.unwrap();
+        let record = runtime.wait_for_completion(job.job_id).await.unwrap();
+        assert_eq!(record.error_message.as_deref(), Some(message));
+        assert_eq!(record.state, MaintenanceJobState::PreDispatchFailed);
+        assert_eq!(record.failure_cause.as_ref(), Some(&cause));
+        assert_eq!(record.failure_cause.as_ref().unwrap().failure_fact(), fact);
+        assert!(record.execution_failure.is_none());
+        assert!(record.compile_control.is_none());
+    }
+}
+
+#[test]
+fn generic_terminal_failure_keeps_its_neutral_detail_without_formatting() {
+    #[derive(Debug)]
+    struct PrivateFailure;
+    impl std::fmt::Display for PrivateFailure {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("a generic failure must not be formatted for a public job message")
+        }
+    }
+    impl std::error::Error for PrivateFailure {}
+    impl FailureProjection for PrivateFailure {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported.failure_fact()
+        }
+    }
+    let fact = PrivateFailure.failure_fact();
+    let terminal = TerminalError::from_original_cause(PrivateFailure);
+    assert_eq!(
+        terminal.message,
+        "table-maintenance original operation failed"
+    );
+    assert_eq!(terminal.selected_failure_fact(), Some(fact));
+    let cause = terminal.failure_cause.unwrap();
+    assert!(cause.downcast_ref::<PrivateFailure>().is_some());
+    assert_eq!(
+        cause.detail(),
+        "table-maintenance original operation failed"
+    );
+}
+
+#[test]
+fn unmarked_connector_diagnostics_cannot_replace_the_neutral_terminal_detail() {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    let error = ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "private SDK response context must remain retained",
+    );
+    assert_eq!(error.public_failure_detail(), None);
+    let fact = error.failure_fact();
+    let terminal = from_connector_cause(error.clone());
+    assert_eq!(
+        terminal.message,
+        "table-maintenance original operation failed"
+    );
+    assert_eq!(terminal.selected_failure_fact(), Some(fact));
+    let cause = terminal.failure_cause.unwrap();
+    assert_eq!(cause.downcast_ref::<ConnectorError>(), Some(&error));
+    assert_eq!(
+        cause.detail(),
+        "table-maintenance original operation failed"
+    );
+}

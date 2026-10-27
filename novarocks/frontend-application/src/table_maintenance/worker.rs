@@ -695,7 +695,7 @@ async fn original_job_rebind_target<'a>(
             .original_result_capacity()
             .cloned()
             .ok_or("Optimize MIO capacity is absent")?;
-        let observation = test.owner.before_rebind(job, &capacity)?;
+        let observation = test.owner.before_rebind(job, &capacity).await?;
         *test
             .observation
             .lock()

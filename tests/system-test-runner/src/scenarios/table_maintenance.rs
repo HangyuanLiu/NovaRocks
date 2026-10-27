@@ -526,9 +526,16 @@ fn wait_for_job_state(
             .iter()
             .find(|(observed_job_id, _)| *observed_job_id == job_id)
             .map(|(_, state)| state.as_str())
-            && state == expected_state
         {
-            return Ok(());
+            if state == expected_state {
+                return Ok(());
+            }
+            if !matches!(state, "PENDING" | "RUNNING") {
+                bail!(
+                    "optimize job {job_id} reached state {state}, expected {expected_state}; {}",
+                    context.diagnostics()
+                );
+            }
         }
         context.remaining("wait for durable optimize job state")?;
         thread::sleep(POLL_INTERVAL);
@@ -550,9 +557,16 @@ fn wait_for_terminal_job(
             .iter()
             .find(|(observed_job_id, _)| *observed_job_id == job_id)
             .map(|(_, state)| state.as_str())
-            && matches!(state, "FINISHED" | "FAILED" | "TARGET_REPLACED")
         {
-            return Ok(());
+            if matches!(state, "FINISHED" | "FAILED" | "TARGET_REPLACED") {
+                return Ok(());
+            }
+            if !matches!(state, "PENDING" | "RUNNING") {
+                bail!(
+                    "resubmitted optimize job {job_id} reached unexpected state {state}; {}",
+                    context.diagnostics()
+                );
+            }
         }
         context.remaining("wait for resubmitted optimize job terminal state")?;
         thread::sleep(POLL_INTERVAL);

@@ -3253,6 +3253,26 @@ fn connector_neutral_detail(detail: &str, expected: FailureFact) -> bool {
         )
 }
 
+fn exact_uncommitted_write_publication_message(message: &str, public_message: &str) -> bool {
+    let prefix = format!("{public_message} (lake publication id=");
+    let Some(publication) = message
+        .strip_prefix(prefix.as_str())
+        .and_then(|rest| rest.strip_suffix(" family=write disposition=KnownUncommitted)"))
+        .and_then(|id| {
+            id.parse::<novarocks_spi::connector::LakePublicationId>()
+                .ok()
+        })
+    else {
+        return false;
+    };
+    // The typed UUIDv7 parser plus complete round-trip equality rejects extra
+    // fields, noncanonical IDs, changed descriptors and any trailing text.
+    message
+        == format!(
+            "{public_message} (lake publication id={publication} family=write disposition=KnownUncommitted)"
+        )
+}
+
 fn assert_connector_failure(
     context: &mut ScenarioContext,
     outcome: &Result<(), mysql::Error>,
@@ -3314,7 +3334,9 @@ fn assert_connector_failure(
     };
     let public_message = format!("[{descriptor}] {detail}");
     anyhow::ensure!(
-        error.code == 1105 && error.state == "HY000" && error.message == public_message,
+        error.code == 1105
+            && error.state == "HY000"
+            && exact_uncommitted_write_publication_message(&error.message, &public_message),
         "{case}: SQL code/state/detail differs from the accepted Connector failure: {error:?}"
     );
     Ok(())
@@ -3487,6 +3509,41 @@ fn await_deadline_abort_terminals(
 #[cfg(test)]
 mod controlled_writer_tests {
     use super::*;
+
+    #[test]
+    fn connector_failure_requires_the_complete_canonical_publication_message() {
+        let id = "018f1f07-1234-7000-8000-00000000000a";
+        for public in [
+            "[query.execution.unexpected] Unexpected failure (reason 4:10)",
+            "[query.execution.invalid_data] Invalid data (reason 4:9)",
+        ] {
+            let complete = format!(
+                "{public} (lake publication id={id} family=write disposition=KnownUncommitted)"
+            );
+            assert!(exact_uncommitted_write_publication_message(
+                &complete, public
+            ));
+            for wrong in [
+                public.to_owned(),
+                complete.replace("family=write", "family=data_mutation"),
+                complete.replace("KnownUncommitted", "CommitUnknown"),
+                complete.replace("KnownUncommitted", "CommittedSucceeded"),
+                complete.replace(id, "not-a-publication-id"),
+                complete.replace(id, "018f1f07-1234-4000-8000-00000000000a"),
+                complete.replace(id, &id.to_uppercase()),
+                complete.replace(" family=write", " extra=true family=write"),
+                complete.replace(" family=write", "  family=write"),
+                format!("{complete} trailing"),
+                format!("prefix {complete}"),
+            ] {
+                assert!(!exact_uncommitted_write_publication_message(&wrong, public));
+            }
+            assert!(!exact_uncommitted_write_publication_message(
+                &complete,
+                "[query.execution.unexpected] Unexpected failure (reason 4:9)"
+            ));
+        }
+    }
 
     #[test]
     fn pre_dispatch_uncommitted_requires_one_terminal_and_all_other_labels_unchanged() {
