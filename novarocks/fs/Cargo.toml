@@ -41,7 +41,7 @@ http-body = "1"
 libc.workspace = true
 opendal = { workspace = true, features = ["services-fs", "services-s3", "services-memory", "executors-tokio", "layers-concurrent-limit", "layers-retry", "layers-timeout"] }
 orc-rust = { version = "0.8.0", default-features = false }
-percent-encoding = "=2.3.2"
+percent-encoding.workspace = true
 serde = { workspace = true, features = ["derive"] }
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 # Provider-owned S3 signing uses this registry implementation directly;

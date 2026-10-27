@@ -83,6 +83,7 @@ opendal = { version = "=0.58.1", default-features = false, features = ["executor
 openssl = "0.10"
 paimon = { version = "=0.3.0", default-features = false }
 parquet = "58.4.0"
+percent-encoding = "=2.3.2"
 prometheus = "0.13"
 proc-macro2 = "1"
 prost = "0.13"

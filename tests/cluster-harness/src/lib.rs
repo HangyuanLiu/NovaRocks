@@ -5927,14 +5927,17 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn kill_be(&mut self, index: usize) -> Result<()> {
         self.ensure_be_index(index)?;
+        // Keep the original fault hold live until process loss is observed.
+        // Closing its session first can return a control error before the
+        // abrupt crash this operation is meant to inject.
+        let stopped = self.be_processes[index]
+            .kill_now()
+            .with_context(|| format!("kill cross-process BE[{index}]"));
         let cleanup = self
             .test_sessions
             .as_mut()
             .map(|plan| plan.end_role(RoleSlot::Backend(index)))
             .transpose();
-        let stopped = self.be_processes[index]
-            .kill_now()
-            .with_context(|| format!("kill cross-process BE[{index}]"));
         combine_role_cleanup(stopped, cleanup.map(|_| ()))?;
         println!("killed cross-process BE[{index}]");
         Ok(())
@@ -6155,12 +6158,15 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn kill_fe(&mut self) -> Result<()> {
+        // Keep the original fault hold live until process loss is observed.
+        // Closing its session first can return a control error over MySQL
+        // before the abrupt crash this operation is meant to inject.
+        let stopped = self.fe_process.kill_now().context("kill cross-process FE");
         let cleanup = self
             .test_sessions
             .as_mut()
             .map(|plan| plan.end_role(RoleSlot::Frontend))
             .transpose();
-        let stopped = self.fe_process.kill_now().context("kill cross-process FE");
         combine_role_cleanup(stopped, cleanup.map(|_| ()))?;
         println!("killed cross-process FE");
         Ok(())
