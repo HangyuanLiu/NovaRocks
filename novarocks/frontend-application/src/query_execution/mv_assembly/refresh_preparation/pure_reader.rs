@@ -17,7 +17,7 @@
 
 //! The original refresh algorithm, suspended only at named I/O leaves.
 
-use super::async_facts::PreparationError;
+use super::async_facts::{PreparationError, require_source_snapshot, validate_source_snapshot};
 use super::async_original::{MvCatalogCaptureInput, MvCatalogCaptureQuery, capture_catalog};
 use super::io_gate::MvRefreshPreparationIo;
 use super::*;
@@ -947,29 +947,21 @@ async fn pin_contract_bases(
             .into());
         }
         let named = base.display();
-        let snapshot_id = contract
-            .snapshot_pins
-            .get(&base.occurrence_id)
-            .and_then(|snapshot| *snapshot)
-            .ok_or_else(|| format!("{what} has no pinned snapshot for {named}"))?;
+        let snapshot_id = require_source_snapshot(
+            contract
+                .snapshot_pins
+                .get(&base.occurrence_id)
+                .copied()
+                .flatten(),
+            what,
+            &named,
+        )?;
         let (observed, exact_revision) = io
             .current_revision(source, &base.table, connector_context)
             .await?;
-        if observed.current_snapshot_id() != Some(snapshot_id) {
-            return Err(
-                format!("{what} source snapshot changed after planning for {named}").into(),
-            );
-        }
         let object_id = observed.object_id().clone();
         let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
             .map_err(|error| format!("persist {what} source identity: {error}"))?;
-        if persisted_object != occurrence.object_id {
-            return Err(format!(
-                "{what} source object changed for D occurrence {}",
-                occurrence.occurrence_id,
-            )
-            .into());
-        }
         let expected_object_id = base_table_object_ids
             .get(&base.occurrence_id)
             .ok_or_else(|| format!("{what} has no object-ID fact for {named}"))?;
@@ -978,6 +970,14 @@ async fn pin_contract_bases(
                 format!("{what} base table identity changed after planning for {named}").into(),
             );
         }
+        validate_source_snapshot(
+            occurrence,
+            &persisted_object,
+            snapshot_id,
+            observed.current_snapshot_id(),
+            what,
+            &named,
+        )?;
         occurrences.push(RefreshSnapshotPinOccurrence::try_new(
             base.occurrence_id,
             base.table.clone(),
@@ -1212,33 +1212,29 @@ async fn prepare_frontend_incremental_write(
                 occurrence.occurrence_id
             )));
         }
-        let snapshot_id = contract
-            .snapshot_pins
-            .get(&base.occurrence_id)
-            .and_then(|snapshot| *snapshot)
-            .ok_or_else(|| {
-                format!(
-                    "MV incremental refresh has no pinned snapshot for {}",
-                    base.display()
-                )
-            })?;
+        let named = base.display();
+        let snapshot_id = require_source_snapshot(
+            contract
+                .snapshot_pins
+                .get(&base.occurrence_id)
+                .copied()
+                .flatten(),
+            "MV incremental refresh",
+            &named,
+        )?;
         let (observed, exact_revision) = io
             .current_revision(source, &base.table, &connector_context)
             .await?;
-        if observed.current_snapshot_id() != Some(snapshot_id) {
-            return Err(PreparationError::user(format!(
-                "MV incremental refresh source snapshot changed after planning for {}",
-                base.display()
-            )));
-        }
         let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
             .map_err(|error| format!("persist incremental-refresh source identity: {error}"))?;
-        if persisted_object != occurrence.object_id {
-            return Err(PreparationError::user(format!(
-                "MV incremental refresh source object changed for D occurrence {}",
-                occurrence.occurrence_id
-            )));
-        }
+        validate_source_snapshot(
+            occurrence,
+            &persisted_object,
+            snapshot_id,
+            observed.current_snapshot_id(),
+            "MV incremental refresh",
+            &named,
+        )?;
         pin_occurrences.push(RefreshSnapshotPinOccurrence::try_new(
             base.occurrence_id,
             base.table.clone(),

@@ -258,8 +258,8 @@ pub enum MvApplicationErrorKind {
     InvalidRequest,
     Engine,
     Unavailable,
-    /// The exact pre-dispatch target binding changed before any provider
-    /// effect was emitted. A fresh preparation may be attempted.
+    /// An exact target binding or source snapshot captured by preparation
+    /// changed before provider dispatch. A fresh preparation may be attempted.
     BindingInvalidated,
     AlreadyActive,
     ShutdownCancelled,

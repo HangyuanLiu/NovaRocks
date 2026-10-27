@@ -99,6 +99,40 @@ impl From<crate::mv::domain::lifecycle::RefreshError> for PreparationError {
     }
 }
 
+/// Missing planned facts and changed object identity are definition failures.
+/// Only a newer snapshot of the same exact source invalidates preparation.
+pub(crate) fn require_source_snapshot(
+    planned: Option<i64>,
+    what: &str,
+    named: &str,
+) -> Result<i64, PreparationError> {
+    planned
+        .ok_or_else(|| PreparationError::user(format!("{what} has no pinned snapshot for {named}")))
+}
+
+pub(crate) fn validate_source_snapshot(
+    occurrence: &novarocks_mv_application::persistence::codec::RelationOccurrence,
+    observed_object: &novarocks_mv_application::persistence::identity::ObjectIdentity,
+    planned_snapshot: i64,
+    observed_snapshot: Option<i64>,
+    what: &str,
+    named: &str,
+) -> Result<(), PreparationError> {
+    if observed_object != &occurrence.object_id {
+        return Err(PreparationError::user(format!(
+            "{what} source object changed for D occurrence {}",
+            occurrence.occurrence_id,
+        )));
+    }
+    if observed_snapshot != Some(planned_snapshot) {
+        return Err(PreparationError(MvApplicationError::new(
+            MvApplicationErrorKind::BindingInvalidated,
+            format!("{what} source snapshot changed after planning for {named}"),
+        )));
+    }
+    Ok(())
+}
+
 impl MvRefreshPreparationIo {
     pub(crate) async fn table_metadata(
         &self,
@@ -335,5 +369,63 @@ impl MvRefreshPreparationIo {
         }
         crate::mv::domain::refresh::pin::RefreshSnapshotPin::try_from_occurrences(occurrences)
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod source_snapshot_tests {
+    use super::{require_source_snapshot, validate_source_snapshot};
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use novarocks_mv_application::persistence::identity::ObjectIdentity;
+    use novarocks_mv_application::product::MvTarget;
+
+    #[test]
+    fn source_snapshot_change_invalidates_only_the_same_object_preparation() {
+        let projection = crate::mv::domain::test_admission::sample_keyed_projection(
+            MvTarget::from_parts(Some("ice"), "sales", "mv"),
+            Some(1),
+        );
+        let occurrence = &projection.definition().relation_occurrences[0];
+        for what in ["MV first-refresh", "MV incremental refresh"] {
+            let snapshot = require_source_snapshot(Some(10), what, "ice.sales.orders")
+                .expect("original planned snapshot");
+            validate_source_snapshot(
+                occurrence,
+                &occurrence.object_id,
+                snapshot,
+                Some(10),
+                what,
+                "ice.sales.orders",
+            )
+            .expect("the same original source revision remains valid");
+            let changed = validate_source_snapshot(
+                occurrence,
+                &occurrence.object_id,
+                snapshot,
+                Some(11),
+                what,
+                "ice.sales.orders",
+            )
+            .expect_err("a concurrent snapshot invalidates this preparation");
+            assert_eq!(changed.0.kind(), MvApplicationErrorKind::BindingInvalidated);
+            assert!(changed.0.compile_control_error().is_none());
+            assert!(changed.0.original_failure().is_none());
+            let missing = require_source_snapshot(None, what, "ice.sales.orders")
+                .expect_err("a missing original pin is not a concurrent snapshot change");
+            assert_eq!(missing.0.kind(), MvApplicationErrorKind::InvalidRequest);
+            let replacement = ObjectIdentity::try_new(vec![9, 8, 7]).expect("replacement identity");
+            for current in [Some(10), Some(11)] {
+                let replaced = validate_source_snapshot(
+                    occurrence,
+                    &replacement,
+                    snapshot,
+                    current,
+                    what,
+                    "ice.sales.orders",
+                )
+                .expect_err("object replacement stays refused even when its snapshot differs");
+                assert_eq!(replaced.0.kind(), MvApplicationErrorKind::InvalidRequest);
+            }
+        }
     }
 }
