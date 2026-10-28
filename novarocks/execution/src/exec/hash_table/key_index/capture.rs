@@ -137,7 +137,7 @@ impl BulkDomain {
             None => Ok(()),
         }
     }
-    fn latch(&self, cause: ExecutionFailure) {
+    pub(super) fn latch(&self, cause: ExecutionFailure) {
         if let Ok(mut gate) = self.gate()
             && gate.failed.is_none()
         {
@@ -459,6 +459,7 @@ impl SealedCapture {
 /// The private domain closes its issued run set exactly once at assembly.
 pub(super) struct BulkInput {
     captures: Vec<Option<SealedCapture>>,
+    sealed_runs: usize,
     domain: BulkDomain,
     _storage: ValueTypeStorageLifetime,
 }
@@ -520,6 +521,7 @@ impl BulkInput {
         checkpoint()?;
         Ok(Self {
             captures: output,
+            sealed_runs: issued,
             domain: domain.clone(),
             _storage: work.owner.storage_lifetime(),
         })
@@ -529,6 +531,11 @@ impl BulkInput {
     }
     pub(super) fn len(&self) -> usize {
         self.captures.len()
+    }
+    /// Frozen original set size. Draining some receipts does not certify that
+    /// the remaining input still covers this set.
+    pub(super) fn sealed_runs(&self) -> usize {
+        self.sealed_runs
     }
     pub(super) fn capture(&self, run_ordinal: usize) -> ExecutionResult<&SealedCapture> {
         self.captures

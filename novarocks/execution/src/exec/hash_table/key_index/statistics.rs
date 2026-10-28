@@ -62,6 +62,7 @@ pub(super) struct BuildRangeStats {
     indexable_rows: usize,
     null_rows: usize,
     integer: Option<IntegerDomain>,
+    integer_root_nullable: Option<bool>,
 }
 impl BuildRangeStats {
     pub(super) fn spec(&self) -> &KeySpec {
@@ -83,6 +84,11 @@ impl BuildRangeStats {
     pub(super) fn integer(&self) -> Option<IntegerDomain> {
         self.integer
     }
+    /// Actual signed input declarations, including empty selected ranges.
+    /// None is the empty merge identity, not an inferred required declaration.
+    pub(super) fn integer_root_nullable_union(&self) -> Option<bool> {
+        self.integer_root_nullable
+    }
     fn empty(spec: &KeySpec, integer: bool) -> Self {
         Self {
             spec: spec.clone(),
@@ -90,6 +96,7 @@ impl BuildRangeStats {
             indexable_rows: 0,
             null_rows: 0,
             integer: integer.then_some(IntegerDomain { min_max: None }),
+            integer_root_nullable: None,
         }
     }
     /// Consume actual saved participation facts; this never reads key bytes to
@@ -131,27 +138,24 @@ impl BuildRangeStats {
         range: Range<usize>,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
-        checkpoint()?;
-        validate_range(input, &range)?;
-        if !direct_integer(&input.spec) {
-            return Err(invariant(ValueViolation::Layout));
-        }
-        let (array, mapping) = input.tuples().physical_component(0)?;
-        match input.spec.types()[0].data_type() {
-            DataType::Int8 => {
-                integer_rows::<Int8Type>(input, array.as_ref(), mapping, range, checkpoint)
+        let mut output = Self::empty(&input.spec, true);
+        visit_integer_occurrences(input, range, checkpoint, &mut |_, value| {
+            output.input_rows += 1;
+            if let Some(value) = value {
+                output.indexable_rows += 1;
+                output
+                    .integer
+                    .as_mut()
+                    .expect("the signed integer range selected")
+                    .observe(value);
+            } else {
+                output.null_rows += 1;
+                output.indexable_rows += usize::from(input.spec.nulls()[0] == NullPolicy::Equal);
             }
-            DataType::Int16 => {
-                integer_rows::<Int16Type>(input, array.as_ref(), mapping, range, checkpoint)
-            }
-            DataType::Int32 => {
-                integer_rows::<Int32Type>(input, array.as_ref(), mapping, range, checkpoint)
-            }
-            DataType::Int64 => {
-                integer_rows::<Int64Type>(input, array.as_ref(), mapping, range, checkpoint)
-            }
-            _ => Err(invariant(ValueViolation::Layout)),
-        }
+            Ok(())
+        })?;
+        output.integer_root_nullable = Some(input.component_binding(0)?.nullable());
+        Ok(output)
     }
     /// The graph owner supplies disjoint, exactly completed task outputs.
     /// Consuming these small facts does not independently certify coverage.
@@ -170,6 +174,10 @@ impl BuildRangeStats {
         let indexable = add(self.indexable_rows, other.indexable_rows)?;
         let nulls = add(self.null_rows, other.null_rows)?;
         let mut integer = self.integer;
+        let nullable = match (self.integer_root_nullable, other.integer_root_nullable) {
+            (Some(a), Some(b)) => Some(a || b),
+            (a, b) => a.or(b),
+        };
         if let (Some(dest), Some(source)) = (&mut integer, other.integer) {
             dest.merge(source);
         }
@@ -178,6 +186,7 @@ impl BuildRangeStats {
         self.indexable_rows = indexable;
         self.null_rows = nulls;
         self.integer = integer;
+        self.integer_root_nullable = nullable;
         Ok(())
     }
 }
@@ -194,13 +203,45 @@ fn validate_range(input: &PreparedKeyBatch<'_>, range: &Range<usize>) -> Executi
     }
     Ok(())
 }
+/// Visit original occurrence coordinates and signed values. Static carrier
+/// dispatch, dictionary row mapping and logical NULL remain one shared author;
+/// direct mark/probe/assignment do not reinterpret the carrier themselves.
+pub(super) fn visit_integer_occurrences(
+    input: &PreparedKeyBatch<'_>,
+    range: Range<usize>,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    visitor: &mut impl FnMut(usize, Option<i64>) -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    validate_range(input, &range)?;
+    if !direct_integer(&input.spec) {
+        return Err(invariant(ValueViolation::Layout));
+    }
+    let (array, mapping) = input.tuples().physical_component(0)?;
+    match input.spec.types()[0].data_type() {
+        DataType::Int8 => {
+            integer_rows::<Int8Type>(input, array.as_ref(), mapping, range, checkpoint, visitor)
+        }
+        DataType::Int16 => {
+            integer_rows::<Int16Type>(input, array.as_ref(), mapping, range, checkpoint, visitor)
+        }
+        DataType::Int32 => {
+            integer_rows::<Int32Type>(input, array.as_ref(), mapping, range, checkpoint, visitor)
+        }
+        DataType::Int64 => {
+            integer_rows::<Int64Type>(input, array.as_ref(), mapping, range, checkpoint, visitor)
+        }
+        _ => Err(invariant(ValueViolation::Layout)),
+    }
+}
 fn integer_rows<T: ArrowPrimitiveType>(
     input: &PreparedKeyBatch<'_>,
     array: &dyn Array,
     mapping: Option<&[usize]>,
     range: Range<usize>,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
-) -> ExecutionResult<BuildRangeStats>
+    visitor: &mut impl FnMut(usize, Option<i64>) -> ExecutionResult<()>,
+) -> ExecutionResult<()>
 where
     T::Native: Into<i64>,
 {
@@ -208,28 +249,20 @@ where
         .as_any()
         .downcast_ref::<PrimitiveArray<T>>()
         .ok_or_else(|| invariant(ValueViolation::Carrier))?;
-    let mut output = BuildRangeStats::empty(&input.spec, true);
     for (i, occurrence) in range.enumerate() {
         checkpoint_at(i, checkpoint)?;
         let row = super::pairs::physical_row(mapping, input.input.row(occurrence)?)?;
         if row >= source.len() {
             return Err(invariant(ValueViolation::Bounds));
         }
-        output.input_rows += 1;
-        if source.is_null(row) {
-            output.null_rows += 1;
-            output.indexable_rows += usize::from(input.spec.nulls()[0] == NullPolicy::Equal);
+        let value = if source.is_null(row) {
+            None
         } else {
-            output.indexable_rows += 1;
-            output
-                .integer
-                .as_mut()
-                .expect("integer range selected")
-                .observe(source.value(row).into());
-        }
+            Some(source.value(row).into())
+        };
+        visitor(occurrence, value)?;
     }
-    checkpoint()?;
-    Ok(output)
+    checkpoint()
 }
 fn add(left: usize, right: usize) -> ExecutionResult<usize> {
     left.checked_add(right).ok_or_else(|| {

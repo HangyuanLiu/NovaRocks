@@ -17,6 +17,8 @@
 
 use super::*;
 
+#[path = "bulk_tests.rs"]
+mod bulk_tests;
 #[path = "captured_tests.rs"]
 mod captured_tests;
 #[path = "compact_tests.rs"]

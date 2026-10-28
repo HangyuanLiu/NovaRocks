@@ -18,6 +18,7 @@
 //! Instance-local typed key equality and storage. Join rows, aggregate state,
 //! set markers and distributed hash identities remain with their own authors.
 
+mod bulk;
 mod canonical_store;
 mod capture;
 mod compact;
