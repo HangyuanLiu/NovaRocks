@@ -4187,9 +4187,13 @@ mod statistics_contract_tests {
             } else {
                 "hll"
             };
-            let forged = field
-                .clone()
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), wrong_tag.into())].into());
+            let forged =
+                field
+                    .clone()
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        NR_LOGICAL_TYPE_KEY.into(),
+                        wrong_tag.into(),
+                    )]));
             let (_, actual) = resolve_statistics_field(&iceberg, &arrow, &forged, false, &frozen)
                 .unwrap()
                 .unwrap();
@@ -4255,13 +4259,11 @@ mod statistics_contract_tests {
             novarocks_type_contract::ValueLogicalType::Variant
         );
         assert_eq!(value_type.data_type(), &DataType::LargeBinary);
-        let conflicting = field.with_metadata(
-            [(
+        let conflicting =
+            field.with_metadata(std::collections::HashMap::<String, String>::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "object".into(),
-            )]
-            .into(),
-        );
+            )]));
         assert_eq!(
             resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen)
                 .unwrap()

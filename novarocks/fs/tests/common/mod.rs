@@ -105,7 +105,7 @@ impl Fixture {
         Self::from_path(directory, path)
     }
 
-    fn from_path(directory: TempDir, path: std::path::PathBuf) -> Self {
+    pub(super) fn from_path(directory: TempDir, path: std::path::PathBuf) -> Self {
         let file_size = std::fs::metadata(&path).expect("file metadata").len();
         let access = FsAccessResolver::new()
             .resolve_location(
@@ -197,12 +197,12 @@ fn fixture_schema() -> Arc<Schema> {
     let id = Field::new("id", DataType::Int32, false).with_metadata(
         [(PARQUET_FIELD_ID_META_KEY.to_string(), "10".to_string())]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
     );
     let name = Field::new("name", DataType::Utf8, false).with_metadata(
         [(PARQUET_FIELD_ID_META_KEY.to_string(), "20".to_string())]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
     );
     Arc::new(Schema::new(vec![id, name]))
 }

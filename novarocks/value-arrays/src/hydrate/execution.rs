@@ -213,7 +213,7 @@ impl Node {
 fn field_changes(source: &Field, target: &Field) -> bool {
     source.name() != target.name()
         || source.is_nullable() != target.is_nullable()
-        || source.metadata().capacity() != 0
+        || source.metadata().as_arc().is_some()
 }
 pub(super) fn local_metadata_changes(
     source: &DataType,

@@ -19282,11 +19282,10 @@ mod logical_projection_tests {
     fn contract_full_source_type_keeps_nested_names_metadata_and_lambda_domains() {
         let source_shape = DataType::List(Arc::new(
             Field::new("provider_item", DataType::Utf8, true).with_metadata(
-                [
+                std::collections::HashMap::<String, String>::from([
                     (NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string()),
                     ("iceberg.field.id".to_string(), "19".to_string()),
-                ]
-                .into(),
+                ]),
             ),
         ));
         let source = ValueType::try_from_typed_binding(
