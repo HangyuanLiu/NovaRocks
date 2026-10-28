@@ -21,7 +21,7 @@ The initial source commit is unmodified except for this inventory.
 ## Dependency policy
 
 Retain upstream registry dependency versions and lints except for the bounded
-Arrow/Parquet upstream backport recorded below (ADR-0200). The root
+Arrow/Parquet upstream backport recorded below (ADR-0204). The root
 `[patch.crates-io]` selects `iceberg`, `iceberg-catalog-hms` and
 `iceberg-property-macro` at version `0.11.0`; the macro has no source patches.
 The unpatched REST SDK is a connector dev-only path dependency, outside the
@@ -69,7 +69,7 @@ The SDK Storage/FileIO interfaces no longer carry a directory extension.
 
 ## Upstream backports — Arrow/Parquet 60
 
-Policy: ADR-0200 permits bounded Iceberg dependency-upgrade backports from
+Policy: ADR-0204 permits bounded Iceberg dependency-upgrade backports from
 upstream. Merged changes are preferred; an unmerged PR is reviewed to the same
 standard as a local patch. Stop and use a future upstream baseline if the
 backport requires a broad upstream refactor. This permission is specific to the
