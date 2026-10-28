@@ -79,7 +79,6 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks-connector-paimon.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true }

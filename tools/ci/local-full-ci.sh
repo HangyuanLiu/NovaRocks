@@ -886,7 +886,7 @@ validate_explicit_suites_early() {
 
   for suite in "${REQUESTED_SUITES[@]}"; do
     if [ "$suite" = "paimon" ]; then
-      echo "error: SQL suite paimon is disabled pending detailed connector design" >&2
+      echo "error: SQL suite paimon is disabled: provider suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14" >&2
       exit 2
     fi
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
