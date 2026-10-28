@@ -1992,8 +1992,13 @@ mod tests {
         assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
         // ResultField retains the expression label separately from the SQL
         // alias. Public rendering owns the column name seen by the client.
-        let render = novarocks_sql::compiler::client_render_schema_from_port(Some(result), 0)
-            .expect("render schema from the original SQL public result declaration");
+        let render = novarocks_sql::compiler::client_render_schema_from_port(
+            Some(result),
+            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 0,
+            },
+        )
+        .expect("render schema from the original SQL public result declaration");
         assert_eq!(render.columns().len(), 1);
         assert_eq!(render.columns()[0].name, "payload");
         assert_eq!(render.columns()[0].source_ordinal, 0);

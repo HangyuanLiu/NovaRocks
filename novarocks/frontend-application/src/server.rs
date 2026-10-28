@@ -157,6 +157,7 @@ pub struct FrontendServingConfig {
     /// Upper bound for terminal resource cleanup after graceful/deadline drain.
     pub frontend_cleanup_timeout: Duration,
     pub mysql_listener: ResolvedMysqlListenerSettings,
+    pub trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: FrontendNativeTransport,
     pub native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
@@ -348,8 +349,11 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
-    let query_application_control =
-        Arc::new(novarocks_query_application::query_control::QueryApplicationControl::default());
+    let query_application_control = Arc::new(
+        novarocks_query_application::query_control::QueryApplicationControl::new(
+            host.frontend_process_id(),
+        ),
+    );
     let query_control = novarocks_query_application::session_control::QueryControlService::new(
         query_application_control.clone(),
     );
@@ -934,6 +938,7 @@ pub async fn shutdown_frontend_application_to_convergence(
 /// Frontend-owned management listener construction. The Server role runner
 /// owns when this listener starts, receives failures, and is torn down.
 pub struct FrontendManagementServer {
+    metrics_registry: Arc<crate::metrics::FrontendMetricsRegistry>,
     serving_reader: Arc<LateBoundFrontendServingSnapshotReader>,
     island_reader: Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
     convergence_reader: Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
@@ -991,6 +996,7 @@ pub fn start_frontend_management_server(
     )
     .map_err(FrontendApplicationError::server)?;
     Ok(FrontendManagementServer {
+        metrics_registry,
         serving_reader,
         island_reader,
         convergence_reader,
@@ -1138,8 +1144,10 @@ where
         ))]
         Arc::clone(&config.native_trust),
         config.mysql_listener,
+        config.trino_listener,
         config.server_version,
         session_factory,
+        products.query_control.clone(),
         client_connections,
         shutdown,
         &mut report_server,
@@ -1171,8 +1179,10 @@ async fn run_mysql_with_listener_supervision<F>(
     ))]
     native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
+    trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
     server_version: String,
     session_factory: Arc<dyn QuerySessionFactory>,
+    query_control: novarocks_query_application::session_control::QueryControlService,
     client_connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
@@ -1184,6 +1194,19 @@ async fn run_mysql_with_listener_supervision<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let mut trino_server = novarocks_trino_adapter::TrinoServerHandle::bind(
+        &trino_listener,
+        server_version.clone(),
+        host.serving_lifecycle().admission(),
+        Arc::clone(&session_factory),
+        query_control,
+    )
+    .await
+    .map_err(FrontendApplicationError::server)?;
+    let trino_port = trino_server.bound_addr().port();
+    let result = async {
+    management_server.metrics_registry.install_trino(&trino_server.observation())
+        .map_err(FrontendApplicationError::server)?;
     #[cfg(feature = "mem-1-m07-root-observation")]
     let _root_observation_claim = root_observation_identity::emit(
         &native_trust,
@@ -1224,8 +1247,10 @@ where
                 host,
                 drain_timeout,
                 cleanup_timeout,
+            &mut trino_server,
             )
             .await;
+
         }
         other => other,
     };
@@ -1244,8 +1269,10 @@ where
             host,
             drain_timeout,
             cleanup_timeout,
+            &mut trino_server,
         )
         .await;
+
     }
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let (finalize_tx, finalize_rx) = tokio::sync::watch::channel(false);
@@ -1266,7 +1293,7 @@ where
             wait_for_signal(drain_rx),
             wait_for_signal(finalize_rx),
             cleanup_timeout,
-            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user),
+            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user, trino_port),
         );
     tokio::pin!(mysql_server);
 
@@ -1274,6 +1301,7 @@ where
         result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
         _ = shutdown => {
             host.begin_serving_drain(drain_timeout);
+            trino_server.begin_drain();
             let _ = drain_tx.send(true);
             let graceful = tokio::time::timeout(
                 drain_timeout,
@@ -1299,8 +1327,9 @@ where
             let _ = finalize_tx.send(true);
             mysql_server.await.map_err(FrontendApplicationError::server)
         }
-        error = wait_for_frontend_listener_failure(report_server, management_server, host) => {
+        error = wait_for_frontend_listener_failure(report_server, management_server, &mut trino_server, host) => {
             host.begin_serving_drain(drain_timeout);
+            trino_server.begin_drain();
             let _ = drain_tx.send(true);
             host.cancel_governed_work_at_drain_deadline();
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
@@ -1315,9 +1344,18 @@ where
             }
         }
     }
+    }.await;
+    trino_server.finalize();
+    combine_server_and_shutdown(
+        result,
+        trino_server
+            .wait_stopped()
+            .await
+            .map_err(FrontendApplicationError::server),
+    )
 }
 
-fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
+fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str, trino_port: u16) {
     info!(
         "standalone mysql server listening on {} (user={}, db={})",
         bind_addr, user, DEFAULT_DATABASE
@@ -1327,18 +1365,23 @@ fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
     // mysql port alone cannot distinguish a freshly-bound server from a
     // pre-existing process that already owned the port.
     println!(
-        "NOVAROCKS_READY mysql_port={} pid={}",
+        "NOVAROCKS_READY mysql_port={} pid={} trino_port={}",
         bind_addr.port(),
-        std::process::id()
+        std::process::id(),
+        trino_port
     );
 }
 
 async fn wait_for_frontend_listener_failure(
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut FrontendManagementServer,
+    trino_server: &mut novarocks_trino_adapter::TrinoServerHandle,
     host: &FrontendApplicationHost,
 ) -> String {
     loop {
+        if let Some(error) = trino_server.poll_failure() {
+            return error;
+        }
         if host.workload_progress_has_failed() {
             return "frontend governed role service failed or exited unexpectedly".to_string();
         }

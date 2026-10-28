@@ -102,6 +102,7 @@ async fn make_explain_preparation(
         } else {
             topology
         };
+        let presentation = input.state.presentation().clone();
         let (catalog, database, execution, mut optimizer, semantics) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
@@ -128,6 +129,7 @@ async fn make_explain_preparation(
             input.cancellation,
             optimizer,
             semantics,
+            presentation,
         ))
         .with_result_capacity(capacity.clone())
         .map_err(|e| internal_error(e.to_string()))?;
@@ -183,6 +185,7 @@ async fn make_profile_diagnostics(
 }
 
 struct ExplainStatementAction {
+    family: novarocks_result_contract::ClientPresentationFamily,
     // Outside the polled preparation F: async unwind may destroy its fields.
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
@@ -504,7 +507,7 @@ impl ExplainStatementAction {
                         .result_window_alias()
                         .ok_or_else(|| internal_error("EXPLAIN has no original result window"))
                         .and_then(|window| {
-                            LocalResultProducer::try_new(owner.scope(), window)
+                            LocalResultProducer::try_new(owner.scope(), window, self.family)
                                 .map_err(internal_error)
                         })
                         .and_then(|producer| {
@@ -611,6 +614,7 @@ impl FrontendQuerySession {
         let provider_source =
             crate::query_execution::completion_facts::FrontendCompletionCustody::new();
         let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
+        let family = *state.presentation();
         let input = ExplainPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -638,6 +642,7 @@ impl FrontendQuerySession {
             Arc::clone(&planning_cpu),
         )) as ProviderClose);
         let action = Box::new(ExplainStatementAction {
+            family,
             provider_source,
             planning_cpu,
             preparation_health: None,
@@ -786,6 +791,7 @@ mod tests {
     }
     fn action(preparation: PreparationFuture) -> ExplainStatementAction {
         ExplainStatementAction {
+            family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
             provider_source:
                 crate::query_execution::completion_facts::FrontendCompletionCustody::new(),
             planning_cpu: FrontendPlanningCpuSource::new(

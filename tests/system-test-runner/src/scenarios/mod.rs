@@ -59,6 +59,8 @@ mod runtime_filter;
 mod state_family;
 mod table_maintenance;
 mod task_evidence;
+mod trino_interop;
+mod trino_protocol;
 mod uea4_catalog_planning;
 mod uea4_range_reads;
 mod uea4_scan_readiness;
@@ -116,6 +118,8 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(execution_failure_prepared::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
+    scenarios.extend(trino_interop::scenarios());
+    scenarios.extend(trino_protocol::scenarios());
     scenarios
 }
 

@@ -3000,7 +3000,10 @@ mod tests {
         .await
         .unwrap();
         cancellation.request(QueryCancellationReason::ExplicitKill {
-            requester_connection_id: 1,
+            requester_session: novarocks_query_application::session_control::ClientSessionKey::new(
+                1,
+            )
+            .expect("nonzero fixture requester"),
         });
         assert!(take(&mut job).await.is_err());
         drop(job);
@@ -3056,7 +3059,9 @@ mod actual_close_tests {
         close_case(None).await;
         for reason in [
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 1,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(1)
+                        .expect("nonzero fixture requester"),
             },
             QueryCancellationReason::DeadlineExceeded { timeout_ms: 91 },
             QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 92 },
@@ -3306,7 +3311,9 @@ mod original_failure_tests {
             .await;
             if early_cancel {
                 cancellation.request(QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 1,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(1)
+                            .expect("nonzero fixture requester"),
                 });
             } else {
                 let _ = release.send(());

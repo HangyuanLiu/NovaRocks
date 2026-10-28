@@ -1983,6 +1983,13 @@ impl FrontendApplicationHost {
     /// the authenticated native-trust capability. Frontend management uses it
     /// only as its process-local owner identity; it never reads StateStore or
     /// target metadata to infer an owner.
+    pub(crate) fn frontend_process_id(&self) -> FrontendProcessId {
+        match self.data_runtime.native_trust().local_process_identity() {
+            Some(NativeProcessIdentity::Frontend(process)) => process,
+            _ => unreachable!("frontend role binds its process identity before composition"),
+        }
+    }
+
     pub(crate) fn native_deployment_id(&self) -> &str {
         self.data_runtime.native_trust().deployment_id().as_str()
     }

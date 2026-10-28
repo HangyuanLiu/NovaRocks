@@ -119,6 +119,7 @@ impl FrontendQueryCompiler {
                     execution,
                     scope,
                     std::time::Instant::now(),
+                    *context.session().presentation(),
                     ports,
                 )
                 .await;
@@ -315,6 +316,7 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
+        family: novarocks_result_contract::ClientPresentationFamily,
         ports: ExplainPreparationPorts<'_>,
     ) -> Result<
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
@@ -402,6 +404,7 @@ impl FrontendQueryCompiler {
                     purpose: ReadEncodingPurpose::Profile(planning_started_at),
                     version,
                     options: query_options,
+                    family,
                     offset: 0,
                     carrier: *self.query.static_plan_carrier(),
                     policy: self.constant_policy(),

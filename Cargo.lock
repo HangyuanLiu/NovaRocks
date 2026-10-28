@@ -4009,6 +4009,7 @@ dependencies = [
  "novarocks-statistics-application",
  "novarocks-table-maintenance",
  "novarocks-task-codec",
+ "novarocks-trino-adapter",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
@@ -4400,6 +4401,8 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "chrono",
+ "chrono-tz",
  "futures",
  "novarocks-connector-contract",
  "novarocks-coordination-contract",
@@ -4444,6 +4447,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "chrono",
+ "chrono-tz",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-result-contract",
@@ -4505,6 +4509,7 @@ dependencies = [
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
  "novarocks-state-store-sqlite",
+ "novarocks-trino-adapter",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-version",
@@ -4843,6 +4848,34 @@ name = "novarocks-transport-io"
 version = "0.1.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "novarocks-trino-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "novarocks-execution-contract",
+ "novarocks-parser",
+ "novarocks-query-application",
+ "novarocks-result-contract",
+ "novarocks-result-render",
+ "novarocks-sql",
+ "novarocks-types",
+ "novarocks-user-error",
+ "novarocks-workload-control",
+ "prometheus",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.5.2",
+ "tracing",
 ]
 
 [[package]]

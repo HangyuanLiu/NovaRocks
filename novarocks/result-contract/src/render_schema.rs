@@ -272,7 +272,10 @@ impl SchemaBounds {
                         NativeRenderType::LargeInt
                             | NativeRenderType::UnsignedInteger(_)
                             | NativeRenderType::Opaque(_)
-                            | NativeRenderType::Decimal { bits: 256, .. }
+                            | NativeRenderType::Decimal {
+                                precision: 39..,
+                                ..
+                            }
                     )
                 {
                     return Err(RootContractError::UnsupportedRenderType);
@@ -519,6 +522,11 @@ mod tests {
                 precision: 38,
                 scale: 12,
             },
+            NativeRenderType::Decimal {
+                bits: 256,
+                precision: 38,
+                scale: 12,
+            },
             NativeRenderType::List(Box::new(child())),
             NativeRenderType::Map {
                 key: Box::new(child()),
@@ -570,7 +578,7 @@ mod tests {
             NativeRenderType::LargeInt,
             NativeRenderType::Decimal {
                 bits: 256,
-                precision: 38,
+                precision: 39,
                 scale: 0,
             },
         ];
@@ -600,6 +608,44 @@ mod tests {
             ClientRenderSchema::try_new(family, vec![trino_column(mixed)], 1),
             Err(RootContractError::UnsupportedRenderType)
         );
+    }
+    #[test]
+    fn trino_decimal_precision_limit_applies_recursively_and_preserves_width() {
+        let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default());
+        for precision in [38, 39, 76] {
+            let decimal = RenderField {
+                native_type: NativeRenderType::Decimal {
+                    bits: 256,
+                    precision,
+                    scale: 2,
+                },
+                nullable: true,
+                presentation: RenderPresentation::TrinoValue,
+            };
+            for native_type in [
+                NativeRenderType::List(Box::new(decimal.clone())),
+                NativeRenderType::Map {
+                    key: Box::new(RenderField {
+                        native_type: NativeRenderType::String,
+                        nullable: false,
+                        presentation: RenderPresentation::TrinoValue,
+                    }),
+                    value: Box::new(decimal.clone()),
+                },
+                NativeRenderType::Struct(vec![NamedRenderField {
+                    name: "amount".into(),
+                    field: decimal.clone(),
+                }]),
+            ] {
+                let actual =
+                    ClientRenderSchema::try_new(family, vec![trino_column(native_type.clone())], 1);
+                if precision <= 38 {
+                    assert_eq!(actual.unwrap().columns()[0].field.native_type, native_type);
+                } else {
+                    assert_eq!(actual, Err(RootContractError::UnsupportedRenderType));
+                }
+            }
+        }
     }
     #[test]
     fn occurrence_order_and_duplicate_names_are_exact() {

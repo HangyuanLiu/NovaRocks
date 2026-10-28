@@ -1648,7 +1648,7 @@ mod tests {
             RenderField, RenderPresentation as P,
         };
         use novarocks_result_render::{
-            ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurnStatus,
+            BoundedClientRowEncoder, ClientRowEncoder, RenderTurnStatus,
         };
         assert_eq!(result.columns.len(), 1);
         assert_eq!(result.batches.len(), 1);
@@ -1683,7 +1683,7 @@ mod tests {
         )
         .unwrap();
         let mut encoder =
-            ArrowMysqlTextEncoder::try_new(Arc::new(schema), result.batches[0].clone()).unwrap();
+            ClientRowEncoder::try_new(Arc::new(schema), result.batches[0].clone()).unwrap();
         let mut body = Vec::new();
         for _ in 0..1024 {
             let mut segment = [0; 4096];

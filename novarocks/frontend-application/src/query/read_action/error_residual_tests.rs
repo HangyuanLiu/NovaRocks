@@ -358,6 +358,7 @@ async fn read_error_hands_same_idle_original_to_residual_only_after_actual_foote
         ),
     );
     let mut action = ReadStatementAction {
+        family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
         planning_cpu: planning_cpu.clone(),
         preparation_health: None,
         provider: provider.clone(),

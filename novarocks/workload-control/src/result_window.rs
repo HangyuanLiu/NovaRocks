@@ -817,6 +817,13 @@ impl ResultWindowAlias {
         *manifest = Some((binding, retained));
         Ok(alias)
     }
+    /// Observe the exact admitted window envelope. This grants no additional capacity.
+    pub fn all_objects_bytes(&self) -> Result<u64, WorkError> {
+        match &self.backing {
+            AliasBacking::Window { holder, .. } => Ok(holder.all_objects_bytes),
+            _ => Err(WorkError::Conflict),
+        }
+    }
     /// Read the SAME original Client envelope, never a guessed peak constant.
     pub fn client_all_objects_bytes(&self) -> Result<u64, WorkError> {
         match &self.backing {

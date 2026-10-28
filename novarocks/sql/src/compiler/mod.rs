@@ -3820,7 +3820,8 @@ mod root_render_type;
 mod root_scalar_type;
 pub use completion::*;
 pub use root_render_type::{
-    client_render_schema, client_render_schema_from_port, validate_public_result_logical_identities,
+    ClientRenderSchemaError, RenderFamilyRequest, client_render_schema,
+    client_render_schema_from_port, validate_public_result_logical_identities,
 };
 pub(crate) mod mv_rewrite;
 

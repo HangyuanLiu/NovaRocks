@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     RenderTimeUnit as U, RootProfileV1 as V,
 };
 use novarocks_result_render::{
-    ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderErrorKind as E, RenderTurnStatus,
+    ArrowMysqlTextEncoder, BoundedClientRowEncoder, RenderErrorKind as E, RenderTurnStatus,
 };
 use std::sync::Arc;
 fn field(n: N, p: P, nullable: bool) -> RenderField {

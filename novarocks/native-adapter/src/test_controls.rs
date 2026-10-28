@@ -1507,7 +1507,7 @@ pub(crate) mod tests {
             statement_run_token: nomination.statement_run_token.clone(),
             frontend_process_id: nomination.frontend_process_id.clone(),
             connection_id: nomination.connection_id,
-            session_epoch: nomination.session_epoch,
+            session_key: nomination.session_key,
             sql_sha256: Sha256::digest(sql.as_bytes()).into(),
         }
     }
@@ -1877,7 +1877,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -2400,7 +2400,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(
@@ -2681,7 +2681,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -2772,7 +2772,7 @@ pub(crate) mod tests {
             statement_run_token: token.into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 19,
-            session_epoch: 2,
+            session_key: 2,
             statement_generation: 3,
         };
         let backend = BackendProcessId::new_v7();
@@ -2815,7 +2815,7 @@ pub(crate) mod tests {
             let mut changed = a.clone();
             match field {
                 0 => changed.connection_id += 1,
-                1 => changed.session_epoch += 1,
+                1 => changed.session_key += 1,
                 2 => changed.frontend_process_id = FrontendProcessId::new_v7().to_string(),
                 _ => changed.target_session_id = "another-fe-session".into(),
             }
@@ -2882,7 +2882,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -3278,7 +3278,7 @@ pub(crate) mod tests {
             statement_run_token: "selected-work".into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 19,
-            session_epoch: 2,
+            session_key: 2,
             statement_generation: 3,
         };
         let first =
@@ -3379,7 +3379,7 @@ pub(crate) mod tests {
             statement_run_token: "original-input".into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -3415,7 +3415,7 @@ pub(crate) mod tests {
                 .all(|pin| pin.statement.is_none())
         );
         let replacement = StatementWorkNomination {
-            session_epoch: 2,
+            session_key: 2,
             ..nomination.clone()
         };
         let replacement_input = statement_input(&replacement, role.scope().launch_id(), "SELECT 1");
