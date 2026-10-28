@@ -96,6 +96,7 @@ impl Scenario for TrinoInterop {
                     "novarocks-server/**",
                     "tests/cluster-harness/**",
                     "tests/test-support/**",
+                    "novarocks/failpoint/**",
                     "tests/system-test-runner/src/scenarios/trino_interop.rs",
                     "tests/system-test-runner/src/scenarios/trino_interop/**",
                     "tests/system-test-runner/src/*.rs",

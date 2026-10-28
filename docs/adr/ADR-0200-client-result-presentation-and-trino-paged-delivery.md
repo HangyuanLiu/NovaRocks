@@ -6,7 +6,7 @@ status: active
 supersedes: []
 superseded-by: null
 date: 2026-10-28
-implementation-status: in-progress
+implementation-status: implemented
 provenance:
   - "discussion: 2026-10-27 and 2026-10-28 client result presentation, session values and acknowledged HTTP pages"
   - "reference: Trino 483, commit 50b0b50b75abd47f830b7805ee1b51716eb4065e (annotated tag object 32d4f28e8311ea6f67edca209df59a0493d869fa)"
@@ -31,7 +31,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-本条固化已接受的结果呈现与 Trino 直连分页契约；实现仍在收敛。接口存在、源码结构和局部编译不代表协议生命周期、官方客户端或原生集群验收已经完成。
+本条的呈现族、语句级会话与分页生命周期已实现。2026-10-28 完成本机规范定向 Rust、原生 1FE+3BE 协议/生命周期、兼容专项、MySQL session、doctest 与严格 Clippy 验证；本机追加的全工作区 Rust 仍记录未关闭的进程监护不一致，实际结果与处置分别保留。用户将 Linux 全量和 Trino 483 / Spark / 官方客户端对照留待手工执行，尚不具备这些验收结论。实现状态不代表正式准入或全部验证通过。
 
 一条查询的原生输出是有类型的根结果契约，BE 按它编码，FE 消费根段。Trino 直连协议把若干完整 JSON 行放在一个 HTTP 响应中，客户端沿 `nextUri` 继续请求。一个 HTTP 请求的结束不能表达整条语句的生命周期；同一 URI 还可能因传输失败而被重试。
 
