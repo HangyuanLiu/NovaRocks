@@ -27,6 +27,7 @@ mod owned_batch;
 mod pairs;
 mod prepared;
 mod read;
+mod statistics;
 mod store;
 mod table;
 #[cfg(test)]

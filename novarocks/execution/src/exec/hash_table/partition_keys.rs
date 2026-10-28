@@ -706,12 +706,25 @@ impl<'a> CanonicalTupleView<'a> {
     }
 
     pub(crate) fn row_has_null(&self, row: usize) -> ExecutionResult<bool> {
-        for ((array, decoded), normalized) in self
+        self.row_has_null_observed(row, &|| Ok(()))
+    }
+
+    pub(crate) fn row_has_null_observed(
+        &self,
+        row: usize,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<bool> {
+        checkpoint()?;
+        for (column, ((array, decoded), normalized)) in self
             .arrays
             .iter()
             .zip(&self.storage.bytes)
             .zip(&self.storage.normalized)
+            .enumerate()
         {
+            if column.is_multiple_of(256) {
+                checkpoint()?;
+            }
             let (array, row) = if let Some(normalized) = normalized {
                 (
                     &normalized.array,
@@ -735,6 +748,7 @@ impl<'a> CanonicalTupleView<'a> {
                 return Ok(true);
             }
         }
+        checkpoint()?;
         Ok(false)
     }
 

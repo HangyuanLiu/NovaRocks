@@ -21,6 +21,8 @@ use super::*;
 mod compact_tests;
 #[path = "export_tests.rs"]
 mod export_tests;
+#[path = "statistics_tests.rs"]
+mod statistics_tests;
 use crate::{
     exec::{
         hash_table::allocation::AggregateAllocator,
