@@ -244,6 +244,22 @@ class Run(unittest.TestCase):
         self.assertTrue((attempt/'identity/source-start.json').is_file());self.assertTrue((attempt/'identity/source-end.json').is_file())
         self.assertFalse(value['layer_ok'],'a mocked command exit without native evidence is never positive coverage')
 
+    def test_ecs_oss_requirement_observes_supplied_file_and_platform_without_cloud_io(self):
+        requirement = ['fixture:aliyun-ecs-oss']
+        with mock.patch.object(run.sys, 'platform', 'linux'):
+            missing = run.requirement_checks(requirement, {}, self.native)
+            self.assertFalse(missing[0]['ok'])
+            self.assertEqual(['NOVA_OSS_TEST_CONFIG'], missing[0]['missing'])
+            config = self.base/'oss.json'; config.write_text('{}')
+            environment = {'NOVA_OSS_TEST_CONFIG': str(config)}
+            supplied = run.requirement_checks(requirement, environment, self.native)
+            self.assertTrue(supplied[0]['ok'])
+            config.unlink()
+            self.assertFalse(run.requirement_checks(requirement, environment, self.native)[0]['ok'])
+        config.write_text('{}')
+        with mock.patch.object(run.sys, 'platform', 'darwin'):
+            self.assertFalse(run.requirement_checks(requirement, environment, self.native)[0]['ok'])
+
     def test_heavy_uses_ignored_only_and_missing_prerequisite_remains_not_run(self):
         heavy=self.scope('rust-test','p::heavy',tier='heavy')
         self.native['ignored_units']={heavy.key:{'class':'heavy','requires':['binary:novarocks']}}

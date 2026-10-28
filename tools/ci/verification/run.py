@@ -734,6 +734,7 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
     """
     checks=[]
     configured={
+        'fixture:aliyun-ecs-oss':('NOVA_OSS_TEST_CONFIG',),
         'fixture:iceberg-rest':('NOVAROCKS_ICEBERG_REST_URI','NOVA_ENV_REST_ENV_FILE'),
         'fixture:minio':('AWS_S3_ENDPOINT','AWS_S3_ACCESS_KEY_ID','AWS_S3_SECRET_ACCESS_KEY'),
         'fixture:iceberg-rest-publication':('UEA7_TEST_CONTROL_URI',),
@@ -756,9 +757,11 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
             names=configured[requirement]
             missing=[name for name in names if not environment.get(name)]
             for name in names:
-                if name.endswith(('_ENV_FILE','_RECEIPT')) and environment.get(name) and not Path(environment[name]).is_file():
+                if (name.endswith(('_ENV_FILE','_RECEIPT')) or name == 'NOVA_OSS_TEST_CONFIG') and environment.get(name) and not Path(environment[name]).is_file():
                     missing.append(name)
             check.update(ok=not missing,missing=sorted(set(missing)),basis='declared effective configuration; native owner validates runtime facts')
+            if requirement == 'fixture:aliyun-ecs-oss':
+                check.update(platform=sys.platform, ok=check['ok'] and sys.platform == 'linux')
         else:
             check['reason']='no native availability contract for this requirement'
         checks.append(check)
