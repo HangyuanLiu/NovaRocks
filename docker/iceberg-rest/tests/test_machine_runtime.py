@@ -35,12 +35,12 @@ import machine_runtime as machine
 
 
 def bom():
-    return {"lock_sha256": "locked-inputs", "images": {
+    return {"schema": 2, "platform": "linux/arm64", "lock_sha256": "locked-inputs", "images": {
         n: {"alias": n, "manifest_digest": "sha256:" + n, "platform": "linux/arm64"}
-        for n in ("minio", "minio-mc", "iceberg-rest")}, "derived_images": {
+        for n in ("iceberg-rest",)}, "derived_images": {
         n: {"alias": n + ":current", "image_id": "sha256:" + n,
             "definition_sha256": "definition-" + n, "platform": "linux/arm64"}
-        for n in ("iceberg-spark", "rest-mv")}}
+        for n in ("minio", "minio-mc", "iceberg-spark", "rest-mv")}}
 
 
 class Backend:
@@ -138,6 +138,39 @@ class Backend:
 
     def disconnect(self, record, container):
         self.events.append(("disconnect", container))
+
+
+class DerivedObjectStoreInputTests(unittest.TestCase):
+    def test_object_store_uses_exact_derived_ids_and_definition_facts(self):
+        inputs = bom()
+        inputs["derived_images"]["minio"]["alias"] = "mutable-minio-alias"
+        inputs["derived_images"]["minio-mc"]["alias"] = "mutable-mc-alias"
+        backend = Backend()
+        with mock.patch.object(backend, "image_id", wraps=backend.image_id) as inspect:
+            images, facts = machine.input_facts(inputs, backend)
+        self.assertEqual(images["minio"]["image_id"], "sha256:minio")
+        self.assertEqual(images["mc"]["image_id"], "sha256:minio-mc")
+        self.assertEqual(images["mc-init"], images["mc"])
+        self.assertEqual(facts["minio"]["receipt"]["definition_sha256"], "definition-minio")
+        self.assertEqual(facts["minio-mc"]["receipt"]["definition_sha256"], "definition-minio-mc")
+        self.assertIn(mock.call("sha256:minio"), inspect.call_args_list)
+        self.assertIn(mock.call("sha256:minio-mc"), inspect.call_args_list)
+        self.assertNotIn(mock.call("mutable-minio-alias"), inspect.call_args_list)
+        self.assertNotIn(mock.call("mutable-mc-alias"), inspect.call_args_list)
+
+    def test_object_store_requires_derived_definition_and_exact_installed_id(self):
+        for name in ("minio", "minio-mc"):
+            with self.subTest(name=name, fault="definition"):
+                inputs = bom()
+                inputs["derived_images"][name].pop("definition_sha256")
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "derived definition identity is missing"):
+                    machine.input_facts(inputs, Backend())
+            with self.subTest(name=name, fault="image"):
+                backend = Backend()
+                original = backend.image_id
+                with mock.patch.object(backend, "image_id", side_effect=lambda reference: "sha256:other" if reference == "sha256:" + name else original(reference)):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, "derived image differs from verified receipt"):
+                        machine.input_facts(bom(), backend)
 
 
 class SupervisionPrerequisiteTests(unittest.TestCase):
@@ -792,6 +825,56 @@ class MachineTests(unittest.TestCase):
 
     def changed(self):
         return self.definition(ports={"rest": 31002})
+
+    def test_readonly_check_missing_machine_creates_no_state_or_lock(self):
+        self.assertFalse(self.owner.root.exists())
+        self.assert_code("MachineUnavailable", lambda: self.owner.check_ready(bom()))
+        self.assertFalse(self.owner.root.exists())
+        self.assertEqual(self.backend.events, [])
+        self.assertIsNone(getattr(self.backend, "maintenance_fd", None))
+
+    def test_readonly_check_reuses_exact_readiness_without_rewrites_or_journals(self):
+        original = self.start()
+        before = {str(path.relative_to(self.owner.root)): (path.stat().st_mtime_ns, path.read_bytes())
+                  for path in self.owner.root.rglob("*") if path.is_file()}
+        events = list(self.backend.events)
+        def healthy(state):
+            self.assertIsNone(getattr(self.backend, "maintenance_fd", None))
+            self.assertIsNone(getattr(self.backend, "maintenance_base", None))
+            return True
+        with mock.patch.object(self.backend, "healthy", side_effect=healthy):
+            actual = self.owner.check_ready(bom())
+        self.assertEqual(actual["generation"], original["generation"])
+        self.assertEqual(actual["version"], original["version"])
+        self.assertTrue(actual["observed_healthy"])
+        after = {str(path.relative_to(self.owner.root)): (path.stat().st_mtime_ns, path.read_bytes())
+                 for path in self.owner.root.rglob("*") if path.is_file()}
+        self.assertEqual(after, before)
+        self.assertEqual(self.backend.events, events)
+        changed = bom(); changed["lock_sha256"] = "another-source-lock"
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(changed))
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(bom(), {"ports": {"rest": 31002}}))
+        self.backend.failure = "health"
+        self.assert_code("MachineUnavailable", lambda: self.owner.check_ready(bom()))
+
+    def test_readonly_check_cannot_cross_an_existing_maintenance_lock(self):
+        self.start()
+        observer = machine.MachineOwner(self.owner.root, backend=copy.deepcopy(self.backend), timeout=0.01)
+        with self.owner.maintenance_lock():
+            self.assert_code("MachineMaintaining", lambda: observer.check_ready(bom()))
+
+    def test_cli_check_uses_original_bom_and_safe_snapshot(self):
+        original = self.start()
+        with mock.patch.object(machine, "MachineOwner", return_value=self.owner), \
+                mock.patch.object(machine, "verified_bom", return_value=bom()) as verify, \
+                mock.patch.object(machine.runtime, "install_signal_handlers"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(machine.main(["check", "--store", "/original-store"]), 0)
+        verify.assert_called_once_with(runtime.SCRIPT_DIR.parent.parent, Path("/original-store"), consumer="iceberg-rest")
+        actual = json.loads(output.getvalue())
+        self.assertEqual(actual["phase"], "ready")
+        self.assertEqual(actual["generation"], original["generation"])
+        self.assertNotIn("credentials", actual)
 
     def test_machine_configuration_rejects_protected_and_rest_domain_overlap_before_effects(self):
         for root in ("s3://warehouse/fixture-machine", "s3://warehouse/fixture-machine/rest/",
