@@ -37,8 +37,8 @@ pub use construction::{
     preflight_empty_construction, preflight_empty_construction_observed,
     preflight_flat_array_structure_construction, preflight_flat_arrow_structure_construction,
     preflight_interleave_construction, preflight_null_arrow_structure_observed,
-    preflight_null_structure_construction, preflight_null_structure_construction_observed,
-    preflight_primitive_vec_adoption_construction,
+    preflight_null_construction, preflight_null_structure_construction,
+    preflight_null_structure_construction_observed, preflight_primitive_vec_adoption_construction,
     preflight_primitive_vec_adoption_construction_observed, preflight_uint64_indices_construction,
     values_copy_kind_observed,
 };

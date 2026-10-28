@@ -22,6 +22,7 @@ mod bulk;
 mod canonical_store;
 mod capture;
 mod compact;
+mod direct_int;
 mod export;
 mod fixed_store;
 mod hash_layout;
