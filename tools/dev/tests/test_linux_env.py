@@ -247,6 +247,31 @@ class EnvironmentTests(unittest.TestCase):
     def commands_matching(self, name):
         return [args for args, _ in self.commands.calls if args[0] == name]
 
+    def test_tools_only_prepare_and_check_never_touch_fixture_or_docker(self):
+        profile = {key: value for key, value in self.profile.items()
+                   if not key.startswith(("fixture_", "docker_", "object_store"))}
+        self.inputs["packages"] += list(linux.DOCKER_PACKAGES)
+        installer = linux.LinuxEnvironment(self.repo, self.inputs, profile, self.account,
+            commands=self.commands, system_root=self.system, tools_only=True)
+        result = installer.prepare()
+        installer.check()
+        self.assertIsNone(result["checks"]["docker"])
+        self.assertNotIn("NOVA_FIXTURE_STORE", installer.environment)
+        self.assertNotIn("DOCKER_CONTEXT", installer.environment)
+        for args, _ in self.commands.calls:
+            self.assertFalse(any("docker" in arg or "fixture" in arg for arg in args), args)
+        self.assertTrue({"build-essential", "libssl-dev"} <= self.commands.packages)
+
+    def test_tools_only_rejects_fixture_or_object_store_configuration_before_commands(self):
+        for field in ("fixture_image_sources", "docker_registry_mirrors", "object_store_kind"):
+            with self.subTest(field=field), self.assertRaises(linux.EnvironmentFailure):
+                linux.LinuxEnvironment(self.repo, self.inputs, {"schema": 1, field: {}},
+                    self.account, commands=self.commands, tools_only=True)
+        with self.assertRaises(linux.EnvironmentFailure):
+            linux.LinuxEnvironment(self.repo, self.inputs, {"schema": 1}, self.account,
+                tools_only=True, object_store_config=Path("/config.json"))
+        self.assertEqual([], self.commands.calls)
+
     def test_fixture_artifact_transports_are_forwarded_only_during_prepare(self):
         self.profile["fixture_artifact_url_prefixes"] = {
             "https://upstream.invalid/maven2/": "https://mirror.invalid/public/",

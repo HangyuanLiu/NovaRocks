@@ -73,6 +73,8 @@ ci_list_stages() {
 {
   "schema": 1,
   "stages": [
+    {"name": "Linux environment tests", "tier": "admission", "domain": ["tools/dev/**"]},
+    {"name": "Aliyun CI platform tests", "tier": "admission", "domain": ["tools/ci/aliyun_ci/**", ".github/workflows/aliyun-ci*.yml"]},
     {"name": "CI build inputs", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "locked Cargo metadata", "tier": "admission", "domain": ["**"]},
     {"name": "Cargo dependency policy", "tier": "admission", "domain": ["**"]},
@@ -680,6 +682,10 @@ MATERIALS
 }
 
 run_cargo_gates() {
+  run_fail_fast_stage "Linux environment tests" "linux-environment-tests.log" \
+    python3 -m unittest discover -s tools/dev/tests -p 'test_*.py'
+  run_fail_fast_stage "Aliyun CI platform tests" "aliyun-ci-platform-tests.log" \
+    bash -c 'cd tools/ci && python3 -m unittest discover -s aliyun_ci/tests -t . -p "test_*.py"'
   ci_set_default_build_jobs || return $?
   run_fail_fast_stage "CI build inputs" "build-inputs.log" \
     ci_validate_build_inputs "$NOVA_CI_CARGO_PROFILE"

@@ -178,8 +178,13 @@ def atomic_text(path: Path, text: str, *, account: Account | None = None,
 class LinuxEnvironment:
     def __init__(self, repo: Path, inputs: dict, profile: dict, account: Account,
                  *, commands: Commands | None = None, system_root: Path = Path("/"),
-                 object_store_config: Path | None = None):
+                 object_store_config: Path | None = None, tools_only: bool = False):
         self.repo, self.inputs, self.profile, self.account = repo, inputs, profile, account
+        self.tools_only = tools_only
+        if tools_only:
+            forbidden = {key for key in profile if key.startswith(("fixture_", "docker_", "object_store"))}
+            if forbidden or object_store_config is not None:
+                raise EnvironmentFailure("tools-only mode rejects fixture, Docker and object-store configuration")
         self.commands = commands or Commands()
         self.system_root = system_root
         if inputs.get("schema") != 1 or profile.get("schema") != 1:
@@ -298,11 +303,12 @@ class LinuxEnvironment:
             "CARGO_HOME": str(self.account.home / ".cargo"),
             "RUSTUP_HOME": str(self.account.home / ".rustup"),
             "RUSTUP_TOOLCHAIN": self.toolchain["channel"],
-            "NOVA_FIXTURE_STORE": str(self.fixture_store),
-            "DOCKER_CONTEXT": "default",
             "PYTHONDONTWRITEBYTECODE": "1",
             "LANG": self.locale, "LC_ALL": self.locale,
         }
+        if not self.tools_only:
+            env["NOVA_FIXTURE_STORE"] = str(self.fixture_store)
+            env["DOCKER_CONTEXT"] = "default"
         if self.object_store is not None:
             env["NOVA_ENV_OBJECT_STORE_CONFIG"] = str(self.object_store_path)
         for key, field in (("RUSTUP_DIST_SERVER", "rustup_dist_server"),
@@ -387,8 +393,9 @@ class LinuxEnvironment:
             return False
 
     def ensure_packages(self) -> None:
-        missing = [package for package in self.inputs["packages"] if not self.package_installed(package)]
-        missing += [package for package in DOCKER_PACKAGES if not self.docker_capability(package)
+        missing = [package for package in self.inputs["packages"]
+                   if (not self.tools_only or package not in DOCKER_PACKAGES) and not self.package_installed(package)]
+        missing += [package for package in DOCKER_PACKAGES if not self.tools_only and not self.docker_capability(package)
                     and not self.package_installed(package)]
         if missing:
             self.run(["apt-get", "update"])
@@ -688,12 +695,14 @@ class LinuxEnvironment:
         facts = self.preflight(prepare=True)
         self.ensure_packages()
         self.ensure_locale()
-        self.ensure_docker()
+        if not self.tools_only:
+            self.ensure_docker()
         self.ensure_rust()
         self.ensure_nextest()
         self.ensure_account_environment()
         self.observe_native()
-        self.fixture(prepare=True)
+        if not self.tools_only:
+            self.fixture(prepare=True)
         return {"action": "prepare", "host": facts, "checks": self.check()}
 
     def check(self) -> dict:
@@ -705,10 +714,12 @@ class LinuxEnvironment:
         if not self.locale_available():
             raise EnvironmentFailure(f"missing locale: {self.locale}")
         native = self.observe_native()
-        daemon = self.observe_docker()
-        config = read_object(self.path("/etc/docker/daemon.json"))
-        if config.get("registry-mirrors", []) != self.profile.get("docker_registry_mirrors", []):
-            raise EnvironmentFailure("Docker mirror configuration does not match profile")
+        daemon = None
+        if not self.tools_only:
+            daemon = self.observe_docker()
+            config = read_object(self.path("/etc/docker/daemon.json"))
+            if config.get("registry-mirrors", []) != self.profile.get("docker_registry_mirrors", []):
+                raise EnvironmentFailure("Docker mirror configuration does not match profile")
         if not self.tool_version("rustup", self.inputs["rustup"]["version"]):
             raise EnvironmentFailure("pinned rustup is missing")
         rust = self.observe_rust()
@@ -720,7 +731,8 @@ class LinuxEnvironment:
         expected_block = f"# BEGIN NOVAROCKS LINUX ENV\n. {shlex.quote(str(self.env_path))}\n# END NOVAROCKS LINUX ENV"
         if expected_block not in profile_text:
             raise EnvironmentFailure("account login profile does not source its managed environment")
-        self.fixture(prepare=False)
+        if not self.tools_only:
+            self.fixture(prepare=False)
         return {"action": "check", "host": facts, "native": native, "docker": daemon, "rust": rust,
                 "nextest": self.inputs["nextest"]["version"], "environment": str(self.env_path)}
 
@@ -730,14 +742,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=("prepare", "check", "env"))
     parser.add_argument("--user", required=True)
     parser.add_argument("--profile", type=Path, required=True)
-    parser.add_argument("--fixture", choices=("iceberg-rest",), required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--fixture", choices=("iceberg-rest",))
+    mode.add_argument("--tools-only", action="store_true")
     parser.add_argument("--object-store-config", type=Path)
     args = parser.parse_args(argv)
     try:
         repo = Path(__file__).resolve().parents[2]
         installer = LinuxEnvironment(repo, read_object(repo / "tools/dev/linux-env.inputs.json"),
                                      read_object(args.profile), Account.lookup(args.user),
-                                     object_store_config=args.object_store_config)
+                                     object_store_config=args.object_store_config, tools_only=args.tools_only)
         if args.action == "env":
             installer.preflight(prepare=False)
             print(installer.environment_text(), end="")
