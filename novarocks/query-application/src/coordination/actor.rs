@@ -4430,6 +4430,7 @@ fn conclude_for_work_cancellation(
             CancellationReason::Requested
             | CancellationReason::ExplicitKill { .. }
             | CancellationReason::ExplicitKillConnection { .. }
+            | CancellationReason::ClientCancelRequested
             | CancellationReason::ClientDisconnected
             | CancellationReason::ServerShutdown
             | CancellationReason::OwnerDropped => (

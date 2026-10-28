@@ -9423,10 +9423,12 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         };
         let base = r#"
 [standalone_server]
 mysql_port = 9030
+trino_port = 8080
 
 [[connector.credentials]]
 purpose = "object-store-data"
@@ -9473,6 +9475,16 @@ access_key_secret = "admin123"
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
+        );
+        assert_eq!(
+            fe_value["standalone_server"]["trino_port"].as_integer(),
+            Some(i64::from(runtime.fe_trino_port))
+        );
+        assert!(
+            be_value
+                .get("standalone_server")
+                .and_then(|table| table.get("trino_port"))
+                .is_none()
         );
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
         assert!(fe_value["cluster"].get("backends").is_none());

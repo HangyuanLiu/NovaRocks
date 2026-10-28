@@ -79,7 +79,14 @@ fn client(columns: usize) -> FrozenRootOutput {
             },
         })
         .collect();
-    FrozenRootOutput::ClientRows(ClientRenderSchema::try_new(columns, 1).unwrap())
+    FrozenRootOutput::ClientRows(
+        ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            columns,
+            1,
+        )
+        .unwrap(),
+    )
 }
 
 struct Fixture {

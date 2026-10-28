@@ -223,6 +223,7 @@ mod request_context_tests {
             cancellation.view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
 
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
@@ -250,6 +251,7 @@ mod request_context_tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
         let before = Instant::now();
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();

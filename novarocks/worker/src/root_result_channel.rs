@@ -2303,6 +2303,7 @@ mod tests {
         let mut name = String::with_capacity(name_capacity);
         name.push('x');
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,

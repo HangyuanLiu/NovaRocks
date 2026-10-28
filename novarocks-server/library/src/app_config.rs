@@ -1065,6 +1065,10 @@ impl ConnectorConfig {
 pub struct StandaloneServerConfig {
     #[serde(default = "default_standalone_server_mysql_port")]
     pub mysql_port: u16,
+    #[serde(default = "default_trino_port")]
+    pub trino_port: u16,
+    #[serde(default = "default_trino_client_timeout_ms")]
+    pub trino_client_timeout_ms: u64,
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
     #[serde(default)]
@@ -1097,6 +1101,13 @@ pub struct StandaloneServerConfig {
     pub iceberg_maintenance_action_cooldown_ms: i64,
     #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
     pub iceberg_maintenance_max_consecutive_failures: u32,
+}
+
+fn default_trino_port() -> u16 {
+    8080
+}
+fn default_trino_client_timeout_ms() -> u64 {
+    300_000
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -1167,6 +1178,8 @@ impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
             mysql_port: default_standalone_server_mysql_port(),
+            trino_port: default_trino_port(),
+            trino_client_timeout_ms: default_trino_client_timeout_ms(),
             user: default_standalone_server_user(),
             mv_refresh_scheduler_enabled: false,
             mv_refresh_scheduler_interval_ms: default_standalone_mv_refresh_scheduler_interval_ms(),
@@ -4315,6 +4328,8 @@ grpc_port = 19080
             cfg.standalone_server,
             Some(StandaloneServerConfig {
                 mysql_port: 9030,
+                trino_port: 8080,
+                trino_client_timeout_ms: 300_000,
                 user: "root".to_string(),
                 mv_refresh_scheduler_enabled: false,
                 mv_refresh_scheduler_interval_ms: 30_000,
