@@ -3818,7 +3818,6 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-failure-contract",
- "novarocks-fs",
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",

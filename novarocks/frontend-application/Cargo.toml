@@ -37,7 +37,6 @@ hex.workspace = true
 h2.workspace = true
 novarocks-catalog-application.workspace = true
 novarocks-connector-contract.workspace = true
-novarocks-fs.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
 novarocks-execution.workspace = true
