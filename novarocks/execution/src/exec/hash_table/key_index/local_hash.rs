@@ -148,7 +148,7 @@ pub(crate) fn hash_batch(
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<LocalHashBatch> {
     checkpoint()?;
-    if !policy.accepts(prepared.spec) {
+    if !policy.accepts(&prepared.spec) {
         return Err(invariant(ValueViolation::Layout));
     }
     let rows = prepared.input.unique_rows();

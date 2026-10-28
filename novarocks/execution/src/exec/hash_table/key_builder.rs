@@ -805,6 +805,27 @@ pub(crate) fn canonical_group_key_equals(
     Ok(sink.equal && sink.offset == expected.len())
 }
 
+/// Compare one normalized complex component using the original nullable
+/// framing and cooperative canonical walker. Ordinary STRING/BINARY keys use
+/// value-arrays batch equality instead of this nested-value author.
+pub(crate) fn canonical_nullable_equals_observed(
+    array: &ArrayRef,
+    row: usize,
+    expected: &[u8],
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<bool> {
+    checkpoint()?;
+    let mut sink = ComparingKeyByteSink {
+        expected,
+        offset: 0,
+        equal: true,
+    };
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    encode_nullable_nested_with(array, row, &mut sink, "tuple component", &mut work)?;
+    checkpoint()?;
+    Ok(sink.equal && sink.offset == expected.len())
+}
+
 struct HashingKeyByteSink {
     hash: u64,
 }

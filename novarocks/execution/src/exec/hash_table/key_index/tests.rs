@@ -405,6 +405,243 @@ fn original_growth_refusal_wins_before_prepared_storage_allocation() {
     );
 }
 
+fn pairs(
+    left: &KeyInput,
+    left_rows: &[usize],
+    right: &KeyInput,
+    right_rows: &[usize],
+    spec: &KeySpec,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<Vec<u8>> {
+    let allocator = AggregateAllocator::new(MemTracker::new_root("local key comparison"));
+    let left = PreparedKeyBatch::new(spec, left, allocator.clone(), owner, &|| Ok(()))?;
+    let right = PreparedKeyBatch::new(spec, right, allocator, owner, &|| Ok(()))?;
+    let mut output = vec![0; left_rows.len()];
+    super::pairs::compare_prepared_pairs(
+        &left,
+        left_rows,
+        &right,
+        right_rows,
+        &mut output,
+        owner,
+        checkpoint,
+    )?;
+    Ok(output)
+}
+
+// These are literal equality-class oracles for K's collision path, independent
+// of the randomized hash and table implementation. Unit scope is sufficient:
+// no fixture, global state or native transport participates in comparisons.
+#[test]
+fn prepared_collision_pairs_keep_mixed_null_policy_dictionary_values_and_order() {
+    let owner = owner();
+    let types = [
+        FunctionValueType::new(DataType::Int32, true),
+        FunctionValueType::new(DataType::Utf8, true),
+    ];
+    let left = input(
+        &[
+            Arc::new(Int32Array::from(vec![Some(7), Some(7), None, Some(8)])),
+            Arc::new(StringArray::from(vec![
+                Some("same prefix left"),
+                None,
+                Some("same prefix right"),
+                Some("same prefix left"),
+            ])),
+        ],
+        &types,
+        &[3, 0, 2, 1, 0],
+        owner.as_ref(),
+    );
+    let right = input(
+        &[
+            Arc::new(Int32Array::from(vec![Some(7), Some(7), None, Some(8)])),
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![Some(1), None, Some(0), Some(1)]),
+                    Arc::new(StringArray::from(vec![
+                        "same prefix right",
+                        "same prefix left",
+                    ])),
+                )
+                .unwrap(),
+            ),
+        ],
+        &types,
+        &[2, 0, 1, 3],
+        owner.as_ref(),
+    );
+    for (policies, expected) in [
+        (
+            [NullPolicy::Equal, NullPolicy::Equal],
+            vec![1, 1, 0, 1, 0, 1],
+        ),
+        (
+            [NullPolicy::Unmatchable, NullPolicy::Equal],
+            vec![1, 0, 0, 1, 0, 1],
+        ),
+        (
+            [NullPolicy::Equal, NullPolicy::Unmatchable],
+            vec![1, 1, 0, 0, 0, 1],
+        ),
+    ] {
+        let spec = KeySpec::new(&types, &policies, owner.as_ref(), &|| Ok(())).unwrap();
+        assert_eq!(
+            pairs(
+                &left,
+                &[0, 2, 0, 1, 3, 0],
+                &right,
+                &[0, 2, 2, 1, 0, 0],
+                &spec,
+                owner.as_ref(),
+                &|| Ok(())
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn fixed_collision_pairs_use_canonical_nan_and_zero_with_exact_decimal_values() {
+    let owner = owner();
+    let types = [
+        FunctionValueType::new(DataType::Float64, false),
+        FunctionValueType::new(DataType::Decimal128(18, 3), false),
+    ];
+    let left = input(
+        &[
+            Arc::new(Float64Array::from(vec![
+                0.0,
+                f64::from_bits(0x7ff8_0000_0000_0001),
+                1.0,
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![1230, 1230, 1230])
+                    .with_precision_and_scale(18, 3)
+                    .unwrap(),
+            ),
+        ],
+        &types,
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let right = input(
+        &[
+            Arc::new(Float64Array::from(vec![
+                -0.0,
+                f64::from_bits(0x7ff8_0000_0000_0042),
+                1.0,
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![1230, 1230, 1231])
+                    .with_precision_and_scale(18, 3)
+                    .unwrap(),
+            ),
+        ],
+        &types,
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 2], owner.as_ref(), &|| Ok(())).unwrap();
+    assert_eq!(
+        pairs(
+            &left,
+            &[1, 0, 2, 1],
+            &right,
+            &[1, 0, 2, 0],
+            &spec,
+            owner.as_ref(),
+            &|| Ok(())
+        )
+        .unwrap(),
+        vec![1, 1, 0, 0]
+    );
+}
+
+#[test]
+fn complex_collision_pairs_reuse_original_nested_framing_and_sql_bytes() {
+    let owner = owner();
+    let mut lists = ListBuilder::new(Int32Builder::new());
+    for values in [Some(&[1, 2][..]), Some(&[1, 3][..]), None, Some(&[][..])] {
+        if let Some(values) = values {
+            for &v in values {
+                lists.values().append_value(v);
+            }
+        }
+        lists.append(values.is_some());
+    }
+    let lists: ArrayRef = Arc::new(lists.finish());
+    let types = [
+        FunctionValueType::new(lists.data_type().clone(), true),
+        FunctionValueType::new(DataType::Utf8, false),
+    ];
+    let keys = input(
+        &[lists, Arc::new(StringArray::from(vec!["same prefix"; 4]))],
+        &types,
+        &[3, 2, 0, 1],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 2], owner.as_ref(), &|| Ok(())).unwrap();
+    assert_eq!(
+        pairs(
+            &keys,
+            &[0, 0, 2, 3, 2, 1],
+            &keys,
+            &[0, 1, 2, 3, 3, 1],
+            &spec,
+            owner.as_ref(),
+            &|| Ok(())
+        )
+        .unwrap(),
+        vec![1, 0, 1, 1, 0, 1]
+    );
+}
+
+#[test]
+fn long_collision_comparison_preserves_caller_stop_and_unselected_rows_are_rejected() {
+    let owner = owner();
+    let text = "same prefix complete bytes".repeat(30_000);
+    let types = [FunctionValueType::new(DataType::Utf8, false)];
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![text.as_str(), "hidden"]))],
+        &types,
+        &[0],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    assert_eq!(
+        pairs(
+            &keys,
+            &[0, 0],
+            &keys,
+            &[0, 0],
+            &spec,
+            owner.as_ref(),
+            &|| Ok(())
+        )
+        .unwrap(),
+        vec![1, 1]
+    );
+    let cause: ExecutionFailure = ConstructionFailure::Control(
+        novarocks_type_contract::CompileControlError::DeadlineExceeded,
+    )
+    .into();
+    let checks = Cell::new(0usize);
+    let error = pairs(&keys, &[0], &keys, &[0], &spec, owner.as_ref(), &|| {
+        checks.set(checks.get() + 1);
+        if checks.get() == 8 {
+            Err(cause.clone())
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert_eq!(error, cause);
+    assert!(pairs(&keys, &[1], &keys, &[0], &spec, owner.as_ref(), &|| Ok(())).is_err());
+}
+
 #[test]
 fn complex_neighbor_does_not_rehash_repeated_long_dictionary_components() {
     let owner = owner();

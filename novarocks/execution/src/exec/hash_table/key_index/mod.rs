@@ -19,6 +19,7 @@
 //! set markers and distributed hash identities remain with their own authors.
 
 mod local_hash;
+mod pairs;
 mod prepared;
 #[cfg(test)]
 mod tests;

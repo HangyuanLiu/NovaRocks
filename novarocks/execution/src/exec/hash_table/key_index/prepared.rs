@@ -347,14 +347,14 @@ impl From<DomainFailure> for ExecutionFailure {
 
 pub(crate) struct PreparedKeyBatch<'a> {
     pub(super) input: &'a KeyInput,
-    pub(super) spec: &'a KeySpec,
+    pub(super) spec: KeySpec,
     pub(super) tuples: CanonicalTupleView<'a>,
     bytes: Vec<Option<PreparedBytes<'a>>>,
     pub(super) allocator: AggregateAllocator,
 }
 impl<'a> PreparedKeyBatch<'a> {
     pub(crate) fn new(
-        spec: &'a KeySpec,
+        spec: &KeySpec,
         input: &'a KeyInput,
         allocator: AggregateAllocator,
         owner: &dyn InputConstructionOwner,
@@ -393,7 +393,7 @@ impl<'a> PreparedKeyBatch<'a> {
         }
         Ok(Self {
             input,
-            spec,
+            spec: spec.clone(),
             tuples,
             bytes,
             allocator,
