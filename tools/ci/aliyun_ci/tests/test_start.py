@@ -122,3 +122,20 @@ class StartTests(unittest.TestCase):
         self.assertEqual(len(api.calls)-1,root['parts'])
         self.assertTrue(all(len(p['Value'])<=4096 for _,p in api.calls))
         self.assertEqual(self.plan.secret_name,api.calls[-1][1]['Name'])
+
+    def test_local_premerge_boot_does_not_require_unpublished_profile_on_github(self):
+        plan = derive(self.config, 'local-20261028T000000Z-abcd', 1, NOW)
+        bad = instance(self.config, plan, ImageId='m-wrong')
+        api = ScriptAPI([('DescribeInstances', EMPTY), ('RunInstances', CREATED),
+            ('DescribeInstances', listed(bad)), ('DescribeInstances', listed(bad)),
+            ('DeleteInstance', {}), ('DescribeInstances', EMPTY)])
+        class NoRemoteSource:
+            def call(self, *args):
+                raise AssertionError('local pre-merge boot has no remote workload admission')
+        class OSS:
+            def get(self, key): return json.dumps({'image_id':'m-exact','region':'cn-beijing'}).encode()
+            def presign(self, *args): return 'https://example.test/upload'
+        with self.assertRaisesRegex(ValueError, 'image or auto release'):
+            start_run(self.config, plan, api, ScriptAPI([]), OSS(), NoRemoteSource(),
+                sha='a'*40, image_id='m-exact', runner={}, now=lambda:NOW, sleep=lambda _:None)
+        self.assertEqual('i-exact', api.calls[-2][1]['InstanceId'])

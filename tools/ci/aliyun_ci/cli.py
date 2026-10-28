@@ -21,6 +21,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import sys
@@ -158,6 +159,14 @@ def execute(config, args):
         retain_plan(args, plan)
         from .runner_sync import current_runner
         from .start import start_run
+        if not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha):
+            raise ValueError('sha must be a complete 40-hex commit')
+        if plan.tags['origin'] == 'local':
+            repo = Path(__file__).resolve().parents[3]
+            resolved = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--verify',
+                                                 args.sha + '^{commit}'], text=True).strip()
+            if resolved.lower() != args.sha.lower():
+                raise ValueError('local probe SHA does not identify the exact preparation commit')
         runner = current_runner(config, oss)
         runner['url'] = oss.presign('GET', runner['key'], plan.deadline)
         value = start_run(config, plan, ecs, oos, oss, github, sha=args.sha,
@@ -187,5 +196,5 @@ def main(argv=None):
                 target.write('plan=' + json.dumps(value['plan'], sort_keys=True) + '\n')
         print(serialized)
         return code
-    except (ValueError, OSError, KeyError, TypeError, RuntimeError) as error:
+    except (ValueError, OSError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
         command_parser.exit(2, f'AliyunCIError: {error}\n')

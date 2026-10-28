@@ -21,6 +21,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import re
 import time
 from .ports import APIError
 from .plan import identity_tags, parse_time
@@ -175,7 +176,13 @@ def start_run(config, plan, ecs, oos, oss, github, *, sha, image_id, runner,
               mode='rust', now=None, sleep=time.sleep, wait_online=True):
     if mode not in ('rust', 'probe'):
         raise ValueError('unsupported run mode')
-    validate_target(config, github, sha)
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
+        raise ValueError('sha must be a complete 40-hex commit')
+    # A local pre-merge boot probe dispatches no test job. Its preparation
+    # commit can still be unpublished; remote workload admission applies only
+    # to GitHub runs, which actually check out and execute the requested SHA.
+    if plan.tags['origin'] == 'github':
+        validate_target(config, github, sha)
     release = json.loads(oss.get(f"{config['oss']['prefix']}/images/{image_id}/release.json"))
     if release.get('image_id') != image_id or release.get('region') != config['region']:
         raise ValueError('image release identity does not match request')

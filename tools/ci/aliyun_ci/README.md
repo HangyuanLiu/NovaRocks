@@ -57,7 +57,7 @@ python3 -m aliyun_ci --config /absolute/config.json janitor
 python3 -m aliyun_ci --config /absolute/config.json promote-image --image-id IMAGE_ID --summary-key DEPLOYMENT_PREFIX/runs/RUN_ID/ATTEMPT/summary.json
 ```
 
-本机 `start` 自动生成 `local-UTC-随机` 身份，仅验证开机和 Runner 上线，不派发测试。首个云副作用前，非秘密 plan 输出到 stderr；有 `--output` 时也独占保存同名 `.plan.json`，即使 start 失败也能用 `teardown --plan` 找回。start 正常输出再保存完整结果；不依赖它才能按原标签回收。
+本机 `start` 自动生成 `local-UTC-随机` 身份，仅验证开机和 Runner 上线，不派发测试；其SHA核对本地准确准备提交，允许尚未发布的候选代码。真正GitHub测试运行仍要求远端SHA及其工具profile存在。首个云副作用前，非秘密 plan 输出到 stderr；有 `--output` 时也独占保存同名 `.plan.json`，即使 start 失败也能用 `teardown --plan` 找回。start 正常输出再保存完整结果；不依赖它才能按原标签回收。
 
 临时 STS 用于预签名时，必须通过非秘密 `ALIYUN_CI_STS_NOT_AFTER` 给出实际凭证的 UTC 到期时间；未知或短于请求 deadline 时在创建实例前拒绝。工作流在请求12小时 STS 前记录保守的有效期上界，RAM role 同样配置12小时上限。SDK 标准公开模型没有到期字段，不能根据预签名参数伪造凭证有效期。长期凭证仍由标准链提供，执行机永远不获得它。
 
