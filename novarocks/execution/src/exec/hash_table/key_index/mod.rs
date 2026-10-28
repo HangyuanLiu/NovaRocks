@@ -26,6 +26,7 @@ mod compact;
 mod direct_int;
 mod export;
 mod fixed_store;
+mod hash_build;
 mod hash_layout;
 #[cfg(test)]
 mod hash_layout_public_tests;

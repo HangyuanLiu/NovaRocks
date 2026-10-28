@@ -651,6 +651,29 @@ impl MergedPartition {
     pub(super) fn ndv(&self) -> RoutedNdv {
         self.ndv
     }
+    /// Move the original directory without allocation or a second page list.
+    /// Its original creator outlives both unread pages and the Vec backing.
+    pub(super) fn into_reference_pages(self) -> MergedReferencePages {
+        MergedReferencePages {
+            pages: self.pages.into_iter(),
+            _storage: self._storage,
+        }
+    }
+}
+/// An owning view of the existing merged reference directory, not a new
+/// routing/completion protocol. Unread pages drop before their directory owner.
+/// Consumed pages move out once; their original source/creator goes with them.
+pub(super) struct MergedReferencePages {
+    pages: std::vec::IntoIter<ReferencePage>,
+    _storage: ValueTypeStorageLifetime,
+}
+impl MergedReferencePages {
+    pub(super) fn next_page(&mut self) -> Option<ReferencePage> {
+        self.pages.next()
+    }
+    pub(super) fn remaining(&self) -> usize {
+        self.pages.len()
+    }
 }
 fn checkpoint(work: &RouteWork<'_>) -> ExecutionResult<()> {
     work.control.checkpoint(0).map_err(ExecutionFailure::from)

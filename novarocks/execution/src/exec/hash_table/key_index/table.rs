@@ -115,6 +115,118 @@ struct CompactedPrefix {
     classes: usize,
     chunk_rows: NonZeroUsize,
 }
+// A soft work/storage preference. Every remaining class continues in another
+// chunk; neither this value nor a page target bounds legal input or key size.
+const COMPACTION_CLASS_ROWS: usize = 4096;
+
+struct ClassSourceIdentity {
+    spec: KeySpec,
+    classes: usize,
+    chunk_rows: NonZeroUsize,
+    _storage: ValueTypeStorageLifetime,
+}
+impl ClassSourceIdentity {
+    fn chunk_count(&self) -> usize {
+        self.classes.div_ceil(self.chunk_rows.get())
+    }
+    fn range(&self, ordinal: usize) -> ExecutionResult<Range<usize>> {
+        if ordinal >= self.chunk_count() {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        let start = ordinal
+            .checked_mul(self.chunk_rows.get())
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let end = start
+            .checked_add((self.classes - start).min(self.chunk_rows.get()))
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        Ok(start..end)
+    }
+}
+
+/// A moved immutable source, funded through the original shared author. The
+/// common task graph owns exclusive claims and actual Body-exit evidence.
+/// An Arc count is an ownership check, never a replacement for that evidence.
+pub(super) struct ClassSourcePlan {
+    index: KeyIndex,
+    identity: Arc<ClassSourceIdentity>,
+    _storage: ValueTypeStorageLifetime,
+}
+/// An already-validated new representative chunk. This non-Clone receipt owns
+/// no whole old source/index; its small paid identity cannot retain old pages.
+pub(super) struct MaterializedClassChunk {
+    batch: Arc<OwnedKeyBatch>,
+    identity: Arc<ClassSourceIdentity>,
+    ordinal: usize,
+    classes: Range<usize>,
+}
+impl ClassSourcePlan {
+    pub(super) fn new(
+        index: KeyIndex,
+        chunk_rows: NonZeroUsize,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<Arc<Self>> {
+        index.check()?;
+        control.checkpoint(0)?;
+        let identity = index.class_source_identity(chunk_rows, owner, control)?;
+        shared(
+            owner,
+            Self {
+                index,
+                identity,
+                _storage: owner.storage_lifetime(),
+            },
+        )
+    }
+    pub(super) fn chunk_count(&self) -> usize {
+        self.identity.chunk_count()
+    }
+    pub(super) fn materialize_chunk(
+        &self,
+        ordinal: usize,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<MaterializedClassChunk> {
+        self.index
+            .materialize_class_chunk(&self.identity, ordinal, owner, control)
+    }
+    /// The common graph must first establish every actual Body exit. No
+    /// duplicate table, source clone, retry/fallback or wait is introduced here.
+    pub(super) fn publish(
+        source: Arc<Self>,
+        completed: Vec<MaterializedClassChunk>,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<(KeyIndex, RetiredClassBatches)> {
+        control.checkpoint(0)?;
+        let mut source = Arc::try_unwrap(source).map_err(|_| invariant(ValueViolation::Layout))?;
+        let retired =
+            source
+                .index
+                .install_class_chunks(&source.identity, completed, owner, control)?;
+        Ok((source.index, retired))
+    }
+}
+
+/// Owns the real former batch directory. Returning it prevents publication
+/// from synchronously destroying all old fragmented representatives. The
+/// common graph lends this holder to its original retirement data-work Body.
+/// Escaping Arrow aliases can independently retain old backing after a pop.
+pub(super) struct RetiredClassBatches {
+    batches: AggregateVec<Arc<OwnedKeyBatch>>,
+}
+impl RetiredClassBatches {
+    pub(super) fn remaining_batches(&self) -> usize {
+        self.batches.len()
+    }
+    /// One prior batch header is one retirement work unit. The caller owns
+    /// original control/CPU allowance and actual exit; no observation, worker,
+    /// completion claim or new resource authority is minted by this method.
+    pub(super) fn retire_one(&mut self) -> bool {
+        self.batches.pop().is_some()
+    }
+}
+
 struct Pending {
     row: usize,
     occurrence: usize,
@@ -232,10 +344,42 @@ impl KeyIndex {
         tracker: Arc<MemTracker>,
         owner: &dyn InputConstructionOwner,
     ) -> ExecutionResult<Self> {
+        Self::new_with_resources(
+            spec,
+            purpose,
+            policy,
+            layout,
+            AggregateAllocator::new(tracker.clone()),
+            expression_allocation_host(tracker),
+            owner,
+        )
+    }
+    pub(super) fn new_for_bulk_hash_with_resources(
+        spec: KeySpec,
+        purpose: IndexPurpose,
+        policy: LocalHashPolicy,
+        layout: HashLayout,
+        allocator: AggregateAllocator,
+        host: Arc<dyn AggregateStateAllocator>,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Self> {
+        if layout.closed_input_bound().is_none() {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        Self::new_with_resources(spec, purpose, policy, layout, allocator, host, owner)
+    }
+    fn new_with_resources(
+        spec: KeySpec,
+        purpose: IndexPurpose,
+        policy: LocalHashPolicy,
+        layout: HashLayout,
+        allocator: AggregateAllocator,
+        host: Arc<dyn AggregateStateAllocator>,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Self> {
         if !policy.accepts(&spec) {
             return Err(invariant(ValueViolation::Layout));
         }
-        let allocator = AggregateAllocator::new(tracker.clone());
         Ok(Self {
             policy,
             layout,
@@ -246,7 +390,7 @@ impl KeyIndex {
             batches: AggregateVec::new_in(allocator.clone()),
             compacted: None,
             allocator,
-            host: expression_allocation_host(tracker),
+            host,
             failed: None,
             _storage: owner.storage_lifetime(),
         })
@@ -259,6 +403,53 @@ impl KeyIndex {
     }
     pub(crate) fn len(&self) -> usize {
         self.classes.len()
+    }
+    /// HashInit's actual empty construction state, never an estimate of D.
+    pub(super) fn validate_bulk_build_input(
+        &self,
+        spec: &KeySpec,
+        policy: &LocalHashPolicy,
+        purpose: IndexPurpose,
+    ) -> ExecutionResult<()> {
+        self.check()?;
+        if !self.spec.same_instance(spec)
+            || !self.policy.same_instance(policy)
+            || self.purpose != purpose
+            || !self.classes.is_empty()
+            || self.layout.closed_input_bound().is_none()
+        {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        Ok(())
+    }
+    /// The common graph supplies a qualified partition estimate plus margin.
+    /// This only preallocates metadata through its existing real allocator;
+    /// exact new classes still grow normally and retain the saved hashes/IDs.
+    pub(super) fn reserve_bulk_distinct(
+        &mut self,
+        initial: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<()> {
+        let result = (|| {
+            self.check()?;
+            let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+            checkpoint()?;
+            if !self.classes.is_empty()
+                || self.layout.closed_input_bound().is_none()
+                || !self.layout.admits_reservation(0, initial)
+            {
+                return Err(invariant(ValueViolation::Layout));
+            }
+            reserve_directory(&mut self.directory, initial, &checkpoint)?;
+            reserve_state(&mut self.classes, initial, &checkpoint)?;
+            checkpoint()
+        })();
+        if let Err(cause) = &result {
+            if self.failed.is_none() {
+                self.failed = Some(cause.clone());
+            }
+        }
+        result
     }
     /// The sole owner of class-to-representative coordinates. Old Class.key
     /// values in a compacted prefix are only dormant numeric coordinates;
@@ -439,41 +630,137 @@ impl KeyIndex {
         }
         result
     }
+    fn class_source_identity(
+        &self,
+        chunk_rows: NonZeroUsize,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<Arc<ClassSourceIdentity>> {
+        self.check()?;
+        control.checkpoint(0)?;
+        shared(
+            owner,
+            ClassSourceIdentity {
+                spec: self.spec.clone(),
+                classes: self.classes.len(),
+                chunk_rows,
+                _storage: owner.storage_lifetime(),
+            },
+        )
+    }
+    /// One finite class chunk is one materialization work unit. Original V
+    /// gather/copy calls retain their cooperative/opaque operation boundaries;
+    /// this delegate does not claim a row-exact resumable quota.
+    fn materialize_class_chunk(
+        &self,
+        identity: &Arc<ClassSourceIdentity>,
+        ordinal: usize,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<MaterializedClassChunk> {
+        self.check()?;
+        control.checkpoint(0)?;
+        if !self.spec.same_instance(&identity.spec) || self.classes.len() != identity.classes {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        let classes = identity.range(ordinal)?;
+        let read = self.read_class_range(classes.clone(), owner, control)?;
+        let batch =
+            super::compact::gather(&read, &self.spec, owner, Arc::clone(&self.host), control)?;
+        if batch.len() != classes.len() {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        let batch = shared(owner, batch)?;
+        control.checkpoint(0)?;
+        Ok(MaterializedClassChunk {
+            batch,
+            identity: Arc::clone(identity),
+            ordinal,
+            classes,
+        })
+    }
+    /// Only O(chunks) headers/directories are inspected here. Each private
+    /// receipt was value-validated by its worker, not by this publisher.
+    fn install_class_chunks(
+        &mut self,
+        identity: &Arc<ClassSourceIdentity>,
+        completed: Vec<MaterializedClassChunk>,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<RetiredClassBatches> {
+        self.check()?;
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
+        if !self.spec.same_instance(&identity.spec)
+            || self.classes.len() != identity.classes
+            || completed.len() != identity.chunk_count()
+        {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        let mut ordered = vector::<Option<Arc<OwnedKeyBatch>>>(owner, completed.len())?;
+        for ordinal in 0..completed.len() {
+            checkpoint_at(ordinal, &checkpoint)?;
+            ordered.push(None);
+        }
+        for (position, chunk) in completed.into_iter().enumerate() {
+            checkpoint_at(position, &checkpoint)?;
+            if !Arc::ptr_eq(identity, &chunk.identity)
+                || chunk.classes != identity.range(chunk.ordinal)?
+                || chunk.batch.len() != chunk.classes.len()
+            {
+                return Err(invariant(ValueViolation::Layout));
+            }
+            let slot = ordered
+                .get_mut(chunk.ordinal)
+                .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+            if slot.is_some() {
+                return Err(invariant(ValueViolation::Layout));
+            }
+            *slot = Some(chunk.batch);
+        }
+        let mut replacement = AggregateVec::new_in(self.allocator.clone());
+        reserve_state(&mut replacement, ordered.len(), &checkpoint)?;
+        for (ordinal, chunk) in ordered.into_iter().enumerate() {
+            checkpoint_at(ordinal, &checkpoint)?;
+            replacement.push(chunk.ok_or_else(|| invariant(ValueViolation::Layout))?);
+        }
+        // All fallible preparation/observation precedes this constant-time
+        // commit. The old directory remains an explicit owned output, so the
+        // graph can retire its actual Arc headers as separate data work.
+        checkpoint()?;
+        let retired = std::mem::replace(&mut self.batches, replacement);
+        self.compacted = Some(CompactedPrefix {
+            classes: identity.classes,
+            chunk_rows: identity.chunk_rows,
+        });
+        Ok(RetiredClassBatches { batches: retired })
+    }
     fn compact_pages(
         &mut self,
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<()> {
-        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
-        checkpoint()?;
+        self.check()?;
+        control.checkpoint(0)?;
         if self.classes.is_empty() {
-            return checkpoint();
+            return control.checkpoint(0).map_err(ExecutionFailure::from);
         }
-        let read = self.read_class_range(0..self.classes.len(), owner, control)?;
-        let batch =
-            super::compact::gather(&read, &self.spec, owner, Arc::clone(&self.host), control)?;
-        if batch.len() != self.classes.len() {
-            return Err(invariant(ValueViolation::Bounds));
+        let rows = NonZeroUsize::new(COMPACTION_CLASS_ROWS)
+            .expect("the soft class chunk preference is positive");
+        let identity = self.class_source_identity(rows, owner, control)?;
+        let mut completed = vector(owner, identity.chunk_count())?;
+        for ordinal in 0..identity.chunk_count() {
+            completed.push(self.materialize_class_chunk(&identity, ordinal, owner, control)?);
         }
-        let batch = shared(owner, batch)?;
-        let mut replacement = AggregateVec::new_in(self.allocator.clone());
-        reserve_state(&mut replacement, 1, &checkpoint)?;
-        replacement.push(batch);
-        drop(read);
-        // This synchronous path still gathers one batch. Installing its
-        // prefix geometry avoids rewriting every Class.key; full/table hashes,
-        // collision links and first-occurrence dense IDs remain unchanged.
-        // Parallel chunk tasks and resumable materialization are not provided
-        // by this location prerequisite.
-        let prefix = CompactedPrefix {
-            classes: self.classes.len(),
-            chunk_rows: NonZeroUsize::new(self.classes.len().max(1))
-                .expect("class chunk size is positive"),
-        };
-        checkpoint()?;
-        self.batches = replacement;
-        self.compacted = Some(prefix);
-        checkpoint()
+        let mut retired = self.install_class_chunks(&identity, completed, owner, control)?;
+        // The incremental wrapper is synchronous, including real retirement.
+        // Bulk uses the same holder under its separate original data-work Body.
+        while retired.remaining_batches() != 0 {
+            control.checkpoint(0)?;
+            retired.retire_one();
+        }
+        drop(retired);
+        control.checkpoint(0).map_err(ExecutionFailure::from)
     }
     /// Mutation publishes a complete result or permanently latches its first
     /// failure. Partially committed internals can never be retried as success.

@@ -785,3 +785,397 @@ fn class_range_fixed_reads_keep_local_ordinals_and_refuse_only_invalid_coordinat
         }
     }
 }
+
+fn chunk_error<T>(result: ExecutionResult<T>) -> ExecutionFailure {
+    match result {
+        Err(cause) => cause,
+        Ok(_) => panic!("invalid chunk publication cannot succeed"),
+    }
+}
+fn chunk_index(
+    spec: &KeySpec,
+    values: &[Option<&str>],
+    tracker: &Arc<MemTracker>,
+    owner: &dyn InputConstructionOwner,
+) -> KeyIndex {
+    let mut index =
+        KeyIndex::new(spec.clone(), IndexPurpose::KeyIds, tracker.clone(), owner).unwrap();
+    for &value in values {
+        let keys = input(
+            &[Arc::new(StringArray::from(vec![value]))],
+            spec.types(),
+            &[0],
+            owner,
+        );
+        insert(&mut index, &keys, tracker, owner);
+    }
+    index
+}
+fn drain_chunk_retirement(mut retired: super::super::table::RetiredClassBatches) {
+    let original = retired.remaining_batches();
+    for remaining in (0..original).rev() {
+        assert!(retired.retire_one());
+        assert_eq!(retired.remaining_batches(), remaining);
+    }
+    assert!(!retired.retire_one());
+}
+
+#[test]
+fn class_chunk_scoped_workers_reverse_results_keep_dense_ids_and_append_after_retirement() {
+    use super::super::table::ClassSourcePlan;
+    use std::{num::NonZeroUsize, sync::Barrier};
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let texts: Vec<_> = (0..32).map(|n| format!("key{n:02}")).collect();
+    let mut values: Vec<_> = texts.iter().map(|s| Some(s.as_str())).collect();
+    values.push(None);
+    let mut index = chunk_index(&spec, &values, &tracker, owner.as_ref());
+    // Hundreds of tiny original batches repeat a small fixed value domain.
+    for i in 0..256 {
+        let keys = input(
+            &[Arc::new(StringArray::from(vec![values[i % values.len()]]))],
+            std::slice::from_ref(&ty),
+            &[0],
+            owner.as_ref(),
+        );
+        insert(&mut index, &keys, &tracker, owner.as_ref());
+    }
+    assert_eq!(index.len(), 33);
+    let ids: Vec<_> = (0..index.len()).map(KeyId).collect();
+    let old_pages = index
+        .read_keys(&ids, owner.as_ref(), &CopyControl)
+        .unwrap()
+        .columns()[0]
+        .pages()
+        .len();
+    let source = ClassSourcePlan::new(
+        index,
+        NonZeroUsize::new(17).unwrap(),
+        owner.as_ref(),
+        &CopyControl,
+    )
+    .unwrap();
+    assert_eq!(source.chunk_count(), 2);
+    let barrier = Barrier::new(2);
+    let chunks = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            let result = source
+                .materialize_chunk(0, owner.as_ref(), &CopyControl)
+                .unwrap();
+            assert_eq!(super::super::local_hash::BYTE_HASH_INITS.with(Cell::get), 0);
+            result
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            let result = source
+                .materialize_chunk(1, owner.as_ref(), &CopyControl)
+                .unwrap();
+            assert_eq!(super::super::local_hash::BYTE_HASH_INITS.with(Cell::get), 0);
+            result
+        });
+        vec![second.join().unwrap(), first.join().unwrap()]
+    });
+    assert_eq!(
+        Arc::strong_count(&source),
+        1,
+        "new receipts do not own the old source"
+    );
+    let (mut index, retired) =
+        ClassSourcePlan::publish(source, chunks, owner.as_ref(), &CopyControl).unwrap();
+    assert!(retired.remaining_batches() > 2);
+    let read = index.read_keys(&ids, owner.as_ref(), &CopyControl).unwrap();
+    assert!(read.columns()[0].pages().len() < old_pages);
+    assert_eq!(
+        location_texts(&read),
+        values
+            .iter()
+            .map(|v| v.map(str::to_owned))
+            .collect::<Vec<_>>()
+    );
+    drop(read);
+    drain_chunk_retirement(retired);
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            Some("key31"),
+            Some("new B"),
+            Some("key00"),
+            Some("new A"),
+            Some("new B"),
+            None,
+        ]))],
+        std::slice::from_ref(&ty),
+        &[3, 1, 4, 0, 5, 2],
+        owner.as_ref(),
+    );
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref()).force_hash(0);
+    let expected = [
+        KeyMatch::Found(KeyId(33)),
+        KeyMatch::Found(KeyId(34)),
+        KeyMatch::Found(KeyId(34)),
+        KeyMatch::Found(KeyId(31)),
+        KeyMatch::Found(KeyId(32)),
+        KeyMatch::Found(KeyId(0)),
+    ];
+    assert_eq!(
+        index
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &expected
+    );
+    index.compact(owner.as_ref(), &CopyControl).unwrap();
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &expected
+    );
+    let ids = [
+        KeyId(34),
+        KeyId(17),
+        KeyId(32),
+        KeyId(0),
+        KeyId(33),
+        KeyId(34),
+    ];
+    let exported = index
+        .export_keys(&ids, &[ty], owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(
+        exported.arrays()[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![
+            Some("new B"),
+            Some("key17"),
+            None,
+            Some("key00"),
+            Some("new A"),
+            Some("new B")
+        ]
+    );
+}
+
+#[test]
+fn class_chunk_publication_rejects_missing_foreign_repeated_and_still_shared_sources() {
+    use super::super::table::ClassSourcePlan;
+    use std::num::NonZeroUsize;
+    enum Refusal {
+        Missing,
+        Foreign,
+        Repeated,
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    for refusal in [Refusal::Missing, Refusal::Foreign, Refusal::Repeated] {
+        let source = ClassSourcePlan::new(
+            chunk_index(
+                &spec,
+                &[Some("alpha"), Some("beta"), Some("gamma")],
+                &tracker,
+                owner.as_ref(),
+            ),
+            NonZeroUsize::new(2).unwrap(),
+            owner.as_ref(),
+            &CopyControl,
+        )
+        .unwrap();
+        let first = source
+            .materialize_chunk(0, owner.as_ref(), &CopyControl)
+            .unwrap();
+        let chunks = match refusal {
+            Refusal::Missing => vec![first],
+            Refusal::Repeated => vec![
+                first,
+                source
+                    .materialize_chunk(0, owner.as_ref(), &CopyControl)
+                    .unwrap(),
+            ],
+            Refusal::Foreign => {
+                let other = ClassSourcePlan::new(
+                    chunk_index(
+                        &spec,
+                        &[Some("alpha"), Some("beta"), Some("gamma")],
+                        &tracker,
+                        owner.as_ref(),
+                    ),
+                    NonZeroUsize::new(2).unwrap(),
+                    owner.as_ref(),
+                    &CopyControl,
+                )
+                .unwrap();
+                let foreign = other
+                    .materialize_chunk(1, owner.as_ref(), &CopyControl)
+                    .unwrap();
+                assert_eq!(Arc::strong_count(&other), 1);
+                drop(other);
+                vec![first, foreign]
+            }
+        };
+        assert_value_failure(
+            &chunk_error(ClassSourcePlan::publish(
+                source,
+                chunks,
+                owner.as_ref(),
+                &CopyControl,
+            )),
+            ValueViolation::Layout,
+        );
+    }
+    let source = ClassSourcePlan::new(
+        chunk_index(&spec, &[Some("alpha")], &tracker, owner.as_ref()),
+        NonZeroUsize::new(2).unwrap(),
+        owner.as_ref(),
+        &CopyControl,
+    )
+    .unwrap();
+    let chunk = source
+        .materialize_chunk(0, owner.as_ref(), &CopyControl)
+        .unwrap();
+    let outstanding_source = Arc::clone(&source);
+    assert_value_failure(
+        &chunk_error(ClassSourcePlan::publish(
+            source,
+            vec![chunk],
+            owner.as_ref(),
+            &CopyControl,
+        )),
+        ValueViolation::Layout,
+    );
+    assert_eq!(outstanding_source.chunk_count(), 1);
+    drop(outstanding_source);
+}
+
+#[test]
+fn class_chunk_retirement_and_last_escaped_buffer_keep_separate_old_and_new_creators() {
+    use super::super::table::ClassSourcePlan;
+    use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
+    use std::{
+        num::NonZeroUsize,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    struct Tag(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Tag {}
+    impl Drop for Tag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            "old and new escaped buffers keep their real creators",
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0],
+        owner.as_ref(),
+    );
+    let old_drops = Arc::new(AtomicUsize::new(0));
+    let new_drops = Arc::new(AtomicUsize::new(0));
+    let old_owner = TaggedCreator {
+        original: owner.as_ref(),
+        storage: owner
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(
+                &ValueTypeStorageLifetime::held(Arc::new(Tag(old_drops.clone()))),
+                |layout| owner.request(layout),
+            )
+            .unwrap(),
+    };
+    insert(&mut index, &keys, &tracker, &old_owner);
+    let read = index
+        .read_keys(&[KeyId(0)], owner.as_ref(), &CopyControl)
+        .unwrap();
+    let KeyReadValues::Bytes { array, .. } = read.columns()[0].pages()[0].values() else {
+        panic!("old byte loan")
+    };
+    let old_alias = Arc::clone(array);
+    let old_buffer = old_alias.to_data().buffers()[0].clone();
+    drop(read);
+    drop(old_owner);
+    let new_owner = TaggedCreator {
+        original: owner.as_ref(),
+        storage: owner
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(
+                &ValueTypeStorageLifetime::held(Arc::new(Tag(new_drops.clone()))),
+                |layout| owner.request(layout),
+            )
+            .unwrap(),
+    };
+    let source = ClassSourcePlan::new(
+        index,
+        NonZeroUsize::new(2).unwrap(),
+        &new_owner,
+        &CopyControl,
+    )
+    .unwrap();
+    let chunk = source
+        .materialize_chunk(0, &new_owner, &CopyControl)
+        .unwrap();
+    assert_eq!(Arc::strong_count(&source), 1);
+    let (index, retired) =
+        ClassSourcePlan::publish(source, vec![chunk], &new_owner, &CopyControl).unwrap();
+    assert_eq!(old_drops.load(Ordering::SeqCst), 0);
+    drain_chunk_retirement(retired);
+    assert_eq!(old_drops.load(Ordering::SeqCst), 0);
+    drop(old_alias);
+    assert_eq!(old_drops.load(Ordering::SeqCst), 0);
+    drop(old_buffer);
+    assert_eq!(old_drops.load(Ordering::SeqCst), 1);
+    let read = index
+        .read_keys(&[KeyId(0)], owner.as_ref(), &CopyControl)
+        .unwrap();
+    let KeyReadValues::Bytes { array, .. } = read.columns()[0].pages()[0].values() else {
+        panic!("new byte loan")
+    };
+    let new_alias = Arc::clone(array);
+    let new_buffer = new_alias.to_data().buffers()[0].clone();
+    drop(read);
+    drop(new_owner);
+    drop(index);
+    assert_eq!(new_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        new_alias
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .value(0),
+        "old and new escaped buffers keep their real creators"
+    );
+    drop(new_alias);
+    assert_eq!(new_drops.load(Ordering::SeqCst), 0);
+    drop(new_buffer);
+    assert_eq!(new_drops.load(Ordering::SeqCst), 1);
+}
