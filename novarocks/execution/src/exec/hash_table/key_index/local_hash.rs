@@ -110,6 +110,11 @@ pub(crate) struct LocalHashBatch {
     _storage: ValueTypeStorageLifetime,
 }
 impl LocalHashBatch {
+    #[cfg(test)]
+    pub(super) fn force_hash(mut self, value: u64) -> Self {
+        self.hashes.fill(value);
+        self
+    }
     pub(crate) fn len(&self) -> usize {
         self.hashes.len()
     }

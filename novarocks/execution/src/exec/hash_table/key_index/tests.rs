@@ -1055,6 +1055,627 @@ impl novarocks_functions::KernelEvaluationControl for CopyControl {
     }
 }
 
+fn index_hash(
+    keys: &KeyInput,
+    index: &KeyIndex,
+    tracker: &Arc<MemTracker>,
+    owner: &dyn InputConstructionOwner,
+) -> LocalHashBatch {
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner,
+        &|| Ok(()),
+    )
+    .unwrap();
+    hash_batch(
+        &prepared,
+        index.policy(),
+        &mut HashScratch::new(),
+        owner,
+        &|| Ok(()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn incremental_index_assigns_first_occurrence_dense_ids_and_keeps_nonparticipation_distinct() {
+    let (owner, tracker) = owner_with_tracker();
+    let types = [
+        FunctionValueType::new(DataType::Int32, false),
+        FunctionValueType::new(DataType::Utf8, true),
+    ];
+    let spec = KeySpec::new(
+        &types,
+        &[NullPolicy::Equal, NullPolicy::Unmatchable],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let keys = input(
+        &[
+            Arc::new(Int32Array::from(vec![7, 7, 8, 7])),
+            Arc::new(StringArray::from(vec![
+                Some("alpha"),
+                None,
+                Some("alpha"),
+                Some("alpha"),
+            ])),
+        ],
+        &types,
+        &[3, 0, 3, 2, 1, 0],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let result = index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(
+        result.matches(),
+        &[
+            KeyMatch::Found(KeyId(0)),
+            KeyMatch::Found(KeyId(0)),
+            KeyMatch::Found(KeyId(0)),
+            KeyMatch::Found(KeyId(1)),
+            KeyMatch::Unmatchable,
+            KeyMatch::Found(KeyId(0))
+        ]
+    );
+    assert_eq!(
+        result.new_keys(),
+        &[
+            NewKey {
+                occurrence: 0,
+                row: 3,
+                id: KeyId(0)
+            },
+            NewKey {
+                occurrence: 3,
+                row: 2,
+                id: KeyId(1)
+            }
+        ]
+    );
+    assert_eq!(index.len(), 2);
+    let next = input(
+        &[
+            Arc::new(Int32Array::from(vec![7, 9, 8, 9])),
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![1, 0, 1, 0]),
+                    Arc::new(StringArray::from(vec!["beta", "alpha"])),
+                )
+                .unwrap(),
+            ),
+        ],
+        &types,
+        &[0, 1, 2, 3],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&next, &index, &tracker, owner.as_ref());
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &next,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &[
+            KeyMatch::Found(KeyId(0)),
+            KeyMatch::Miss,
+            KeyMatch::Found(KeyId(1)),
+            KeyMatch::Miss
+        ]
+    );
+    let result = index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(
+        result.matches(),
+        &[
+            KeyMatch::Found(KeyId(0)),
+            KeyMatch::Found(KeyId(2)),
+            KeyMatch::Found(KeyId(1)),
+            KeyMatch::Found(KeyId(2))
+        ]
+    );
+    assert_eq!(
+        result.new_keys(),
+        &[NewKey {
+            occurrence: 1,
+            row: 1,
+            id: KeyId(2)
+        }]
+    );
+    assert_eq!(index.len(), 3);
+}
+
+#[test]
+fn forced_zero_hash_collisions_and_repeated_inputs_across_work_chunks_use_exact_equality() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let values = (0..700)
+        .map(|i| {
+            if i % 50 == 0 {
+                None
+            } else {
+                Some(format!("same prefix distinct tail {}", i % 19))
+            }
+        })
+        .collect::<Vec<_>>();
+    let rows = (0..values.len()).collect::<Vec<_>>();
+    let keys = input(
+        &[Arc::new(StringArray::from(values.clone()))],
+        &[ty],
+        &rows,
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref()).force_hash(0);
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &keys,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    super::local_hash::BYTE_HASH_INITS.with(|counter| counter.set(0));
+    let result = index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(super::local_hash::BYTE_HASH_INITS.with(Cell::get), 0);
+    let mut distinct = Vec::<Option<String>>::new();
+    let mut expected = Vec::new();
+    let mut firsts = Vec::new();
+    for (occurrence, value) in values.iter().enumerate() {
+        let id = match distinct.iter().position(|old| old == value) {
+            Some(id) => id,
+            None => {
+                let id = distinct.len();
+                distinct.push(value.clone());
+                firsts.push(NewKey {
+                    occurrence,
+                    row: occurrence,
+                    id: KeyId(id),
+                });
+                id
+            }
+        };
+        expected.push(KeyMatch::Found(KeyId(id)));
+    }
+    assert_eq!(result.matches(), expected);
+    assert_eq!(result.new_keys(), firsts);
+    assert_eq!(index.len(), 20);
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        expected
+    );
+    let repeated = index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert!(repeated.new_keys().is_empty());
+    assert_eq!(repeated.matches(), expected);
+}
+
+#[test]
+fn presence_index_retains_one_exact_representative_per_class_without_exposing_ids() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Unmatchable],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index = KeyIndex::new(
+        spec,
+        IndexPurpose::PresenceOnly,
+        tracker.clone(),
+        owner.as_ref(),
+    )
+    .unwrap();
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            Some("alpha"),
+            None,
+            Some("beta"),
+            Some("alpha"),
+        ]))],
+        std::slice::from_ref(&ty),
+        &[3, 0, 1, 2, 3],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref()).force_hash(0);
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let added: usize = index
+        .include_presence(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(added, 2);
+    assert_eq!(index.len(), 2);
+    assert!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .is_err()
+    );
+    let probe = input(
+        &[Arc::new(StringArray::from(vec![
+            Some("gamma"),
+            Some("beta"),
+            None,
+            Some("alpha"),
+        ]))],
+        &[ty],
+        &[0, 1, 2, 3],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&probe, &index, &tracker, owner.as_ref()).force_hash(0);
+    let probe = PreparedKeyBatch::new(
+        index.spec(),
+        &probe,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let result = index
+        .contains_batch(&probe, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(result.present(), &[0, 1, 0, 1]);
+    assert_eq!(result.participates(), &[1, 1, 0, 1]);
+    assert_eq!(
+        index
+            .include_presence(&probe, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap(),
+        1
+    );
+    assert_eq!(index.len(), 3);
+}
+
+#[test]
+fn mixed_fixed_bytes_and_complex_index_batches_preserve_full_tuple_equality() {
+    let (owner, tracker) = owner_with_tracker();
+    let mut lists = ListBuilder::new(Int32Builder::new());
+    for value in [1, 1, 1, 1, 2] {
+        lists.values().append_value(value);
+        lists.append(true);
+    }
+    let list: ArrayRef = Arc::new(lists.finish());
+    let types = [
+        FunctionValueType::new(DataType::Int32, false),
+        FunctionValueType::new(DataType::Utf8, false),
+        FunctionValueType::new(list.data_type().clone(), false),
+    ];
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 3], owner.as_ref(), &|| Ok(())).unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let keys = input(
+        &[
+            Arc::new(Int32Array::from(vec![1, 1, 2, 1, 1])),
+            Arc::new(StringArray::from(vec![
+                "alpha", "beta", "alpha", "alpha", "alpha",
+            ])),
+            list,
+        ],
+        &types,
+        &[3, 1, 0, 2, 4, 3],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref()).force_hash(0);
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &keys,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let result = index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    let expected = [
+        KeyMatch::Found(KeyId(0)),
+        KeyMatch::Found(KeyId(1)),
+        KeyMatch::Found(KeyId(0)),
+        KeyMatch::Found(KeyId(2)),
+        KeyMatch::Found(KeyId(3)),
+        KeyMatch::Found(KeyId(0)),
+    ];
+    assert_eq!(result.matches(), expected);
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        expected
+    );
+}
+
+#[test]
+fn owned_byte_page_groups_restore_reordered_probe_occurrences_in_the_complete_index() {
+    let (owner, tracker) = owner_with_tracker();
+    let length = super::store::OwnedByteColumn::page_target_for_test() + 31;
+    let strings =
+        ["alpha", "beta", "gamma", "delta"].map(|prefix| format!("{prefix}{}", "x".repeat(length)));
+    let mut lists = ListBuilder::new(Int32Builder::new());
+    for _ in 0..4 {
+        lists.values().append_value(1);
+        lists.append(true);
+    }
+    let list: ArrayRef = Arc::new(lists.finish());
+    let types = [
+        FunctionValueType::new(DataType::Int32, false),
+        FunctionValueType::new(DataType::Utf8, false),
+        FunctionValueType::new(list.data_type().clone(), false),
+    ];
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from(vec![1; 4])),
+        Arc::new(StringArray::from(
+            strings.iter().map(String::as_str).collect::<Vec<_>>(),
+        )),
+        list,
+    ];
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 3], owner.as_ref(), &|| Ok(())).unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let keys = input(&arrays, &types, &[1, 0, 3, 2], owner.as_ref());
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    let query = input(&arrays, &types, &[3, 0, 2, 1, 0], owner.as_ref());
+    let hashes = index_hash(&query, &index, &tracker, owner.as_ref());
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &query,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &[
+            KeyMatch::Found(KeyId(2)),
+            KeyMatch::Found(KeyId(1)),
+            KeyMatch::Found(KeyId(3)),
+            KeyMatch::Found(KeyId(0)),
+            KeyMatch::Found(KeyId(1))
+        ]
+    );
+}
+
+#[test]
+fn a_final_commit_checkpoint_refusal_never_publishes_assignments_or_allows_index_reuse() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Control {
+        calls: AtomicUsize,
+        stop_at: Option<usize>,
+    }
+    impl novarocks_functions::KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.stop_at == Some(call) {
+                Err(novarocks_functions::KernelFailure::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("key index never waits")
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::UInt64, false);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let count = 300;
+    let keys = input(
+        &[Arc::new(UInt64Array::from_iter_values(0..count as u64))],
+        &[ty],
+        &(0..count).collect::<Vec<_>>(),
+        owner.as_ref(),
+    );
+    let mut first = KeyIndex::new(
+        spec.clone(),
+        IndexPurpose::KeyIds,
+        tracker.clone(),
+        owner.as_ref(),
+    )
+    .unwrap();
+    let hashes = index_hash(&keys, &first, &tracker, owner.as_ref()).force_hash(0);
+    let prepared = PreparedKeyBatch::new(
+        first.spec(),
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let baseline = Control {
+        calls: AtomicUsize::new(0),
+        stop_at: None,
+    };
+    let complete = first
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &baseline)
+        .unwrap();
+    assert_eq!(complete.new_keys().len(), count);
+    let calls = baseline.calls.load(Ordering::SeqCst);
+    // The injection follows this same deterministic forced-collision work,
+    // not a frozen implementation call count or a wall-clock timeout.
+    let mut second =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let hashes = index_hash(&keys, &second, &tracker, owner.as_ref()).force_hash(0);
+    let prepared = PreparedKeyBatch::new(
+        second.spec(),
+        &keys,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let stop = Control {
+        calls: AtomicUsize::new(0),
+        stop_at: Some(calls),
+    };
+    let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
+    assert_eq!(
+        second
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &stop)
+            .err()
+            .unwrap(),
+        cause
+    );
+    // This observes the failed object's diagnostic prefix, not a successful
+    // result. Every semantic operation must still return its original error.
+    assert_eq!(second.len(), count);
+    assert_eq!(stop.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(
+        second
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .err()
+            .unwrap(),
+        cause
+    );
+    assert_eq!(
+        second
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .err()
+            .unwrap(),
+        cause
+    );
+}
+
+#[test]
+fn readonly_index_failure_preserves_published_state_and_mutating_failure_is_permanent() {
+    struct Stop;
+    impl novarocks_functions::KernelEvaluationControl for Stop {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Err(novarocks_functions::KernelFailure::DeadlineExceeded)
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("key index never waits")
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let keys = input(
+        &[Arc::new(Int64Array::from(vec![7, 9]))],
+        &[ty],
+        &[0, 1],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+    let prepared = PreparedKeyBatch::new(
+        index.spec(),
+        &keys,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &Stop)
+            .err()
+            .unwrap(),
+        cause
+    );
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &[KeyMatch::Found(KeyId(0)), KeyMatch::Found(KeyId(1))]
+    );
+    assert_eq!(
+        index
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &Stop)
+            .err()
+            .unwrap(),
+        cause
+    );
+    assert_eq!(
+        index
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .err()
+            .unwrap(),
+        cause
+    );
+    assert_eq!(
+        index
+            .contains_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .err()
+            .unwrap(),
+        cause
+    );
+}
+
 #[test]
 fn owned_complex_components_keep_original_framing_nullable_classes_and_literal_list_values() {
     let (owner, tracker) = owner_with_tracker();

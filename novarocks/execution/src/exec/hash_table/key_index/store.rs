@@ -58,6 +58,10 @@ struct KeyColumnCreator {
     _storage: ValueTypeStorageLifetime,
 }
 impl OwnedByteColumn {
+    #[cfg(test)]
+    pub(super) fn page_target_for_test() -> usize {
+        BYTE_PAGE_TARGET
+    }
     /// Prepare the selected source once, then publish as many owned pages as
     /// needed in occurrence order. Pagination never rescans a remaining suffix.
     pub(super) fn copy_pages(

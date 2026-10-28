@@ -295,6 +295,16 @@ pub(super) fn sort_rows(
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<()> {
+    sort_by_key(rows, owner, checkpoint, |row| row)
+}
+/// The same controlled merge passes also group bounded collision metadata by
+/// owned page. Keys are primitive coordinates, never fallible value equality.
+pub(super) fn sort_by_key<T: Copy, K: Ord>(
+    rows: &mut [T],
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    key: impl Fn(T) -> K,
+) -> ExecutionResult<()> {
     let mut scratch = vector(owner, rows.len())?;
     for (i, &row) in rows.iter().enumerate() {
         checkpoint_at(i, checkpoint)?;
@@ -309,7 +319,7 @@ pub(super) fn sort_rows(
             let (mut left, mut right) = (start, middle);
             for (offset, slot) in scratch[start..end].iter_mut().enumerate() {
                 checkpoint_at(offset, checkpoint)?;
-                if left < middle && (right == end || rows[left] <= rows[right]) {
+                if left < middle && (right == end || key(rows[left]) <= key(rows[right])) {
                     *slot = rows[left];
                     left += 1;
                 } else {

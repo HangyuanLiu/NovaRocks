@@ -21,9 +21,11 @@
 mod canonical_store;
 mod fixed_store;
 mod local_hash;
+mod owned_batch;
 mod pairs;
 mod prepared;
 mod store;
+mod table;
 #[cfg(test)]
 mod tests;
 
@@ -31,6 +33,7 @@ pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
 pub(crate) use prepared::{
     IndexPurpose, KeyId, KeyInput, KeySpec, KeyStrategy, NullPolicy, PreparedKeyBatch,
 };
+pub(crate) use table::{InternBatch, KeyIndex, KeyMatch, NewKey, PresenceBatch, ProbeBatch};
 
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
