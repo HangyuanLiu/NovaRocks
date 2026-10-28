@@ -15,3 +15,4 @@
 # specific language governing permissions and limitations
 # under the License.
 
+'Low-cost behavior tests owned by CI platform maintainers.'
