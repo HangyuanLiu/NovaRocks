@@ -2913,3 +2913,132 @@ fn nested_binary_offset_widths_use_one_index_projection_without_changing_the_cod
         assert_eq!(index.len(), 3);
     }
 }
+
+#[test]
+fn nonnull_nested_plain_byte_layouts_share_local_classes_in_every_index_projection() {
+    use arrow_buffer::OffsetBuffer;
+    let (owner, tracker) = owner_with_tracker();
+    let text = [Some("one"), None, Some("two"), Some("one")];
+    let data = [
+        Some([255, 1].as_slice()),
+        None,
+        Some([254, 2].as_slice()),
+        Some([255, 1].as_slice()),
+    ];
+    let families: Vec<Vec<ArrayRef>> = vec![
+        vec![
+            Arc::new(StringArray::from(text.to_vec())),
+            Arc::new(StringViewArray::from(text.to_vec())),
+            Arc::new(LargeStringArray::from(text.to_vec())),
+        ],
+        vec![
+            Arc::new(BinaryArray::from(data.to_vec())),
+            Arc::new(BinaryViewArray::from(data.to_vec())),
+            Arc::new(LargeBinaryArray::from(data.to_vec())),
+        ],
+    ];
+    for children in families {
+        let pages: Vec<ArrayRef> = children
+            .into_iter()
+            .map(|child| {
+                Arc::new(ListArray::new(
+                    Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        child.data_type().clone(),
+                        true,
+                    )),
+                    OffsetBuffer::new(vec![0, 1, 2, 3, 4].into()),
+                    child,
+                    None,
+                )) as ArrayRef
+            })
+            .collect();
+        for build in &pages {
+            let binding = FunctionValueType::new(build.data_type().clone(), true);
+            let spec = KeySpec::new(
+                std::slice::from_ref(&binding),
+                &[NullPolicy::Equal],
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let mut index = KeyIndex::new(
+                spec.clone(),
+                IndexPurpose::KeyIds,
+                tracker.clone(),
+                owner.as_ref(),
+            )
+            .unwrap();
+            let keys = input(
+                &[Arc::clone(build)],
+                &[binding],
+                &[2, 0, 1, 3, 0],
+                owner.as_ref(),
+            );
+            let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+            let prepared = PreparedKeyBatch::new(
+                &spec,
+                &keys,
+                AggregateAllocator::new(tracker.clone()),
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                index
+                    .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+                    .unwrap()
+                    .matches(),
+                &[
+                    KeyMatch::Found(KeyId(0)),
+                    KeyMatch::Found(KeyId(1)),
+                    KeyMatch::Found(KeyId(2)),
+                    KeyMatch::Found(KeyId(1)),
+                    KeyMatch::Found(KeyId(1))
+                ]
+            );
+            for page in &pages {
+                let binding = FunctionValueType::new(page.data_type().clone(), true);
+                let query = input(
+                    &[Arc::clone(page)],
+                    &[binding],
+                    &[3, 1, 2, 0, 3],
+                    owner.as_ref(),
+                );
+                let actual_hashes = index_hash(&query, &index, &tracker, owner.as_ref());
+                for (q, b) in [(0, 1), (1, 2), (2, 0), (3, 1), (4, 1)] {
+                    assert_eq!(actual_hashes.hash(q).unwrap(), hashes.hash(b).unwrap());
+                }
+                let prepared = PreparedKeyBatch::new(
+                    &spec,
+                    &query,
+                    AggregateAllocator::new(tracker.clone()),
+                    owner.as_ref(),
+                    &|| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(
+                    index
+                        .probe_batch(&prepared, &actual_hashes, owner.as_ref(), &CopyControl)
+                        .unwrap()
+                        .matches(),
+                    &[
+                        KeyMatch::Found(KeyId(1)),
+                        KeyMatch::Found(KeyId(2)),
+                        KeyMatch::Found(KeyId(0)),
+                        KeyMatch::Found(KeyId(1)),
+                        KeyMatch::Found(KeyId(1))
+                    ]
+                );
+                assert!(
+                    index
+                        .intern_batch(&prepared, &actual_hashes, owner.as_ref(), &CopyControl)
+                        .unwrap()
+                        .new_keys()
+                        .is_empty()
+                );
+                assert_eq!(index.len(), 3);
+            }
+        }
+    }
+}

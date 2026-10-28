@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    DictionaryArray, FixedSizeBinaryArray, Int32Array, LargeBinaryArray, LargeStringArray,
-    ListArray, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
+    Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Int32Array, LargeBinaryArray,
+    LargeStringArray, ListArray, MapArray, StringArray, StringViewArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 #[cfg(test)]
@@ -1043,6 +1044,42 @@ pub(crate) fn append_canonical_nullable_tracked_observed(
     checkpoint()
 }
 
+/// Borrow the original byte leaf value and its existing canonical frame.
+/// Physical UTF8 offsets/view layouts share marker8; BinaryView shares the
+/// original Binary marker20. LargeBinary deliberately keeps marker21.
+/// Dictionary encoding is removed by the original typed preparation owner.
+fn canonical_byte_value(
+    array: &ArrayRef,
+    row: usize,
+) -> ExecutionResult<(&[u8], u8, &'static str)> {
+    macro_rules! value {
+        ($array:ty) => {
+            array
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| {
+                    group_key_encoding_contract(
+                        "canonical byte value does not match its declared carrier",
+                    )
+                })?
+                .value(row)
+        };
+    }
+    Ok(match array.data_type() {
+        DataType::Utf8 => (value!(StringArray).as_bytes(), 8, "Utf8"),
+        DataType::LargeUtf8 => (value!(LargeStringArray).as_bytes(), 8, "LargeUtf8"),
+        DataType::Utf8View => (value!(StringViewArray).as_bytes(), 8, "Utf8View"),
+        DataType::Binary => (value!(BinaryArray), 20, "Binary"),
+        DataType::BinaryView => (value!(BinaryViewArray), 20, "BinaryView"),
+        DataType::LargeBinary => (value!(LargeBinaryArray), 21, "LargeBinary"),
+        _ => {
+            return Err(group_key_encoding_contract(
+                "canonical byte value requires a byte carrier",
+            ));
+        }
+    })
+}
+
 fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
     array: &ArrayRef,
     row: usize,
@@ -1142,50 +1179,15 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
             work.extend(out, &canonical_f64_bits(arr.value(row)).to_le_bytes())?;
             Ok(())
         }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast StringArray while encoding group key",
-                    )
-                })?;
-            work.push(out, 8)?;
-            let value = arr.value(row).as_bytes();
-            let len = value.len() as u32;
-            work.extend(out, &len.to_le_bytes())?;
-            work.extend(out, value)?;
-            Ok(())
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast BinaryArray while encoding group key",
-                    )
-                })?;
-            work.push(out, 20)?;
-            let value = arr.value(row);
-            let len = group_key_component_len(value.len(), "Binary")?;
-            work.extend(out, &len.to_le_bytes())?;
-            work.extend(out, value)?;
-            Ok(())
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast LargeBinaryArray while encoding group key",
-                    )
-                })?;
-            work.push(out, 21)?;
-            let value = arr.value(row);
-            let len = group_key_component_len(value.len(), "LargeBinary")?;
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::LargeBinary => {
+            let (value, marker, component) = canonical_byte_value(array, row)?;
+            let len = group_key_component_len(value.len(), component)?;
+            work.push(out, marker)?;
             work.extend(out, &len.to_le_bytes())?;
             work.extend(out, value)?;
             Ok(())
@@ -1401,38 +1403,15 @@ fn encoded_group_key_non_null_len_with<W: CanonicalKeyWork>(
         return Ok(fixed);
     }
     match array.data_type() {
-        DataType::Utf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast StringArray while sizing group key",
-                    )
-                })?;
-            Ok(5usize.saturating_add(array.value(row).len()))
-        }
-        DataType::Binary => {
-            let array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast BinaryArray while sizing group key",
-                    )
-                })?;
-            Ok(5usize.saturating_add(array.value(row).len()))
-        }
-        DataType::LargeBinary => {
-            let array = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast LargeBinaryArray while sizing group key",
-                    )
-                })?;
-            Ok(5usize.saturating_add(array.value(row).len()))
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::LargeBinary => {
+            let (value, _, component) = canonical_byte_value(array, row)?;
+            group_key_component_len(value.len(), component)?;
+            checked_encoded_len_add(5, value.len())
         }
         DataType::List(_) => {
             let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
@@ -2387,6 +2366,10 @@ pub(crate) fn build_compressed_flags(
     }
     Ok(flags)
 }
+
+#[cfg(test)]
+#[path = "key_builder/nested_byte_tests.rs"]
+mod nested_byte_tests;
 
 #[cfg(test)]
 mod tests {

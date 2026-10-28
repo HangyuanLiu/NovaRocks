@@ -414,7 +414,12 @@ fn decode(
             resource.checkpoint()?;
             Ok(Arc::new(result))
         }
-        DataType::Utf8 | DataType::Binary | DataType::LargeBinary => bytes(ty, rows, resource),
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::LargeBinary => bytes(ty, rows, resource),
         DataType::List(field) => list(field, rows, resource),
         DataType::Struct(fields) => structure(fields, rows, resource),
         DataType::Map(field, ordered) => map(field, *ordered, rows, resource),
@@ -475,12 +480,17 @@ fn bytes(
 ) -> ExecutionResult<ArrayRef> {
     let (marker, kind) = match ty {
         DataType::Utf8 => (8, Some(GroupKeyOutputKind::Utf8)),
+        DataType::LargeUtf8 | DataType::Utf8View => (8, None),
         DataType::Binary => (20, Some(GroupKeyOutputKind::Binary)),
+        DataType::BinaryView => (20, None),
         DataType::LargeBinary => (21, None),
         _ => unreachable!("canonical bytes branch"),
     };
     // Header-only size facts precede all output builder allocations. The real
     // signed offsets limit stays a representation boundary, never a quota.
+    // The canonical marker is independent of the actual output layout: view
+    // and Int64-offset outputs must not inherit an Int32 total-payload gate.
+    // Their actual constructor extents remain with ValueBuilder.
     if let Some(kind) = kind {
         let mut tally = GroupKeyOutputTally::default();
         for row in rows {
