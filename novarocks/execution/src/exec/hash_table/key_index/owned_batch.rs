@@ -161,6 +161,59 @@ impl OwnedKeyBatch {
     pub(super) fn len(&self) -> usize {
         self.len
     }
+    pub(super) fn append_reads<'a>(
+        &'a self,
+        column: usize,
+        requests: &[super::read::ReadRequest],
+        output: &mut Vec<super::read::KeyReadPage<'a>>,
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        use super::read::{KeyReadValues, append_pages};
+        checkpoint()?;
+        match self
+            .columns
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?
+        {
+            Column::Fixed(data) => append_pages(
+                requests,
+                |row| Ok((0, row)),
+                |_| {
+                    Ok(KeyReadValues::Fixed {
+                        array: data.array_ref(),
+                        binding: data.binding(),
+                    })
+                },
+                output,
+                owner,
+                checkpoint,
+            ),
+            Column::Bytes { pages, locations } => append_pages(
+                requests,
+                |row| {
+                    let pos = locations
+                        .get(row)
+                        .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+                    Ok((pos.page, pos.row))
+                },
+                |page| {
+                    let data = pages
+                        .get(page)
+                        .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+                    Ok(KeyReadValues::Bytes {
+                        array: data.array_ref(),
+                        binding: data.binding(),
+                        page: data.page(),
+                    })
+                },
+                output,
+                owner,
+                checkpoint,
+            ),
+            Column::Canonical(data) => data.append_reads(requests, output, owner, checkpoint),
+        }
+    }
     /// Pair output is conjunctive full-key equality. Any error invalidates the
     /// entire operation output, never just its unfinished suffix.
     #[allow(clippy::too_many_arguments)]

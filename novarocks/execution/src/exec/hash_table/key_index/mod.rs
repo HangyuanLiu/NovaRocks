@@ -24,6 +24,7 @@ mod local_hash;
 mod owned_batch;
 mod pairs;
 mod prepared;
+mod read;
 mod store;
 mod table;
 #[cfg(test)]
@@ -33,6 +34,7 @@ pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
 pub(crate) use prepared::{
     IndexPurpose, KeyId, KeyInput, KeySpec, KeyStrategy, NullPolicy, PreparedKeyBatch,
 };
+pub(crate) use read::{KeyReadColumn, KeyReadPage, KeyReadRow, KeyReadValues, OwnedKeyReadBatch};
 pub(crate) use table::{InternBatch, KeyIndex, KeyMatch, NewKey, PresenceBatch, ProbeBatch};
 
 use crate::{

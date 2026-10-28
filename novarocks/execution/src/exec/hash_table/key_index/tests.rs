@@ -1490,6 +1490,79 @@ fn owned_byte_page_groups_restore_reordered_probe_occurrences_in_the_complete_in
             KeyMatch::Found(KeyId(1))
         ]
     );
+    let read = index
+        .read_keys(
+            &[KeyId(2), KeyId(1), KeyId(3), KeyId(0), KeyId(1)],
+            owner.as_ref(),
+            &CopyControl,
+        )
+        .unwrap();
+    assert!(read.columns()[1].pages().len() > 1);
+    let mut actual = vec![String::new(); 5];
+    let mut aliases = Vec::new();
+    for page in read.columns()[1].pages() {
+        let KeyReadValues::Bytes { array, .. } = page.values() else {
+            panic!("byte page")
+        };
+        let values = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+        for row in page.rows() {
+            actual[row.ordinal] = values.value(row.row).to_owned();
+        }
+        aliases.push(Arc::clone(array));
+    }
+    assert_eq!(
+        actual,
+        [
+            strings[3].clone(),
+            strings[0].clone(),
+            strings[2].clone(),
+            strings[1].clone(),
+            strings[0].clone()
+        ]
+    );
+    let mut list_values = vec![None; 5];
+    for page in read.columns()[2].pages() {
+        let KeyReadValues::Canonical {
+            encoded,
+            logical_binding,
+        } = page.values()
+        else {
+            panic!("explicit canonical page")
+        };
+        assert!(logical_binding.same_value_domain(&types[2]));
+        for row in page.rows() {
+            let payload =
+                super::super::key_builder::canonical_component_payload(encoded.value(row.row))
+                    .unwrap();
+            let decoded = super::super::key_builder::decode_group_key_rows(
+                logical_binding.data_type(),
+                &[payload],
+            )
+            .unwrap();
+            let lists = decoded.as_any().downcast_ref::<ListArray>().unwrap();
+            let value = lists.value(0);
+            list_values[row.ordinal] = Some(
+                value
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec(),
+            );
+        }
+    }
+    assert_eq!(list_values, vec![Some(vec![1]); 5]);
+    drop(read);
+    drop(index);
+    assert!(aliases.iter().all(|array| {
+        array
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .value(0)
+            .len()
+            > 12
+    }));
 }
 
 #[test]
@@ -1670,6 +1743,13 @@ fn readonly_index_failure_preserves_published_state_and_mutating_failure_is_perm
     assert_eq!(
         index
             .contains_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .err()
+            .unwrap(),
+        cause
+    );
+    assert_eq!(
+        index
+            .read_keys(&[], owner.as_ref(), &CopyControl)
             .err()
             .unwrap(),
         cause
@@ -2483,4 +2563,353 @@ fn owned_byte_page_retains_actual_nullable_binding_and_rejects_another_nominal_d
             .is_err()
     );
     assert_eq!(out, [None]);
+}
+
+#[test]
+fn read_keys_groups_actual_pages_and_preserves_requested_occurrences_and_aliases() {
+    let (owner, tracker) = owner_with_tracker();
+    let types = [
+        FunctionValueType::new(DataType::Int64, false),
+        FunctionValueType::new(DataType::Utf8, true),
+    ];
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 2], owner.as_ref(), &|| Ok(())).unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    for (numbers, strings, order) in [
+        (vec![7, 9], vec![Some("alpha"), None], vec![1, 0]),
+        (
+            vec![7, 11],
+            vec![Some("alpha"), Some("charlie")],
+            vec![0, 1],
+        ),
+    ] {
+        let keys = input(
+            &[
+                Arc::new(Int64Array::from(numbers)),
+                Arc::new(StringArray::from(strings)),
+            ],
+            &types,
+            &order,
+            owner.as_ref(),
+        );
+        let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+        let spec = index.spec().clone();
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        index
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap();
+    }
+    assert_eq!(index.len(), 3);
+    let read = index
+        .read_keys(
+            &[KeyId(2), KeyId(0), KeyId(2), KeyId(1)],
+            owner.as_ref(),
+            &CopyControl,
+        )
+        .unwrap();
+    assert_eq!(read.len(), 4);
+    assert_eq!(read.columns().len(), 2);
+    let mut numbers = [0; 4];
+    let mut words: [Option<String>; 4] = std::array::from_fn(|_| None);
+    let mut aliases = Vec::new();
+    for page in read.columns()[0].pages() {
+        let KeyReadValues::Fixed { array, binding } = page.values() else {
+            panic!("fixed loan")
+        };
+        assert_eq!(binding.data_type(), &DataType::Int64);
+        let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        for row in page.rows() {
+            numbers[row.ordinal] = array.value(row.row);
+        }
+    }
+    for page in read.columns()[1].pages() {
+        let KeyReadValues::Bytes {
+            array,
+            binding,
+            page: bound,
+        } = page.values()
+        else {
+            panic!("byte loan")
+        };
+        assert_eq!(binding.data_type(), &DataType::Utf8View);
+        let values = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+        for row in page.rows() {
+            assert!(bound.defined_rows().contains(row.row));
+            words[row.ordinal] = if values.is_null(row.row) {
+                None
+            } else {
+                Some(values.value(row.row).to_owned())
+            };
+        }
+        aliases.push(Arc::clone(array));
+    }
+    assert_eq!(numbers, [11, 9, 11, 7]);
+    assert_eq!(
+        words,
+        [
+            Some("charlie".to_owned()),
+            None,
+            Some("charlie".to_owned()),
+            Some("alpha".to_owned())
+        ]
+    );
+    drop(read);
+    assert!(
+        index
+            .read_keys(&[KeyId(99)], owner.as_ref(), &CopyControl)
+            .is_err()
+    );
+    assert_eq!(
+        index
+            .read_keys(&[], owner.as_ref(), &CopyControl)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        index
+            .read_keys(&[KeyId(1)], owner.as_ref(), &CopyControl)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(index);
+    let mut retained = Vec::new();
+    for array in aliases {
+        let values = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+        for row in 0..values.len() {
+            if !values.is_null(row) {
+                retained.push(values.value(row).to_owned());
+            }
+        }
+    }
+    retained.sort();
+    assert_eq!(retained, vec!["alpha", "charlie"]);
+}
+
+#[test]
+fn read_only_metadata_refusals_preserve_published_keys_and_presence_never_exposes_ids() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Count {
+        calls: AtomicUsize,
+        stop_at: Option<usize>,
+    }
+    impl novarocks_functions::KernelEvaluationControl for Count {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.stop_at == Some(call) {
+                Err(novarocks_functions::KernelFailure::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("key read does not wait")
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index = KeyIndex::new(
+        spec.clone(),
+        IndexPurpose::KeyIds,
+        tracker.clone(),
+        owner.as_ref(),
+    )
+    .unwrap();
+    let keys = input(
+        &[Arc::new(Int32Array::from(vec![3, 5]))],
+        &[ty],
+        &[0, 1],
+        owner.as_ref(),
+    );
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    let count = Count {
+        calls: AtomicUsize::new(0),
+        stop_at: None,
+    };
+    let ids = [KeyId(1), KeyId(0), KeyId(1)];
+    assert_eq!(
+        index.read_keys(&ids, owner.as_ref(), &count).unwrap().len(),
+        3
+    );
+    let stop = Count {
+        calls: AtomicUsize::new(0),
+        stop_at: Some(count.calls.load(Ordering::SeqCst) / 2),
+    };
+    assert_eq!(
+        index.read_keys(&ids, owner.as_ref(), &stop).err().unwrap(),
+        ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded)
+    );
+    let cause: ExecutionFailure = ConstructionFailure::Control(
+        novarocks_type_contract::CompileControlError::ResourceExhausted,
+    )
+    .into();
+    let refusing = RefusingOwner(owner.as_ref(), cause.clone());
+    let failed = index
+        .read_keys(&ids, &refusing, &CopyControl)
+        .err()
+        .unwrap();
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&failed),
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause)
+    );
+    assert_eq!(
+        index
+            .read_keys(&ids, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(index.len(), 2);
+    let presence =
+        KeyIndex::new(spec, IndexPurpose::PresenceOnly, tracker, owner.as_ref()).unwrap();
+    assert!(
+        presence
+            .read_keys(&[], owner.as_ref(), &CopyControl)
+            .is_err()
+    );
+}
+
+#[test]
+fn nested_binary_offset_widths_use_one_index_projection_without_changing_the_codec() {
+    let (owner, tracker) = owner_with_tracker();
+    let mut narrow = ListBuilder::new(BinaryBuilder::new());
+    let mut wide = ListBuilder::new(LargeBinaryBuilder::new());
+    for values in [
+        Some(vec![Some(b"one".as_slice()), None]),
+        None,
+        Some(vec![Some(b"two".as_slice())]),
+    ] {
+        if let Some(values) = &values {
+            for value in values {
+                narrow.values().append_option(*value);
+                wide.values().append_option(*value);
+            }
+        }
+        narrow.append(values.is_some());
+        wide.append(values.is_some());
+    }
+    let first: ArrayRef = Arc::new(narrow.finish());
+    let second: ArrayRef = Arc::new(wide.finish());
+    let types = [
+        FunctionValueType::new(first.data_type().clone(), true),
+        FunctionValueType::new(second.data_type().clone(), true),
+    ];
+    assert!(types[0].same_value_domain(&types[1]));
+    for build_view in [false, true] {
+        let build_strings: ArrayRef = if build_view {
+            Arc::new(StringViewArray::from(vec!["same"; 3]))
+        } else {
+            Arc::new(StringArray::from(vec!["same"; 3]))
+        };
+        let probe_strings: ArrayRef = if build_view {
+            Arc::new(StringArray::from(vec!["same"; 3]))
+        } else {
+            Arc::new(StringViewArray::from(vec!["same"; 3]))
+        };
+        let build_types = [
+            types[0].clone(),
+            FunctionValueType::new(build_strings.data_type().clone(), false),
+        ];
+        let probe_types = [
+            types[1].clone(),
+            FunctionValueType::new(probe_strings.data_type().clone(), false),
+        ];
+        let spec = KeySpec::new(
+            &build_types,
+            &[NullPolicy::Equal; 2],
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let mut index = KeyIndex::new(
+            spec.clone(),
+            IndexPurpose::KeyIds,
+            tracker.clone(),
+            owner.as_ref(),
+        )
+        .unwrap();
+        let keys = input(
+            &[Arc::clone(&first), build_strings],
+            &build_types,
+            &[2, 0, 1, 2],
+            owner.as_ref(),
+        );
+        let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        index
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap();
+        let query = input(
+            &[Arc::clone(&second), probe_strings],
+            &probe_types,
+            &[0, 2, 1, 0],
+            owner.as_ref(),
+        );
+        let actual_hashes = index_hash(&query, &index, &tracker, owner.as_ref());
+        for (q, b) in [(0, 1), (1, 0), (2, 2), (3, 1)] {
+            assert_eq!(actual_hashes.hash(q).unwrap(), hashes.hash(b).unwrap());
+        }
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &query,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            index
+                .probe_batch(&prepared, &actual_hashes, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            &[
+                KeyMatch::Found(KeyId(1)),
+                KeyMatch::Found(KeyId(0)),
+                KeyMatch::Found(KeyId(2)),
+                KeyMatch::Found(KeyId(1))
+            ]
+        );
+        assert_eq!(
+            index
+                .intern_batch(&prepared, &actual_hashes, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .new_keys()
+                .len(),
+            0
+        );
+        assert_eq!(index.len(), 3);
+    }
 }

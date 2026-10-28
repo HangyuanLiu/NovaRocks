@@ -116,8 +116,10 @@ impl OwnedCanonicalColumn {
         {
             return Err(invariant(ValueViolation::Carrier));
         }
-        let (source, mapping) = input.tuples.physical_component(column)?;
-        let binding = input.input.bindings()[column].clone_observed(checkpoint)?;
+        let (source, mapping) = input.tuples().physical_component(column)?;
+        let binding = input
+            .component_binding(column)?
+            .clone_observed(checkpoint)?;
         let mut locations = vector(owner, rows.len())?;
         let mut pages = Vec::new();
         let mut builder = ValueBuilder::new(ByteLayout::BinaryView);
@@ -130,7 +132,7 @@ impl OwnedCanonicalColumn {
             let physical = super::pairs::physical_row(mapping, row)?;
             // This is the original cooperative serializer, not a new key codec.
             // Its temporary is released after copying this representative.
-            let bytes = input.tuples.encode_component_row(
+            let bytes = input.tuples().encode_component_row(
                 column,
                 row,
                 input.allocator.clone(),
@@ -196,6 +198,37 @@ impl OwnedCanonicalColumn {
     pub(super) fn len(&self) -> usize {
         self.locations.len()
     }
+    pub(super) fn append_reads<'a>(
+        &'a self,
+        requests: &[super::read::ReadRequest],
+        output: &mut Vec<super::read::KeyReadPage<'a>>,
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        super::read::append_pages(
+            requests,
+            |row| {
+                let pos = self
+                    .locations
+                    .get(row)
+                    .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+                Ok((pos.page, pos.row))
+            },
+            |page| {
+                let data = self
+                    .pages
+                    .get(page)
+                    .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+                Ok(super::read::KeyReadValues::Canonical {
+                    encoded: data.values()?,
+                    logical_binding: &self.binding,
+                })
+            },
+            output,
+            owner,
+            checkpoint,
+        )
+    }
     pub(super) fn read(&self, row: usize) -> ExecutionResult<CanonicalKeyRead<'_>> {
         let location = self
             .locations
@@ -233,7 +266,7 @@ impl OwnedCanonicalColumn {
         {
             return Err(invariant(ValueViolation::Layout));
         }
-        let (source, mapping) = input.tuples.physical_component(column)?;
+        let (source, mapping) = input.tuples().physical_component(column)?;
         let nulls_equal = self.spec.nulls()[column] == NullPolicy::Equal;
         let mut cached: Option<(usize, &BinaryViewArray)> = None;
         for (i, ((&row, &owned_row), out)) in input_rows

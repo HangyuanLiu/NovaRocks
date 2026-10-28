@@ -27,14 +27,18 @@ pub use take_host::{
     CopyIndexView, CopyIndices, CopyOperationError, CopyOperationFacts, RetainedTakeResult,
     take_copy_in,
 };
+#[path = "selected_copy/fixed_binary.rs"]
+mod fixed_binary;
+pub use fixed_binary::preflight_fixed_binary_constructor_extent;
 #[path = "selected_copy/construction.rs"]
 mod construction;
 pub use construction::{
-    ValuesCopyKind, copy_nested_values_construction, preflight_empty_construction,
-    preflight_empty_construction_observed, preflight_flat_array_structure_construction,
-    preflight_flat_arrow_structure_construction, preflight_interleave_construction,
-    preflight_null_arrow_structure_observed, preflight_null_structure_construction,
-    preflight_null_structure_construction_observed, preflight_primitive_vec_adoption_construction,
+    ValuesCopyKind, copy_nested_values_construction, preflight_arrow_node_structure_construction,
+    preflight_empty_construction, preflight_empty_construction_observed,
+    preflight_flat_array_structure_construction, preflight_flat_arrow_structure_construction,
+    preflight_interleave_construction, preflight_null_arrow_structure_observed,
+    preflight_null_structure_construction, preflight_null_structure_construction_observed,
+    preflight_primitive_vec_adoption_construction,
     preflight_primitive_vec_adoption_construction_observed, preflight_uint64_indices_construction,
     values_copy_kind_observed,
 };

@@ -58,7 +58,7 @@ impl OwnedFixedColumn {
         if !super::prepared::is_fixed(signed.data_type()) {
             return Err(invariant(ValueViolation::Carrier));
         }
-        let (source, mapping) = input.tuples.physical_component(column)?;
+        let (source, mapping) = input.tuples().physical_component(column)?;
         let mut choices = vector(owner, rows.len())?;
         for (i, &row) in rows.iter().enumerate() {
             checkpoint_at(i, &checkpoint)?;
@@ -73,10 +73,9 @@ impl OwnedFixedColumn {
         let mut request = |layout| owner.request(layout);
         let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
         let mut creation = ValueSchemaCreation::new(storage.clone(), &mut request, &mut opaque);
-        // The original public copy checks before and after each Arrow extend.
-        // Its indivisible per-row fixed-byte copy is an upstream boundary;
-        // this adapter does not claim an internal byte checkpoint or add a
-        // width quota to disguise it.
+        // The original public author handles top-level FixedSizeBinary with
+        // controlled byte blocks; other original Arrow/container operations
+        // retain their documented indivisible implementation boundaries.
         let array = copy_nested_values_construction(&sources, &choices, &mut creation, control)
             .map_err(|cause| match cause {
                 CopyConstructionError::Creator(cause) => ExecutionFailure::from(cause),
@@ -98,6 +97,9 @@ impl OwnedFixedColumn {
     }
     pub(super) fn len(&self) -> usize {
         self.array.len()
+    }
+    pub(super) fn array_ref(&self) -> &ArrayRef {
+        &self.array
     }
     pub(super) fn array(&self) -> &dyn Array {
         self.array.as_ref()
@@ -137,7 +139,7 @@ impl OwnedFixedColumn {
             }
             *out = 1;
         }
-        let (source, mapping) = input.tuples.physical_component(column)?;
+        let (source, mapping) = input.tuples().physical_component(column)?;
         super::pairs::compare_fixed_pairs(
             source,
             mapping,

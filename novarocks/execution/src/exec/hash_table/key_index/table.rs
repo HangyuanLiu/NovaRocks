@@ -216,6 +216,67 @@ impl KeyIndex {
             None => Ok(()),
         }
     }
+    /// Borrow actual published pages, grouping each column at page boundaries.
+    /// The metadata preserves every requested occurrence in caller order.
+    pub(crate) fn read_keys(
+        &self,
+        ids: &[KeyId],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::read::OwnedKeyReadBatch<'_>> {
+        self.check()?;
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
+        if self.purpose != IndexPurpose::KeyIds {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        let mut requests = vector(owner, ids.len())?;
+        for (ordinal, id) in ids.iter().enumerate() {
+            checkpoint_at(ordinal, &checkpoint)?;
+            let class = self
+                .classes
+                .get(id.index())
+                .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+            requests.push(super::read::ReadRequest {
+                ordinal,
+                batch: class.key.batch,
+                row: class.key.row,
+            });
+        }
+        super::prepared::sort_by_key(&mut requests, owner, &checkpoint, |r| (r.batch, r.ordinal))?;
+        let mut columns = vector(owner, self.spec.types().len())?;
+        for column in 0..self.spec.types().len() {
+            checkpoint()?;
+            let mut pages = Vec::new();
+            let mut begin = 0;
+            while begin < requests.len() {
+                checkpoint()?;
+                let mut end = begin + 1;
+                while end < requests.len() && requests[end].batch == requests[begin].batch {
+                    checkpoint_at(end - begin, &checkpoint)?;
+                    end += 1;
+                }
+                self.batches
+                    .get(requests[begin].batch)
+                    .ok_or_else(|| invariant(ValueViolation::Bounds))?
+                    .append_reads(
+                        column,
+                        &requests[begin..end],
+                        &mut pages,
+                        owner,
+                        &checkpoint,
+                    )?;
+                begin = end;
+            }
+            columns.push(super::read::KeyReadColumn { pages });
+        }
+        checkpoint()?;
+        Ok(super::read::OwnedKeyReadBatch {
+            columns,
+            len: ids.len(),
+            _storage: owner.storage_lifetime(),
+        })
+    }
     fn validate(
         &self,
         input: &PreparedKeyBatch<'_>,

@@ -172,8 +172,15 @@ pub(crate) fn native_tuple_hashes_observed(
             return Err(invariant(ValueViolation::Bounds));
         }
         if needs_nested_normalization(array, ty) {
-            let normalized =
-                normalize_nested_selected(array, ty, selected, conversions, owner, checkpoint)?;
+            let normalized = normalize_nested_selected(
+                array,
+                ty,
+                selected,
+                conversions,
+                owner,
+                checkpoint,
+                novarocks_value_arrays::hydrate::HydrateOptions::default(),
+            )?;
             request::<Option<u64>>(owner, normalized.rows.len())?;
             let mut compact = normalized
                 .rows
@@ -326,9 +333,10 @@ fn normalize_nested_selected(
     conversions: &mut ValueConversionContext,
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    options: novarocks_value_arrays::hydrate::HydrateOptions,
 ) -> ExecutionResult<NormalizedNested> {
     use novarocks_functions::selected_copy::{self, CopyConstructionError, CopyIndexView};
-    use novarocks_value_arrays::hydrate::{HydrateOptions, HydratePlan};
+    use novarocks_value_arrays::hydrate::HydratePlan;
     request::<usize>(owner, selected.len())?;
     request::<u32>(owner, selected.len())?;
     request::<usize>(owner, selected.len())?;
@@ -410,7 +418,7 @@ fn normalize_nested_selected(
     let plan = HydratePlan::plan_with_options_and_storage_observed(
         &compact,
         ty.typed_binding(),
-        HydrateOptions::default(),
+        options,
         conversions,
         &storage,
         &mut |_, _| false,
@@ -826,6 +834,50 @@ pub(crate) fn prepare_canonical_tuple<'a>(
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<CanonicalTupleBatch<'a>> {
+    prepare_canonical_tuple_with_options(
+        arrays,
+        key_types,
+        selected,
+        conversions,
+        owner,
+        checkpoint,
+        novarocks_value_arrays::hydrate::HydrateOptions::default(),
+    )
+}
+
+/// A local equality index explicitly projects same-domain byte leaves to its
+/// own frozen layout. Versioned distribution callers retain the default path.
+pub(crate) fn prepare_canonical_tuple_with_byte_layout_projection<'a>(
+    arrays: &'a [ArrayRef],
+    key_types: &[FunctionValueType],
+    selected: &ReachableRows<'_>,
+    conversions: &mut ValueConversionContext,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<CanonicalTupleBatch<'a>> {
+    prepare_canonical_tuple_with_options(
+        arrays,
+        key_types,
+        selected,
+        conversions,
+        owner,
+        checkpoint,
+        novarocks_value_arrays::hydrate::HydrateOptions {
+            projection: novarocks_value_arrays::hydrate::HydrateProjection::ExactByteLayouts,
+            ..Default::default()
+        },
+    )
+}
+
+fn prepare_canonical_tuple_with_options<'a>(
+    arrays: &'a [ArrayRef],
+    key_types: &[FunctionValueType],
+    selected: &ReachableRows<'_>,
+    conversions: &mut ValueConversionContext,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    options: novarocks_value_arrays::hydrate::HydrateOptions,
+) -> ExecutionResult<CanonicalTupleBatch<'a>> {
     if arrays.len() != key_types.len() || arrays.is_empty() {
         return Err(invariant(ValueViolation::Layout));
     }
@@ -855,6 +907,7 @@ pub(crate) fn prepare_canonical_tuple<'a>(
                 conversions,
                 owner,
                 checkpoint,
+                options,
             )?)
         } else {
             None

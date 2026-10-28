@@ -283,7 +283,7 @@ fn complex_hashes(
     valid: &mut [u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<()> {
-    let (array, mapping) = prepared.tuples.physical_component(column)?;
+    let (array, mapping) = prepared.tuples().physical_component(column)?;
     for (ordinal, &row) in prepared.input.unique_rows().iter().enumerate() {
         checkpoint_at(ordinal, checkpoint)?;
         if array.is_null(physical_row(mapping, row)?) {
@@ -292,7 +292,7 @@ fn complex_hashes(
                 valid[ordinal] = 0;
             }
         } else {
-            let bytes = prepared.tuples.encode_component_row(
+            let bytes = prepared.tuples().encode_component_row(
                 column,
                 row,
                 prepared.allocator.clone(),
@@ -311,7 +311,7 @@ fn fixed_hashes(
     valid: &mut [u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<()> {
-    let (array, mapping) = prepared.tuples.physical_component(column)?;
+    let (array, mapping) = prepared.tuples().physical_component(column)?;
     let rows = prepared.input.unique_rows();
     let unmatchable = prepared.spec.nulls()[column] == NullPolicy::Unmatchable;
     macro_rules! primitive {

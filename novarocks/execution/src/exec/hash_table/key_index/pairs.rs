@@ -95,8 +95,8 @@ pub(super) fn compare_prepared_pairs(
                 }
             }
             (None, None) => {
-                let (a, am) = left.tuples.physical_component(column)?;
-                let (b, bm) = right.tuples.physical_component(column)?;
+                let (a, am) = left.tuples().physical_component(column)?;
+                let (b, bm) = right.tuples().physical_component(column)?;
                 if super::prepared::is_fixed(left.spec.types()[column].data_type()) {
                     compare_fixed_pairs(
                         a, am, left_rows, b, bm, right_rows, nulls, output, checkpoint,
@@ -117,7 +117,7 @@ pub(super) fn compare_prepared_pairs(
                         if let Some(equal) = null_equal(a.is_null(ap), b.is_null(bp), nulls) {
                             *result = u8::from(equal);
                         } else {
-                            let expected = left.tuples.encode_component_row(
+                            let expected = left.tuples().encode_component_row(
                                 column,
                                 ar,
                                 left.allocator.clone(),

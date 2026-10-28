@@ -126,7 +126,7 @@ impl OwnedByteColumn {
                 &mut |_, row, _| {
                     strings.push(
                         input
-                            .tuples
+                            .tuples()
                             .string_component(column, row)?
                             .ok_or_else(|| invariant(ValueViolation::Carrier))?,
                     );
@@ -172,6 +172,12 @@ impl OwnedByteColumn {
     }
     pub(super) fn len(&self) -> usize {
         self.page.len()
+    }
+    pub(super) fn array_ref(&self) -> &ArrayRef {
+        &self.array
+    }
+    pub(super) fn page(&self) -> &OwnedBytesPage {
+        &self.page
     }
     pub(super) fn array(&self) -> &dyn Array {
         self.array.as_ref()
@@ -375,7 +381,7 @@ pub(super) fn retain_created_array(
     Ok(result)
 }
 
-enum BindingFailure {
+pub(super) enum BindingFailure {
     Type(novarocks_type_contract::ExecutionValueTypeError),
     Caller(ExecutionFailure),
 }
