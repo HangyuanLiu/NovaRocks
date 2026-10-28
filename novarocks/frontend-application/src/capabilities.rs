@@ -239,7 +239,7 @@ impl DmlEnginePorts {
                 Arc::clone(&self.functions),
                 Arc::clone(&self.catalog_service),
                 self.constant_policy,
-                self.static_plan_carrier,
+                self.static_plan_carrier.clone(),
             ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
@@ -460,7 +460,7 @@ impl MaintenanceCommandPorts {
             Arc::clone(&self.mv_readiness),
             Arc::clone(&self.service),
             self.constant_policy,
-            self.static_plan_carrier,
+            self.static_plan_carrier.clone(),
         )
         .with_state_store_original(self.state_store.clone());
         match self.rewrite_runtime.as_ref() {

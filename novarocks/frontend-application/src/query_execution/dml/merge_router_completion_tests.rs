@@ -400,7 +400,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+        &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
             novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
         ),

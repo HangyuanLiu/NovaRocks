@@ -2044,7 +2044,7 @@ mod tests {
             .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             paired,
-            &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
                 novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
             ),

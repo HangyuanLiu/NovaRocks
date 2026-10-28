@@ -1104,6 +1104,7 @@ impl FrontendExecutionConfig {
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         logical_runtime: FrontendLogicalExecutionRuntimeConfig,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
     ) -> Self {
         Self {
             #[cfg(novarocks_dev_controls)]
@@ -1112,13 +1113,7 @@ impl FrontendExecutionConfig {
             native_compatibility_id,
             function_catalog,
             constant_policy,
-            // Default composition freezes the same package structure that the
-            // production receiver admits.
-            static_plan_carrier:
-                crate::query_execution::package_freeze::CompiledPackageCarrier::new(
-                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
-                ),
+            static_plan_carrier,
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:
@@ -1184,6 +1179,10 @@ impl FrontendExecutionConfig {
             function_catalog,
             FrontendLogicalExecutionRuntimeConfig::for_test(),
             constant_policy,
+            crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            ),
         )
     }
 
@@ -1222,16 +1221,6 @@ impl FrontendExecutionConfig {
 
     pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy
-    }
-
-    /// Supply the package admission and encode limits paired with this
-    /// process's compiled backend interpreter.
-    pub fn with_static_plan_carrier(
-        mut self,
-        carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
-    ) -> Self {
-        self.static_plan_carrier = carrier;
-        self
     }
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
@@ -2216,10 +2205,10 @@ impl FrontendApplicationHost {
 
     /// The static carrier every owner that encodes a completed plan receives
     /// beside the function catalog.
-    pub(crate) const fn static_plan_carrier(
+    pub(crate) fn static_plan_carrier(
         &self,
     ) -> crate::query_execution::package_freeze::CompiledPackageCarrier {
-        self.static_plan_carrier
+        self.static_plan_carrier.clone()
     }
 
     pub fn connector_control_registry(

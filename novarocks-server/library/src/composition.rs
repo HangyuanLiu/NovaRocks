@@ -492,7 +492,7 @@ pub fn compose_backend_server_config(
             #[cfg(novarocks_dev_controls)]
             &test_slots,
         )?,
-        static_plan_interpreter: static_plan.backend_interpreter()?,
+        static_plan_interpreter: static_plan.backend_interpreter(),
         process_memory: backend_process_memory_observation(memory_authority),
     })
 }
@@ -611,12 +611,15 @@ pub fn compose_frontend_role_config(
         result_profile,
         capacity_profile,
     );
+    // The frontend freezes the one carrier its island's backends interpret,
+    // under the same structural package admission as their receiver.
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,
         logical_runtime,
         constant_policy,
+        static_plan.frontend_carrier(),
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
@@ -674,9 +677,6 @@ pub fn compose_frontend_role_config(
         Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),
     ))
     .with_query_blocking_executor_config(query_blocking_config);
-    // The frontend freezes the one carrier its island's backends interpret,
-    // under the same structural package admission as their receiver.
-    execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =

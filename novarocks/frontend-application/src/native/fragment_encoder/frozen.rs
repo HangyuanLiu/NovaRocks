@@ -38,12 +38,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use novarocks_execution::task_execution::FrozenBytes;
 use novarocks_physical_plan::{
     Edge, EdgeId, Fragment, FragmentPackage, FragmentSink, NodeId, NodeKind, PipelineDopDomain,
     WriteTargetOrdinal,
 };
-use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
 use novarocks_proto_models::novarocks as wire;
 use novarocks_type_contract::PureCompileControl;
 use prost::Message;
@@ -213,7 +213,7 @@ impl FragmentArtifact {
     pub(crate) fn freeze_package(
         package: &FragmentPackage,
         edges: &BTreeMap<EdgeId, Edge>,
-        limits: &PackageEncodeLimits,
+        carrier: &CompiledPackageCarrier,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<Self>, PackageFreezeError> {
         let fragment = package.fragment();
@@ -268,7 +268,7 @@ impl FragmentArtifact {
             carries_runtime_filter_bindings: true,
         };
         let frozen = wire::FrozenFragment {
-            package: encode_checked_package(package, limits, control)?.into(),
+            package: encode_checked_package(package, carrier, control)?.into(),
         };
         let content = FrozenBytes::freeze_encoded(frozen.encode_to_vec());
         #[cfg(test)]
@@ -665,8 +665,16 @@ pub(crate) mod tests {
             &control,
         )
         .expect("checked package");
-        FragmentArtifact::freeze_package(&package, &edges, &PackageEncodeLimits::FROZEN, &control)
-            .expect("a genuine package freezes")
+        FragmentArtifact::freeze_package(
+            &package,
+            &edges,
+            &CompiledPackageCarrier::for_test(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            ),
+            &control,
+        )
+        .expect("a genuine package freezes")
     }
 
     #[test]
