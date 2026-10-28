@@ -53,6 +53,12 @@ pub(super) struct OwnedByteColumn {
     page: OwnedBytesPage,
     storage: ValueTypeStorageLifetime,
 }
+/// Nominal byte values may use raw private view storage, but that storage is
+/// never a legal replacement for their separately retained logical carrier.
+pub(super) fn is_nominal_byte(binding: &FunctionValueType) -> bool {
+    binding.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        && ByteLayout::from_data_type(binding.data_type()).is_some()
+}
 struct KeyColumnCreator {
     _binding: FunctionValueType,
     _storage: ValueTypeStorageLifetime,
@@ -77,8 +83,13 @@ impl OwnedByteColumn {
             &binding,
             &checkpoint,
         )?;
-        if !ByteLayout::from_data_type(binding.data_type()).is_some_and(ByteLayout::is_view)
-            || binding.data_type() != built.array.data_type()
+        let logical = ByteLayout::from_data_type(binding.data_type())
+            .ok_or_else(|| invariant(ValueViolation::Carrier))?;
+        let raw = ByteLayout::from_data_type(built.array.data_type())
+            .filter(|layout| layout.is_view())
+            .ok_or_else(|| invariant(ValueViolation::Carrier))?;
+        if logical.is_utf8() != raw.is_utf8()
+            || (!is_nominal_byte(&binding) && binding.data_type() != built.array.data_type())
         {
             return Err(invariant(ValueViolation::Carrier));
         }
@@ -363,22 +374,28 @@ fn emit_pages<T: ByteLoan>(
             )
             .map_err(original)?;
         let storage = owner.storage_lifetime();
-        owner.request(
-            ValueLayout::storage_allocation_layout().map_err(ConstructionFailure::from)?,
-        )?;
-        let physical = ValueLayout::try_from_normalized_arrow_observed::<BindingFailure>(
-            layout.data_type(),
-            storage.clone(),
-            |_| checkpoint().map_err(BindingFailure::Caller),
-        )
-        .map_err(ExecutionFailure::from)?;
-        // Root NULL declarations describe the actual admitted input; the index
-        // equality domain intentionally ignores root nullability.
-        let binding = FunctionValueType::try_from_value(
-            input.input.bindings()[column].value_type().clone(),
-            physical,
-        )
-        .map_err(|cause| ExecutionFailure::from(novarocks_functions::KernelFailure::from(cause)))?;
+        let declared = &input.input.bindings()[column];
+        let binding = if is_nominal_byte(declared) {
+            // The view is private raw byte storage. Keep the original legal
+            // nominal carrier and actual root NULL declaration separately;
+            // never create a fictitious Json+Utf8View or Hll+BinaryView type.
+            declared.clone_observed(&checkpoint)?
+        } else {
+            owner.request(
+                ValueLayout::storage_allocation_layout().map_err(ConstructionFailure::from)?,
+            )?;
+            let physical = ValueLayout::try_from_normalized_arrow_observed::<BindingFailure>(
+                layout.data_type(),
+                storage.clone(),
+                |_| checkpoint().map_err(BindingFailure::Caller),
+            )
+            .map_err(ExecutionFailure::from)?;
+            // Root NULL declarations describe the actual admitted input; the
+            // index equality domain intentionally ignores root nullability.
+            FunctionValueType::try_from_value(declared.value_type().clone(), physical).map_err(
+                |cause| ExecutionFailure::from(novarocks_functions::KernelFailure::from(cause)),
+            )?
+        };
         // Attach this real finite creator to every exported Buffer alias, not
         // just to the page struct. The envelope never holds an input array.
         built.array =

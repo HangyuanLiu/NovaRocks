@@ -99,13 +99,12 @@ pub(super) fn gather(
             let built = if layout.is_utf8() {
                 let mut values = slots::<Option<&str>>(read.len(), owner, &checkpoint)?;
                 for page in source.pages() {
-                    let KeyReadValues::Bytes {
-                        array,
-                        page: admitted,
-                        ..
-                    } = page.values()
-                    else {
-                        return Err(invariant(ValueViolation::Carrier));
+                    let (array, admitted) = match page.values() {
+                        KeyReadValues::Bytes { array, page, .. }
+                        | KeyReadValues::NominalBytes {
+                            raw: array, page, ..
+                        } => (*array, *page),
+                        _ => return Err(invariant(ValueViolation::Carrier)),
                     };
                     let strings = array
                         .as_any()
@@ -134,13 +133,12 @@ pub(super) fn gather(
             } else {
                 let mut values = slots::<Option<&[u8]>>(read.len(), owner, &checkpoint)?;
                 for page in source.pages() {
-                    let KeyReadValues::Bytes {
-                        array,
-                        page: admitted,
-                        ..
-                    } = page.values()
-                    else {
-                        return Err(invariant(ValueViolation::Carrier));
+                    let (array, admitted) = match page.values() {
+                        KeyReadValues::Bytes { array, page, .. }
+                        | KeyReadValues::NominalBytes {
+                            raw: array, page, ..
+                        } => (*array, *page),
+                        _ => return Err(invariant(ValueViolation::Carrier)),
                     };
                     let bytes = array
                         .as_any()
@@ -259,7 +257,10 @@ fn merge_binding(
         checkpoint()?;
         let binding = match page.values() {
             KeyReadValues::Fixed { binding, .. } | KeyReadValues::Bytes { binding, .. } => *binding,
-            KeyReadValues::Canonical {
+            KeyReadValues::NominalBytes {
+                logical_binding, ..
+            }
+            | KeyReadValues::Canonical {
                 logical_binding, ..
             } => *logical_binding,
         };
@@ -291,6 +292,10 @@ fn view_binding(
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<FunctionValueType> {
+    if super::store::is_nominal_byte(&binding) {
+        // Raw private view storage does not change a nominal logical carrier.
+        return Ok(binding);
+    }
     owner.request(ValueLayout::storage_allocation_layout().map_err(ConstructionFailure::from)?)?;
     let physical = ValueLayout::try_from_normalized_arrow_observed::<super::store::BindingFailure>(
         layout.data_type(),

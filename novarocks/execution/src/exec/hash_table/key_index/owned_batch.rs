@@ -243,10 +243,18 @@ impl OwnedKeyBatch {
                     let data = pages
                         .get(page)
                         .ok_or_else(|| invariant(ValueViolation::Bounds))?;
-                    Ok(KeyReadValues::Bytes {
-                        array: data.array_ref(),
-                        binding: data.binding(),
-                        page: data.page(),
+                    Ok(if super::store::is_nominal_byte(data.binding()) {
+                        KeyReadValues::NominalBytes {
+                            raw: data.array_ref(),
+                            logical_binding: data.binding(),
+                            page: data.page(),
+                        }
+                    } else {
+                        KeyReadValues::Bytes {
+                            array: data.array_ref(),
+                            binding: data.binding(),
+                            page: data.page(),
+                        }
                     })
                 },
                 output,

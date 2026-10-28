@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Short immutable page loans. Each page carries its actual typed binding and
-//! ordered output coordinates. Encoded complex values remain explicitly encoded;
-//! their Binary carrier is never presented as a List/Struct/Map Arrow array.
+//! Short immutable page loans retain complete logical declarations, explicit
+//! storage representations and ordered output coordinates. Raw nominal bytes
+//! and encoded complex values never masquerade as their signed Arrow carriers.
 
 use super::{checkpoint_at, invariant, prepared::sort_by_key, reserve_push, vector};
 use crate::{exec::pipeline::operator::InputConstructionOwner, runtime::fragment::ExecutionResult};
@@ -41,6 +41,13 @@ pub(crate) enum KeyReadValues<'a> {
     Bytes {
         array: &'a ArrayRef,
         binding: &'a FunctionValueType,
+        page: &'a OwnedBytesPage,
+    },
+    /// Private raw view bytes, not an Arrow array of logical_binding's type.
+    /// Only original byte constructors may publish the signed logical carrier.
+    NominalBytes {
+        raw: &'a ArrayRef,
+        logical_binding: &'a FunctionValueType,
         page: &'a OwnedBytesPage,
     },
     Canonical {
@@ -148,7 +155,9 @@ pub(super) fn append_positioned_pages<'a, P: Copy + Ord>(
         }
         let values = page(ordered[begin].page)?;
         let len = match &values {
-            KeyReadValues::Fixed { array, .. } | KeyReadValues::Bytes { array, .. } => array.len(),
+            KeyReadValues::Fixed { array, .. }
+            | KeyReadValues::Bytes { array, .. }
+            | KeyReadValues::NominalBytes { raw: array, .. } => array.len(),
             KeyReadValues::Canonical { encoded, .. } => {
                 use arrow::array::Array;
                 encoded.len()

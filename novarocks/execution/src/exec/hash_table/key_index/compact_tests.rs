@@ -524,7 +524,10 @@ fn compact_preserves_actual_nullable_page_declarations_when_spec_root_is_require
                 KeyReadValues::Fixed { binding, .. } | KeyReadValues::Bytes { binding, .. } => {
                     *binding
                 }
-                KeyReadValues::Canonical {
+                KeyReadValues::NominalBytes {
+                    logical_binding, ..
+                }
+                | KeyReadValues::Canonical {
                     logical_binding, ..
                 } => *logical_binding,
             };
@@ -1178,4 +1181,499 @@ fn class_chunk_retirement_and_last_escaped_buffer_keep_separate_old_and_new_crea
     assert_eq!(new_drops.load(Ordering::SeqCst), 0);
     drop(new_buffer);
     assert_eq!(new_drops.load(Ordering::SeqCst), 1);
+}
+
+// HLL states are created by the original sketch implementation. K treats their
+// serialized bytes as nominal opaque values; it does not parse or recode them.
+fn nominal_hll_values() -> (Vec<u8>, Vec<u8>) {
+    use novarocks_functions::datasketches_hll::{HllHandle, HllTargetType};
+    let mut sketch = HllHandle::new_unreserved(12, HllTargetType::Hll8).unwrap();
+    sketch.update_hash_unreserved(17).unwrap();
+    let first = sketch.serialize().unwrap();
+    sketch.update_hash_unreserved(19).unwrap();
+    (first, sketch.serialize().unwrap())
+}
+fn nominal_byte_fixture(
+    dictionary: bool,
+    first: &[u8],
+    second: &[u8],
+) -> (Vec<ArrayRef>, Vec<FunctionValueType>, Vec<usize>) {
+    use novarocks_type_contract::ValueLogicalType;
+    let json =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    let hll = FunctionValueType::try_with_logical_type(
+        if dictionary {
+            DataType::LargeBinary
+        } else {
+            DataType::Binary
+        },
+        true,
+        ValueLogicalType::Hll,
+    )
+    .unwrap();
+    if dictionary {
+        let codes = Int32Array::from(vec![2, 0, 1]);
+        (
+            vec![
+                Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(
+                        codes,
+                        Arc::new(StringArray::from(vec![Some("[1]"), None, Some("[2]")])),
+                    )
+                    .unwrap(),
+                ),
+                // The frozen dictionary vocabulary is string-only. HLL uses
+                // its legal wider plain carrier with the same logical rows.
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(second),
+                    Some(first),
+                    None,
+                ])),
+                Arc::new(StringViewArray::from(vec![
+                    Some("beta"),
+                    Some("alpha"),
+                    None,
+                ])),
+                Arc::new(BinaryViewArray::from(vec![
+                    Some(b"B".as_slice()),
+                    Some(b"A".as_slice()),
+                    None,
+                ])),
+            ],
+            vec![
+                json,
+                hll,
+                FunctionValueType::new(DataType::Utf8View, true),
+                FunctionValueType::new(DataType::BinaryView, true),
+            ],
+            vec![1, 2, 0, 1],
+        )
+    } else {
+        (
+            vec![
+                Arc::new(StringArray::from(vec![Some("[1]"), None, Some("[2]")])),
+                Arc::new(BinaryArray::from(vec![Some(first), None, Some(second)])),
+                Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"A".as_slice()),
+                    None,
+                    Some(b"B".as_slice()),
+                ])),
+            ],
+            vec![
+                json,
+                hll,
+                FunctionValueType::new(DataType::Utf8, true),
+                FunctionValueType::new(DataType::Binary, true),
+            ],
+            vec![0, 1, 2, 0],
+        )
+    }
+}
+fn assert_nominal_byte_export(exported: &ExportedKeys, first: &[u8], second: &[u8], null: bool) {
+    let mut strings = vec![Some("[2]"), Some("[1]"), Some("[1]")];
+    let mut hll = vec![Some(second), Some(first), Some(first)];
+    let mut physical_text = vec![Some("beta"), Some("alpha"), Some("alpha")];
+    let mut physical_bytes = vec![
+        Some(b"B".as_slice()),
+        Some(b"A".as_slice()),
+        Some(b"A".as_slice()),
+    ];
+    if null {
+        strings.push(None);
+        hll.push(None);
+        physical_text.push(None);
+        physical_bytes.push(None);
+    }
+    assert_eq!(
+        exported.arrays()[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        strings
+    );
+    let actual_hll = match exported.arrays()[1].data_type() {
+        DataType::Binary => exported.arrays()[1]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        DataType::LargeBinary => exported.arrays()[1]
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        other => panic!("nominal HLL output must retain its signed byte layout: {other:?}"),
+    };
+    assert_eq!(actual_hll, hll);
+    assert_eq!(
+        exported.arrays()[2]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        physical_text
+    );
+    assert_eq!(
+        exported.arrays()[3]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        physical_bytes
+    );
+}
+#[test]
+fn nominal_raw_bytes_preserve_legal_domains_cross_carriers_dictionaries_and_both_null_policies() {
+    for null_policy in [NullPolicy::Equal, NullPolicy::Unmatchable] {
+        let (owner, tracker) = owner_with_tracker();
+        let (first, second) = nominal_hll_values();
+        let (arrays, types, rows) = nominal_byte_fixture(false, &first, &second);
+        let spec = KeySpec::new(&types, &[null_policy; 4], owner.as_ref(), &|| Ok(())).unwrap();
+        let mut index = KeyIndex::new(
+            spec.clone(),
+            IndexPurpose::KeyIds,
+            tracker.clone(),
+            owner.as_ref(),
+        )
+        .unwrap();
+        let keys = input(&arrays, &types, &rows, owner.as_ref());
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let hashes = index_hash(&keys, &index, &tracker, owner.as_ref()).force_hash(0);
+        let null_equal = null_policy == NullPolicy::Equal;
+        let expected = [
+            KeyMatch::Found(KeyId(0)),
+            if null_equal {
+                KeyMatch::Found(KeyId(1))
+            } else {
+                KeyMatch::Unmatchable
+            },
+            KeyMatch::Found(KeyId(if null_equal { 2 } else { 1 })),
+            KeyMatch::Found(KeyId(0)),
+        ];
+        assert_eq!(
+            index
+                .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            &expected
+        );
+        let (other_arrays, other_types, other_rows) = nominal_byte_fixture(true, &first, &second);
+        let other = input(&other_arrays, &other_types, &other_rows, owner.as_ref());
+        let other_prepared = PreparedKeyBatch::new(
+            &spec,
+            &other,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let other_hashes = index_hash(&other, &index, &tracker, owner.as_ref()).force_hash(0);
+        let mut ids = vec![KeyId(if null_equal { 2 } else { 1 }), KeyId(0), KeyId(0)];
+        if null_equal {
+            ids.push(KeyId(1));
+        }
+        for after_compact in [false, true] {
+            if after_compact {
+                index.compact(owner.as_ref(), &CopyControl).unwrap();
+            }
+            assert_eq!(
+                index
+                    .probe_batch(&other_prepared, &other_hashes, owner.as_ref(), &CopyControl)
+                    .unwrap()
+                    .matches(),
+                &expected
+            );
+            assert_eq!(
+                index
+                    .intern_batch(&other_prepared, &other_hashes, owner.as_ref(), &CopyControl)
+                    .unwrap()
+                    .matches(),
+                &expected
+            );
+            let read = index.read_keys(&ids, owner.as_ref(), &CopyControl).unwrap();
+            for (column, source) in read.columns().iter().enumerate() {
+                for page in source.pages() {
+                    if column < 2 {
+                        let KeyReadValues::NominalBytes {
+                            raw,
+                            logical_binding,
+                            page: admitted,
+                        } = page.values()
+                        else {
+                            panic!("nominal bytes require an explicit raw-storage loan")
+                        };
+                        assert_eq!(*logical_binding, &types[column]);
+                        assert_eq!(
+                            raw.data_type(),
+                            if column == 0 {
+                                &DataType::Utf8View
+                            } else {
+                                &DataType::BinaryView
+                            }
+                        );
+                        assert_eq!(admitted.is_utf8(), column == 0);
+                    } else {
+                        let KeyReadValues::Bytes { array, binding, .. } = page.values() else {
+                            panic!("ordinary byte values retain their original view binding")
+                        };
+                        assert_eq!(array.data_type(), binding.data_type());
+                    }
+                }
+            }
+            drop(read);
+            for large in [false, true] {
+                let mut targets = types.clone();
+                targets[1] = FunctionValueType::try_with_logical_type(
+                    if large {
+                        DataType::LargeBinary
+                    } else {
+                        DataType::Binary
+                    },
+                    true,
+                    novarocks_type_contract::ValueLogicalType::Hll,
+                )
+                .unwrap();
+                let exported = index
+                    .export_keys(&ids, &targets, owner.as_ref(), &CopyControl)
+                    .unwrap();
+                assert_eq!(exported.bindings(), &targets);
+                assert_nominal_byte_export(&exported, &first, &second, null_equal);
+            }
+            if null_equal {
+                let mut required = types.clone();
+                required[0] = required[0].with_nullable(false).unwrap();
+                assert_value_failure(
+                    &index
+                        .export_keys(&[KeyId(1)], &required, owner.as_ref(), &CopyControl)
+                        .err()
+                        .unwrap(),
+                    ValueViolation::RequiredNull,
+                );
+                // A failed readonly export cannot poison the published index.
+                assert_eq!(
+                    index
+                        .probe_batch(&other_prepared, &other_hashes, owner.as_ref(), &CopyControl)
+                        .unwrap()
+                        .matches(),
+                    &expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nominal_raw_bytes_follow_the_real_bulk_hash_graph_without_reframing() {
+    use std::num::NonZeroUsize;
+    for null_policy in [NullPolicy::Equal, NullPolicy::Unmatchable] {
+        let (owner, tracker) = owner_with_tracker();
+        let (first, second) = nominal_hll_values();
+        let (_, types, _) = nominal_byte_fixture(false, &first, &second);
+        let spec = KeySpec::new(&types, &[null_policy; 4], owner.as_ref(), &|| Ok(())).unwrap();
+        let domain = BulkDomain::new(&spec, owner.as_ref(), &CopyControl).unwrap();
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
+        let capture = CaptureWork {
+            owner: owner.as_ref(),
+            allocator: AggregateAllocator::new(tracker.clone()),
+            host: Arc::clone(&host),
+            control: &CopyControl,
+        };
+        let mut captures = Vec::new();
+        for dictionary in [false, true] {
+            let mut writer = domain.begin_capture(&capture).unwrap();
+            let (arrays, bindings, occurrences) = nominal_byte_fixture(dictionary, &first, &second);
+            writer
+                .push_evaluated(
+                    EvaluatedPage {
+                        arrays: &arrays,
+                        bindings: &bindings,
+                        readable: &readable(3),
+                        occurrences: &occurrences,
+                    },
+                    &mut ValueConversionContext::default(),
+                    &capture,
+                )
+                .unwrap();
+            captures.push(writer.seal(&capture).unwrap());
+        }
+        let complete = CompleteInput::from_captures(
+            BulkInput::new(&domain, captures, &capture).unwrap(),
+            IndexPurpose::KeyIds,
+            &capture,
+        )
+        .unwrap();
+        let ports = BulkWork {
+            owner: owner.as_ref(),
+            allocator: AggregateAllocator::new(tracker.clone()),
+            host: Arc::clone(&host),
+            control: &CopyControl,
+        };
+        let graph = BulkTaskGraph::begin(
+            complete,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            &ports,
+        )
+        .unwrap();
+        let mut pending = Vec::new();
+        loop {
+            // A retained route cursor can wait for frontier space. Continue
+            // claiming eager merge work before advancing each retained task
+            // once; do not try to finish one route before claiming its merge.
+            loop {
+                match graph.claim(&ports).unwrap() {
+                    BulkClaim::Task(task) => pending.push(task),
+                    BulkClaim::Pending | BulkClaim::Finished => break,
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for mut task in pending {
+                if task.advance(1, &ports).unwrap() {
+                    let mut complete = task.finish().unwrap();
+                    graph.complete(&mut complete, &ports).unwrap();
+                } else {
+                    next.push(task);
+                }
+            }
+            pending = next;
+        }
+        let ready = graph.take_ready(&ports).unwrap().unwrap();
+        let (arrays, bindings, rows) = nominal_byte_fixture(true, &first, &second);
+        let keys = input(&arrays, &bindings, &rows, owner.as_ref());
+        let prepared = PreparedKeyBatch::new(
+            ready.spec(),
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let found = ready
+            .probe(&prepared, None, owner.as_ref(), &CopyControl)
+            .unwrap();
+        let BulkMatch::Found(first_id) = found.matches()[0] else {
+            panic!("first nominal key")
+        };
+        let BulkMatch::Found(second_id) = found.matches()[2] else {
+            panic!("second nominal key")
+        };
+        assert_eq!(found.matches()[3], BulkMatch::Found(first_id));
+        assert_ne!(first_id, second_id);
+        let mut ids = vec![second_id, first_id, first_id];
+        if null_policy == NullPolicy::Equal {
+            let BulkMatch::Found(null_id) = found.matches()[1] else {
+                panic!("NULL equality class")
+            };
+            assert_ne!(null_id, first_id);
+            assert_ne!(null_id, second_id);
+            ids.push(null_id);
+        } else {
+            assert_eq!(found.matches()[1], BulkMatch::Unmatchable);
+        }
+        let read = ready.read_keys(&ids, owner.as_ref(), &CopyControl).unwrap();
+        assert!(
+            read.columns()[0]
+                .pages()
+                .iter()
+                .all(|page| matches!(page.values(), KeyReadValues::NominalBytes { .. }))
+        );
+        drop(read);
+        let exported = ready
+            .export_keys(
+                &ids,
+                &types,
+                owner.as_ref(),
+                Arc::clone(&host),
+                &CopyControl,
+            )
+            .unwrap();
+        assert_nominal_byte_export(&exported, &first, &second, null_policy == NullPolicy::Equal);
+    }
+}
+
+#[test]
+fn nominal_raw_byte_compaction_retains_the_actual_old_creator_until_the_last_buffer_alias() {
+    use novarocks_type_contract::{
+        ValueLogicalType, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Tag(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Tag {}
+    impl Drop for Tag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap();
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            "{\"message\":\"the private raw JSON view retains its original creator\"}",
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0],
+        owner.as_ref(),
+    );
+    let drops = Arc::new(AtomicUsize::new(0));
+    let tagged = TaggedCreator {
+        original: owner.as_ref(),
+        storage: owner
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(
+                &ValueTypeStorageLifetime::held(Arc::new(Tag(Arc::clone(&drops)))),
+                |layout| owner.request(layout),
+            )
+            .unwrap(),
+    };
+    insert(&mut index, &keys, &tracker, &tagged);
+    let read = index
+        .read_keys(&[KeyId(0)], owner.as_ref(), &CopyControl)
+        .unwrap();
+    let KeyReadValues::NominalBytes { raw, .. } = read.columns()[0].pages()[0].values() else {
+        panic!("explicit nominal raw storage")
+    };
+    let alias = Arc::clone(raw);
+    let buffer = alias.to_data().buffers()[0].clone();
+    drop(read);
+    drop(tagged);
+    index.compact(owner.as_ref(), &CopyControl).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(alias);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(buffer);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let exported = index
+        .export_keys(&[KeyId(0)], &[ty], owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(exported.arrays()[0].data_type(), &DataType::Utf8);
 }

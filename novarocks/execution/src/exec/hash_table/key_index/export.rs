@@ -150,7 +150,9 @@ fn reject_selected_nulls(
     for page in column.pages() {
         checkpoint()?;
         match page.values() {
-            KeyReadValues::Fixed { array, .. } | KeyReadValues::Bytes { array, .. } => {
+            KeyReadValues::Fixed { array, .. }
+            | KeyReadValues::Bytes { array, .. }
+            | KeyReadValues::NominalBytes { raw: array, .. } => {
                 for (i, selected) in page.rows().iter().enumerate() {
                     checkpoint_at(i, &checkpoint)?;
                     if crate::exec::hash_table::partition_keys::normalized_root_is_null(
@@ -248,8 +250,10 @@ fn bytes(
         }
         for page in column.pages() {
             checkpoint()?;
-            let KeyReadValues::Bytes { array, .. } = page.values() else {
-                return Err(invariant(ValueViolation::Carrier));
+            let array = match page.values() {
+                KeyReadValues::Bytes { array, .. }
+                | KeyReadValues::NominalBytes { raw: array, .. } => *array,
+                _ => return Err(invariant(ValueViolation::Carrier)),
             };
             let source = array
                 .as_any()
@@ -278,8 +282,10 @@ fn bytes(
         }
         for page in column.pages() {
             checkpoint()?;
-            let KeyReadValues::Bytes { array, .. } = page.values() else {
-                return Err(invariant(ValueViolation::Carrier));
+            let array = match page.values() {
+                KeyReadValues::Bytes { array, .. }
+                | KeyReadValues::NominalBytes { raw: array, .. } => *array,
+                _ => return Err(invariant(ValueViolation::Carrier)),
             };
             let source = array
                 .as_any()
