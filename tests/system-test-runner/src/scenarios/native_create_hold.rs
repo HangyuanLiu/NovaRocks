@@ -136,20 +136,34 @@ mod tests {
     fn release_keeps_peer_open_until_fixture_owner_retires() {
         let (stream, mut backend) = UnixStream::pair().unwrap();
         let mut create = HeldCreate {
-            deadline: Instant::now() + Duration::from_secs(1), backend: 1,
-            execution: "10:20:1".into(), stage: "2".into(), task: "3".into(),
-            process: "exact-process".into(), outbound_edges: 1,
-            payload: "exact held Create".into(), stream: Some(stream), released_peer: None,
+            deadline: Instant::now() + Duration::from_secs(1),
+            backend: 1,
+            execution: "10:20:1".into(),
+            stage: "2".into(),
+            task: "3".into(),
+            process: "exact-process".into(),
+            outbound_edges: 1,
+            payload: "exact held Create".into(),
+            stream: Some(stream),
+            released_peer: None,
         };
         create.release().unwrap();
-        backend.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        backend
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let mut release = [0_u8; 1];
         backend.read_exact(&mut release).unwrap();
         assert_eq!(release, [b'R']);
         backend.set_nonblocking(true).unwrap();
-        assert_eq!(backend.read(&mut release).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            backend.read(&mut release).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         create.release().unwrap();
-        assert_eq!(backend.read(&mut release).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            backend.read(&mut release).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         drop(create);
         assert_eq!(backend.read(&mut release).unwrap(), 0);
     }

@@ -581,7 +581,7 @@ class BoundedResponse(http.client.HTTPResponse):
         # detecting an extension is safer than losing a semantic header while
         # claiming transparency. No response is substituted on this refusal.
         line = self.fp.readline(65537)
-        need(len(line) <= 65536 and line in (b"", b"\r\n", b"\n"),
+        need(len(line) <= 65536 and line in (b"\r\n", b"\n"),
              "downstream trailers outside frozen normal contract")
 
 
@@ -1027,7 +1027,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             original_lengths = [v for k, v in response_headers if k.lower() == "content-length"]
             forwarded_length = original_lengths[0] if original_lengths else str(len(raw))
             with audit.lock:
-                self.close_connection = self.close_connection or self.pair.closing
+                self.close_connection = self.close_connection or self.pair.closing or response.will_close
             lines.extend(["Content-Length: " + forwarded_length + "\r\n",
                           "Connection: close\r\n" if self.close_connection else "Connection: keep-alive\r\n", "\r\n"])
             self.connection.sendall("".join(lines).encode("latin-1"))
@@ -1334,14 +1334,6 @@ class LoopbackTests(unittest.TestCase):
                 inner.close_connection = (not keepalive or "truncated" in inner.path
                                           or "silent_close" in inner.path)
 
-            def finish(inner):
-                try:
-                    super().finish()
-                finally:
-                    if "silent_close" in getattr(inner, "path", ""):
-                        inner.connection.shutdown(socket.SHUT_RDWR)
-                        upstream_closed.set()
-
             do_GET = handle_literal
             do_POST = handle_literal
             do_HEAD = handle_literal
@@ -1353,6 +1345,9 @@ class LoopbackTests(unittest.TestCase):
                 try:
                     super().finish()
                 finally:
+                    if "silent_close" in getattr(inner, "path", ""):
+                        inner.connection.shutdown(socket.SHUT_RDWR)
+                        upstream_closed.set()
                     if getattr(inner, "raw_requestline", None) == b"":
                         backend_eof.set()
 
