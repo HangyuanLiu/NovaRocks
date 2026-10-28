@@ -19,6 +19,7 @@
 //! set markers and distributed hash identities remain with their own authors.
 
 mod canonical_store;
+mod capture;
 mod compact;
 mod export;
 mod fixed_store;

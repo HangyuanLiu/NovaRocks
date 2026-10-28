@@ -64,6 +64,13 @@ pub(super) struct BuildRangeStats {
     integer: Option<IntegerDomain>,
 }
 impl BuildRangeStats {
+    pub(super) fn spec(&self) -> &KeySpec {
+        &self.spec
+    }
+    /// Preserve the original signed-integer vocabulary at its single author.
+    pub(super) fn empty_for_spec(spec: &KeySpec) -> Self {
+        Self::empty(spec, direct_integer(spec))
+    }
     pub(super) fn input_rows(&self) -> usize {
         self.input_rows
     }
