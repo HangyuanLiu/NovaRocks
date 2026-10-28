@@ -2716,13 +2716,6 @@
       "review_by": "2026-12-15"
     },
     {
-      "unit": "system-scenario:connector/distributed-writer-row-level",
-      "reason": "The original 1FE+3BE/900-second scenario passes DV deletion, repeated DV deletion, position deletion and COW update, then refuses the matched/unmatched MERGE Router sink at Frontend physical_encoding.rs (PLAN_CODEC 17:40 -> UnsupportedCompiledShape). Current clean 2b51 action sequence matches the retained separate single-scenario typed diagnostic and unchanged signed MOR author chain; all roles/fixture exit normally. Later data/snapshot assertions remain unverified. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "exit_condition": "B1b restores this exact compiled change-stream Router sink/edge, and B2 revalidates the unchanged entire connector/distributed-writer-row-level scenario under native 1FE+3BE with its original 900-second limit, including matched/unmatched MERGE data/snapshot assertions, resource convergence and complete role/fixture cleanup. Then remove this exact quarantine.",
-      "review_by": "2026-12-15"
-    },
-    {
       "unit": "system-scenario:execution-failure/representation-recovery-policy",
       "owner": "B7",
       "review_by": "2026-12-15",
