@@ -23,10 +23,12 @@ use crate::{
     reachability::SelectionSet,
 };
 use arrow_array::{Array, Int32Array};
-use std::convert::Infallible;
+use novarocks_type_contract::ValueTypeStorageLifetime;
+use std::{convert::Infallible, sync::Arc};
 
 /// Borrows a decoded owner and its admitted logical selection. No conversion
 /// cache borrow or temporary descriptor allocation escapes preparation.
+#[derive(Clone, Copy)]
 pub struct PreparedBytes<'a> {
     decoded: &'a DecodedBytes,
     rows: &'a SelectionSet,
@@ -50,26 +52,7 @@ impl<'a> PreparedBytes<'a> {
             return Err(ValueError::Invariant(ValueViolation::Bounds).into());
         }
         let view = BoundView::bind(decoded.bottom().as_ref())?;
-        work(0).map_err(ValueFailure::Caller)?;
-        let mut control = super::RowWork::new(work);
-        let mut count = 0;
-        let mut cursor = rows.cursor();
-        while let Some(row) = cursor.next_observed(&mut |n| control.observe_metadata(n))? {
-            control.row()?;
-            if !decoded.readable_rows().contains(row) {
-                return Err(ValueError::Invariant(ValueViolation::UndefinedRow).into());
-            }
-            if let Some(bottom) = decoded.mapping().mapped_row(row)? {
-                if !decoded.bottom_coverage().contains(bottom) {
-                    return Err(ValueError::Invariant(ValueViolation::UndefinedRow).into());
-                }
-                // Check only selected values; placeholders outside coverage are
-                // never dereferenced, even when their descriptor is present.
-                view.value(bottom)?;
-            }
-            count += 1;
-        }
-        control.flush()?;
+        let count = check_prepared_selection(decoded, rows, view, work)?;
         Ok(Self {
             decoded,
             rows,
@@ -107,6 +90,115 @@ impl<'a> PreparedBytes<'a> {
         }
     }
 }
+// Both borrowed and owned preparation retain this single selected-domain
+// validator. Its caller preserves the original length-before-bind ordering.
+fn check_prepared_selection<E, W>(
+    decoded: &DecodedBytes,
+    rows: &SelectionSet,
+    view: BoundView<'_>,
+    work: &mut W,
+) -> Result<usize, ValueFailure<E>>
+where
+    W: FnMut(usize) -> Result<(), E>,
+{
+    #[cfg(test)]
+    PREPARATION_CHECKS.with(|checks| {
+        let (calls, selected) = checks.get();
+        checks.set((calls + 1, selected));
+    });
+    work(0).map_err(ValueFailure::Caller)?;
+    let mut control = super::RowWork::new(work);
+    let mut count = 0;
+    let mut cursor = rows.cursor();
+    while let Some(row) = cursor.next_observed(&mut |n| control.observe_metadata(n))? {
+        control.row()?;
+        #[cfg(test)]
+        PREPARATION_CHECKS.with(|checks| {
+            let (calls, selected) = checks.get();
+            checks.set((calls, selected + 1));
+        });
+        if !decoded.readable_rows().contains(row) {
+            return Err(ValueError::Invariant(ValueViolation::UndefinedRow).into());
+        }
+        if let Some(bottom) = decoded.mapping().mapped_row(row)? {
+            if !decoded.bottom_coverage().contains(bottom) {
+                return Err(ValueError::Invariant(ValueViolation::UndefinedRow).into());
+            }
+            // Check only selected values; placeholders outside coverage are
+            // never dereferenced, even when their descriptor is present.
+            view.value(bottom)?;
+        }
+        count += 1;
+    }
+    control.flush()?;
+    Ok(count)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PREPARATION_CHECKS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// An immutable checked byte batch which owns the real decoded source,
+/// selection and view handles. Moving this value never creates a self borrow.
+///
+/// The selection Arc must come from its actual construction owner. `storage`
+/// retains the creator for preparation metadata; decoded retains its own source
+/// creator. Neither lifetime handle grants allocation capacity.
+///
+/// Fields destroy the extra view aliases before their decoded source creator,
+/// then release the preparation creator after all owned preparation backing.
+pub struct OwnedPreparedBytes {
+    owner: OwnedView,
+    rows: Arc<SelectionSet>,
+    decoded: DecodedBytes,
+    count: usize,
+    _storage: ValueTypeStorageLifetime,
+}
+impl OwnedPreparedBytes {
+    pub fn new_observed<E, G, W>(
+        decoded: DecodedBytes,
+        rows: Arc<SelectionSet>,
+        storage: ValueTypeStorageLifetime,
+        growth: &mut G,
+        work: &mut W,
+    ) -> Result<Self, ValueFailure<E>>
+    where
+        G: FnMut(std::alloc::Layout) -> Result<(), E>,
+        W: FnMut(usize) -> Result<(), E>,
+    {
+        // On a failed construction the extra view handles (declared below)
+        // must drop first, followed by rows/decoded and their preparation hold.
+        // Keep these inputs together until no fallible step remains.
+        let pending = (rows, decoded, storage);
+        if pending.0.len() != pending.1.len() {
+            return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        }
+        let owner = OwnedView::bind_observed(pending.1.bottom().as_ref(), growth, work)?;
+        let count = check_prepared_selection(&pending.1, &pending.0, owner.view(), work)?;
+        let (rows, decoded, storage) = pending;
+        Ok(Self {
+            owner,
+            rows,
+            decoded,
+            count,
+            _storage: storage,
+        })
+    }
+
+    /// Recreate a short loan in constant time without binding, validation,
+    /// selection traversal, allocation or payload copying. The private fields
+    /// refer to this exact immutable checked owner; no new domain is admitted.
+    pub fn borrow(&self) -> PreparedBytes<'_> {
+        PreparedBytes {
+            decoded: &self.decoded,
+            rows: &self.rows,
+            view: self.owner.view(),
+            count: self.count,
+        }
+    }
+}
+
 /// A checked, immutable view page published by the public value builder.
 /// The page owns its descriptor, validity, payload and defined-domain handles;
 /// a new or compacted page never changes an existing page's readable values.
@@ -412,3 +504,7 @@ mod owned_growth_test {
         assert!(matches!(result, Err(ValueFailure::Caller("page-growth"))));
     }
 }
+
+#[cfg(test)]
+#[path = "owned_preparation_tests.rs"]
+mod owned_preparation_tests;

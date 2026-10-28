@@ -268,7 +268,7 @@ impl OwnedByteColumn {
             .bytes(column)?
             .ok_or_else(|| invariant(ValueViolation::Carrier))?;
         compare_owned_pairs_into(
-            input,
+            &input,
             input_rows,
             &self.page,
             page_rows,

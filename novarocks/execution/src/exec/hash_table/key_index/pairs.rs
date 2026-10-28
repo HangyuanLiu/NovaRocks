@@ -77,9 +77,9 @@ pub(super) fn compare_prepared_pairs(
         match (left.bytes(column)?, right.bytes(column)?) {
             (Some(a), Some(b)) => {
                 compare_pairs_into(
-                    a,
+                    &a,
                     left_rows,
-                    b,
+                    &b,
                     right_rows,
                     match nulls {
                         NullPolicy::Equal => NullEquality::Equal,

@@ -180,7 +180,7 @@ pub(crate) fn hash_batch(
         checkpoint()?;
         if let Some(bytes) = prepared.bytes(column)? {
             hash_into(
-                bytes,
+                &bytes,
                 &Xxh3Kernel,
                 HashOptions {
                     seeds: HashSeed::Uniform(policy.seed()),
@@ -194,7 +194,7 @@ pub(crate) fn hash_batch(
             .map_err(original)?;
             if prepared.spec.nulls()[column] == NullPolicy::Unmatchable {
                 visit_selected(
-                    bytes,
+                    &bytes,
                     &mut |ordinal, _, value| {
                         if value.is_none() {
                             valid[ordinal] = 0;

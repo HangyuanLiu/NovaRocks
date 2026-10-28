@@ -17,6 +17,8 @@
 
 use super::*;
 
+#[path = "captured_tests.rs"]
+mod captured_tests;
 #[path = "compact_tests.rs"]
 mod compact_tests;
 #[path = "export_tests.rs"]

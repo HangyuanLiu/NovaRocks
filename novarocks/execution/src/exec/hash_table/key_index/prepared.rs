@@ -33,7 +33,7 @@ use arrow::{array::ArrayRef, datatypes::DataType};
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::{
     ByteLayout, ValueViolation,
-    batch::PreparedBytes,
+    batch::{OwnedPreparedBytes, PreparedBytes},
     decode::ValueConversionContext,
     reachability::{ReachableRows, SelectionSet},
 };
@@ -158,11 +158,12 @@ pub(super) fn is_fixed(ty: &DataType) -> bool {
 struct InputData {
     arrays: Vec<ArrayRef>,
     bindings: Vec<FunctionValueType>,
-    selected: SelectionSet,
+    selected: Arc<SelectionSet>,
     rows: Vec<usize>,
     ordinals: Vec<usize>,
-    storage: ValueTypeStorageLifetime,
     tuples: CanonicalTupleStorage,
+    preparation: Option<CapturedPreparation>,
+    storage: ValueTypeStorageLifetime,
 }
 /// One immutable, evaluated page. Saved hashes bind to this actual owner, not
 /// to an array address, caller-supplied hash or reconstructed dictionary code.
@@ -170,6 +171,51 @@ struct InputData {
 pub(crate) struct KeyInput(Arc<InputData>);
 impl KeyInput {
     pub(crate) fn new(
+        arrays: &[ArrayRef],
+        bindings: &[FunctionValueType],
+        readable: &SelectionSet,
+        occurrences: &[usize],
+        conversions: &mut ValueConversionContext,
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        Self::capture(
+            None,
+            arrays,
+            bindings,
+            readable,
+            occurrences,
+            conversions,
+            owner,
+            checkpoint,
+        )
+    }
+    /// Freeze one page's exact key projection and byte preparation before the
+    /// immutable input is shared with bulk tasks. No task borrows a temporary
+    /// conversion context or repeats whole-page preparation at each advance.
+    pub(crate) fn new_for_spec(
+        spec: &KeySpec,
+        arrays: &[ArrayRef],
+        bindings: &[FunctionValueType],
+        readable: &SelectionSet,
+        occurrences: &[usize],
+        conversions: &mut ValueConversionContext,
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        Self::capture(
+            Some(spec),
+            arrays,
+            bindings,
+            readable,
+            occurrences,
+            conversions,
+            owner,
+            checkpoint,
+        )
+    }
+    fn capture(
+        spec: Option<&KeySpec>,
         arrays: &[ArrayRef],
         bindings: &[FunctionValueType],
         readable: &SelectionSet,
@@ -226,6 +272,7 @@ impl KeyInput {
                 .insert(row)
                 .map_err(ExecutionFailure::from_domain)?;
         }
+        let selected = shared(owner, selected)?;
         let mut ordinals = vector(owner, occurrences.len())?;
         for (i, row) in occurrences.iter().enumerate() {
             checkpoint_at(i, checkpoint)?;
@@ -244,18 +291,20 @@ impl KeyInput {
             checkpoint,
         )?
         .into_storage();
-        Ok(Self(shared(
-            owner,
-            InputData {
-                arrays: columns,
-                bindings: types,
-                selected,
-                rows,
-                ordinals,
-                storage: owner.storage_lifetime(),
-                tuples,
-            },
-        )?))
+        let mut data = InputData {
+            arrays: columns,
+            bindings: types,
+            selected,
+            rows,
+            ordinals,
+            tuples,
+            preparation: None,
+            storage: owner.storage_lifetime(),
+        };
+        if let Some(spec) = spec {
+            data.preparation = Some(CapturedPreparation::new(spec, &data, owner, checkpoint)?);
+        }
+        Ok(Self(shared(owner, data)?))
     }
     pub(crate) fn len(&self) -> usize {
         self.0.ordinals.len()
@@ -358,12 +407,165 @@ impl From<DomainFailure> for ExecutionFailure {
     }
 }
 
+/// Owns one exact projection and its checked byte receipts. It is constructed
+/// before InputData publication and never contains a reference back to KeyInput.
+struct CapturedPreparation {
+    projected: Option<(CanonicalTupleStorage, Vec<FunctionValueType>)>,
+    bytes: Vec<Option<OwnedPreparedBytes>>,
+    spec: KeySpec,
+    _storage: ValueTypeStorageLifetime,
+}
+impl CapturedPreparation {
+    fn new(
+        spec: &KeySpec,
+        input: &InputData,
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        let projected = prepare_projection(spec, input, owner, checkpoint)?;
+        let mut bytes = vector(owner, spec.types().len())?;
+        for column in 0..spec.types().len() {
+            checkpoint_at(column, checkpoint)?;
+            bytes.push(
+                input
+                    .tuples
+                    .decoded_component(column)
+                    .map(|decoded| {
+                        OwnedPreparedBytes::new_observed(
+                            decoded.clone(),
+                            Arc::clone(&input.selected),
+                            owner.storage_lifetime(),
+                            &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                            &mut |_| checkpoint(),
+                        )
+                        .map_err(original)
+                    })
+                    .transpose()?,
+            );
+        }
+        checkpoint()?;
+        Ok(Self {
+            projected,
+            bytes,
+            spec: spec.clone(),
+            _storage: owner.storage_lifetime(),
+        })
+    }
+}
+
+/// Both short-lived and captured preparation use this single signed-domain and
+/// complex-layout projection author. Ordinary byte columns keep their actual
+/// admitted carrier even beside a projected complex column.
+fn prepare_projection(
+    spec: &KeySpec,
+    input: &InputData,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<Option<(CanonicalTupleStorage, Vec<FunctionValueType>)>> {
+    checkpoint()?;
+    if spec.types().len() != input.bindings.len() {
+        return Err(invariant(ValueViolation::Layout));
+    }
+    for (expected, actual) in spec.types().iter().zip(&input.bindings) {
+        if !expected
+            .same_value_domain_observed::<DomainFailure>(actual, || {
+                checkpoint().map_err(DomainFailure::Caller)
+            })
+            .map_err(ExecutionFailure::from)?
+        {
+            return Err(invariant(ValueViolation::Layout));
+        }
+    }
+    // The original codec distinguishes some physical layouts (for example
+    // Binary and LargeBinary framing). Normalize complex columns once to
+    // this index's exact projection, while keeping each admitted input's
+    // own root NULL declaration. Distributed encoders remain unchanged.
+    let mut needs_projection = false;
+    for (expected, actual) in spec.types().iter().zip(&input.bindings) {
+        if !is_fixed(expected.data_type())
+            && ByteLayout::from_data_type(expected.data_type()).is_none()
+            && !expected
+                .typed_binding()
+                .layout()
+                .equals_observed(actual.typed_binding().layout(), checkpoint)?
+        {
+            needs_projection = true;
+        }
+    }
+    let projected = if needs_projection {
+        let mut bindings = vector(owner, spec.types().len())?;
+        for (expected, actual) in spec.types().iter().zip(&input.bindings) {
+            checkpoint()?;
+            // A complex neighbor does not change an ordinary byte
+            // carrier or invalidate its original decoded source.
+            if is_fixed(expected.data_type())
+                || ByteLayout::from_data_type(expected.data_type()).is_some()
+            {
+                bindings.push(actual.clone_observed(checkpoint)?);
+                continue;
+            }
+            let value = actual.value_type().clone();
+            checkpoint()?;
+            let layout = expected.typed_binding().layout().clone();
+            let binding = novarocks_type_contract::TypedValueBinding::try_new_observed::<
+                super::store::BindingFailure,
+            >(value, layout, |_| {
+                checkpoint().map_err(super::store::BindingFailure::Caller)
+            })
+            .map_err(ExecutionFailure::from)?;
+            bindings.push(
+                FunctionValueType::try_from_typed_binding(binding).map_err(|e| {
+                    ExecutionFailure::from(novarocks_functions::KernelFailure::from(e))
+                })?,
+            );
+        }
+        let storage = prepare_canonical_tuple_with_byte_layout_projection(
+            input.arrays.as_slice(),
+            &bindings,
+            &ReachableRows::Selection(input.selected.as_ref()),
+            &mut ValueConversionContext::default(),
+            owner,
+            checkpoint,
+        )?
+        .into_storage();
+        Some((storage, bindings))
+    } else {
+        None
+    };
+    Ok(projected)
+}
+
+enum Preparation<'a> {
+    Temporary {
+        projected: Option<(CanonicalTupleStorage, Vec<FunctionValueType>)>,
+        bytes: Vec<Option<PreparedBytes<'a>>>,
+        _storage: ValueTypeStorageLifetime,
+    },
+    Captured(&'a CapturedPreparation),
+}
+impl Preparation<'_> {
+    fn projected(&self) -> Option<&(CanonicalTupleStorage, Vec<FunctionValueType>)> {
+        match self {
+            Self::Temporary { projected, .. } => projected.as_ref(),
+            Self::Captured(prepared) => prepared.projected.as_ref(),
+        }
+    }
+    fn bytes(&self, column: usize) -> ExecutionResult<Option<PreparedBytes<'_>>> {
+        match self {
+            Self::Temporary { bytes, .. } => bytes.get(column).copied(),
+            Self::Captured(prepared) => prepared
+                .bytes
+                .get(column)
+                .map(|bytes| bytes.as_ref().map(OwnedPreparedBytes::borrow)),
+        }
+        .ok_or_else(|| invariant(ValueViolation::Bounds))
+    }
+}
+
 pub(crate) struct PreparedKeyBatch<'a> {
     pub(super) input: &'a KeyInput,
     pub(super) spec: KeySpec,
-    projected: Option<(CanonicalTupleStorage, Vec<FunctionValueType>)>,
-    _storage: ValueTypeStorageLifetime,
-    bytes: Vec<Option<PreparedBytes<'a>>>,
+    preparation: Preparation<'a>,
     pub(super) allocator: AggregateAllocator,
 }
 impl<'a> PreparedKeyBatch<'a> {
@@ -374,75 +576,7 @@ impl<'a> PreparedKeyBatch<'a> {
         owner: &dyn InputConstructionOwner,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
-        checkpoint()?;
-        if spec.types().len() != input.bindings().len() {
-            return Err(invariant(ValueViolation::Layout));
-        }
-        for (expected, actual) in spec.types().iter().zip(input.bindings()) {
-            if !expected
-                .same_value_domain_observed::<DomainFailure>(actual, || {
-                    checkpoint().map_err(DomainFailure::Caller)
-                })
-                .map_err(ExecutionFailure::from)?
-            {
-                return Err(invariant(ValueViolation::Layout));
-            }
-        }
-        // The original codec distinguishes some physical layouts (for example
-        // Binary and LargeBinary framing). Normalize complex columns once to
-        // this index's exact projection, while keeping each admitted input's
-        // own root NULL declaration. Distributed encoders remain unchanged.
-        let mut needs_projection = false;
-        for (expected, actual) in spec.types().iter().zip(input.bindings()) {
-            if !is_fixed(expected.data_type())
-                && ByteLayout::from_data_type(expected.data_type()).is_none()
-                && !expected
-                    .typed_binding()
-                    .layout()
-                    .equals_observed(actual.typed_binding().layout(), checkpoint)?
-            {
-                needs_projection = true;
-            }
-        }
-        let projected =
-            if needs_projection {
-                let mut bindings = vector(owner, spec.types().len())?;
-                for (expected, actual) in spec.types().iter().zip(input.bindings()) {
-                    checkpoint()?;
-                    // A complex neighbor does not change an ordinary byte
-                    // carrier or invalidate its original decoded source.
-                    if is_fixed(expected.data_type())
-                        || ByteLayout::from_data_type(expected.data_type()).is_some()
-                    {
-                        bindings.push(actual.clone_observed(checkpoint)?);
-                        continue;
-                    }
-                    let value = actual.value_type().clone();
-                    checkpoint()?;
-                    let layout = expected.typed_binding().layout().clone();
-                    let binding = novarocks_type_contract::TypedValueBinding::try_new_observed::<
-                        super::store::BindingFailure,
-                    >(value, layout, |_| {
-                        checkpoint().map_err(super::store::BindingFailure::Caller)
-                    })
-                    .map_err(ExecutionFailure::from)?;
-                    bindings.push(FunctionValueType::try_from_typed_binding(binding).map_err(
-                        |e| ExecutionFailure::from(novarocks_functions::KernelFailure::from(e)),
-                    )?);
-                }
-                let storage = prepare_canonical_tuple_with_byte_layout_projection(
-                    input.arrays(),
-                    &bindings,
-                    &ReachableRows::Selection(input.selected()),
-                    &mut ValueConversionContext::default(),
-                    owner,
-                    checkpoint,
-                )?
-                .into_storage();
-                Some((storage, bindings))
-            } else {
-                None
-            };
+        let projected = prepare_projection(spec, &input.0, owner, checkpoint)?;
         let mut bytes = vector(owner, spec.types().len())?;
         for column in 0..spec.types().len() {
             bytes.push(
@@ -462,22 +596,46 @@ impl<'a> PreparedKeyBatch<'a> {
         Ok(Self {
             input,
             spec: spec.clone(),
-            projected,
-            _storage: owner.storage_lifetime(),
-            bytes,
+            preparation: Preparation::Temporary {
+                projected,
+                bytes,
+                _storage: owner.storage_lifetime(),
+            },
+            allocator,
+        })
+    }
+    /// Constant-time loan of this exact immutable capture. Missing or foreign
+    /// preparation is rejected; it never falls back to scanning the whole page.
+    pub(crate) fn from_captured(
+        spec: &KeySpec,
+        input: &'a KeyInput,
+        allocator: AggregateAllocator,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        checkpoint()?;
+        let captured = input
+            .0
+            .preparation
+            .as_ref()
+            .filter(|captured| captured.spec.same_instance(spec))
+            .ok_or_else(|| invariant(ValueViolation::Layout))?;
+        Ok(Self {
+            input,
+            spec: spec.clone(),
+            preparation: Preparation::Captured(captured),
             allocator,
         })
     }
     pub(super) fn tuples(&self) -> CanonicalTupleView<'_> {
-        self.projected
-            .as_ref()
+        self.preparation
+            .projected()
             .map_or(&self.input.0.tuples, |(storage, _)| storage)
             .view(self.input.arrays())
     }
     pub(super) fn component_binding(&self, column: usize) -> ExecutionResult<&FunctionValueType> {
         let bindings = self
-            .projected
-            .as_ref()
+            .preparation
+            .projected()
             .map_or(self.input.bindings(), |(_, bindings)| bindings.as_slice());
         bindings
             .get(column)
@@ -486,11 +644,8 @@ impl<'a> PreparedKeyBatch<'a> {
     pub(crate) fn len(&self) -> usize {
         self.input.len()
     }
-    pub(crate) fn bytes(&self, column: usize) -> ExecutionResult<Option<&PreparedBytes<'a>>> {
-        self.bytes
-            .get(column)
-            .map(Option::as_ref)
-            .ok_or_else(|| invariant(ValueViolation::Bounds))
+    pub(crate) fn bytes(&self, column: usize) -> ExecutionResult<Option<PreparedBytes<'_>>> {
+        self.preparation.bytes(column)
     }
 
     /// Bind a materialization subset once, borrowing the same decoded source.
