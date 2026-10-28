@@ -1901,6 +1901,16 @@ struct EncodedCursor<'a> {
     offset: usize,
 }
 
+/// Borrow the original nullable component frame without inventing a second
+/// tuple parser in a key store. The payload remains the canonical author's
+/// non-NULL group-key encoding, not an Arrow value or a physical value layout.
+pub(crate) fn canonical_component_payload(bytes: &[u8]) -> ExecutionResult<Option<&[u8]>> {
+    let mut cursor = EncodedCursor::new(bytes);
+    let payload = cursor.read_nested()?;
+    cursor.finish()?;
+    Ok(payload)
+}
+
 impl<'a> EncodedCursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }

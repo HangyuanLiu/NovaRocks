@@ -1056,6 +1056,355 @@ impl novarocks_functions::KernelEvaluationControl for CopyControl {
 }
 
 #[test]
+fn owned_complex_components_keep_original_framing_nullable_classes_and_literal_list_values() {
+    let (owner, tracker) = owner_with_tracker();
+    let mut lists = ListBuilder::new(Int32Builder::new());
+    for values in [
+        Some(vec![Some(1), None, Some(2)]),
+        None,
+        Some(vec![]),
+        Some(vec![Some(1), None, Some(3)]),
+    ] {
+        if let Some(values) = &values {
+            for value in values {
+                lists.values().append_option(*value);
+            }
+        }
+        lists.append(values.is_some());
+    }
+    let array: ArrayRef = Arc::new(lists.finish());
+    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let keys = input(
+        &[array],
+        std::slice::from_ref(&ty),
+        &[3, 2, 0, 1, 0],
+        owner.as_ref(),
+    );
+    for (policy, expected) in [
+        (NullPolicy::Equal, [1, 0, 1, 1, 0]),
+        (NullPolicy::Unmatchable, [1, 0, 0, 1, 0]),
+    ] {
+        let spec = KeySpec::new(
+            std::slice::from_ref(&ty),
+            &[policy],
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let stored = super::canonical_store::OwnedCanonicalColumn::copy_selected(
+            &prepared,
+            0,
+            &[0, 1, 2],
+            owner.as_ref(),
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+            &CopyControl,
+        )
+        .unwrap();
+        assert_eq!(stored.len(), 3);
+        let mut out = [0; 5];
+        stored
+            .compare_pairs(
+                &prepared,
+                0,
+                &[0, 3, 1, 2, 0],
+                &[0, 0, 1, 2, 2],
+                &mut out,
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(out, expected);
+        let read = stored.read(0).unwrap();
+        assert!(read.binding.same_value_domain(&ty));
+        // The original decoder is only an independent test observer here;
+        // production typed materialization still needs its governed creator.
+        let decoded = super::super::key_builder::decode_group_key_rows(
+            ty.data_type(),
+            &[
+                read.payload,
+                stored.read(1).unwrap().payload,
+                stored.read(2).unwrap().payload,
+            ],
+        )
+        .unwrap();
+        let list = decoded.as_any().downcast_ref::<ListArray>().unwrap();
+        let first = list.value(0);
+        assert_eq!(
+            first
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(1), None, Some(2)]
+        );
+        assert!(list.is_null(1));
+        assert_eq!(list.value_length(2), 0);
+    }
+}
+
+#[test]
+fn empty_complex_value_does_not_pin_unreferenced_view_payload_or_invent_an_arrow_binding() {
+    use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Payload {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(Payload {
+        bytes: "unreferenced view backing".repeat(8192).into_bytes(),
+        drops: drops.clone(),
+    });
+    let length = source.bytes.len();
+    let pointer = std::ptr::NonNull::new(source.bytes.as_ptr().cast_mut()).unwrap();
+    // SAFETY: the immutable Vec and its complete extent live in Payload until
+    // every Buffer alias exits. No write is performed through this pointer.
+    let buffer = unsafe { Buffer::from_custom_allocation(pointer, length, source) };
+    let offsets: ArrayRef = Arc::new(StringArray::new(
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, length as i32])),
+        buffer,
+        None,
+    ));
+    let mut view = novarocks_value_arrays::build::ValueBuilder::new(
+        novarocks_value_arrays::ByteLayout::Utf8View,
+    );
+    view.append_array_value(
+        offsets.as_ref(),
+        0,
+        &mut novarocks_value_arrays::control::global_growth,
+        &mut novarocks_value_arrays::control::uncontrolled,
+    )
+    .unwrap();
+    let view = view.finish().unwrap().array;
+    drop(offsets);
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        DataType::Utf8View,
+        true,
+    ));
+    let list: ArrayRef = Arc::new(ListArray::new(
+        field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0])),
+        view,
+        None,
+    ));
+    let ty = FunctionValueType::new(list.data_type().clone(), true);
+    let keys = input(&[list], std::slice::from_ref(&ty), &[0], owner.as_ref());
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let stored = {
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        super::canonical_store::OwnedCanonicalColumn::copy_selected(
+            &prepared,
+            0,
+            &[0],
+            owner.as_ref(),
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+            &CopyControl,
+        )
+        .unwrap()
+    };
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(keys);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let read = stored.read(0).unwrap();
+    assert!(read.payload.is_some());
+    assert!(read.binding.same_value_domain(&ty));
+    let independent_empty: ArrayRef = Arc::new(ListArray::new(
+        field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0])),
+        new_empty_array(&DataType::Utf8View),
+        None,
+    ));
+    let probe = input(&[independent_empty], &[ty], &[0], owner.as_ref());
+    let probe = PreparedKeyBatch::new(
+        &spec,
+        &probe,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut out = [0];
+    stored
+        .compare_pairs(&probe, 0, &[0], &[0], &mut out, &|| Ok(()))
+        .unwrap();
+    assert_eq!(out, [1]);
+}
+
+#[test]
+fn complex_owned_serialization_keeps_the_original_stop_inside_a_long_value() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Stop {
+        visits: AtomicUsize,
+    }
+    impl novarocks_functions::KernelEvaluationControl for Stop {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            if self.visits.fetch_add(1, Ordering::SeqCst) + 1 == 12 {
+                Err(novarocks_functions::KernelFailure::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("copy never waits")
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let mut lists = ListBuilder::new(StringBuilder::new());
+    lists.values().append_value("x".repeat(700_000));
+    lists.append(true);
+    let array: ArrayRef = Arc::new(lists.finish());
+    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let keys = input(&[array], std::slice::from_ref(&ty), &[0], owner.as_ref());
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
+    let control = Stop {
+        visits: AtomicUsize::new(0),
+    };
+    let error = super::canonical_store::OwnedCanonicalColumn::copy_selected(
+        &prepared,
+        0,
+        &[0],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+        &control,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error, cause);
+    assert_eq!(control.visits.load(Ordering::SeqCst), 12);
+}
+
+#[test]
+fn canonical_owned_locations_and_reads_preserve_literals_across_actual_page_boundaries() {
+    let (owner, tracker) = owner_with_tracker();
+    let alpha = "alpha".repeat(40);
+    let beta = "beta".repeat(40);
+    let mut lists = ListBuilder::new(StringBuilder::new());
+    for value in [Some(alpha.as_str()), Some(beta.as_str()), None, Some("")] {
+        if let Some(value) = value {
+            lists.values().append_value(value);
+        }
+        lists.append(value.is_some());
+    }
+    let array: ArrayRef = Arc::new(lists.finish());
+    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let keys = input(
+        &[array],
+        std::slice::from_ref(&ty),
+        &[3, 2, 1, 0],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    // A unit-only soft target exercises the real publication loop without
+    // freezing production page size or introducing a product size limit.
+    let stored = super::canonical_store::OwnedCanonicalColumn::copy_selected_for_target(
+        &prepared,
+        0,
+        &[1, 2, 0, 3, 1],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+        &CopyControl,
+        128,
+    )
+    .unwrap();
+    assert!(stored.page_count() > 1);
+    let payloads = (0..stored.len())
+        .map(|row| stored.read(row).unwrap().payload)
+        .collect::<Vec<_>>();
+    let decoded =
+        super::super::key_builder::decode_group_key_rows(ty.data_type(), &payloads).unwrap();
+    let lists = decoded.as_any().downcast_ref::<ListArray>().unwrap();
+    for (row, expected) in [
+        Some(beta.as_str()),
+        None,
+        Some(alpha.as_str()),
+        Some(""),
+        Some(beta.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match expected {
+            None => assert!(lists.is_null(row)),
+            Some(expected) => {
+                let child = lists.value(row);
+                assert_eq!(
+                    child
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec![Some(expected)]
+                );
+            }
+        }
+    }
+    let mut out = [0; 6];
+    stored
+        .compare_pairs(
+            &prepared,
+            0,
+            &[1, 1, 0, 3, 2, 0],
+            &[0, 4, 2, 3, 1, 0],
+            &mut out,
+            &|| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(out, [1, 1, 1, 1, 1, 0]);
+}
+
+#[test]
 fn owned_fixed_decimal_rows_are_selected_copied_and_keep_exact_signed_parameters() {
     use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
     use std::sync::atomic::{AtomicUsize, Ordering};
