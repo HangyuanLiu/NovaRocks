@@ -261,7 +261,7 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
     );
     match error.kind() {
         MvApplicationErrorKind::AlreadyActive => {
-            ScheduledRefreshDisposition::AlreadyActive(error.compile_control_error())
+            ScheduledRefreshDisposition::AlreadyActive(failure)
         }
         MvApplicationErrorKind::Unavailable | MvApplicationErrorKind::BindingInvalidated => {
             ScheduledRefreshDisposition::TransientUnavailable(failure)
@@ -274,7 +274,7 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
             ScheduledRefreshDisposition::TerminalFailure(failure)
         }
         MvApplicationErrorKind::ShutdownCancelled => {
-            ScheduledRefreshDisposition::ShutdownCancelled(error.compile_control_error())
+            ScheduledRefreshDisposition::ShutdownCancelled(failure)
         }
         MvApplicationErrorKind::Engine => ScheduledRefreshDisposition::InvariantViolation(failure),
     }
