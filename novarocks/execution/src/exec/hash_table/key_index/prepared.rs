@@ -290,7 +290,7 @@ impl KeyInput {
 /// Coordinate sorting is ordinary fast-path linear for ordered pages. The
 /// uncommon reordered occurrence input uses controlled primitive merge passes;
 /// no uninterruptible full-input sort or per-key Arrow array is introduced.
-fn sort_rows(
+pub(super) fn sort_rows(
     rows: &mut [usize],
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
@@ -407,5 +407,22 @@ impl<'a> PreparedKeyBatch<'a> {
             .get(column)
             .map(Option::as_ref)
             .ok_or_else(|| invariant(ValueViolation::Bounds))
+    }
+
+    /// Bind a materialization subset once, borrowing the same decoded source.
+    /// The subset does not authorize rows outside this input's readable domain.
+    pub(super) fn byte_subset<'b>(
+        &'b self,
+        column: usize,
+        rows: &'b SelectionSet,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<PreparedBytes<'b>> {
+        let decoded = self
+            .input
+            .0
+            .tuples
+            .decoded_component(column)
+            .ok_or_else(|| invariant(ValueViolation::Carrier))?;
+        PreparedBytes::new_observed(decoded, rows, &mut |_| checkpoint()).map_err(original)
     }
 }

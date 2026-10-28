@@ -21,6 +21,7 @@
 mod local_hash;
 mod pairs;
 mod prepared;
+mod store;
 #[cfg(test)]
 mod tests;
 
@@ -65,6 +66,34 @@ fn vector<T>(owner: &dyn InputConstructionOwner, count: usize) -> ExecutionResul
         })
     })?;
     Ok(values)
+}
+fn reserve_push<T>(
+    values: &mut Vec<T>,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    let growth =
+        novarocks_type_contract::owned_resources::vec::push_growth(values).map_err(|cause| {
+            match cause {
+                novarocks_type_contract::ControlResourceError::Control(cause) => {
+                    ConstructionFailure::Control(cause)
+                }
+                novarocks_type_contract::ControlResourceError::SourceModel(cause) => {
+                    ConstructionFailure::InvalidSource(cause.to_owned())
+                }
+            }
+        })?;
+    if let Some(layout) = growth.requested_backing {
+        owner.request(layout)?;
+        values.try_reserve(1).map_err(|source| {
+            ExecutionFailure::from_domain(ValueError::Allocation {
+                requested: layout.size(),
+                source,
+            })
+        })?;
+    }
+    checkpoint()
 }
 fn shared<T>(owner: &dyn InputConstructionOwner, value: T) -> ExecutionResult<std::sync::Arc<T>> {
     owner.request(

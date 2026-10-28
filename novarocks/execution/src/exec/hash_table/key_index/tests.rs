@@ -39,9 +39,13 @@ use novarocks_value_arrays::{
 use std::{alloc::Layout, cell::Cell, sync::Arc};
 
 fn owner() -> Box<dyn InputConstructionOwner> {
+    owner_with_tracker().0
+}
+fn owner_with_tracker() -> (Box<dyn InputConstructionOwner>, Arc<MemTracker>) {
+    let tracker = MemTracker::new_root("local key test construction");
     let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-        MemTracker::new_root("local key test construction"),
+        tracker.clone(),
         Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     ).unwrap();
     let declaration = crate::exec::chunk::typed_fixture::layout(
@@ -50,7 +54,7 @@ fn owner() -> Box<dyn InputConstructionOwner> {
         &[],
     );
     let schema = factory.create_compiled_chunk_schema(&declaration).unwrap();
-    factory.begin_typed_construction(&schema).unwrap()
+    (factory.begin_typed_construction(&schema).unwrap(), tracker)
 }
 fn readable(len: usize) -> SelectionSet {
     ReachableRows::all(len)
@@ -643,6 +647,306 @@ fn long_collision_comparison_preserves_caller_stop_and_unselected_rows_are_rejec
 }
 
 #[test]
+fn owned_byte_representatives_keep_order_and_survive_the_actual_source_payload_exit() {
+    use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Source {
+        payload: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let wanted = "same prefix selected representative";
+    let hidden = "unused backing".repeat(40_000);
+    let payload = [hidden.as_bytes(), wanted.as_bytes()].concat();
+    let source = Arc::new(Source {
+        payload,
+        drops: drops.clone(),
+    });
+    let pointer = std::ptr::NonNull::new(source.payload.as_ptr().cast_mut()).unwrap();
+    let length = source.payload.len();
+    // SAFETY: Source keeps this unchanged Vec allocation alive for every
+    // Buffer alias. The only mutable pointer is never written through.
+    let payload = unsafe { Buffer::from_custom_allocation(pointer, length, source) };
+    let array: ArrayRef = Arc::new(StringArray::new(
+        OffsetBuffer::new(ScalarBuffer::from(vec![
+            0i32,
+            hidden.len() as i32,
+            length as i32,
+        ])),
+        payload,
+        None,
+    ));
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let keys = input(&[array], std::slice::from_ref(&ty), &[1], owner.as_ref());
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let page = {
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let mut pages = super::store::OwnedByteColumn::copy_pages(
+            &prepared,
+            0,
+            &[1, 1],
+            owner.as_ref(),
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+            &CopyControl,
+        )
+        .unwrap();
+        assert_eq!(pages.len(), 1);
+        let page = pages.pop().unwrap();
+        assert_eq!(page.len(), 2);
+        let mut matches = [None; 3];
+        page.compare_pairs(&prepared, 0, &[1, 1, 1], &[1, 0, 1], &mut matches, &|| {
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(matches, [Some(true); 3]);
+        page
+    };
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(keys);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let array = page
+        .array()
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap();
+    assert_eq!(array.value(0), wanted);
+    assert_eq!(array.value(1), wanted);
+    assert_eq!(page.binding().data_type(), &DataType::Utf8View);
+    assert!(page.binding().same_value_domain(&ty));
+    assert!(!page.storage().is_pure());
+}
+
+#[test]
+fn owned_byte_page_target_splits_work_without_rejecting_a_larger_single_value() {
+    let (owner, tracker) = owner_with_tracker();
+    let long = "x".repeat(150_000);
+    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            Some(long.as_str()),
+            None,
+            Some("tail"),
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let pages = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &[0, 1, 2],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &CopyControl,
+    )
+    .unwrap();
+    // The page target is private tuning. Preserve values across any valid
+    // page boundaries instead of freezing a production page size in a test.
+    let actual = pages
+        .iter()
+        .flat_map(|page| {
+            page.array()
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .iter()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![Some(long.as_str()), None, Some("tail")]);
+    let pages = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &[2, 1, 2],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &CopyControl,
+    )
+    .unwrap();
+    let actual = pages
+        .iter()
+        .flat_map(|page| {
+            page.array()
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .iter()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![Some("tail"), None, Some("tail")]);
+}
+
+#[test]
+fn owned_binary_pages_preserve_non_utf8_empty_null_and_cross_carrier_pairs() {
+    let (owner, tracker) = owner_with_tracker();
+    let raw = [0xff, 0, 1];
+    let ty = FunctionValueType::new(DataType::Binary, true);
+    let keys = input(
+        &[Arc::new(BinaryArray::from(vec![
+            Some(raw.as_slice()),
+            Some(b"".as_slice()),
+            None,
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let pages = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &[2, 0, 1, 0],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &CopyControl,
+    )
+    .unwrap();
+    let actual = pages
+        .iter()
+        .flat_map(|page| {
+            page.array()
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap()
+                .iter()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            None,
+            Some(raw.as_slice()),
+            Some(b"".as_slice()),
+            Some(raw.as_slice())
+        ]
+    );
+    let locations = pages
+        .iter()
+        .enumerate()
+        .flat_map(|(page, values)| (0..values.len()).map(move |row| (page, row)))
+        .collect::<Vec<_>>();
+    let probe = input(
+        &[Arc::new(BinaryViewArray::from(vec![
+            Some(raw.as_slice()),
+            None,
+            Some(b"".as_slice()),
+        ]))],
+        &[FunctionValueType::new(DataType::BinaryView, true)],
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let probe = PreparedKeyBatch::new(
+        &spec,
+        &probe,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let pairs = [(0, 1, true), (1, 0, true), (2, 2, true), (0, 2, false)];
+    for (page_index, page) in pages.iter().enumerate() {
+        let selected = pairs
+            .iter()
+            .filter(|(_, stored, _)| locations[*stored].0 == page_index)
+            .collect::<Vec<_>>();
+        let input_rows = selected.iter().map(|(row, _, _)| *row).collect::<Vec<_>>();
+        let page_rows = selected
+            .iter()
+            .map(|(_, stored, _)| locations[*stored].1)
+            .collect::<Vec<_>>();
+        let mut out = vec![None; selected.len()];
+        page.compare_pairs(&probe, 0, &input_rows, &page_rows, &mut out, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            out,
+            selected
+                .iter()
+                .map(|(_, _, expected)| Some(*expected))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn owned_byte_publication_preserves_the_original_construction_refusal() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Binary, false);
+    let keys = input(
+        &[Arc::new(BinaryArray::from(vec![
+            b"binary value".as_slice(),
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let cause: ExecutionFailure = ConstructionFailure::Control(
+        novarocks_type_contract::CompileControlError::ResourceExhausted,
+    )
+    .into();
+    let refusing = RefusingOwner(owner.as_ref(), cause.clone());
+    let result = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &[0],
+        &refusing,
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &CopyControl,
+    );
+    let error = match result {
+        Err(cause) => cause,
+        Ok(_) => panic!("refused key page cannot be published"),
+    };
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&error),
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause)
+    );
+}
+
+#[test]
 fn complex_neighbor_does_not_rehash_repeated_long_dictionary_components() {
     let owner = owner();
     let mut lists = ListBuilder::new(Int32Builder::new());
@@ -739,4 +1043,233 @@ fn nominal_json_and_string_with_the_same_arrow_carrier_are_distinct_domains() {
         )
         .is_err()
     );
+}
+
+struct CopyControl;
+impl novarocks_functions::KernelEvaluationControl for CopyControl {
+    fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+        panic!("byte copy never waits")
+    }
+}
+
+struct TaggedCreator<'a> {
+    original: &'a dyn InputConstructionOwner,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl InputConstructionOwner for TaggedCreator<'_> {
+    fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+    fn request(&self, layout: Layout) -> Result<(), ConstructionFailure> {
+        self.original.request(layout)
+    }
+    fn observe_opaque_upper_bound(&self, bytes: usize) -> Result<(), ConstructionFailure> {
+        self.original.observe_opaque_upper_bound(bytes)
+    }
+    fn observe(
+        &self,
+        n: usize,
+        path: &[crate::exec::chunk::ArrayPathStep],
+        step: crate::exec::chunk::ArrayNormalizationStep<'_>,
+    ) -> Result<(), ConstructionFailure> {
+        self.original.observe(n, path, step)
+    }
+}
+
+#[test]
+fn owned_byte_creator_stays_with_the_last_arrow_buffer_alias_after_page_drop() {
+    use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Tag(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Tag {}
+    impl Drop for Tag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            "long owned payload retained by a sliced Arrow buffer",
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let tagged = TaggedCreator {
+        original: owner.as_ref(),
+        storage: owner
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(
+                &ValueTypeStorageLifetime::held(Arc::new(Tag(drops.clone()))),
+                |layout| owner.request(layout),
+            )
+            .unwrap(),
+    };
+    let pages = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &[0],
+        &tagged,
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+        &CopyControl,
+    )
+    .unwrap();
+    let alias = pages[0].array().slice(0, 1);
+    drop(pages);
+    drop(tagged);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        alias
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .value(0),
+        "long owned payload retained by a sliced Arrow buffer"
+    );
+    drop(alias);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn owned_byte_page_directory_grows_with_published_pages_instead_of_representative_rows() {
+    let (owner, tracker) = owner_with_tracker();
+    let count = 8192;
+    let values = (0..count)
+        .map(|i| format!("key-{i:08}-{}", "payload".repeat(12)))
+        .collect::<Vec<_>>();
+    let rows = (0..count).collect::<Vec<_>>();
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let keys = input(
+        &[Arc::new(StringArray::from(values))],
+        std::slice::from_ref(&ty),
+        &rows,
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let pages = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &rows,
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+        &CopyControl,
+    )
+    .unwrap();
+    assert_eq!(
+        pages
+            .iter()
+            .map(super::store::OwnedByteColumn::len)
+            .sum::<usize>(),
+        count
+    );
+    // The original Vec author may keep amortized spare slots; capacity scales
+    // with real page count, never one page header for every short input key.
+    assert!(pages.capacity() <= pages.len().saturating_mul(2).max(4));
+    assert!(pages.capacity() < count / 2);
+    let mut ordinal = 0;
+    for page in &pages {
+        let values = page
+            .array()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        for row in 0..values.len() {
+            assert_eq!(
+                values.value(row),
+                format!("key-{ordinal:08}-{}", "payload".repeat(12))
+            );
+            ordinal += 1;
+        }
+    }
+}
+
+#[test]
+fn owned_byte_page_retains_actual_nullable_binding_and_rejects_another_nominal_domain() {
+    let (owner, tracker) = owner_with_tracker();
+    let required = FunctionValueType::new(DataType::Utf8, false);
+    let nullable = FunctionValueType::new(DataType::Utf8, true);
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![None, Some("{}")]))],
+        &[nullable],
+        &[0, 1],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(
+        &[required],
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let pages = super::store::OwnedByteColumn::copy_pages(
+        &prepared,
+        0,
+        &[0, 1],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &CopyControl,
+    )
+    .unwrap();
+    assert!(pages[0].binding().nullable());
+    assert!(pages[0].array().is_null(0));
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::Utf8,
+        false,
+        novarocks_type_contract::ValueLogicalType::Json,
+    )
+    .unwrap();
+    let other = input(
+        &[Arc::new(StringArray::from(vec!["{}", "{}"]))],
+        std::slice::from_ref(&json),
+        &[0, 1],
+        owner.as_ref(),
+    );
+    let json_spec =
+        KeySpec::new(&[json], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let other = PreparedKeyBatch::new(
+        &json_spec,
+        &other,
+        AggregateAllocator::new(tracker),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut out = [None];
+    assert!(
+        pages[0]
+            .compare_pairs(&other, 0, &[1], &[1], &mut out, &|| Ok(()))
+            .is_err()
+    );
+    assert_eq!(out, [None]);
 }
