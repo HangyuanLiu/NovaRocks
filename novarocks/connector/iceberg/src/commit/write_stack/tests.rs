@@ -6509,3 +6509,112 @@ fn borrowed_provider_finish_and_abort_preserve_the_winning_terminal_fact() {
         }
     }
 }
+
+#[test]
+fn partition_replace_freezes_after_image_recipe_and_old_file_delete_ownership() {
+    let input = merge_on_read_input_shape();
+    let mut material = session_material(input.clone());
+    material.data_recipe = super::domain::IcebergDataBranchRecipe::try_new(
+        Some(
+            serde_json::json!({"type":"struct","schema-id":1,"fields":[
+                {"id":1,"name":"k1","required":false,"type":"long"},
+                {"id":4,"name":"v1","required":false,"type":"string"}
+            ]})
+            .to_string(),
+        ),
+        vec!["k1".into()],
+        vec!["partition_key".into()],
+        vec!["bucket[8]".into()],
+        false,
+    )
+    .unwrap();
+    let old_file = "s3://b/wh/db/t/data/old-p0.parquet";
+    let old_partition = super::domain::IcebergArtifactPartition::try_new(
+        "partition_key=0".into(),
+        String::new(),
+        0,
+        crate::write_descriptor::IcebergPartitionDescriptor {
+            values: vec![crate::write_descriptor::IcebergPartitionValueDescriptor {
+                is_null: false,
+                datum_bytes: Some(0_i32.to_le_bytes().to_vec()),
+            }],
+        },
+    )
+    .unwrap();
+    material.merge_targets = vec![
+        IcebergOldDeleteMergeTarget::try_new(
+            old_file.into(),
+            100,
+            Some(4),
+            old_partition,
+            77,
+            Vec::new(),
+        )
+        .unwrap(),
+    ];
+    let frozen_old_partition = material.merge_targets[0].partition().clone();
+    let plan = plan_row_mutation_branches(&material).unwrap();
+    let (_, plans) = flavor_session(plan);
+    let data = &plans[0];
+    let delete = &plans[1];
+    let new_partition = input
+        .fields()
+        .into_iter()
+        .find(|field| field.field().name() == "k1")
+        .unwrap()
+        .token();
+    let old_file_token = input
+        .fields()
+        .into_iter()
+        .find(|field| field.field().name() == "_file")
+        .unwrap()
+        .token();
+    assert!(
+        data.route()
+            .unwrap()
+            .input_ordinals()
+            .iter()
+            .any(|field| field.token() == new_partition)
+    );
+    assert_eq!(
+        data.handle().data().unwrap().transform_exprs(),
+        &["bucket[8]".to_string()]
+    );
+    assert_eq!(
+        delete.route().unwrap().requirements().colocation,
+        novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(vec![
+            old_file_token
+        ])
+    );
+    assert!(
+        !delete
+            .route()
+            .unwrap()
+            .input_ordinals()
+            .iter()
+            .any(|field| field.token() == new_partition),
+        "new partition data cannot become old-delete ownership"
+    );
+    assert_eq!(
+        delete
+            .handle()
+            .old_deletes()
+            .get(old_file)
+            .unwrap()
+            .partition(),
+        &frozen_old_partition
+    );
+    assert!(
+        data.route()
+            .unwrap()
+            .accepted_effects()
+            .contains(&ConnectorRowMutationEffect::Replace)
+    );
+    assert!(
+        delete
+            .route()
+            .unwrap()
+            .accepted_effects()
+            .contains(&ConnectorRowMutationEffect::Replace)
+    );
+}

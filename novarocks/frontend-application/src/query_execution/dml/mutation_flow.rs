@@ -860,9 +860,10 @@ fn finish_update_mutation_preparation(
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 ) -> Result<PreparedUpdateMutation, String> {
     let planning_lease = target_binding.lease().clone();
-    // Target columns and the partition-column set are provider-signed facts, so
-    // assignment validation never decodes an Iceberg schema. The branch/format
-    // gate now lives in row-mutation admission below.
+    // Validate assignments against the Provider's exact target declaration.
+    // Partition columns are ordinary target values: the signed strategy keeps
+    // old-file deletion separate from partitioning the replacement after-image.
+    // Branch/format and transform admission stay with the Provider.
     // The physical strategy is whatever the provider signs for this table state.
     let strategy_operation_id = operation_id;
     let (strategy_lease, strategy_preparation) = target_binding.prepare_row_mutation(
@@ -888,26 +889,7 @@ fn finish_update_mutation_preparation(
         } else {
             target_binding.dml_target_columns()?
         };
-    let partition_source_columns = target_binding
-        .metadata()
-        .planning_facts
-        .partition_source_column_ordinals()
-        .iter()
-        .map(|ordinal| {
-            target_columns
-                .get(*ordinal as usize)
-                .map(|column| column.name.clone())
-                .ok_or_else(|| {
-                    "connector write target has a partition source ordinal outside its admitted schema"
-                        .to_string()
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    validate_update_assignments(
-        &stmt.assignments,
-        &target_columns,
-        &partition_source_columns,
-    )?;
+    validate_update_assignments(&stmt.assignments, &target_columns)?;
     let signed_preparations =
         DmlChangeStreamPreparations::from_signed(strategy_lease, strategy_preparation);
     let cow_preparations = (mode
@@ -1037,25 +1019,10 @@ fn finish_merge_mutation_preparation(
     } else {
         target_binding.dml_target_columns()?
     };
-    let partition_source_columns = target_binding
-        .metadata()
-        .planning_facts
-        .partition_source_column_ordinals()
-        .iter()
-        .map(|ordinal| {
-            target_columns
-                .get(*ordinal as usize)
-                .map(|column| column.name.clone())
-                .ok_or_else(|| {
-                    "connector write target has a partition source ordinal outside its admitted schema"
-                        .to_string()
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     if let Some(clause) = stmt.matched.as_ref()
         && let PreparedMergeMatchedAction::Update { assignments } = &clause.action
     {
-        validate_update_assignments(assignments, &target_columns, &partition_source_columns)?;
+        validate_update_assignments(assignments, &target_columns)?;
     }
     let insert_columns_resolved = stmt
         .not_matched
@@ -2784,15 +2751,10 @@ fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRe
 fn validate_update_assignments(
     assignments: &[PreparedMutationAssignment],
     target_columns: &[novarocks_types::schema::ColumnDef],
-    partition_columns: &[String],
 ) -> Result<(), String> {
     let target_names = target_columns
         .iter()
         .map(|c| c.name.to_ascii_lowercase())
-        .collect::<std::collections::HashSet<_>>();
-    let partition_names = partition_columns
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
         .collect::<std::collections::HashSet<_>>();
     let mut seen = std::collections::HashSet::new();
     for assignment in assignments {
@@ -2809,12 +2771,6 @@ fn validate_update_assignments(
         if !target_names.contains(&name) {
             return Err(format!(
                 "UPDATE assignment references unknown target column `{}`",
-                assignment.column
-            ));
-        }
-        if partition_names.contains(&name) {
-            return Err(format!(
-                "UPDATE cannot modify Iceberg partition column `{}` in the first implementation",
                 assignment.column
             ));
         }
@@ -4897,24 +4853,57 @@ mod tests {
                 value_sql: "1".to_string(),
             }],
             &[col("id"), col("v")],
-            &[],
         )
         .expect_err("must reject");
         assert!(err.contains("reserved Iceberg metadata column"), "{err}");
     }
 
     #[test]
-    fn reject_partition_column_update() {
-        let err = validate_update_assignments(
-            &[PreparedMutationAssignment {
-                column: "id".to_string(),
-                value_sql: "1".to_string(),
+    fn replacement_assignment_uses_target_conversion_and_original_old_identity() {
+        let columns = [col("id"), col("p")];
+        let assignments = [PreparedMutationAssignment {
+            column: "P".into(),
+            value_sql: "NULL".into(),
+        }];
+        validate_update_assignments(&assignments, &columns).unwrap();
+        let projected = update_assignment_projection_sql(&assignments, &columns).unwrap();
+        assert_eq!(projected[0].0, "p");
+        assert!(projected[0].1.contains("CAST"));
+        assert!(projected[0].1.contains("NULL"));
+        assert!(projected[0].1.contains("BIGINT"));
+        let sql = build_update_match_query_sql(
+            "ice.db.t AS t",
+            "t",
+            None,
+            &[(projected[0].0.as_str(), projected[0].1.as_str())],
+            Some("t.id=1"),
+        );
+        assert!(sql.contains("t._file AS __nr_file"));
+        assert!(sql.contains("t._pos AS __nr_pos"));
+        assert!(sql.contains("t._row_id AS __nr_row_id"));
+        assert!(sql.contains("AS __nr_new_p"));
+        assert!(
+            sql.contains("t.*"),
+            "the old row and new p must remain separate: {sql}"
+        );
+        for assignments in [
+            vec![PreparedMutationAssignment {
+                column: "missing".into(),
+                value_sql: "1".into(),
             }],
-            &[col("id"), col("v")],
-            &["id".to_string()],
-        )
-        .expect_err("must reject");
-        assert!(err.contains("partition column"), "{err}");
+            vec![
+                PreparedMutationAssignment {
+                    column: "p".into(),
+                    value_sql: "1".into(),
+                },
+                PreparedMutationAssignment {
+                    column: "P".into(),
+                    value_sql: "2".into(),
+                },
+            ],
+        ] {
+            assert!(validate_update_assignments(&assignments, &columns).is_err());
+        }
     }
 
     #[test]
