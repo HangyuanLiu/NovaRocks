@@ -61,9 +61,15 @@ or independent verification client may use the observer during native phases.
 Semantic headers/status/reason/payload bytes are preserved. HTTP hop framing
 (Host, Connection, transfer chunk framing) is adapted on each direct hop.
 An admitted handler reuses its one upstream connection only after a complete
-self-delimited response; idle keepalive has no in-flight request deadline. No JSON, names, tokens, credentials, errors or status are rewritten.
-Observer bound/transport failures close the socket and taint the phase; they
-never generate a substitute HTTP error, retry, partial-success or fake catalog.
+self-delimited response; idle keepalive has no in-flight request deadline.
+The same owner observes idle upstream EOF and exposes closure on both hops;
+no failed request is reconnected or replayed. No JSON, names, tokens,
+credentials, errors or status are rewritten.
+Observer bound/protocol and request transport failures close the socket and
+taint the phase; they never generate a substitute HTTP error, retry,
+partial-success or fake catalog. A reset observed in confirmed local idle
+state after a complete exchange retires the same pair as a lifecycle event;
+that event proves neither TCP orderly close nor FE consumption.
 Compressed listing bodies are observed with bounded gzip decode, then the exact
 original compressed bytes/header are forwarded. Unsupported encodings taint
 the phase while the actual bounded response is still forwarded unchanged.
@@ -73,6 +79,7 @@ tests. It is explicitly NOT real provider, native CL or product acceptance.
 """
 
 import argparse
+import errno
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -83,6 +90,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import socket
 from socketserver import TCPServer, ThreadingMixIn
 import sys
@@ -108,6 +116,15 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 
 class Refusal(Exception):
     """Only static safe reason strings may be passed to this exception."""
+
+
+class IdleReset:
+    """A reset from an exact idle read site, not a successful RPC result."""
+
+    __slots__ = ("side", "probe", "error")
+
+    def __init__(self, side, probe, error):
+        self.side, self.probe, self.error = side, probe, error
 
 
 def need(condition, reason):
@@ -344,7 +361,7 @@ class Audit:
             self.upstream_connections -= 1
             need(self.upstream_connections >= 0, "upstream socket ownership underflow")
 
-    def failure(self, reason, admission=False, *, operation=None, error=None):
+    def failure(self, reason, admission=False, *, operation=None, error=None, request_held=None):
         with self.lock:
             self.counters["failures"] += 1
             self.total_failures += 1
@@ -356,6 +373,8 @@ class Audit:
                 event["error"] = {"type": type(error).__name__,
                                   "errno": error.errno if isinstance(error, OSError) else None,
                                   "operation": operation}
+            if request_held is not None:
+                event["request_held"] = request_held
             self.event(event)
 
     def begin(self, method, target, category, peer):
@@ -546,6 +565,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
         self.upstream_counted = False
         self.request_held = False
         self.timer = None
+        self.idle_exchange_complete = False
         self.socket_lock = threading.Lock()
         super().setup()
         self.rfile = HeaderReader(self.rfile, self.server.bounds["max_header_bytes"])
@@ -575,17 +595,150 @@ class ObserverHandler(BaseHTTPRequestHandler):
         self.server.audit.failure("invalid HTTP request; no substitute response")
         self.close_connection = True
 
+    def peek_idle_client(self):
+        # The original BufferedReader may already hold the next request even
+        # when its raw fd is not readable. A nonblocking peek retains every
+        # byte for the sole stdlib HTTP parser; no second reader or timer runs.
+        previous = self.connection.gettimeout()
+        try:
+            self.connection.setblocking(False)
+            try:
+                return self.rfile.peek(1)
+            except BlockingIOError:
+                return b""
+            except ConnectionResetError as error:
+                if error.errno != errno.ECONNRESET:
+                    raise
+                return IdleReset("client", "buffered_client_peek", error)
+        finally:
+            self.connection.settimeout(previous)
+
+    @staticmethod
+    def peek_idle_socket(sock, side="client", probe="raw_client_peek"):
+        previous = sock.gettimeout()
+        try:
+            sock.setblocking(False)
+            try:
+                return sock.recv(1, socket.MSG_PEEK)
+            except BlockingIOError:
+                return None
+            except ConnectionResetError as error:
+                if error.errno != errno.ECONNRESET:
+                    raise
+                return IdleReset(side, probe, error)
+        finally:
+            sock.settimeout(previous)
+
+    def retire_idle_reset(self, reset):
+        # This is only the original local HTTP idle state: prior framing and
+        # forwarding ended, and their request/timer have actually exited.
+        # It does not acknowledge FE consumption or any peer application effect.
+        if not self.idle_exchange_complete or self.request_held or self.timer is not None:
+            raise reset.error
+        audit = self.server.audit
+        with audit.lock:
+            audit.event({"event": "idle-pair-reset", "phase": audit.phase,
+                         "generation": audit.generation, "side": reset.side,
+                         "probe": reset.probe, "errno": reset.error.errno,
+                         "peer_ip": self.client_address[0], "peer_port": self.client_address[1],
+                         "sequence": None, "previous_exchange_complete": True,
+                         "first_byte_observed": False})
+        self.close_connection = True
+        return None
+
+    def wait_client_first_byte(self):
+        # Idle belongs to this original pair owner. Readiness/probes cannot
+        # make a later send atomic with peer closure; any later failure still
+        # takes forward's original no-replay path.
+        while True:
+            first_byte = None
+            try:
+                pending = self.peek_idle_client()
+                if isinstance(pending, IdleReset):
+                    return self.retire_idle_reset(pending)
+                first_byte = time.monotonic() if pending else None
+                upstream = self.upstream_socket
+                watched = [self.connection] + ([upstream] if upstream is not None else [])
+                readable, _, _ = select.select(watched, [], [], 0 if pending else None)
+                if not pending and self.connection in readable:
+                    pending = self.peek_idle_client()
+                    if isinstance(pending, IdleReset):
+                        return self.retire_idle_reset(pending)
+                    if pending:
+                        first_byte = time.monotonic()
+                    else:
+                        client_input = self.peek_idle_socket(self.connection)
+                        if isinstance(client_input, IdleReset):
+                            return self.retire_idle_reset(client_input)
+                        if client_input == b"":
+                            return None
+                        if client_input:
+                            # Bytes can arrive between the buffered peek and
+                            # this raw peek. Preserve their first observation;
+                            # the stdlib parser still consumes the same bytes.
+                            pending = client_input
+                            first_byte = time.monotonic()
+                if upstream is not None and upstream in readable:
+                    upstream_input = self.peek_idle_socket(upstream, "upstream", "raw_upstream_peek")
+                    if isinstance(upstream_input, IdleReset):
+                        if pending:
+                            return first_byte, upstream_input.error
+                        # An upstream reset can race with client input. It is
+                        # not idle merely because the earlier probe was empty.
+                        pending = self.peek_idle_client()
+                        if isinstance(pending, IdleReset):
+                            return self.retire_idle_reset(pending)
+                        if pending:
+                            return time.monotonic(), upstream_input.error
+                        return self.retire_idle_reset(upstream_input)
+                    if upstream_input == b"":
+                        # Check buffered/client input again before classifying a
+                        # closure as idle. Simultaneous input must retain request
+                        # failure, never become a clean idle success or reconnect.
+                        if not pending:
+                            pending = self.peek_idle_client()
+                            if isinstance(pending, IdleReset):
+                                return self.retire_idle_reset(pending)
+                            if pending:
+                                first_byte = time.monotonic()
+                        if pending:
+                            return first_byte, Refusal("upstream EOF with pending client request")
+                        audit = self.server.audit
+                        with audit.lock:
+                            audit.event({"event": "idle-upstream-eof", "phase": audit.phase,
+                                         "generation": audit.generation,
+                                         "peer_ip": self.client_address[0],
+                                         "peer_port": self.client_address[1]})
+                        self.close_connection = True
+                        return None
+                    if upstream_input is not None:
+                        if pending:
+                            return first_byte, Refusal("unexpected upstream input with pending client request")
+                        raise Refusal("unexpected upstream input while no request is outstanding")
+                if pending:
+                    return first_byte, None
+            except (Refusal, OSError, ValueError, http.client.HTTPException) as error:
+                if first_byte is not None:
+                    return first_byte, error
+                raise
+
     def handle(self):
         self.close_connection = False
         while not self.close_connection:
+            completed_exchange = False
+            operation = "prepare_client_idle_wait"
             try:
                 # Idle sockets belong to this handler, not to a phase RPC.
                 # Start the original absolute RPC deadline at its first byte;
                 # the stdlib remains the sole HTTP request parser.
                 self.connection.settimeout(None)
-                if not self.rfile.peek(1):
+                operation = "wait_client_first_byte"
+                ready = self.wait_client_first_byte()
+                if ready is None:
                     break
-                self.started = time.monotonic()
+                operation = "begin_client_request"
+                self.started, idle_refusal = ready
+                self.idle_exchange_complete = False
                 self.deadline = self.started + self.server.bounds["request_absolute_deadline_seconds"]
                 self.server.audit.request_enter()
                 self.request_held = True
@@ -607,10 +760,18 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 self.timer = threading.Timer(max(0, self.deadline - time.monotonic()), expire)
                 self.timer.daemon = True
                 self.timer.start()
+                if idle_refusal is not None:
+                    operation = "idle_upstream_refusal_with_client_input"
+                    raise idle_refusal
+                operation = "parse_client_request"
                 self.handle_one_request()
+                operation = "post_client_request_deadline"
                 self.check()
-            except (Refusal, OSError, ValueError, http.client.HTTPException):
-                self.server.audit.failure("request parse/transport refusal")
+                completed_exchange = not self.close_connection
+            except (Refusal, OSError, ValueError, http.client.HTTPException) as error:
+                self.server.audit.failure("request parse/transport refusal",
+                                          operation=operation, error=error,
+                                          request_held=self.request_held)
                 self.close_connection = True
             finally:
                 if self.timer is not None:
@@ -620,6 +781,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 if self.request_held:
                     self.server.audit.request_exit()
                     self.request_held = False
+                self.idle_exchange_complete = completed_exchange
 
     def check(self):
         need(time.monotonic() < self.deadline, "observer RPC absolute deadline expired")
@@ -909,6 +1071,117 @@ class PureTests(unittest.TestCase):
             self.assertNotIn(private, recorded)
 
 
+    def test_request_boundary_failures_keep_safe_cause_and_original_taint(self):
+        import errno
+        import select as select_module
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+
+        cases = (
+            (False, OSError(errno.ECONNRESET, "private-message", "private-filename"),
+             "wait_client_first_byte"),
+            (False, OSError(errno.EIO, "private-message", "private-filename"),
+             "wait_client_first_byte"),
+            (True, OSError(errno.ECONNRESET, "private-message", "private-filename"),
+             "parse_client_request"),
+            (True, Refusal("private-refusal-message"), "parse_client_request"),
+        )
+        for first_byte, error, operation in cases:
+            with self.subTest(first_byte=first_byte, error=type(error).__name__), tempfile.TemporaryFile() as ledger:
+                audit = Audit(ledger)
+                handler = object.__new__(ObserverHandler)
+                handler.server = SimpleNamespace(audit=audit, bounds=BOUNDS)
+                handler.connection = mock.Mock()
+                handler.rfile = mock.Mock()
+                handler.upstream_socket = None
+                handler.idle_exchange_complete = False
+                handler.close_connection = False
+                handler.request_held = False
+                handler.timer = None
+                handler.socket_lock = threading.Lock()
+                handler.path = "/v1/namespaces/private?token=private-token"
+                handler.headers = {"Authorization": "Bearer private-token"}
+                handler.handle_one_request = mock.Mock(side_effect=error)
+                if first_byte:
+                    handler.rfile.peek.return_value = b"G"
+                else:
+                    handler.rfile.peek.side_effect = error
+                timer = mock.Mock()
+                with mock.patch.object(threading, "Timer", return_value=timer), \
+                        mock.patch.object(select_module, "select", return_value=([], [], [])):
+                    handler.handle()
+                ledger.seek(0)
+                recorded = ledger.read()
+                events = [parse_json(line) for line in recorded.splitlines()]
+                self.assertEqual(len(events), 1)
+                failure = events[0]
+                self.assertEqual(failure["reason"], "request parse/transport refusal")
+                self.assertEqual(failure["request_held"], first_byte)
+                self.assertEqual(failure["error"], {
+                    "type": type(error).__name__,
+                    "errno": error.errno if isinstance(error, OSError) else None,
+                    "operation": operation,
+                })
+                self.assertTrue(handler.close_connection)
+                self.assertFalse(handler.request_held)
+                self.assertEqual(audit.snapshot()["active_http_requests"], 0)
+                self.assertEqual(audit.snapshot()["counters"]["requests"], 0)
+                self.assertEqual(audit.snapshot()["counters"]["failures"], 1)
+                self.assertEqual(audit.snapshot()["lifetime_failures"], 1)
+                self.assertFalse(audit.snapshot()["valid_observation"])
+                if first_byte:
+                    handler.handle_one_request.assert_called_once()
+                    timer.cancel.assert_called_once()
+                    timer.join.assert_called_once()
+                else:
+                    handler.handle_one_request.assert_not_called()
+                    timer.start.assert_not_called()
+                for private in (b"private-token", b"private-message", b"private-filename",
+                                b"private-refusal-message", b"Authorization", b"/v1/"):
+                    self.assertNotIn(private, recorded)
+
+    def test_upstream_reset_rechecks_buffered_client_before_idle_classification(self):
+        import errno
+        import select as select_module
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+
+        with tempfile.TemporaryFile() as ledger:
+            audit = Audit(ledger)
+            handler = object.__new__(ObserverHandler)
+            handler.server = SimpleNamespace(audit=audit, bounds=BOUNDS)
+            handler.connection = mock.Mock()
+            handler.rfile = mock.Mock()
+            handler.rfile.peek.side_effect = [b"", b"POST"]
+            handler.upstream_socket = mock.Mock()
+            handler.upstream_socket.recv.side_effect = ConnectionResetError(errno.ECONNRESET, "private-reset")
+            handler.idle_exchange_complete = True
+            handler.close_connection = False
+            handler.request_held = False
+            handler.timer = None
+            handler.socket_lock = threading.Lock()
+            handler.handle_one_request = mock.Mock(side_effect=AssertionError("pending reset cannot dispatch"))
+            timer = mock.Mock()
+            with mock.patch.object(select_module, "select", return_value=([handler.upstream_socket], [], [])), \
+                    mock.patch.object(threading, "Timer", return_value=timer):
+                handler.handle()
+            handler.handle_one_request.assert_not_called()
+            timer.start.assert_called_once()
+            timer.cancel.assert_called_once()
+            timer.join.assert_called_once()
+            self.assertEqual(handler.deadline - handler.started, BOUNDS["request_absolute_deadline_seconds"])
+            ledger.seek(0)
+            events = [parse_json(line) for line in ledger.read().splitlines()]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "failure")
+            self.assertTrue(events[0]["request_held"])
+            self.assertEqual(events[0]["error"]["errno"], errno.ECONNRESET)
+            self.assertNotIn(b"private-reset", encode(events))
+            self.assertFalse(audit.snapshot()["valid_observation"])
+
+
 class LoopbackTests(unittest.TestCase):
     """Synthetic HTTP byte transparency only, deliberately outside provider gates."""
 
@@ -916,6 +1189,8 @@ class LoopbackTests(unittest.TestCase):
         self.captured = []
         self.upstream_peers = []
         self.upstream_closed = threading.Event()
+        self.allow_idle_reset = threading.Event()
+        allow_idle_reset = self.allow_idle_reset
         captured = self.captured
         upstream_peers = self.upstream_peers
         upstream_closed = self.upstream_closed
@@ -930,6 +1205,22 @@ class LoopbackTests(unittest.TestCase):
                 length = int(inner.headers.get("Content-Length", "0"))
                 captured.append((inner.command, inner.path, inner.rfile.read(length),
                                  inner.headers.get("Authorization"), inner.headers.get_all("X-Exact")))
+                if inner.command == "POST" and "reset_before_headers" in inner.path:
+                    import struct
+                    inner.close_connection = True
+                    inner.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                                struct.pack("ii", 1, 0))
+                    inner.connection.close()
+                    upstream_closed.set()
+                    return
+                if inner.command == "POST" and "close_before_headers" in inner.path:
+                    # The original mutation reached this actual fixture once;
+                    # close before status, rather than making idle EOF look
+                    # like a request that can be safely replayed.
+                    inner.close_connection = True
+                    inner.connection.shutdown(socket.SHUT_RDWR)
+                    upstream_closed.set()
+                    return
                 status = 409 if "error" in inner.path else 200
                 if "slow" in inner.path:
                     time.sleep(0.2)
@@ -962,12 +1253,19 @@ class LoopbackTests(unittest.TestCase):
                     except OSError:
                         pass
                 inner.close_connection = (not persistent or "truncated" in inner.path
-                                          or "silent_close" in inner.path)
+                                          or "silent_close" in inner.path or "idle_reset" in inner.path)
 
             def finish(inner):
                 try:
                     super().finish()
                 finally:
+                    if "idle_reset" in getattr(inner, "path", ""):
+                        import struct
+                        allow_idle_reset.wait(2)
+                        inner.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                                    struct.pack("ii", 1, 0))
+                        inner.connection.close()
+                        upstream_closed.set()
                     if "silent_close" in getattr(inner, "path", ""):
                         inner.connection.shutdown(socket.SHUT_RDWR)
                         upstream_closed.set()
@@ -1225,7 +1523,7 @@ class LoopbackTests(unittest.TestCase):
         self.assertEqual(self.audit.snapshot()["counters"]["completed"], 0)
         self.assertFalse(self.audit.snapshot()["valid_observation"])
 
-    def test_stale_persistent_upstream_does_not_reconnect_or_replay_mutation(self):
+    def test_idle_upstream_eof_retires_pair_without_rpc_or_reconnect(self):
         from contextlib import closing
 
         with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
@@ -1234,14 +1532,211 @@ class LoopbackTests(unittest.TestCase):
             self.assertEqual(response.read(), self.literal)
             response.close()
             self.assertTrue(self.upstream_closed.wait(2))
-            self.await_audit(lambda a: a["active_http_requests"] == 0)
-            client.request("POST", "/v1/namespaces/ns/error", body=b"literal")
-            with self.assertRaises(http.client.RemoteDisconnected):
-                client.getresponse()
-        final = self.await_audit(lambda a: a["active_connections"] == 0)
+            # No next RPC wakes the observer: the same owner must expose the
+            # original upstream EOF and actually release both idle sockets.
+            final = self.await_audit(lambda a: a["active_connections"] == 0)
+            self.assertEqual(client.sock.recv(1), b"")
         self.assertEqual(len(self.upstream_peers), 1)
         self.assertEqual([request[0] for request in self.captured], ["GET"])
         self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(final["counters"]["requests"], 1)
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertEqual(final["counters"]["failures"], 0)
+        self.assertTrue(final["valid_observation"])
+
+    def test_stale_persistent_upstream_does_not_reconnect_or_replay_mutation(self):
+        from contextlib import closing
+
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1")
+            response = client.getresponse()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            client.request("POST", "/v1/namespaces/ns/error?close_before_headers=1", body=b"literal")
+            with self.assertRaises(http.client.RemoteDisconnected):
+                client.getresponse()
+            self.assertTrue(self.upstream_closed.wait(2))
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(len(self.upstream_peers), 2)
+        self.assertEqual(len(set(self.upstream_peers)), 1)
+        self.assertEqual([request[0] for request in self.captured], ["GET", "POST"])
+        self.assertEqual(self.captured[1][2], b"literal")
+        self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(final["counters"]["upstream_mutations_sent"], 1)
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertFalse(final["valid_observation"])
+
+    def test_buffered_next_request_keeps_both_messages_and_upstream_reuse(self):
+        from contextlib import closing
+
+        with closing(socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)) as client:
+            # Both messages may be prefetched by the existing BufferedReader;
+            # raw client-fd readiness is not the parser's only source of work.
+            client.sendall(
+                b"GET /v1/namespaces/ns/tables?keepalive=one HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                b"GET /v1/namespaces/ns/tables?keepalive=two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            received = bytearray()
+            while chunk := client.recv(4096):
+                received.extend(chunk)
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(received.count(b"HTTP/1.1 200 Literal reason\r\n"), 2)
+        self.assertEqual(received.count(self.literal), 2)
+        self.assertEqual(len(self.captured), 2)
+        self.assertEqual(len(set(self.upstream_peers)), 1)
+        self.assertEqual(final["counters"]["completed"], 2)
+        self.assertTrue(final["valid_observation"])
+
+    def test_pending_mutation_and_upstream_close_preserve_failure_without_replay(self):
+        from contextlib import closing
+
+        with closing(socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)) as client:
+            # EOF and the next buffered request can become ready together.
+            # Either pre-dispatch refusal or the original dispatch-time EOF is
+            # a failure, never an idle-success reclassification or replay.
+            client.sendall(
+                b"GET /v1/namespaces/ns/tables?keepalive=1&silent_close=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                b"POST /v1/namespaces/ns/error HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\nliteral")
+            received = bytearray()
+            while chunk := client.recv(4096):
+                received.extend(chunk)
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(received.count(b"HTTP/1.1 200 Literal reason\r\n"), 1)
+        self.assertEqual(received.count(self.literal), 1)
+        self.assertEqual([request[0] for request in self.captured], ["GET"])
+        self.assertEqual(len(self.upstream_peers), 1)
+        self.assertLessEqual(final["counters"]["upstream_mutations_sent"], 1)
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertGreater(final["counters"]["failures"], 0)
+        self.assertFalse(final["valid_observation"])
+
+    def test_idle_client_reset_retires_settled_pair_without_new_rpc(self):
+        import errno
+        import struct
+        import tempfile
+        from contextlib import closing
+
+        self.audit.ledger = self.enterContext(tempfile.TemporaryFile())
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1")
+            response = client.getresponse()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            client.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            client.close()
+            final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(final["counters"]["requests"], 1)
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertEqual(final["counters"]["failures"], 0)
+        self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(len(self.captured), 1)
+        self.assertEqual(len(self.upstream_peers), 1)
+        self.assertTrue(final["valid_observation"])
+        self.audit.ledger.seek(0)
+        events = [parse_json(line) for line in self.audit.ledger.read().splitlines()]
+        reset = [event for event in events if event["event"] == "idle-pair-reset"]
+        self.assertEqual(len(reset), 1)
+        self.assertEqual(reset[0]["side"], "client")
+        self.assertIn(reset[0]["probe"], {"buffered_client_peek", "raw_client_peek"})
+        self.assertEqual(reset[0]["errno"], errno.ECONNRESET)
+        self.assertTrue(reset[0]["previous_exchange_complete"])
+        self.assertFalse(reset[0]["first_byte_observed"])
+
+    def test_idle_upstream_reset_retires_settled_pair_without_new_rpc(self):
+        import errno
+        import tempfile
+        from contextlib import closing
+
+        self.audit.ledger = self.enterContext(tempfile.TemporaryFile())
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1&idle_reset=1")
+            response = client.getresponse()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            self.allow_idle_reset.set()
+            self.assertTrue(self.upstream_closed.wait(2))
+            final = self.await_audit(lambda a: a["active_connections"] == 0)
+            self.assertEqual(client.sock.recv(1), b"")
+        self.assertEqual(final["counters"]["requests"], 1)
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertEqual(final["counters"]["failures"], 0)
+        self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(len(self.captured), 1)
+        self.assertTrue(final["valid_observation"])
+        self.audit.ledger.seek(0)
+        events = [parse_json(line) for line in self.audit.ledger.read().splitlines()]
+        reset = [event for event in events if event["event"] == "idle-pair-reset"]
+        self.assertEqual(len(reset), 1)
+        self.assertEqual((reset[0]["side"], reset[0]["probe"], reset[0]["errno"]),
+                         ("upstream", "raw_upstream_peek", errno.ECONNRESET))
+
+    def test_partial_request_reset_keeps_request_failure_and_original_deadline(self):
+        import struct
+        import tempfile
+
+        self.audit.ledger = self.enterContext(tempfile.TemporaryFile())
+        client = socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)
+        try:
+            client.sendall(b"GET /v1/namespaces/ns/tables HTTP/1.1\r\nHost:")
+            self.await_audit(lambda a: a["active_http_requests"] == 1)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        finally:
+            client.close()
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertFalse(final["valid_observation"])
+        self.assertEqual(final["counters"]["completed"], 0)
+        self.assertEqual(len(self.captured), 0)
+        self.audit.ledger.seek(0)
+        events = [parse_json(line) for line in self.audit.ledger.read().splitlines()]
+        failures = [event for event in events if event["event"] == "failure"]
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0]["request_held"])
+        self.assertEqual(failures[0]["error"]["operation"], "parse_client_request")
+        self.assertFalse(any(event["event"] == "idle-pair-reset" for event in events))
+
+    def test_pending_request_and_upstream_reset_keep_failure_without_replay(self):
+        from contextlib import closing
+
+        with closing(socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)) as client:
+            client.sendall(b"GET /v1/namespaces/ns/tables?keepalive=1&idle_reset=1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            response = http.client.HTTPResponse(client)
+            response.begin()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            client.sendall(b"POST /v1/namespaces/ns/error HTTP/1.1\r\nHost:")
+            self.await_audit(lambda a: a["active_http_requests"] == 1)
+            self.allow_idle_reset.set()
+            self.assertTrue(self.upstream_closed.wait(2))
+            client.sendall(b" localhost\r\nContent-Length: 7\r\n\r\nliteral")
+            self.assertEqual(client.recv(4096), b"")
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertFalse(final["valid_observation"])
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertEqual([request[0] for request in self.captured], ["GET"])
+        self.assertEqual(len(self.upstream_peers), 1)
+        self.assertLessEqual(final["counters"]["upstream_mutations_sent"], 1)
+        self.assertGreater(final["counters"]["failures"], 0)
+
+    def test_dispatched_mutation_reset_before_headers_keeps_failure_and_single_send(self):
+        from contextlib import closing
+
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1")
+            response = client.getresponse()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            client.request("POST", "/v1/namespaces/ns/error?reset_before_headers=1", body=b"literal")
+            with self.assertRaises(http.client.RemoteDisconnected):
+                client.getresponse()
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual([request[0] for request in self.captured], ["GET", "POST"])
+        self.assertEqual(self.captured[1][2], b"literal")
+        self.assertEqual(len(set(self.upstream_peers)), 1)
+        self.assertEqual(final["counters"]["upstream_mutations_sent"], 1)
         self.assertEqual(final["counters"]["completed"], 1)
         self.assertFalse(final["valid_observation"])
 
