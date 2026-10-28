@@ -3538,7 +3538,7 @@ dependencies = [
  "mysql-common-derive",
  "num-bigint",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.8.8",
  "regex",
  "rust_decimal",
  "saturating",
@@ -3774,7 +3774,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest",
  "roaring 0.10.12",
  "serde",
@@ -3920,7 +3920,7 @@ dependencies = [
  "parquet",
  "prometheus",
  "prost 0.13.5",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4109,7 +4109,7 @@ dependencies = [
  "novarocks-value-arrays",
  "num-traits",
  "openssl",
- "rand 0.8.5",
+ "rand 0.8.8",
  "regex",
  "roaring 0.10.12",
  "ryu",
@@ -4870,7 +4870,7 @@ dependencies = [
  "novarocks-user-error",
  "novarocks-workload-control",
  "prometheus",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "tokio",
@@ -5331,7 +5331,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
 dependencies = [
  "num-traits",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
 ]
 
@@ -5422,7 +5422,7 @@ checksum = "ed02b73fbd5cfbe20df6b66bca52f5ba66e3c29bd00ad450fbc02f9e94242a4b"
 dependencies = [
  "matrixmultiply",
  "nalgebra",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rayon",
  "roaring 0.11.3",
 ]
@@ -6122,9 +6122,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -6335,7 +6335,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "quick-xml 0.37.5",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest",
  "rust-ini",
  "serde",
@@ -6596,7 +6596,7 @@ dependencies = [
  "borsh",
  "bytes",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rkyv 0.7.45",
  "serde",
  "serde_json",
@@ -6608,7 +6608,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 dependencies = [
- "rand 0.8.5",
+ "rand 0.8.8",
 ]
 
 [[package]]
@@ -7711,7 +7711,7 @@ dependencies = [
  "indexmap 1.9.3",
  "pin-project",
  "pin-project-lite",
- "rand 0.8.5",
+ "rand 0.8.8",
  "slab",
  "tokio",
  "tokio-util",
@@ -7848,7 +7848,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
- "rand 0.8.5",
+ "rand 0.8.8",
  "static_assertions",
 ]
 
