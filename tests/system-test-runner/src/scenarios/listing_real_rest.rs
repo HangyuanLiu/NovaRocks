@@ -965,7 +965,8 @@ sys.exit(1)
     #[test]
     fn completed_work_keeps_idle_connections_distinct_from_quiescence() {
         let mut audit = json!({
-            "active_connections":2,"active_requests":0,
+            "active_connections":2,"active_upstream_connections":2,
+            "active_http_requests":1,"active_requests":0,
             "active_upstream_requests":0,"active_upstream_listings":0,
             "valid_observation":true,
             "counters":{"metadata_loads":0,"listing_active_peak":8}
@@ -976,7 +977,13 @@ sys.exit(1)
         audit["counters"]["metadata_loads"] = json!(16384);
         assert!(phase_work_matches(&audit, Some(16384)).unwrap());
         assert!(!idle(&audit));
+        audit["active_http_requests"] = json!(0);
+        assert!(idle(&audit));
+        // Request idle is not QUIESCENT while socket owners remain live.
+        assert_eq!(audit["active_connections"], 2);
+        assert_eq!(audit["active_upstream_connections"], 2);
         audit["active_connections"] = json!(0);
+        audit["active_upstream_connections"] = json!(0);
         assert!(idle(&audit));
         audit["counters"]["metadata_loads"] = json!(16385);
         assert!(phase_work_matches(&audit, Some(16384)).is_err());

@@ -181,8 +181,8 @@ impl NativeRootResultReader {
         self
     }
 
-    /// Observe only the outcome already settled by the original root owner.
-    /// A finite diagnostic grant cannot change the read or mint an EOS fact.
+    /// Observe only first Data and actual EOS settled by the original root owner.
+    /// Control-only replies cannot spend this finite stream grant or mint EOS.
     #[cfg(novarocks_dev_controls)]
     fn observe_read(&self, request: &RootResultRead, response: &NativeRootReadResponse) {
         let Some(controls) = &self.observation_controls else {
@@ -206,11 +206,9 @@ impl NativeRootResultReader {
         }
         let marker = match response {
             NativeRootReadResponse::Owned(reply) => root_reply_marker(reply.reply()),
-            NativeRootReadResponse::Refused(_) => Some(root_control_marker(identity, "refused")),
-            NativeRootReadResponse::AwaitTerminalControl { .. } => {
-                Some(root_control_marker(identity, "await-terminal-control"))
-            }
-            NativeRootReadResponse::Deferred(_) => None,
+            NativeRootReadResponse::Refused(_)
+            | NativeRootReadResponse::AwaitTerminalControl { .. }
+            | NativeRootReadResponse::Deferred(_) => None,
         };
         let Some(marker) = marker else {
             return;
@@ -461,17 +459,6 @@ fn root_marker_identity(
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
-fn root_control_marker(
-    identity: novarocks_execution_contract::task_execution::identity::TaskIdentity,
-    outcome: &str,
-) -> String {
-    format!(
-        "{} outcome={outcome} eos=false",
-        root_marker_identity(identity)
-    )
-}
-
-#[cfg(any(test, novarocks_dev_controls))]
 fn root_reply_marker(reply: &RootResultReply) -> Option<String> {
     use novarocks_execution_contract::root_result::RootReadOutcome;
     let prefix = || root_marker_identity(reply.root_task);
@@ -503,11 +490,8 @@ fn root_reply_marker(reply: &RootResultReply) -> Option<String> {
             end.sequence,
             end.output_rows,
         )),
-        RootReadOutcome::AwaitTerminalControl => Some(root_control_marker(
-            reply.root_task,
-            "await-terminal-control",
-        )),
-        RootReadOutcome::AckOnly
+        RootReadOutcome::AwaitTerminalControl
+        | RootReadOutcome::AckOnly
         | RootReadOutcome::NotReady
         | RootReadOutcome::Retired
         | RootReadOutcome::Data(_) => None,
@@ -893,19 +877,14 @@ mod observation_marker_tests {
     }
 
     #[test]
-    fn control_outcomes_never_synthesize_root_eos() {
+    fn control_outcomes_do_not_consume_finite_root_observations() {
         for outcome in [
+            RootReadOutcome::AwaitTerminalControl,
             RootReadOutcome::AckOnly,
             RootReadOutcome::NotReady,
             RootReadOutcome::Retired,
         ] {
             assert!(root_reply_marker(&reply(outcome)).is_none());
         }
-        let reply = reply(RootReadOutcome::AwaitTerminalControl);
-        let awaiting = root_reply_marker(&reply).unwrap();
-        assert!(awaiting.contains("outcome=await-terminal-control eos=false"));
-        let refused = root_control_marker(reply.root_task, "refused");
-        assert!(refused.contains("outcome=refused eos=false"));
-        assert!(!refused.contains("output_rows="));
     }
 }

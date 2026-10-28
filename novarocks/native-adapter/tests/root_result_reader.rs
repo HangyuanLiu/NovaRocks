@@ -647,7 +647,7 @@ mod root_observation_tests {
     }
 
     #[tokio::test]
-    async fn root_refusal_read_observes_without_replacing_original_failure() {
+    async fn root_refusal_neither_observes_nor_replaces_original_failure() {
         let fixture = Fixture::new(false);
         let task = fixture.root.spec().task;
         let session = Session::new(task);
@@ -662,7 +662,55 @@ mod root_observation_tests {
         .unwrap();
         let refusal = refused(session.reader(&fixture).read(&request).await, &request);
         assert_eq!(refusal.fact(), root_refusal_fact(43));
-        session.assert_observed_once();
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert!(fixture.root.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn admitted_and_late_await_control_do_not_consume_stream_observation() {
+        let fixture = Fixture::new(false);
+        fixture.finish();
+        drop(owned(
+            fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
+        ));
+        drop(owned(
+            fixture.reader.read(&fixture.request(None, 1, 1)).await,
+        ));
+        let session = Session::new(fixture.root.spec().task);
+        let reader = session.reader(&fixture);
+        let request = fixture.request(Some(3), 1, 1000);
+        let mut read = Box::pin(reader.read(&request));
+        pending(read.as_mut()).await;
+        fixture.seal();
+        assert_eq!(
+            fixture.registry.context_state(fixture.context),
+            QueryContextState::Releasing
+        );
+        let reply = owned(
+            tokio::time::timeout(Duration::from_millis(100), read)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(reply.reply().outcome, RootReadOutcome::AwaitTerminalControl);
+        assert_eq!(reply.reply().accepted_consumed, 1);
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert!(matches!(
+            reader.read(&fixture.request(Some(3), 2, 1)).await,
+            NativeRootReadResponse::AwaitTerminalControl {
+                accepted_consumed: 1
+            }
+        ));
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert_eq!(fixture.root.snapshot().consumed_through, 1);
+        drop(reply);
+        fixture.registry.advance_deadlines();
+        assert_eq!(
+            fixture.registry.context_state(fixture.context),
+            QueryContextState::TerminalRetained
+        );
         assert!(fixture.root.physical_idle());
     }
 
