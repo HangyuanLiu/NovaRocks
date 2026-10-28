@@ -1242,6 +1242,9 @@ fn incremental_index_assigns_first_occurrence_dense_ids_and_keeps_nonparticipati
         }]
     );
     assert_eq!(index.len(), 3);
+    assert_eq!(index.key_id_at(0).unwrap(), KeyId(0));
+    assert_eq!(index.key_id_at(2).unwrap(), KeyId(2));
+    assert!(index.key_id_at(3).is_err());
 }
 
 #[test]
@@ -1366,6 +1369,7 @@ fn presence_index_retains_one_exact_representative_per_class_without_exposing_id
         .unwrap();
     assert_eq!(added, 2);
     assert_eq!(index.len(), 2);
+    assert!(index.key_id_at(0).is_err());
     assert!(
         index
             .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)

@@ -20,7 +20,7 @@
 //! the oracle, not the cursor implementation. No cluster or timing gate is used.
 
 use super::super::{
-    KeyId, KeySpec, NullPolicy,
+    KeyId, KeyMatch, KeySpec, NullPolicy,
     capture::{BulkInput, CaptureWork, EvaluatedPage},
 };
 use super::*;
@@ -147,7 +147,13 @@ fn input(purpose: IndexPurpose, ports: &DirectWork<'_>) -> (CompleteInput, Expec
 fn graph(purpose: IndexPurpose, ports: &DirectWork<'_>) -> (BulkTaskGraph, ExpectedPages) {
     let (input, expected) = input(purpose, ports);
     (
-        BulkTaskGraph::begin_direct(input, NonZeroUsize::new(2).unwrap(), ports).unwrap(),
+        BulkTaskGraph::begin(
+            input,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            ports,
+        )
+        .unwrap(),
         expected,
     )
 }
@@ -266,7 +272,8 @@ fn direct_graph_uses_multiple_real_workers_and_preserves_all_physical_occurrence
         KeyId(0),
         KeyId(values.len() - 1),
         KeyId(0),
-    ];
+    ]
+    .map(|id| BulkKey { partition: 0, id });
     let read = ready
         .read_keys(&requested, owner.as_ref(), &Control)
         .unwrap();
@@ -309,7 +316,13 @@ fn direct_graph_uses_multiple_real_workers_and_preserves_all_physical_occurrence
             let expected = rows[occurrence]
                 .1
                 .map_or(KeyId(values.len()), |value| ids[&value]);
-            assert_eq!(*found, KeyMatch::Found(expected));
+            assert_eq!(
+                *found,
+                BulkMatch::Found(BulkKey {
+                    partition: 0,
+                    id: expected
+                })
+            );
         }
     }
     assert_eq!(
@@ -572,3 +585,6 @@ fn lazy_input_ranges_observe_original_control_while_skipping_empty_runs() {
     assert_eq!(checks.get(), 2);
     assert_eq!(ranges.run, 256);
 }
+
+#[path = "bulk_tasks_hash_tests.rs"]
+mod hash_tests;

@@ -316,11 +316,11 @@ fn null_upper(kind: IntegerKind) -> Option<usize> {
     .map(|f| f.operation_peak_bytes())
 }
 
-pub(super) struct DirectWork<'a> {
-    pub(super) owner: &'a dyn InputConstructionOwner,
-    pub(super) allocator: AggregateAllocator,
-    pub(super) host: Arc<dyn AggregateStateAllocator>,
-    pub(super) control: &'a dyn KernelEvaluationControl,
+pub(crate) struct DirectWork<'a> {
+    pub(crate) owner: &'a dyn InputConstructionOwner,
+    pub(crate) allocator: AggregateAllocator,
+    pub(crate) host: Arc<dyn AggregateStateAllocator>,
+    pub(crate) control: &'a dyn KernelEvaluationControl,
 }
 struct Page {
     bits: Vec<AtomicU64>,
@@ -403,6 +403,9 @@ impl Storage {
                 _storage: work.owner.storage_lifetime(),
             },
         )
+    }
+    pub(super) fn spec(&self) -> &KeySpec {
+        &self.spec
     }
     pub(super) fn geometry(&self) -> DirectGeometry {
         self.geometry

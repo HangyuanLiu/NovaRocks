@@ -140,12 +140,12 @@ impl CompleteStats {
 
 /// This proves complete capture facts only. The later graph must still build,
 /// materialize and assign every required range before it can publish Ready.
-pub(super) struct CompleteInput {
+pub(crate) struct CompleteInput {
     runs: CapturedRuns,
     stats: CompleteStats,
 }
 impl CompleteInput {
-    pub(super) fn from_captures(
+    pub(crate) fn from_captures(
         input: BulkInput,
         purpose: IndexPurpose,
         work: &CaptureWork<'_>,

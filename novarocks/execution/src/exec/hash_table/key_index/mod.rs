@@ -19,6 +19,7 @@
 //! set markers and distributed hash identities remain with their own authors.
 
 mod bulk;
+mod bulk_read;
 mod bulk_tasks;
 mod canonical_store;
 mod capture;
@@ -44,6 +45,17 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use bulk::CompleteInput;
+pub(crate) use bulk_read::{BulkKey, BulkMatch, BulkPresenceBatch, BulkProbeBatch, IndexView};
+pub(crate) use bulk_tasks::{
+    AssignmentChunk, Assignments, BulkAssignments, BulkReady, BulkTaskGraph, Claim as BulkClaim,
+    Completion as BulkCompletion, Task as BulkTask,
+};
+pub(crate) use capture::{
+    BulkDomain, BulkInput, CaptureBuilder, CaptureWork, CapturedPageId, EvaluatedPage,
+    SealedCapture,
+};
+pub(crate) use direct_int::DirectWork as BulkWork;
 pub(crate) use export::ExportedKeys;
 pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
 pub(crate) use prepared::{

@@ -404,6 +404,38 @@ impl KeyIndex {
     pub(crate) fn len(&self) -> usize {
         self.classes.len()
     }
+    /// Translate a caller's dense state/output position without exposing an
+    /// unchecked ID constructor or requiring a second O(D) identity vector.
+    pub(crate) fn key_id_at(&self, index: usize) -> ExecutionResult<KeyId> {
+        self.check()?;
+        if self.purpose != IndexPurpose::KeyIds {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        if index >= self.classes.len() {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        Ok(KeyId(index))
+    }
+    /// Header validation for the private read-only bulk view. The parent graph
+    /// alone certifies all partition coverage and immutable Ready publication.
+    pub(super) fn validate_bulk_view_input(
+        &self,
+        spec: &KeySpec,
+        policy: &LocalHashPolicy,
+        purpose: IndexPurpose,
+        layout: HashLayout,
+    ) -> ExecutionResult<()> {
+        self.check()?;
+        if !self.spec.same_instance(spec)
+            || !self.policy.same_instance(policy)
+            || self.purpose != purpose
+            || layout.closed_input_bound().is_none()
+            || !self.layout.same_layout(layout)
+        {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        Ok(())
+    }
     /// HashInit's actual empty construction state, never an estimate of D.
     pub(super) fn validate_bulk_build_input(
         &self,

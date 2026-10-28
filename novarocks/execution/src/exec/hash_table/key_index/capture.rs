@@ -44,17 +44,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Borrow only the original caller's existing construction and allocation ports.
 /// Nothing here is retained in a sealed page or grants resource capacity.
-pub(super) struct CaptureWork<'a> {
-    pub(super) owner: &'a dyn InputConstructionOwner,
-    pub(super) allocator: AggregateAllocator,
-    pub(super) host: Arc<dyn AggregateStateAllocator>,
-    pub(super) control: &'a dyn KernelEvaluationControl,
+pub(crate) struct CaptureWork<'a> {
+    pub(crate) owner: &'a dyn InputConstructionOwner,
+    pub(crate) allocator: AggregateAllocator,
+    pub(crate) host: Arc<dyn AggregateStateAllocator>,
+    pub(crate) control: &'a dyn KernelEvaluationControl,
 }
-pub(super) struct EvaluatedPage<'a> {
-    pub(super) arrays: &'a [ArrayRef],
-    pub(super) bindings: &'a [FunctionValueType],
-    pub(super) readable: &'a SelectionSet,
-    pub(super) occurrences: &'a [usize],
+pub(crate) struct EvaluatedPage<'a> {
+    pub(crate) arrays: &'a [ArrayRef],
+    pub(crate) bindings: &'a [FunctionValueType],
+    pub(crate) readable: &'a SelectionSet,
+    pub(crate) occurrences: &'a [usize],
 }
 
 struct CaptureGate {
@@ -74,9 +74,9 @@ struct Domain {
 /// All producers share this actual spec/policy/whole-sketch instance. Equal
 /// seeds, root declarations or numeric run labels do not recreate this domain.
 #[derive(Clone)]
-pub(super) struct BulkDomain(Arc<Domain>);
+pub(crate) struct BulkDomain(Arc<Domain>);
 impl BulkDomain {
-    pub(super) fn new(
+    pub(crate) fn new(
         spec: &KeySpec,
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
@@ -118,10 +118,10 @@ impl BulkDomain {
             .forced_hash = Some(hash);
         Ok(domain)
     }
-    pub(super) fn spec(&self) -> &KeySpec {
+    pub(crate) fn spec(&self) -> &KeySpec {
         &self.0.spec
     }
-    pub(super) fn policy(&self) -> &LocalHashPolicy {
+    pub(crate) fn policy(&self) -> &LocalHashPolicy {
         &self.0.policy
     }
     pub(super) fn sizing_domain(&self) -> &SizingDomain {
@@ -180,7 +180,7 @@ impl BulkDomain {
     }
     /// The claim is private and non-Clone. Reusing a caller usize cannot create
     /// another writer for the same run, or manufacture a completed run receipt.
-    pub(super) fn begin_capture(&self, work: &CaptureWork<'_>) -> ExecutionResult<CaptureBuilder> {
+    pub(crate) fn begin_capture(&self, work: &CaptureWork<'_>) -> ExecutionResult<CaptureBuilder> {
         let result = (|| {
             let claim = self.claim()?;
             CaptureBuilder::from_claim(claim, work)
@@ -216,7 +216,7 @@ impl CaptureRunId {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CapturedPageId {
+pub(crate) struct CapturedPageId {
     pub(super) run: CaptureRunId,
     pub(super) page: usize,
 }
@@ -262,7 +262,7 @@ struct OpenCapture {
     // Directory backing drops before the finite hold of its actual last grower.
     directory_storage: ValueTypeStorageLifetime,
 }
-pub(super) struct CaptureBuilder {
+pub(crate) struct CaptureBuilder {
     domain: BulkDomain,
     run: CaptureRunId,
     open: Option<OpenCapture>,
@@ -311,7 +311,7 @@ impl CaptureBuilder {
         // backing exit under their existing creator holds, before any refund.
         self.open = None;
     }
-    pub(super) fn push_evaluated(
+    pub(crate) fn push_evaluated(
         &mut self,
         page: EvaluatedPage<'_>,
         conversions: &mut ValueConversionContext,
@@ -407,7 +407,7 @@ impl CaptureBuilder {
     }
     /// Exactly one successful seal. All page work is already complete; only
     /// fixed-parameter HLL serialization and ownership moves happen here.
-    pub(super) fn seal(&mut self, work: &CaptureWork<'_>) -> ExecutionResult<SealedCapture> {
+    pub(crate) fn seal(&mut self, work: &CaptureWork<'_>) -> ExecutionResult<SealedCapture> {
         let result = (|| {
             self.check()?;
             self.seal_inner(work)
@@ -464,7 +464,7 @@ impl SealedPages {
             .ok_or_else(|| invariant(ValueViolation::Bounds))
     }
 }
-pub(super) struct SealedCapture {
+pub(crate) struct SealedCapture {
     directory: SealedPages,
     counts: BuildRangeStats,
     sizing: SizingPayload,
@@ -482,14 +482,14 @@ impl SealedCapture {
 }
 /// E sealed directories, never a flattened B-page or B-row coordinator array.
 /// The private domain closes its issued run set exactly once at assembly.
-pub(super) struct BulkInput {
+pub(crate) struct BulkInput {
     captures: Vec<Option<SealedCapture>>,
     sealed_runs: usize,
     domain: BulkDomain,
     _storage: ValueTypeStorageLifetime,
 }
 impl BulkInput {
-    pub(super) fn new(
+    pub(crate) fn new(
         domain: &BulkDomain,
         captures: Vec<SealedCapture>,
         work: &CaptureWork<'_>,

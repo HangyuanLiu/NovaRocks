@@ -75,6 +75,14 @@ impl HashLayout {
             }),
         }
     }
+    /// Actual private layout equality, including the original closed growth
+    /// fact. Matching geometry grants no completion or resource authority.
+    pub(super) fn same_layout(self, other: Self) -> bool {
+        self.route_shift == other.route_shift
+            && self.route_bits == other.route_bits
+            && self.bulk.map(|b| (b.eligible_rows, b.bucket_bits_upper))
+                == other.bulk.map(|b| (b.eligible_rows, b.bucket_bits_upper))
+    }
     pub(super) fn partitions(self) -> usize {
         1usize << self.route_bits
     }

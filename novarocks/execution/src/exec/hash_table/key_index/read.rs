@@ -52,6 +52,8 @@ pub(crate) enum KeyReadValues<'a> {
 pub(crate) struct KeyReadPage<'a> {
     values: KeyReadValues<'a>,
     rows: Vec<KeyReadRow>,
+    // Rows may move into a combined loan while the original batch exits.
+    _storage: ValueTypeStorageLifetime,
 }
 impl<'a> KeyReadPage<'a> {
     pub(crate) fn values(&self) -> &KeyReadValues<'a> {
@@ -161,8 +163,47 @@ pub(super) fn append_positioned_pages<'a, P: Copy + Ord>(
             rows.push(request.selected);
         }
         reserve_push(output, owner, checkpoint)?;
-        output.push(KeyReadPage { values, rows });
+        output.push(KeyReadPage {
+            values,
+            rows,
+            _storage: owner.storage_lifetime(),
+        });
         begin = end;
+    }
+    checkpoint()
+}
+
+/// Move already-funded page loans into a batch funded by this same output
+/// owner. Only row metadata is reindexed; values keep their original binding.
+/// Each moved page retains its real row-vector creator independently.
+/// The input batch stays alive until its emptied column/page directories drop.
+pub(super) fn append_reindexed<'a>(
+    mut source: OwnedKeyReadBatch<'a>,
+    ordinals: &[usize],
+    output: &mut OwnedKeyReadBatch<'a>,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    if source.len != ordinals.len() || source.columns.len() != output.columns.len() {
+        return Err(invariant(ValueViolation::Layout));
+    }
+    let len = output.len;
+    for (column, from) in source.columns.iter_mut().enumerate() {
+        checkpoint()?;
+        let to = &mut output.columns[column].pages;
+        for mut page in from.pages.drain(..) {
+            checkpoint()?;
+            for (i, selected) in page.rows.iter_mut().enumerate() {
+                checkpoint_at(i, checkpoint)?;
+                selected.ordinal = *ordinals
+                    .get(selected.ordinal)
+                    .filter(|&&ordinal| ordinal < len)
+                    .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+            }
+            reserve_push(to, owner, checkpoint)?;
+            to.push(page);
+        }
     }
     checkpoint()
 }
