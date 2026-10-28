@@ -23,6 +23,8 @@ mod compact_tests;
 mod export_tests;
 #[path = "hash_layout_index_tests.rs"]
 mod hash_layout_index_tests;
+#[path = "selected_tests.rs"]
+mod selected_tests;
 #[path = "sizing_tests.rs"]
 mod sizing_tests;
 #[path = "statistics_tests.rs"]

@@ -123,7 +123,7 @@ enum Match {
     Temporary(usize),
 }
 struct Chunk {
-    start: usize,
+    occurrences: Vec<usize>,
     rows: Vec<usize>,
     hashes: Vec<u64>,
     table_hashes: Vec<u64>,
@@ -423,7 +423,29 @@ impl KeyIndex {
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<InternBatch> {
-        let result = self.intern(input, hashes, true, owner, control);
+        self.intern_ids(input, hashes, 0..input.len(), owner, control)
+    }
+    /// Read only these original occurrence coordinates from one already
+    /// prepared input and its saved hashes. Repetition and caller order remain.
+    pub(super) fn intern_selected(
+        &mut self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        occurrences: &[usize],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<InternBatch> {
+        self.intern_ids(input, hashes, occurrences.iter().copied(), owner, control)
+    }
+    fn intern_ids<I: ExactSizeIterator<Item = usize>>(
+        &mut self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        occurrences: I,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<InternBatch> {
+        let result = self.intern(input, hashes, occurrences, true, owner, control);
         match result {
             Ok(Some(output)) => Ok(output),
             Ok(None) => unreachable!("KeyIds intern returns its assignment"),
@@ -444,8 +466,28 @@ impl KeyIndex {
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<usize> {
+        self.include_occurrences(input, hashes, 0..input.len(), owner, control)
+    }
+    pub(super) fn include_selected_presence(
+        &mut self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        occurrences: &[usize],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<usize> {
+        self.include_occurrences(input, hashes, occurrences.iter().copied(), owner, control)
+    }
+    fn include_occurrences<I: ExactSizeIterator<Item = usize>>(
+        &mut self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        occurrences: I,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<usize> {
         let before = self.len();
-        match self.intern(input, hashes, false, owner, control) {
+        match self.intern(input, hashes, occurrences, false, owner, control) {
             Ok(_) => Ok(self.len() - before),
             Err(cause) => {
                 if self.failed.is_none() {
@@ -462,6 +504,26 @@ impl KeyIndex {
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<ProbeBatch> {
+        self.probe_occurrences(input, hashes, 0..input.len(), owner, control)
+    }
+    pub(super) fn probe_selected(
+        &self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        occurrences: &[usize],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<ProbeBatch> {
+        self.probe_occurrences(input, hashes, occurrences.iter().copied(), owner, control)
+    }
+    fn probe_occurrences<I: ExactSizeIterator<Item = usize>>(
+        &self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        mut occurrences: I,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<ProbeBatch> {
         self.check()?;
         let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
         checkpoint()?;
@@ -469,10 +531,17 @@ impl KeyIndex {
         if self.purpose != IndexPurpose::KeyIds {
             return Err(invariant(ValueViolation::Layout));
         }
-        let mut output = vector(owner, input.len())?;
-        for start in (0..input.len()).step_by(WORK_ROWS) {
+        let mut output = vector(owner, occurrences.len())?;
+        while occurrences.len() != 0 {
             checkpoint()?;
-            let chunk = Chunk::load(input, hashes, start, self.layout, owner, &checkpoint)?;
+            let chunk = Chunk::load(
+                input,
+                hashes,
+                &mut occurrences,
+                self.layout,
+                owner,
+                &checkpoint,
+            )?;
             let mut found = chunk.matches(owner, &checkpoint)?;
             self.probe_existing(input, &chunk, &mut found, owner, &checkpoint)?;
             for (i, found) in found.into_iter().enumerate() {
@@ -493,15 +562,42 @@ impl KeyIndex {
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<PresenceBatch> {
+        self.contains_occurrences(input, hashes, 0..input.len(), owner, control)
+    }
+    pub(super) fn contains_selected(
+        &self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        occurrences: &[usize],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<PresenceBatch> {
+        self.contains_occurrences(input, hashes, occurrences.iter().copied(), owner, control)
+    }
+    fn contains_occurrences<I: ExactSizeIterator<Item = usize>>(
+        &self,
+        input: &PreparedKeyBatch<'_>,
+        hashes: &LocalHashBatch,
+        mut occurrences: I,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<PresenceBatch> {
         self.check()?;
         let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
         checkpoint()?;
         self.validate(input, hashes)?;
-        let mut present = vector(owner, input.len())?;
-        let mut participates = vector(owner, input.len())?;
-        for start in (0..input.len()).step_by(WORK_ROWS) {
+        let mut present = vector(owner, occurrences.len())?;
+        let mut participates = vector(owner, occurrences.len())?;
+        while occurrences.len() != 0 {
             checkpoint()?;
-            let chunk = Chunk::load(input, hashes, start, self.layout, owner, &checkpoint)?;
+            let chunk = Chunk::load(
+                input,
+                hashes,
+                &mut occurrences,
+                self.layout,
+                owner,
+                &checkpoint,
+            )?;
             let mut found = chunk.matches(owner, &checkpoint)?;
             self.probe_existing(input, &chunk, &mut found, owner, &checkpoint)?;
             for (i, found) in found.into_iter().enumerate() {
@@ -562,10 +658,11 @@ impl KeyIndex {
             checkpoint,
         )
     }
-    fn intern(
+    fn intern<I: ExactSizeIterator<Item = usize>>(
         &mut self,
         input: &PreparedKeyBatch<'_>,
         hashes: &LocalHashBatch,
+        mut occurrences: I,
         ids: bool,
         owner: &dyn InputConstructionOwner,
         control: &dyn KernelEvaluationControl,
@@ -583,13 +680,20 @@ impl KeyIndex {
         let mut directory =
             HashTable::<Directory, AggregateAllocator>::new_in(self.allocator.clone());
         let mut output = if ids {
-            Some(vector(owner, input.len())?)
+            Some(vector(owner, occurrences.len())?)
         } else {
             None
         };
-        for start in (0..input.len()).step_by(WORK_ROWS) {
+        while occurrences.len() != 0 {
             checkpoint()?;
-            let chunk = Chunk::load(input, hashes, start, self.layout, owner, &checkpoint)?;
+            let chunk = Chunk::load(
+                input,
+                hashes,
+                &mut occurrences,
+                self.layout,
+                owner,
+                &checkpoint,
+            )?;
             let mut found = chunk.matches(owner, &checkpoint)?;
             self.probe_existing(input, &chunk, &mut found, owner, &checkpoint)?;
             let mut buffers = PairBuffers::new(chunk.rows.len(), owner)?;
@@ -725,21 +829,26 @@ impl KeyIndex {
     }
 }
 impl Chunk {
-    fn load(
+    fn load<I: ExactSizeIterator<Item = usize>>(
         input: &PreparedKeyBatch<'_>,
         hashes: &LocalHashBatch,
-        start: usize,
+        input_occurrences: &mut I,
         layout: HashLayout,
         owner: &dyn InputConstructionOwner,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
-        let end = start.saturating_add(WORK_ROWS).min(input.len());
-        let mut rows = vector(owner, end - start)?;
-        let mut full = vector(owner, end - start)?;
-        let mut table_hashes = vector(owner, end - start)?;
-        let mut valid = vector(owner, end - start)?;
-        for occurrence in start..end {
-            checkpoint_at(occurrence, checkpoint)?;
+        let count = input_occurrences.len().min(WORK_ROWS);
+        let mut occurrences = vector(owner, count)?;
+        let mut rows = vector(owner, count)?;
+        let mut full = vector(owner, count)?;
+        let mut table_hashes = vector(owner, count)?;
+        let mut valid = vector(owner, count)?;
+        for offset in 0..count {
+            checkpoint_at(offset, checkpoint)?;
+            let occurrence = input_occurrences
+                .next()
+                .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+            occurrences.push(occurrence);
             rows.push(input.input.row(occurrence)?);
             let hash = hashes.hash(occurrence)?;
             full.push(hash);
@@ -747,7 +856,7 @@ impl Chunk {
             valid.push(u8::from(hashes.participates(occurrence)?));
         }
         Ok(Self {
-            start,
+            occurrences,
             rows,
             hashes: full,
             table_hashes,
@@ -942,7 +1051,7 @@ fn deduplicate_chunk(
             .map(|entry| entry.head);
         pending.push(Pending {
             row: chunk.rows[probe],
-            occurrence: chunk.start + probe,
+            occurrence: chunk.occurrences[probe],
             hash,
             table,
             next: previous,
