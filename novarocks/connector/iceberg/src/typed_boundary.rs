@@ -5135,6 +5135,37 @@ mod historical_window_schema_tests {
     use crate::iceberg::spec::{Operation, Snapshot, SortOrder, Summary, TableMetadataBuilder};
 
     #[test]
+    fn equal_fabricated_change_window_endpoints_are_validated_before_empty_window() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "key",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory:///unadmitted-window".to_owned(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let error = pinned_change_window_handle(
+            &SchemaTableName::try_new("db", "orders").unwrap(),
+            &metadata,
+            ConnectorReadChangeWindow::new(0, 0),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "iceberg snapshot 0 does not exist");
+    }
+
+    #[test]
     fn later_promotion_does_not_rebind_historical_window_admission_or_execution() {
         let schema = |primitive| {
             Schema::builder()

@@ -118,6 +118,9 @@ pub(crate) fn run_imv_rewrite(
     // optimizer still consume LogicalPlanNode. This is the optimizer-to-engine
     // exit, not an internal optimizer rewrite round-trip.
     let plan_out = to_logical_plan(opt_out, &scalars.borrow());
+    // This is an IMV input contract, not an optional optimization rule.
+    // Aggregate roots may omit their sign, but each Delta producer may not.
+    crate::planner::imv_rewrite::action_column::validate_delta_producer_scans(&plan_out, control)?;
 
     let ext = ctx_rw
         .extension::<ImvExtension>()
@@ -1894,6 +1897,110 @@ pub(crate) mod tests {
 
         assert_eq!(factory.borrow().peek_next_id(), 2);
         assert!(matches!(outcome.plan.kind, LogicalPlanKind::Scan(_)));
+    }
+
+    #[test]
+    fn imv_delta_producer_validation_survives_disabled_rewrite_rules() {
+        use crate::planner::imv_rewrite::action_column::ImvActionColumn;
+        let action = ImvActionColumn::output_column(ColumnId(100));
+        let mut wrong = action.clone();
+        wrong.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let mut nullable = action.clone();
+        nullable.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int8, true);
+        for (actions, expected) in [
+            (vec![], "missing action column"),
+            (vec![wrong], "non-Int8 action column"),
+            (vec![nullable], "nullable action column"),
+            (
+                vec![action, ImvActionColumn::output_column(ColumnId(101))],
+                "duplicate action columns",
+            ),
+        ] {
+            let mut plan = iceberg_scan_plan();
+            let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+                unreachable!()
+            };
+            let ScanSource::Sql(source) = &mut scan.table.source;
+            source.kind = SqlScanKind::Delta {
+                from_snapshot_id: 11,
+                to_snapshot_id: 22,
+            };
+            scan.columns.extend(actions);
+            // Deliberately disable both injection and the optional validation
+            // rule. The entrypoint still owns this exact producer contract.
+            let disabled_rules = build_imv_pipeline()
+                .rule_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let error = run_imv_rewrite(ImvRewriteInput {
+                plan,
+                snapshot: dummy_mv_ctx(),
+                disabled_rules,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                constant_policy: crate::constant::test_constant_policy(),
+                control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                column_ref_factory: test_column_ref_factory(),
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, SqlCompileError::Compilation(message) if message.contains("Delta-bound scan ice.db.b") && message.contains(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_imv_delta_leaf_validation_does_not_require_an_aggregate_root_sign() {
+        fn sign_delta_leaf(plan: &mut LogicalPlanNode) {
+            if let LogicalPlanKind::Scan(scan) = &mut plan.kind {
+                let ScanSource::Sql(source) = &mut scan.table.source;
+                source.kind = SqlScanKind::Delta {
+                    from_snapshot_id: 11,
+                    to_snapshot_id: 22,
+                };
+                scan.columns.push(
+                    crate::planner::imv_rewrite::action_column::ImvActionColumn::output_column(
+                        ColumnId(100),
+                    ),
+                );
+                crate::planner::imv_rewrite::action_column::ImvActionColumn::ensure_metadata_column(
+                    &mut scan.table.iceberg_row_lineage_metadata_columns,
+                );
+            }
+            for child in &mut plan.children {
+                sign_delta_leaf(child);
+            }
+        }
+        let mut plan = aggregate_plan();
+        sign_delta_leaf(&mut plan);
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan,
+            snapshot: aggregate_mv_ctx(),
+            disabled_rules: build_imv_pipeline()
+                .rule_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        let outputs = crate::planner::plan_output_columns(&outcome.plan).unwrap();
+        assert!(outputs.iter().all(|column| {
+            !crate::planner::imv_rewrite::action_column::ImvActionColumn::matches(column)
+        }));
+        let leaf = find_delta_scan(&outcome.plan).unwrap();
+        assert_eq!(
+            leaf.columns
+                .iter()
+                .filter(|column| {
+                    crate::planner::imv_rewrite::action_column::ImvActionColumn::matches(column)
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3875,6 +3982,96 @@ crate::constant::test_constant_policy(),
             panic!("expected Project(Scan)");
         };
         scan
+    }
+
+    #[test]
+    fn wide_imv_delta_producer_keeps_mid_scan_control_and_original_source() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct StopValidateBatch {
+            cause: CompileControlError,
+            batches: std::sync::atomic::AtomicUsize,
+        }
+        impl PureCompileControl for StopValidateBatch {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::Validate
+                    && units == novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK
+                {
+                    self.batches
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let source = CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        );
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            source,
+        ] {
+            let mut plan = iceberg_scan_plan();
+            let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+                unreachable!()
+            };
+            let ScanSource::Sql(binding) = &mut scan.table.source;
+            binding.kind = SqlScanKind::Delta {
+                from_snapshot_id: 11,
+                to_snapshot_id: 22,
+            };
+            // These are real ordinary scan declarations, not private actions.
+            // A one-node plan makes the full Validate quantum belong to the
+            // mandatory declaration scan, rather than node or edge traversal.
+            for ordinal in 2..=769u32 {
+                let name = format!("payload_{ordinal}");
+                scan.table.columns.push(ColumnDef {
+                    name: name.clone(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                });
+                scan.columns.push(OutputColumn {
+                    column_id: ColumnId(ordinal),
+                    name,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+                    is_internal: false,
+                });
+            }
+            let control = StopValidateBatch {
+                cause: cause.clone(),
+                batches: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let error = run_imv_rewrite(ImvRewriteInput {
+                plan,
+                snapshot: dummy_mv_ctx(),
+                disabled_rules: build_imv_pipeline()
+                    .rule_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                constant_policy: crate::constant::test_constant_policy(),
+                control: &control,
+                column_ref_factory: test_column_ref_factory(),
+            })
+            .unwrap_err();
+            assert_eq!(control.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(error, SqlCompileError::from(cause.clone()));
+            if let CompileControlError::Source(expected) = &cause {
+                assert_eq!(error.source_failure(), Some(expected));
+            }
+        }
     }
 
     #[test]

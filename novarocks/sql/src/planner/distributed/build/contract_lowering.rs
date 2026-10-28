@@ -17516,6 +17516,48 @@ mod tests {
     }
 
     #[test]
+    fn right_outer_left_build_keeps_source_output_and_null_extends_empty_target() {
+        let target = column(1, "target_key", DataType::Int64, false);
+        let source = column(2, "source_key", DataType::Int64, false);
+        let nullable_target = column(1, "target_key", DataType::Int64, true);
+        let joined = hash_join(
+            crate::common::JoinKind::RightOuter,
+            PhysicalHashJoinBuildSide::Left,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![target], Vec::new()),
+            values(
+                vec![source.clone()],
+                vec![vec![literal_int(7)], vec![literal_int(7)]],
+            ),
+            vec![nullable_target, source],
+        );
+        let plan = finish_for_test(&joined).unwrap();
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::HashJoin {
+            kind,
+            build_side,
+            null_extended,
+            ..
+        } = &root.kind
+        else {
+            panic!("expected hash join")
+        };
+        assert_eq!(*kind, ContractJoinKind::RightOuter);
+        assert_eq!(*build_side, ContractJoinSide::Left);
+        assert_eq!(null_extended.len(), 1);
+        assert_eq!(root.output.columns.len(), 2);
+        assert_eq!(root.output.columns[0], null_extended[0]);
+        assert!(fragment.values()[&root.output.columns[0]].ty.nullable());
+        assert!(!fragment.values()[&root.output.columns[1]].ty.nullable());
+        assert!(
+            matches!(fragment.values()[&null_extended[0]].origin, ValueOrigin::NullExtended { node, .. } if node == root.id)
+        );
+        assert!(plan.runtime_filters().is_empty());
+    }
+
+    #[test]
     fn left_outer_hash_join_defines_a_new_nullable_right_value() {
         let left = column(1, "left_key", DataType::Int64, false);
         let right = column(2, "right_key", DataType::Int64, false);

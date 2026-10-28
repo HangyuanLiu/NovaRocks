@@ -1052,66 +1052,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_basic_lifecycle",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 8; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_merge_cow",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 6; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_merge_mor",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 6; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_projection_filter",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_projection_hidden_pk_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_projection_partition_evolution_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 9; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-ivm/iceberg_backed_mv_refresh_strategy",
       "failure": {
         "class": "error_code",
@@ -1119,46 +1059,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B1a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_base_rename_unreferenced",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_target_field_id_mismatch",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a1_large_delta_mixed",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_a1_update_only",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1382,16 +1282,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_base_delete_row_lineage",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_branch_union_aggregate",
       "failure": {
         "class": "error_code",
@@ -1399,26 +1289,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B1a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_delete_applicability",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 10 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_empty_delta_metadata_only",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 4; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1542,16 +1412,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_noop_and_stale_refresh",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 9; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_optimize_replace_refresh",
       "failure": {
         "class": "error_code",
@@ -1599,26 +1459,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 8 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B1a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_union_projection_filter",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/imv_projection_filter_cutover_basic",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 4; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1959,16 +1799,6 @@
       },
       "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
       "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:materialized-view/lake_native_mv_smoke",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion. Earlier shared02 materialized-view suite cleanup FAILED from cross-run shared metadata; retain that raw failure separately. The repaired private01 complete materialized-view lifecycle subsequently cleaned up successfully; its lake case still FAILS.",
-      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -2372,28 +2202,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-mv-scheduler/iceberg_mv_scheduler_async_interval",
-      "failure": {
-        "class": "mismatch",
-        "statement": 4,
-        "actual_digest": "57a04a41c73a00283fa53044e5170dea3a0d63292885df44a5744ee0e061e9cb"
-      },
-      "reason": "OPEN: the unchanged positive native case still has its exact registered result mismatch at step 4, raw digest 57a04a41c73a00283fa53044e5170dea3a0d63292885df44a5744ee0e061e9cb, after the original 30 attempts/500ms; raw SQL has no engine/sql error code and remains FAIL. Same-run original background author directly records mv_id=79 and its exact MV target refusing reason 19:1 (private01 INFO:7996). The adjacent serial ScheduledCall target planning and query `946eb1cb-8f0b-8d64-0000-000000000114` Task/ACK evidence show exact B3 feature `build-preserving hash join kind (merged build match flags)`, NodeId(2), pipeline_dop=5. The scheduler warning has no direct query-id field; query association uses the original serial target/time/Native evidence and cannot be promoted to direct identity proof. The old Router/B1 cause is superseded; the automatic-refresh/resume result obligation remains OPEN, not UnsupportedCompiledShape or PASS. Do not add a new exception or infer acceptance from the existing classifier match. Raw case remains FAIL at step 4; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B1b (acceptance OPEN); UEA-5E B3 (observed dependency)",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-mv-scheduler/iceberg_mv_scheduler_pause_resume",
-      "failure": {
-        "class": "mismatch",
-        "statement": 7,
-        "actual_digest": "85b8af0d090535fd79d1b2cf2325c63a00c640c32ce1013d8c5d58eebc23d748"
-      },
-      "reason": "OPEN: the unchanged positive native case still has its exact registered result mismatch at step 7, raw digest 85b8af0d090535fd79d1b2cf2325c63a00c640c32ce1013d8c5d58eebc23d748, after the original 30 attempts/500ms; raw SQL has no engine/sql error code and remains FAIL. Same-run original background author directly records mv_id=82 and its exact MV target refusing reason 19:1 (private01 INFO:9378). The adjacent serial ScheduledCall target planning and query `946eb1cb-8f0b-8d64-0000-000000000141` Task/ACK evidence show exact B3 feature `build-preserving hash join kind (merged build match flags)`, NodeId(2), pipeline_dop=5. The scheduler warning has no direct query-id field; query association uses the original serial target/time/Native evidence and cannot be promoted to direct identity proof. The old Router/B1 cause is superseded; the automatic-refresh/resume result obligation remains OPEN, not UnsupportedCompiledShape or PASS. Do not add a new exception or infer acceptance from the existing classifier match. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B1b (acceptance OPEN); UEA-5E B3 (observed dependency)",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-dml/merge_into_cow",
       "failure": {
         "class": "error_code",
@@ -2777,10 +2585,10 @@
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_projection_repartition",
       "failure": {
         "class": "error_code",
-        "code": "UnsupportedCompiledShape"
+        "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 4; 9 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
+      "reason": "Approved B1b-10 exact first-cause handoff to the existing B1a aggregate-state capability, explicitly anticipated for this unit by accepted spec section 5.10. Original complete native 1FE+3BE p11-native-private-sql-current-01 remains FAIL (exit1, stable input 391c2211): iceberg_ivm_projection_repartition first fails at step 11, statement 2/2, with [sql.analyze.unavailable_implementation] selected overload `builtin.aggregate/count_state/derived-v1` having no installed implementation for the selected carrier. Required result oracles at steps 3/5/7/9/10 passed; required result oracles 13/14/16/17 and expected-error oracle 18 remain unfulfilled, and original cleanup step 19 passed. The new predicate deliberately changes the exact public code from UnsupportedCompiledShape to sql.analyze.unavailable_implementation; class remains error_code. Unit and expiry are unchanged. This code-only classifier does not establish the overload or dispose a later first failure: every newly exposed first cause requires original statement/source review. Preserve the old Unsupported/B3 raw FAIL, all original result/expected-error oracles and unexecuted suffix. Evidence: p11-private-sql-current-01/sql.results.jsonl, its original case failure.txt, p11-private-sql-first-cause-disposition-review/exact-forty-seven-failures.json, and p11-repartition-pure-handoff-proposal/mapping.json. Remove only after the same complete original native case passes every required oracle and its original case/suite/server/fixture cleanup; no case PASS, System or final CI acceptance is inferred.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -2838,38 +2646,10 @@
       "exit_condition": "I3 explicitly delivers and reviews the physical cohort versus shared funding contract. On one clean source and canonical artifacts, this original JSON whole-group oracle and the original bitwise/narrow-shift physical last-free oracles must all pass, or an explicitly approved oracle migration must preserve the intended real funding and actual last-exit guarantees. Remove this exact quarantine after that delivery; F3 merge, renaming, a different JSON test, or an isolated pass is insufficient."
     },
     {
-      "unit": "system-scenario:mv/scheduler-recovery",
-      "reason": "Approved B1b-10 first-cause handoff to the existing B3 join capability: the new native 1FE+3BE p10-native-system-mv-typed-cause-01 run remains FAIL (exit1, stable dirty input 19fb65ae). The unchanged scheduler oracle validates original Source identity, canonical Unsupported/Originating fact domain19 code1 and its fixed safe projection. This run's target/time/Native Task correlation independently records exact feature `build-preserving hash join kind (merged build match flags)` at stage2/node2/pipeline_dop5 for orders_mv_a query b6e40349-bc64-20f4-0000-00000000000f and orders_mv_b query b6e40349-bc64-20f4-0000-000000000011; 19:1 alone is not a feature oracle. Scheduler warnings have no direct query field and finite artifacts retain actual Task/publication NOT_OBSERVED. Original cluster shutdown and private fixture teardown complete; incremental/recovery row oracle remains unfulfilled. Prior p10-native-system-mv-01 UNKNOWN is preserved. Evidence: p10-mv-native-failure-confirmation-review.md and p10-mv-system-handoff-proposal/mapping.json. Keep this quarantine and its original full-scenario exit condition; fixing typed delivery or removing the first refusal does not prove recovery or final CI.",
-      "owner": "UEA-5E B3",
-      "exit_condition": "B1 restores the compiled MV change-stream Router sink/edge and MV cut boundaries, then the entire unchanged scenario passes its original incremental row, dependency/configuration/crash/scheduler recovery and cleanup assertions. Reassess any newly exposed first failure independently; do not close merely because the first refusal disappears.",
-      "review_by": "2026-12-15"
-    },
-    {
       "unit": "system-scenario:mv/rewrite-final-target-binding",
       "reason": "Approved D0-5(a) named capability gap: sum_state/derived-v1 missing installed aggregate carrier implementation. Clean fffbffe8 actual native 1FE+3BE result remains FAIL (exit1), with complete formal and scene cleanup; business suffix remains unobserved. See independent evidence p30-system11-fff-independent-review-r1.json, ordinal 63.",
       "owner": "B1",
       "exit_condition": "B1 installs the selected builtin.aggregate/sum_state/derived-v1 pure aggregate carrier/effect contract and all required MV-state owners, then the entire unchanged scenario passes its original publication/target-binding/fault and cleanup assertions. Reassess any newly exposed first failure independently; do not close on admission alone.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:mv/current-dependency-recheck",
-      "reason": "Approved B1b-10 first-cause handoff to the existing B3 join capability. The independent unchanged native 1FE+3BE p10-native-system-mv-dependency-01 run (ed3a5cc8 clean/stable) remains FAIL (exit1) before its required BE-computation/Current-recheck marker. This run's original target system_mv_dependency_recheck and Native query b4c6e251-3123-aeff-0000-000000000004 directly record exact feature `build-preserving hash join kind (merged build match flags)`, stage2/node2/pipeline_dop5; the public 19:1 alone does not establish that feature. Original cluster shutdown and private fixture teardown complete; required Current-recheck/recovery/row suffix is unobserved. Evidence: p10-system-mv-first-failure-audit/mapping.json independent followup and p10-mv-system-handoff-proposal/mapping.json. Keep the raw FAIL, this quarantine and its original full-scenario exit condition; no marker, recovery or final CI PASS is inferred.",
-      "owner": "UEA-5E B3",
-      "exit_condition": "B1 restores the compiled MV change-stream Router sink/edge and MV cut boundaries, then the entire unchanged scenario passes its original incremental row, dependency/configuration/crash/scheduler recovery and cleanup assertions. Reassess any newly exposed first failure independently; do not close merely because the first refusal disappears.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:mv/refresh-configuration-interleaving",
-      "reason": "Approved B1b-10 first-cause handoff to the existing B3 join capability. The independent unchanged native 1FE+3BE p10-native-system-mv-interleaving-01 run (ed3a5cc8 clean/stable) remains FAIL (exit1) before its required completed-computation/configuration-write marker. This run's original target system_mv_config_interleaving and Native query 8af39e48-670a-6221-0000-000000000004 directly record exact feature `build-preserving hash join kind (merged build match flags)`, stage2/node2/pipeline_dop5; the public 19:1 alone does not establish that feature. Original cluster shutdown and private fixture teardown complete; required interleaving/row suffix is unobserved. Evidence: p10-system-mv-first-failure-audit/mapping.json independent followup and p10-mv-system-handoff-proposal/mapping.json. Keep the raw FAIL, this quarantine and its original full-scenario exit condition; no marker, recovery or final CI PASS is inferred.",
-      "owner": "UEA-5E B3",
-      "exit_condition": "B1 restores the compiled MV change-stream Router sink/edge and MV cut boundaries, then the entire unchanged scenario passes its original incremental row, dependency/configuration/crash/scheduler recovery and cleanup assertions. Reassess any newly exposed first failure independently; do not close merely because the first refusal disappears.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:mv/staged-published-recovery",
-      "reason": "Approved B1b-10 first-cause handoff to the existing B3 join capability. The independent unchanged native 1FE+3BE p10-native-system-mv-staged-01 run (ed3a5cc8 clean/stable) remains FAIL (exit1) before its second publication-recovery barrier. Its first crash/restart/management-recovery and row prefix do not prove the unexecuted second recovery suffix. This run's original target system_mv_recovery and Native query bd633457-300c-fa93-0000-000000000004 directly record exact feature `build-preserving hash join kind (merged build match flags)`, stage2/node2/pipeline_dop5; the public 19:1 alone does not establish that feature. Original cluster shutdown and private fixture teardown complete. Evidence: p10-system-mv-first-failure-audit/mapping.json independent followup and p10-mv-system-handoff-proposal/mapping.json. Keep the raw FAIL, this quarantine and its original full-scenario exit condition; no second recovery or final CI PASS is inferred.",
-      "owner": "UEA-5E B3",
-      "exit_condition": "B1 restores the compiled MV change-stream Router sink/edge and MV cut boundaries, then the entire unchanged scenario passes its original incremental row, dependency/configuration/crash/scheduler recovery and cleanup assertions. Reassess any newly exposed first failure independently; do not close merely because the first refusal disappears.",
       "review_by": "2026-12-15"
     },
     {
