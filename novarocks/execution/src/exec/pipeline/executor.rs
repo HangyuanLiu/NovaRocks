@@ -380,7 +380,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
     clippy::too_many_arguments,
     reason = "Program, Task capabilities, and schema preparation remain independently owned inputs."
 )]
-// Design: ADR-0202 (docs/adr/ADR-0202-frozen-write-placement-and-task-completion-assembly.md)
+// Design: ADR-0204 (docs/adr/ADR-0204-frozen-write-placement-and-task-completion-assembly.md)
 pub(crate) fn prepare_compiled_program_with_sink_materializer(
     program: Arc<novarocks_local_program::LocalProgram>,
     time_slice: Duration,
