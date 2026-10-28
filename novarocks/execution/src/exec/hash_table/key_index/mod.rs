@@ -36,6 +36,7 @@ mod read;
 mod sizing;
 mod statistics;
 mod store;
+mod strategy;
 mod table;
 #[cfg(test)]
 mod tests;

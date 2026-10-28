@@ -222,3 +222,31 @@ mod tests {
         assert_eq!(word32_no_gap.table_hash(u64::MAX), u64::MAX);
     }
 }
+
+/// Known entry/control portion of the locked table's projected backing.
+/// The private library's trailing group and alignment padding remain unknown;
+/// this is deliberately not a complete Layout or allocation upper bound.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HashTableCost {
+    pub(super) buckets: usize,
+    pub(super) entry_slot_bytes: u128,
+    pub(super) control_byte_minimum: u128,
+    pub(super) unmodeled_trailer_and_alignment: bool,
+}
+impl HashLayout {
+    pub(super) fn table_cost<T>(items: usize) -> Option<HashTableCost> {
+        let buckets = if items == 0 {
+            0
+        } else {
+            1usize.checked_shl(bucket_bits_for_items(items)?)?
+        };
+        // Reuse the original sole locked capacity-to-bucket model above.
+        let entries = std::alloc::Layout::array::<T>(buckets).ok()?;
+        Some(HashTableCost {
+            buckets,
+            entry_slot_bytes: entries.size() as u128,
+            control_byte_minimum: buckets as u128,
+            unmodeled_trailer_and_alignment: buckets != 0,
+        })
+    }
+}

@@ -1109,3 +1109,139 @@ fn reserve_state<T>(
     })?;
     checkpoint()
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IntegerHashCosts {
+    pub(super) purpose: super::IndexPurpose,
+    pub(super) exact_eligible: usize,
+    pub(super) reserve_classes_estimate: usize,
+    pub(super) index_inline_bytes: u128,
+    pub(super) directory: super::hash_layout::HashTableCost,
+    pub(super) class_live_bytes_estimate: u128,
+    pub(super) representative_payload_estimate: u128,
+    /// Includes the actual OwnedKeyBatch Arc, one Column Vec element and one
+    /// actual batches-vector Arc handle. Column includes OwnedFixedColumn;
+    /// do not add that same inline body again.
+    pub(super) representative_batch_structure_bytes: u128,
+    /// Original Functions node author; not an authority to allocate that node.
+    pub(super) representative_node_metadata_upper: u128,
+    pub(super) representative_validity_may_exist: bool,
+    /// Vec spare capacity, private hashbrown group/alignment, creator/custody
+    /// chains and source retention are not represented as known zero bytes.
+    pub(super) has_unmodeled_custody_and_capacity: bool,
+}
+impl IntegerHashCosts {
+    /// Caller chooses a concrete batch-fragmentation estimate within this
+    /// range. Class cardinality itself remains only the complete NDV estimate.
+    /// This does not claim actual representatives will occupy that many batches.
+    pub(super) fn batch_range(self) -> std::ops::RangeInclusive<usize> {
+        if self.reserve_classes_estimate == 0 {
+            0..=0
+        } else {
+            1..=self.reserve_classes_estimate
+        }
+    }
+
+    /// A comparable modeled subtotal, not an invoice, physical upper bound,
+    /// feasibility proof or a resource-failure retry/fallback decision.
+    pub(super) fn modeled_bytes(self, batches_estimate: usize) -> Option<u128> {
+        if !self.batch_range().contains(&batches_estimate) {
+            return None;
+        }
+        let per_batch = self
+            .representative_batch_structure_bytes
+            .checked_add(self.representative_node_metadata_upper)?;
+        let metadata = (batches_estimate as u128).checked_mul(per_batch)?;
+        let validity = if self.representative_validity_may_exist && batches_estimate != 0 {
+            // Sum ceil(rows_i/8) <= ceil(total_rows/8) + batches - 1.
+            (self.reserve_classes_estimate as u128)
+                .div_ceil(8)
+                .checked_add((batches_estimate - 1) as u128)?
+        } else {
+            0
+        };
+        self.index_inline_bytes
+            .checked_add(self.directory.entry_slot_bytes)?
+            .checked_add(self.directory.control_byte_minimum)?
+            .checked_add(self.class_live_bytes_estimate)?
+            .checked_add(self.representative_payload_estimate)?
+            .checked_add(metadata)?
+            .checked_add(validity)
+    }
+}
+
+/// Costs for the single signed integer path being compared with Direct.
+/// None means this model cannot represent its own geometry; it never refuses
+/// legal input or permits retry after an actual allocation refusal.
+pub(super) fn integer_hash_costs(
+    stats: &super::bulk::CompleteStats,
+) -> ExecutionResult<Option<IntegerHashCosts>> {
+    stats.check()?;
+    let spec = stats.exact().spec();
+    if stats.exact().integer().is_none() || spec.types().len() != 1 {
+        return Ok(None);
+    }
+    let Some(width) = spec.types()[0].data_type().primitive_width() else {
+        return Ok(None);
+    };
+    let reserve = stats.hint().initial_reservation();
+    let nullable = stats
+        .exact()
+        .integer_root_nullable_union()
+        .unwrap_or(spec.types()[0].nullable());
+    let estimate = (|| {
+        let directory = HashLayout::table_cost::<Directory>(reserve)?;
+        let batch_arc =
+            novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+                OwnedKeyBatch,
+            >())
+            .ok()?
+            .size() as u128;
+        let batch_structure = batch_arc
+            .checked_add(std::mem::size_of::<super::owned_batch::Column>() as u128)?
+            .checked_add(std::mem::size_of::<Arc<OwnedKeyBatch>>() as u128)?;
+        let node_metadata = fixed_node_cost(spec.types()[0].data_type(), nullable)?;
+        Some(IntegerHashCosts {
+            purpose: stats.purpose(),
+            exact_eligible: stats.exact().indexable_rows(),
+            reserve_classes_estimate: reserve,
+            index_inline_bytes: std::mem::size_of::<KeyIndex>() as u128,
+            directory,
+            class_live_bytes_estimate: (reserve as u128)
+                .checked_mul(std::mem::size_of::<Class>() as u128)?,
+            representative_payload_estimate: (reserve as u128).checked_mul(width as u128)?,
+            representative_batch_structure_bytes: batch_structure,
+            representative_node_metadata_upper: node_metadata,
+            representative_validity_may_exist: nullable,
+            has_unmodeled_custody_and_capacity: true,
+        })
+    })();
+    Ok(estimate)
+}
+
+fn fixed_node_cost(ty: &arrow::datatypes::DataType, has_nulls: bool) -> Option<u128> {
+    use std::convert::Infallible;
+    let mut exact = Some(0u128);
+    let mut opaque = Some(0u128);
+    let mut request = |layout: std::alloc::Layout| {
+        exact = exact.and_then(|n| n.checked_add(layout.size() as u128));
+        Ok::<_, Infallible>(())
+    };
+    let mut bound = |bytes| {
+        opaque = opaque.and_then(|n| n.checked_add(bytes as u128));
+        Ok::<_, Infallible>(())
+    };
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut bound,
+    );
+    novarocks_functions::selected_copy::preflight_arrow_node_structure_construction(
+        ty,
+        has_nulls,
+        &mut creation,
+        &mut |_| Ok::<_, Infallible>(()),
+    )
+    .ok()?;
+    exact?.checked_add(opaque?)
+}

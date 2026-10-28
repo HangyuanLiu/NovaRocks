@@ -27,6 +27,9 @@ use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "strategy_tests.rs"]
+mod strategy_tests;
+
 fn work<'a>(
     owner: &'a dyn InputConstructionOwner,
     tracker: &Arc<MemTracker>,
