@@ -153,7 +153,10 @@ fn reject_selected_nulls(
             KeyReadValues::Fixed { array, .. } | KeyReadValues::Bytes { array, .. } => {
                 for (i, selected) in page.rows().iter().enumerate() {
                     checkpoint_at(i, &checkpoint)?;
-                    if array.is_null(selected.row) {
+                    if crate::exec::hash_table::partition_keys::normalized_root_is_null(
+                        array.as_ref(),
+                        selected.row,
+                    ) {
                         return Err(invariant(ValueViolation::RequiredNull));
                     }
                 }

@@ -63,7 +63,7 @@ impl OwnedFixedColumn {
         {
             return Err(invariant(ValueViolation::Carrier));
         }
-        if !binding.nullable() && array.null_count() != 0 {
+        if !binding.nullable() && array.logical_null_count() != 0 {
             return Err(invariant(ValueViolation::RequiredNull));
         }
         let storage = construction.owner.storage_lifetime();

@@ -304,7 +304,7 @@ fn append_native_column(
             let Some(accumulator) = hash.as_mut() else {
                 continue;
             };
-            if array.is_null(row) && !ty.nullable() {
+            if normalized_root_is_null(array.as_ref(), row) && !ty.nullable() {
                 return Err(invariant(ValueViolation::RequiredNull));
             }
             let leaf = primitive_hash(array, row, checkpoint)?;
@@ -312,6 +312,13 @@ fn append_native_column(
         }
     }
     Ok(())
+}
+
+/// Only for physical roots after encoded byte sources have been decoded by
+/// their original author. Arrow NullArray has no validity buffer, so is_null
+/// alone does not express the logical NULL of that carrier.
+pub(crate) fn normalized_root_is_null(array: &dyn arrow::array::Array, row: usize) -> bool {
+    matches!(array.data_type(), DataType::Null) || array.is_null(row)
 }
 
 struct NormalizedNested {
@@ -742,7 +749,7 @@ impl<'a> CanonicalTupleView<'a> {
                     .value(row)
                     .map_err(ExecutionFailure::from_domain)?
                     .is_none(),
-                None => array.is_null(row),
+                None => normalized_root_is_null(array.as_ref(), row),
             };
             if null {
                 return Ok(true);
@@ -983,7 +990,7 @@ fn prepare_canonical_tuple_with_options<'a>(
         } else {
             selected
                 .for_each(&mut |row| {
-                    if array.is_null(row) && !ty.nullable() {
+                    if normalized_root_is_null(array.as_ref(), row) && !ty.nullable() {
                         return Err(invariant(ValueViolation::RequiredNull));
                     }
                     checkpoint()

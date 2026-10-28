@@ -256,3 +256,63 @@ fn original_null_observer_can_stop_inside_one_wide_tuple_without_reading_a_later
     assert_eq!(ticks.get(), 3);
     assert!(!page.tuples().row_has_null(0).unwrap());
 }
+
+#[test]
+fn null_carrier_statistics_and_tuple_required_checks_use_logical_null_without_a_bitmap() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Null, true);
+    let source: ArrayRef = Arc::new(NullArray::new(3));
+    assert!(source.nulls().is_none());
+    let keys = input(
+        std::slice::from_ref(&source),
+        std::slice::from_ref(&ty),
+        &[2, 0, 2, 1],
+        owner.as_ref(),
+    );
+    for nulls in [NullPolicy::Equal, NullPolicy::Unmatchable] {
+        let spec = KeySpec::new(std::slice::from_ref(&ty), &[nulls], owner.as_ref(), &|| {
+            Ok(())
+        })
+        .unwrap();
+        let policy = LocalHashPolicy::new(&spec, owner.as_ref()).unwrap();
+        let hashes = hash(&keys, &spec, &policy, owner.as_ref());
+        let page = prepare(&spec, &keys, owner.as_ref(), &tracker);
+        assert!(page.tuples().row_has_null(2).unwrap());
+        let stats =
+            BuildRangeStats::collect_hashed(&page, &hashes, &policy, 0..4, &|| Ok(())).unwrap();
+        assert_eq!(
+            (
+                stats.input_rows(),
+                stats.indexable_rows(),
+                stats.null_rows()
+            ),
+            (4, if nulls == NullPolicy::Equal { 4 } else { 0 }, 4)
+        );
+        assert!(stats.integer().is_none());
+        let sub =
+            BuildRangeStats::collect_hashed(&page, &hashes, &policy, 1..3, &|| Ok(())).unwrap();
+        assert_eq!((sub.input_rows(), sub.null_rows()), (2, 2));
+        let empty =
+            BuildRangeStats::collect_hashed(&page, &hashes, &policy, 2..2, &|| Ok(())).unwrap();
+        assert_eq!(
+            (
+                empty.input_rows(),
+                empty.indexable_rows(),
+                empty.null_rows()
+            ),
+            (0, 0, 0)
+        );
+    }
+    let error = KeyInput::new(
+        &[source],
+        &[FunctionValueType::new(DataType::Null, false)],
+        &readable(3),
+        &[0],
+        &mut ValueConversionContext::default(),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .err()
+    .unwrap();
+    assert_value_failure(&error, novarocks_value_arrays::ValueViolation::RequiredNull);
+}

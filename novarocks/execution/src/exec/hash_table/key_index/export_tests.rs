@@ -771,3 +771,33 @@ fn export_required_complex_root_checks_selected_logical_null_without_changing_ch
         1
     );
 }
+
+#[test]
+fn exported_null_carrier_cannot_be_signed_as_required_and_survives_compaction() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Null, true);
+    let mut index = index(std::slice::from_ref(&ty), owner.as_ref(), &tracker);
+    intern(
+        &mut index,
+        &[Arc::new(NullArray::new(3))],
+        std::slice::from_ref(&ty),
+        &[2, 0, 2, 1],
+        owner.as_ref(),
+        &tracker,
+    );
+    assert_eq!(index.len(), 1);
+    index.compact(owner.as_ref(), &CopyControl).unwrap();
+    let error = failure(index.export_keys(
+        &[KeyId(0)],
+        &[FunctionValueType::new(DataType::Null, false)],
+        owner.as_ref(),
+        &CopyControl,
+    ));
+    assert_value_failure(&error, novarocks_value_arrays::ValueViolation::RequiredNull);
+    let output = index
+        .export_keys(&[KeyId(0), KeyId(0)], &[ty], owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(output.arrays()[0].len(), 2);
+    assert_eq!(output.arrays()[0].logical_null_count(), 2);
+    assert!(output.arrays()[0].nulls().is_none());
+}
