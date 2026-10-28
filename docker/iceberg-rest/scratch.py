@@ -947,6 +947,8 @@ class ScratchSweeper:
         identity = scope.identity
         if not isinstance(exact_users_and_policies, list):
             raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup needs predeclared IAM pairs")
+        if self.cloud_owner is not None and exact_users_and_policies:
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "cloud exact cleanup cannot carry IAM pairs")
         seen = set()
         for pair in exact_users_and_policies:
             if not isinstance(pair, dict) or set(pair) != {"user", "policy"}:
@@ -994,8 +996,6 @@ class ScratchSweeper:
             self._check(deadline)
             identity = self._exact_iam_identity(scope, exact_users_and_policies)
             if self.cloud_owner is not None:
-                if exact_users_and_policies:
-                    raise runtime.RuntimeFailure("CloudIamUnsupported", "cloud exact cleanup cannot carry IAM pairs")
                 self.groups, self.blocked_runs = {}, set()
                 self._identity_fact(identity)
                 inventory = self._catalog_inventory(deadline, report)
@@ -1016,8 +1016,8 @@ class ScratchSweeper:
     def _oss(self, operation, uri, deadline, *extra):
         self._check(deadline)
         output = self.backend.run_oss(self.record, [operation, "--uri", uri, *extra], deadline=deadline)
-        if not isinstance(output, str) or len(output.encode()) > MAX_MC_BYTES:
-            raise runtime.RuntimeFailure("InvalidObjectStoreResponse", "OSS response exceeds its byte bound")
+        if not isinstance(output, str):
+            raise runtime.RuntimeFailure("InvalidObjectStoreResponse", "OSS response must be JSON text")
         try:
             value = json.loads(output)
         except (TypeError, ValueError) as error:
