@@ -602,10 +602,24 @@ class LinuxEnvironment:
                 continue
             lines.append(f"export {key}={shlex.quote(value)}")
         lines.append(f'export PATH={shlex.quote(str(self.account.home / ".cargo/bin"))}:"$PATH"')
-        # The machine's available count is recomputed by env on each invocation.
+        # Tools-only images resolve available CPUs when sourced on each worker.
         # An explicitly supplied user value remains the authority.
-        default_jobs = str(available_cpus()) if self.profile.get("cargo_build_jobs", "available") == "available" else str(self.profile["cargo_build_jobs"])
-        lines.append(': "${CARGO_BUILD_JOBS:=' + default_jobs + '}"')
+        policy = self.profile.get("cargo_build_jobs", "available")
+        if self.tools_only and policy == "available":
+            cpu_probe = (
+                "import os,sys; "
+                "count = os.process_cpu_count() if hasattr(os, 'process_cpu_count') else "
+                "len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count(); "
+                "sys.exit('cannot observe available CPU count') if not count or count < 1 else print(count)"
+            )
+            lines.extend([
+                'if [ -z "${CARGO_BUILD_JOBS:-}" ]; then',
+                '    CARGO_BUILD_JOBS=$(python3 -c ' + shlex.quote(cpu_probe) + ') || return "$?"',
+                'fi',
+            ])
+        else:
+            default_jobs = str(available_cpus()) if policy == "available" else str(policy)
+            lines.append(': "${CARGO_BUILD_JOBS:=' + default_jobs + '}"')
         lines.append("export CARGO_BUILD_JOBS")
         return "\n".join(lines) + "\n"
 
