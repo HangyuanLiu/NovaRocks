@@ -102,3 +102,15 @@ class TeardownTests(unittest.TestCase):
         self.assertTrue(result['handoff']['final']['manifest_ok'])
         self.assertIsNone(result['rust_result'])
         self.assertIsNone(result['tools_check'])
+
+    def test_unreadable_archive_does_not_claim_absence(self):
+        plan = self.plan
+        class DeniedStore(Store):
+            def get(self, key):
+                if key == plan.oss_keys['final']:
+                    raise APIError('AccessDenied', 'cannot observe the object')
+                return super().get(key)
+        result = teardown_run(self.config, plan, ScriptAPI([('DescribeInstances',EMPTY)]),
+            ScriptAPI([('ListSecretParameters',{'Parameters':[]})]), DeniedStore(), EmptyGitHub(), now=lambda:NOW)
+        self.assertIsNone(result['handoff']['final']['present'])
+        self.assertFalse(result['handoff']['interrupted']['present'])

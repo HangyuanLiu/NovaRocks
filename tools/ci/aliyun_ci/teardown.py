@@ -170,7 +170,8 @@ def teardown_run(config, plan, ecs, oos, oss, github, *, instance_id=None,
                     except (ValueError, OSError, tarfile.TarError) as error:
                         fact['native_result_error'] = str(error)
         except APIError as error:
-            archives[kind] = {'present': False, 'error': error.code}
+            missing = error.code in ('NoSuchKey', 'NotFound', '404')
+            archives[kind] = {'present': False if missing else None, 'error': error.code}
         except Exception as error:
             archives[kind] = {'present': True, 'manifest_ok': False, 'error': str(error)}
     for kind in ('final', 'interrupted'):
