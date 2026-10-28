@@ -592,6 +592,12 @@ impl FrontendExecutionRuntimeOwner {
             .mark_ready()
     }
 
+    fn close_root_admission(&self) {
+        if let Some(workload) = self.workload.as_ref() {
+            workload.close_root_admission();
+        }
+    }
+
     fn close_admission(&self) {
         if let Some(workload) = self.workload.as_ref() {
             workload.close_admission();
@@ -2007,7 +2013,7 @@ impl FrontendApplicationHost {
     /// publishing Draining so no new workload root can enter after the role
     /// has started refusing statements.
     pub fn begin_serving_drain(&self, timeout: Duration) {
-        self.execution_runtime_owner.close_admission();
+        self.execution_runtime_owner.close_root_admission();
         self.serving_lifecycle.begin_drain(timeout);
     }
 
