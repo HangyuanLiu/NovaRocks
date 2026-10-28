@@ -887,8 +887,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/variant_typeof/(any)->utf8;strict;legacy; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/variant_typeof/(any)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7d, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7d",
       "expires": "2026-12-15"
     },
     {
@@ -897,8 +897,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/variant_typeof/(any)->utf8;strict;legacy; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/variant_typeof/(any)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7d, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7d",
       "expires": "2026-12-15"
     },
     {
@@ -927,8 +927,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/__struct_subfield/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/__struct_subfield/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -937,8 +937,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 6; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -947,8 +947,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -957,8 +957,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/map/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -967,8 +967,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/map/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 8; 9 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -997,8 +997,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -1017,8 +1017,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/try_variant_get/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/try_variant_get/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7d, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 10 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7d",
       "expires": "2026-12-15"
     },
     {
@@ -1027,8 +1027,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/variant_typeof/(any)->utf8;strict;legacy; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/variant_typeof/(any)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7d, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 4; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7d",
       "expires": "2026-12-15"
     },
     {
@@ -1037,8 +1037,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7; remove after capability repair and native verification",
-      "owner": "B7",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -1047,8 +1047,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1057,8 +1057,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 8; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1067,8 +1067,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 6; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1077,8 +1077,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 6; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1087,8 +1087,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1097,8 +1097,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1107,8 +1107,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 9; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1117,8 +1117,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1127,8 +1127,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1137,8 +1137,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1147,8 +1147,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1157,8 +1157,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1167,8 +1167,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1177,8 +1177,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1187,8 +1187,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1197,8 +1197,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1207,8 +1207,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/bool_and_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/bool_and_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 7 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1217,8 +1217,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/bool_or_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/bool_or_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 8 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1227,8 +1227,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1237,8 +1237,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 8 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1247,8 +1247,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 10 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1257,8 +1257,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 8 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1267,8 +1267,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 7 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1277,8 +1277,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1287,8 +1287,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1297,8 +1297,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1307,8 +1307,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1317,8 +1317,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1327,8 +1327,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1337,8 +1337,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1347,8 +1347,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 7 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1357,8 +1357,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1367,8 +1367,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 11 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1377,8 +1377,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1387,8 +1387,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1397,8 +1397,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1407,8 +1407,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 10 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1417,8 +1417,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 4; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1427,8 +1427,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1437,8 +1437,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "B8, B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B8",
       "expires": "2026-12-15"
     },
     {
@@ -1447,8 +1447,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "B8, B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B8",
       "expires": "2026-12-15"
     },
     {
@@ -1457,8 +1457,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 19 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1467,8 +1467,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1477,8 +1477,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1487,8 +1487,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1497,8 +1497,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/min_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1507,8 +1507,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "B8, B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B8",
       "expires": "2026-12-15"
     },
     {
@@ -1517,8 +1517,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "B8, B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B8",
       "expires": "2026-12-15"
     },
     {
@@ -1527,8 +1527,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "B8, B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B8",
       "expires": "2026-12-15"
     },
     {
@@ -1537,8 +1537,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/sum_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/sum_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 7; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1547,8 +1547,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 9; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1557,8 +1557,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1567,8 +1567,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1577,8 +1577,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1587,8 +1587,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1597,8 +1597,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/count_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 8 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1607,8 +1607,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 5; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1617,8 +1617,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 4; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1647,8 +1647,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.aggregate/sum_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
-      "owner": "B1, I5",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/sum_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 8 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -1967,8 +1967,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion. Earlier shared02 materialized-view suite cleanup FAILED from cross-run shared metadata; retain that raw failure separately. The repaired private01 complete materialized-view lifecycle subsequently cleaned up successfully; its lake case still FAILS.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -2378,8 +2378,8 @@
         "statement": 4,
         "actual_digest": "57a04a41c73a00283fa53044e5170dea3a0d63292885df44a5744ee0e061e9cb"
       },
-      "reason": "The unchanged positive SQL case has this exact result mismatch after the scheduler for its exact same-run MV target refuses the compiled change-stream Router capability. The one failed result_set oracle is this registered mismatch itself, not another failed assertion; no expected-error mismatch or cleanup violation accompanies it. Raw SQL failure has no engine/sql error code and remains FAIL. Restore B1 incremental MV router capability and pass the entire original native case, including automatic refresh and all original result oracles, before removal. Actual source: fffbffe8dc9105af9b357be835aeafd8966dff86; exact target and original refusal author are retained in the linked evidence.",
-      "owner": "UEA-5E B1",
+      "reason": "OPEN: the unchanged positive native case still has its exact registered result mismatch at step 4, raw digest 57a04a41c73a00283fa53044e5170dea3a0d63292885df44a5744ee0e061e9cb, after the original 30 attempts/500ms; raw SQL has no engine/sql error code and remains FAIL. Same-run original background author directly records mv_id=79 and its exact MV target refusing reason 19:1 (private01 INFO:7996). The adjacent serial ScheduledCall target planning and query `946eb1cb-8f0b-8d64-0000-000000000114` Task/ACK evidence show exact B3 feature `build-preserving hash join kind (merged build match flags)`, NodeId(2), pipeline_dop=5. The scheduler warning has no direct query-id field; query association uses the original serial target/time/Native evidence and cannot be promoted to direct identity proof. The old Router/B1 cause is superseded; the automatic-refresh/resume result obligation remains OPEN, not UnsupportedCompiledShape or PASS. Do not add a new exception or infer acceptance from the existing classifier match. Raw case remains FAIL at step 4; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1b (acceptance OPEN); UEA-5E B3 (observed dependency)",
       "expires": "2026-12-15"
     },
     {
@@ -2389,8 +2389,8 @@
         "statement": 7,
         "actual_digest": "85b8af0d090535fd79d1b2cf2325c63a00c640c32ce1013d8c5d58eebc23d748"
       },
-      "reason": "The unchanged positive SQL case has this exact result mismatch after the scheduler for its exact same-run MV target refuses the compiled change-stream Router capability. The one failed result_set oracle is this registered mismatch itself, not another failed assertion; no expected-error mismatch or cleanup violation accompanies it. Raw SQL failure has no engine/sql error code and remains FAIL. Restore B1 incremental MV router capability and pass the entire original native case, including automatic refresh and all original result oracles, before removal. Actual source: fffbffe8dc9105af9b357be835aeafd8966dff86; exact target and original refusal author are retained in the linked evidence.",
-      "owner": "UEA-5E B1",
+      "reason": "OPEN: the unchanged positive native case still has its exact registered result mismatch at step 7, raw digest 85b8af0d090535fd79d1b2cf2325c63a00c640c32ce1013d8c5d58eebc23d748, after the original 30 attempts/500ms; raw SQL has no engine/sql error code and remains FAIL. Same-run original background author directly records mv_id=82 and its exact MV target refusing reason 19:1 (private01 INFO:9378). The adjacent serial ScheduledCall target planning and query `946eb1cb-8f0b-8d64-0000-000000000141` Task/ACK evidence show exact B3 feature `build-preserving hash join kind (merged build match flags)`, NodeId(2), pipeline_dop=5. The scheduler warning has no direct query-id field; query association uses the original serial target/time/Native evidence and cannot be promoted to direct identity proof. The old Router/B1 cause is superseded; the automatic-refresh/resume result obligation remains OPEN, not UnsupportedCompiledShape or PASS. Do not add a new exception or infer acceptance from the existing classifier match. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1b (acceptance OPEN); UEA-5E B3 (observed dependency)",
       "expires": "2026-12-15"
     },
     {
@@ -2709,8 +2709,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "The original case reaches statement 2 and the frozen selected overload builtin.aggregate/sum_state/derived-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B1",
+      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/sum_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 6 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B1a",
       "expires": "2026-12-15"
     },
     {
@@ -2779,8 +2779,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "The unchanged projection/filter MV case fails at statement 4, substatement 3 REFRESH, after its initial refresh/result and the INSERT/DELETE prefix complete. Frozen incremental PF construction preserves only primitive columns and predicates, completes a real change-stream Router sink, and encoding refuses that sink before writer/package recipe extraction. Earlier structural/read errors cannot produce the observed typed Source Unsupported; missing implementation admission would emit a distinct Analyze code. This exact Router capability is owned by B1. No independent failed oracle or cleanup violation accompanies the refusal. Restore the incremental change-stream Router capability and pass the unchanged entire native case, including repartition/publication, later refresh and all positive/negative oracles, before removal.",
-      "owner": "UEA-5E B1",
+      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 4; 9 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
+      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -2904,7 +2904,7 @@
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_base_rename_referenced",
       "owner": "UEA-7B3, UEA-7B5",
       "review_by": "2026-12-15",
-      "reason": "D0-5(d), spec 5.6 K7(b): the existing MV refresh owner explicitly refuses occurrence-aware SQL field rebinding after a referenced source rename. Current native step 7 returns the untyped original message MV refresh requires occurrence-aware SQL field rebinding (MySQL 1105/HY000, SQL code absent); step 8 is not reached, original step 9 cleanup passed. This is the approved intentional MV-arc refusal, not a newly inferred UnsupportedCompiledShape code. Preserve the original positive refresh/output oracle.",
+      "reason": "D0-5(d), spec 5.6 K7(b): the existing MV refresh owner explicitly refuses occurrence-aware SQL field rebinding after a referenced source rename. Current native step 7 returns the untyped original message MV refresh requires occurrence-aware SQL field rebinding (MySQL 1105/HY000, SQL code absent); step 8 is not reached, original step 9 cleanup passed. This is the approved intentional MV-arc refusal, not a newly inferred UnsupportedCompiledShape code. Preserve the original positive refresh/output oracle. Reobserved in complete private01: original step 7 gives the same untyped original message; raw FAIL and unfulfilled suffix remain. All three private suite lifecycles closed successfully. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. No conversion to UnsupportedCompiledShape and no quarantine closure.",
       "exit_condition": "UEA-7B3/UEA-7B5 deliver occurrence-aware SQL field rebinding for the same field-id-preserving referenced rename; rerun this unchanged complete native case so step 7 refresh succeeds, step 8 returns the original expected region output including id=4, and original cleanup passes. Remove this exact quarantine only then; do not accept renaming the oracle, parsing the old message into a new code, or reusing the passed prefix."
     },
     {

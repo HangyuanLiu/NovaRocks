@@ -811,6 +811,20 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
         self.admission.release_capacity_alias();
         Ok(())
     }
+    /// Install the exact original observer before a fallible domain observation.
+    /// Refusal and unwind leave that observer in the caller's stable tail slot.
+    pub(crate) fn transfer_native_tail_then<T, E>(
+        &mut self,
+        target: &mut Option<StatementNativeTail>,
+        observe: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, StatementNativeHealthFailure> {
+        if target.is_some() {
+            return Err(self.admission.health.clone());
+        }
+        self.release_result_aliases()?;
+        *target = Some(self.take_native_tail()?);
+        Ok(observe())
+    }
     pub(crate) fn take_native_tail(
         &mut self,
     ) -> Result<StatementNativeTail, StatementNativeHealthFailure> {
@@ -1194,4 +1208,6 @@ mod tests {
         control.close_admission();
         assert!(control.shutdown().is_ok());
     }
+
+    include!("statement_computation_count_handoff_tests.rs");
 }

@@ -205,6 +205,10 @@ SQL client
   编排 prepare、计算、publication 和必要 finalize。共享阶段/计算在 `query/statement_computation.rs`，
   共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
   成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
+  命令完成经 Query Application 的 `StatementCommandCompletion` / `GovernedCompletionStatementResult`
+  保留原业务选定的 affected rows，再由 MySQL `terminal.rs` 标准编码。普通/MOR 取同 Session
+  完整冻结的 Root 计数，COW 取原 selection，CTAS 等最终 CREATE；控制与签名 NoOp 显式为零。
+  缺计数或失败不能转成 OK(0)，完成数据不替代原 visibility、取消、真实 flush 与退出。
 
 - `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
   Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit

@@ -22,6 +22,12 @@ code-anchors:
   - "novarocks/execution/src/runtime/fragment/sink.rs (materialize_compiled_sink_for_pipeline)"
   - "novarocks/execution/src/exec/pipeline/builder/compiled_writer.rs (build_logical_finish)"
   - "novarocks/frontend-application/src/query/statement_publication.rs (StatementPublication)"
+  - "novarocks/frontend-application/src/query/write_action.rs (selected_command_completion)"
+  - "novarocks/frontend-application/src/query/mutation_action.rs (MutationAffectedRows)"
+  - "novarocks/frontend-application/src/query_execution/write_session.rs (ConnectorWriteSession::freeze_received_row_count)"
+  - "novarocks/query-application/src/session_control/statement_action.rs (StatementCommandCompletion, StatementActionReady::transfer_protocol_in)"
+  - "novarocks/query-application/src/protocol_delivery.rs (GovernedCompletionStatementResult)"
+  - "novarocks/mysql-adapter/src/terminal.rs (write_success, ok_payload)"
 ---
 
 ## 问题
@@ -76,6 +82,8 @@ code-anchors:
 8. **领域就绪与发布分离规则。** 原 FE write consumer 完整解释 Root 数据和 End，等待 manifest 冻结的 writer、summary source 与 root 完成义务，并保留 stream failure、原 Task cause、取消与 deadline 否决；普通写的空 summary-source 集不增加义务。随后将同一个 prepared set 交入同一个 Session union，Ready 仍保留原 credentials、lease 与代次。只有原 FE publication owner 能调用 Provider mutation；KnownCommitted、KnownUncommitted、Unknown 与后续清理不因晚到错误重新解释，也不由 ComputationReady 推断。
 
 9. **交付、容量与兼容分离规则。** ACK 只证明接收；sender 正常收束观察自己的发送响应与真实退出，不增加远端 Consumed 等待。现有本地结构水位、查询状态收费和结果预算继续由原 owner 执行，严格消费不宣称远端接收有界。新增成功/装配语义进入原 Native exact compatibility island，能解码而不能执行同一完成语义的进程不能混用。
+
+10. **业务计数与协议完成规则。** 成功命令通过显式中立完成值保留领域选定的 affected rows，不能把完成简化为无载荷 OK。普通写和 MOR 复用同 Session 已完整接收、只冻结一次的 Root 逻辑计数；COW 保留原实际 selection 的动作数，重写保留行不能覆盖它。CTAS 只在最终 CREATE 和必要业务步骤成功后暴露原写数，签名 NoOp 与控制命令明确给零。Unknown、未提交、必要步骤失败或缺少原计数不能退成 OK(0)。协议 owner 只按标准无符号整数编码该事实，保留原 visibility、取消、实际 flush 和退休责任；一个标量不授予新 publication、资源或协议权限。
 
 ## 接受的妥协（诚实记录）
 

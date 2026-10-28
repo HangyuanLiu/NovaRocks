@@ -2611,7 +2611,12 @@ impl FrontendQuerySession {
         match result {
             Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
-                GovernedCompletionStatementResult::new(statement),
+                GovernedCompletionStatementResult::new(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                    statement,
+                ),
             )),
             Ok(
                 StatementResult::GovernedQuery(_)

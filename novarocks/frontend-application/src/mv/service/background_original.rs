@@ -343,7 +343,7 @@ impl GovernedBackgroundAction for BackgroundMvAction {
     ) -> Poll<Result<(), QueryServiceError>> {
         self.0.poll_action(context, cx).map(|result| {
             result.and_then(|value| match value {
-                StatementActionValue::Ok => Ok(()),
+                StatementActionValue::Ok(_) => Ok(()),
                 _ => Err(protocol("MV background command returned a row consumer")),
             })
         })

@@ -316,10 +316,12 @@ fn selected_actions(
         Err(mysql::Error::MySqlError(error)) => anyhow::ensure!(
             error
                 .message
-                .starts_with("[query.execution.invalid_data] Invalid data (reason "),
+                .starts_with("[query.execution.invalid_data] Data failure (reason 7:317)"),
             "{label} TRUE+TRUE returned the wrong public failure: {error:?}"
         ),
-        other => bail!("{label} TRUE+TRUE must fail with a public data error, got {other:?}"),
+        other => {
+            bail!("{label} TRUE+TRUE must fail with the public duplicate-key error, got {other:?}")
+        }
     }
     let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
     assert_commit_never_invoked(

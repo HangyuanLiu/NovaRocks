@@ -898,7 +898,9 @@ mod tests {
         let (_workload, _capacity, owner, _session) = statement().await;
         let token = owner.token();
         let mut source = Some(StatementActionReady {
-            result: Ok(StatementActionValue::Ok),
+            result: Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )),
             owner,
         });
         let mut target = Some(StatementResult::Ok);
@@ -911,8 +913,10 @@ mod tests {
         let StatementResult::GovernedCompletion(result) = target.take().unwrap() else {
             panic!("same governed completion")
         };
+        let (completion, mut protocol) = result.into_parts();
+        assert_eq!(completion.affected_rows(), 0);
         assert_eq!(
-            result.into_protocol().complete(),
+            protocol.complete(),
             novarocks_query_application::session_control::GovernedStatementFinishOutcome::Completed
         );
     }
