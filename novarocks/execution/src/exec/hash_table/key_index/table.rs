@@ -627,6 +627,30 @@ impl KeyIndex {
     }
     /// Construct complete typed output in the caller's requested ID order.
     /// Refusal does not poison this immutable index.
+    /// Export an actual dense output interval through the same typed read and
+    /// output authors, without a second O(D) vector of synthetic key IDs.
+    pub(crate) fn export_key_range(
+        &self,
+        classes: Range<usize>,
+        targets: &[novarocks_type_contract::FunctionValueType],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::ExportedKeys> {
+        self.check()?;
+        if self.purpose != IndexPurpose::KeyIds {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        super::export::validate_targets(&self.spec, targets, control)?;
+        let read = self.read_class_range(classes, owner, control)?;
+        super::export::construct(
+            &read,
+            &self.spec,
+            targets,
+            owner,
+            Arc::clone(&self.host),
+            control,
+        )
+    }
     pub(crate) fn export_keys(
         &self,
         ids: &[KeyId],

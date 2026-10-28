@@ -220,6 +220,16 @@ pub(crate) struct CapturedPageId {
     pub(super) run: CaptureRunId,
     pub(super) page: usize,
 }
+impl CapturedPageId {
+    /// Original build-local directory coordinates, not a fresh identity or
+    /// permission to construct, replay or settle a captured page.
+    pub(crate) fn run_index(self) -> usize {
+        self.run.index()
+    }
+    pub(crate) fn page_index(self) -> usize {
+        self.page
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BulkOccurrence {
     pub(super) page: CapturedPageId,
@@ -310,6 +320,25 @@ impl CaptureBuilder {
         // Failed capture cannot publish partial success. Actual inputs and HLL
         // backing exit under their existing creator holds, before any refund.
         self.open = None;
+    }
+    /// Borrow this still-open producer's stored page by build-local directory
+    /// coordinates. The builder is the access owner; a numeric page ID is not
+    /// an independent proof of identity, coverage, completion or capacity.
+    pub(crate) fn captured_page(
+        &self,
+        id: CapturedPageId,
+    ) -> ExecutionResult<(&KeyInput, &LocalHashBatch)> {
+        self.check()?;
+        if id.run != self.run {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        let page = self
+            .open
+            .as_ref()
+            .and_then(|open| open.pages.get(id.page))
+            .filter(|page| page.id == id)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        Ok((&page.input, &page.hashes))
     }
     pub(crate) fn push_evaluated(
         &mut self,

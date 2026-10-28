@@ -83,7 +83,7 @@ impl LocalHashPolicy {
 pub(super) struct Xxh3Kernel;
 #[cfg(test)]
 std::thread_local! {
-    pub(super) static BYTE_HASH_INITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static BYTE_HASH_INITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 impl ByteHashKernel for Xxh3Kernel {
     type Seed = u64;
@@ -117,7 +117,7 @@ impl LocalHashBatch {
         self
     }
     #[cfg(test)]
-    pub(super) fn force_hash(mut self, value: u64) -> Self {
+    pub(crate) fn force_hash(mut self, value: u64) -> Self {
         self.hashes.fill(value);
         self
     }

@@ -317,6 +317,26 @@ impl KeyInput {
             .ok_or_else(|| invariant(ValueViolation::Bounds))?;
         Ok(self.0.rows[ordinal])
     }
+    /// Observe root SQL NULL through the same already-prepared tuple author,
+    /// including dictionary bottom NULL and logical NULL carriers. Occurrence
+    /// coordinates retain their original source-row mapping and duplicates.
+    pub(crate) fn row_has_null_observed(
+        &self,
+        occurrence: usize,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<bool> {
+        checkpoint()?;
+        let row = self.row(occurrence)?;
+        let storage = self
+            .0
+            .preparation
+            .as_ref()
+            .and_then(|p| p.projected.as_ref())
+            .map_or(&self.0.tuples, |(storage, _)| storage);
+        storage
+            .view(self.arrays())
+            .row_has_null_observed(row, checkpoint)
+    }
     pub(crate) fn arrays(&self) -> &[ArrayRef] {
         &self.0.arrays
     }

@@ -57,6 +57,8 @@ pub(crate) use capture::{
 };
 pub(crate) use direct_int::DirectWork as BulkWork;
 pub(crate) use export::ExportedKeys;
+#[cfg(test)]
+pub(crate) use local_hash::BYTE_HASH_INITS;
 pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
 pub(crate) use prepared::{
     IndexPurpose, KeyId, KeyInput, KeySpec, KeyStrategy, NullPolicy, PreparedKeyBatch,
