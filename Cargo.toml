@@ -118,6 +118,7 @@ tracing = "0.1"
 twox-hash = "2.1"
 url = "2"
 uuid = "1.8"
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 # Internal dependency identities are rooted here; consumers retain dependency
 # kind, target, optionality, and feature selection.

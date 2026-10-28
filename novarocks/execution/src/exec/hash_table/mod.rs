@@ -17,6 +17,7 @@
 pub mod hash;
 pub mod key_builder;
 pub mod key_column;
+pub(crate) mod key_index;
 pub mod key_layout;
 pub mod key_storage;
 pub mod key_strategy;
