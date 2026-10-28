@@ -25,7 +25,6 @@ novarocks-secret.workspace = true
 novarocks-types.workspace = true
 rcgen.workspace = true
 rustls = { workspace = true, features = ["ring"] }
-rustls-pemfile = "2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
