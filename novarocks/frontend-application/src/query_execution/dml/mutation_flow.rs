@@ -426,7 +426,8 @@ fn finish_change_stream_write(
             },
         ))?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
+    let dop_domain =
+        crate::query_execution::contract::completed_plan_dop_domain(query_options.as_ref())?;
     let finalized = completion.finish(
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
@@ -2527,6 +2528,7 @@ fn finish_cow_match_plan(
         crate::query_execution::provider_read_facts::FrozenProviderRead,
     >,
     declaration: &[novarocks_type_contract::FunctionValueType],
+    query_options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -2548,7 +2550,7 @@ fn finish_cow_match_plan(
     let version = crate::query_execution::physical_encoding::mint_plan_version();
     let plan = completion.finish(
         version,
-        crate::query_execution::contract::completed_plan_dop_domain(None)?,
+        crate::query_execution::contract::completed_plan_dop_domain(query_options)?,
         reads,
         completion_control,
     )?;

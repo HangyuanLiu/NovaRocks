@@ -89,6 +89,10 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 10 combines the complete change-stream runtime, exact summary-source
+/// obligations and pre-success strict input validation with the epoch-9 value
+/// semantics. Epoch-9 binaries cannot enforce the complete write obligations
+/// and must remain in a distinct production compatibility island.
 /// Epoch 9 freezes unique case-insensitive struct-field ordinals, checked TIME
 /// conversion overflow, and NULL-preserving selection semantics. These execution
 /// rules are not encoded by function metadata, descriptors or carrier layouts.
@@ -110,11 +114,11 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 9;
+pub const NATIVE_COMPAT_EPOCH: u64 = 10;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 10;
+pub const NATIVE_COMPAT_EPOCH: u64 = 11;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");

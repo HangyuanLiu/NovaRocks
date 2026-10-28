@@ -481,24 +481,19 @@ const fn compiled_sink_refusal(sink: &FragmentSink) -> Option<&'static str> {
         FragmentSink::Multicast { .. } => {
             Some("the compiled package carrier does not express CTE multicast sinks yet")
         }
-        FragmentSink::Router { .. } => {
-            Some("the compiled package carrier does not express change-stream router sinks yet")
-        }
         FragmentSink::Result
         | FragmentSink::RootResult(_)
         | FragmentSink::Stream { .. }
+        | FragmentSink::Router { .. }
         | FragmentSink::Noop => None,
     }
 }
 
 const fn compiled_edge_refusal(kind: EdgeKind) -> Option<&'static str> {
     match kind {
-        EdgeKind::Stream => None,
+        EdgeKind::Stream | EdgeKind::ChangeStreamRouter => None,
         EdgeKind::CteMulticast => {
             Some("the compiled package carrier does not express CTE multicast edges yet")
-        }
-        EdgeKind::ChangeStreamRouter => {
-            Some("the compiled package carrier does not express change-stream router edges yet")
         }
     }
 }
@@ -1277,7 +1272,7 @@ mod tests {
     /// A scan is expressed, from the read its freeze kept, and a writer from
     /// the session that sealed its target.
     #[test]
-    fn the_compiled_carrier_refuses_routers_and_multicast_but_admits_scans_and_writers() {
+    fn compiled_router_uses_package_validation_and_multicast_remains_refused() {
         use novarocks_physical_plan::ValueId;
 
         let (plan, _) = crate::query_execution::package_writes::tests::insert_values_plan();
@@ -1296,7 +1291,7 @@ mod tests {
                 effect: ValueId::new(0),
                 routes: Box::default(),
             })
-            .is_some_and(|reason| reason.contains("router"))
+            .is_none()
         );
         assert!(
             compiled_sink_refusal(&FragmentSink::Multicast {
@@ -1304,10 +1299,7 @@ mod tests {
             })
             .is_some_and(|reason| reason.contains("multicast"))
         );
-        assert!(
-            compiled_edge_refusal(EdgeKind::ChangeStreamRouter)
-                .is_some_and(|reason| reason.contains("router"))
-        );
+        assert_eq!(compiled_edge_refusal(EdgeKind::ChangeStreamRouter), None);
         assert!(
             compiled_edge_refusal(EdgeKind::CteMulticast)
                 .is_some_and(|reason| reason.contains("multicast"))

@@ -37,14 +37,14 @@ use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::ResultBufferSinkFactory;
-use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation;
+use crate::exec::pipeline::executor::prepare_compiled_program_with_sink_materializer;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers;
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
 use crate::runtime::fragment::scan::{
     CompiledScanSources, materialize_compiled_scan_bindings, validate_compiled_scan_sources,
 };
-use crate::runtime::fragment::sink::materialize_compiled_sink;
+use crate::runtime::fragment::sink::materialize_compiled_sink_for_pipeline;
 
 /// One Task's write capabilities for its compiled program: one bound write
 /// capability per compiled TableWriter and one validation authority per
@@ -306,11 +306,7 @@ pub fn compiled_sink_kind(
             Ok(FragmentSinkKind::MultiCastDataStream)
         }
         Some(StaticSinkProgram::SplitDataStream { .. }) => Ok(FragmentSinkKind::SplitDataStream),
-        Some(StaticSinkProgram::ChangeStreamRouter { .. }) => Err(FragmentBindingError::new(
-            FragmentBindingTarget::Sink,
-            FragmentBindingErrorKind::InvalidAssignment,
-            "compiled change-stream router runtime is not installed",
-        )),
+        Some(StaticSinkProgram::ChangeStreamRouter { .. }) => Ok(FragmentSinkKind::SplitDataStream),
         None => Err(FragmentBindingError::new(
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,
@@ -529,37 +525,33 @@ fn prepare_compiled_fragment_in(
             }
             _ => None,
         };
-        let sink = materialize_compiled_sink(
-            program,
-            instance.sink_assignment(),
-            finst_id,
-            Arc::clone(&context.exchange_transmitter),
-            result_sink,
-            context.edge_gates.clone(),
-        )?;
         let scan_bindings =
             materialize_compiled_scan_bindings(program, &submission.scans, instance)?;
-        prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
+        prepare_compiled_program_with_sink_materializer(
             Arc::clone(program),
             Duration::from_millis(50),
-            sink,
+            |actual_root_dop| {
+                materialize_compiled_sink_for_pipeline(
+                    program,
+                    instance.sink_assignment(),
+                    finst_id,
+                    Arc::clone(&context.exchange_transmitter),
+                    result_sink,
+                    context.edge_gates.clone(),
+                    actual_root_dop,
+                    runtime_state.mem_tracker(),
+                )
+            },
             receivers.bindings,
             scan_bindings,
             writers,
             Some((finst_id.high(), finst_id.low())),
             context.profiler.clone(),
             pipeline_dop,
-            runtime_state,
+            Arc::clone(&runtime_state),
             Arc::clone(&context.event_sink),
             schema_preparation,
         )
-        .map_err(|error| {
-            FragmentLaunchError::from_failure(
-                FragmentLaunchStage::BuildPipelines,
-                FragmentLaunchErrorKind::PipelineBuild,
-                error,
-            )
-        })
     })();
     match prepare_result {
         Ok(prepared) => Ok(DormantFragmentHandle {

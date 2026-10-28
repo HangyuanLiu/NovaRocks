@@ -1775,6 +1775,7 @@ fn protocol_fixture_inputs(
 
 #[cfg(test)]
 mod tests {
+    include!("task_manifest_binding_router_freeze_tests.rs");
     use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
     use std::num::{NonZeroU32, NonZeroUsize};
 
