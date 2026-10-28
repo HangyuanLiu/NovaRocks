@@ -32,11 +32,11 @@ use novarocks_value_arrays::ValueViolation;
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
-struct PageRow {
-    page: usize,
-    row: usize,
+pub(super) struct PageRow {
+    pub(super) page: usize,
+    pub(super) row: usize,
 }
-enum Column {
+pub(super) enum Column {
     Fixed(OwnedFixedColumn),
     Bytes {
         pages: Vec<OwnedByteColumn>,
@@ -97,6 +97,48 @@ impl CompareScratch {
     }
 }
 impl OwnedKeyBatch {
+    pub(super) fn from_compacted(
+        spec: &KeySpec,
+        columns: Vec<Column>,
+        len: usize,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<Self> {
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
+        if columns.len() != spec.types().len() {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        for column in &columns {
+            checkpoint()?;
+            let actual = match column {
+                Column::Fixed(data) => data.len(),
+                Column::Canonical(data) => data.len(),
+                Column::Bytes { pages, locations } => {
+                    for (index, position) in locations.iter().enumerate() {
+                        checkpoint_at(index, &checkpoint)?;
+                        if pages
+                            .get(position.page)
+                            .is_none_or(|p| position.row >= p.len())
+                        {
+                            return Err(invariant(ValueViolation::Bounds));
+                        }
+                    }
+                    locations.len()
+                }
+            };
+            if actual != len {
+                return Err(invariant(ValueViolation::Bounds));
+            }
+        }
+        checkpoint()?;
+        Ok(Self {
+            columns,
+            spec: spec.clone(),
+            len,
+            _storage: owner.storage_lifetime(),
+        })
+    }
     pub(super) fn copy_selected(
         input: &PreparedKeyBatch<'_>,
         rows: &[usize],
@@ -362,6 +404,30 @@ fn compare_bytes(
             output[ordinal] &= u8::from(scratch.bytes[i] == Some(true));
         }
         start = end;
+    }
+    checkpoint()
+}
+
+/// Compaction preserves the index's complete logical domain while deriving
+/// root NULL declarations from the actual representative pages.
+pub(super) fn validate_compacted_binding(
+    spec: &KeySpec,
+    column: usize,
+    binding: &novarocks_type_contract::FunctionValueType,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    let expected = spec
+        .types()
+        .get(column)
+        .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+    if !expected
+        .same_value_domain_observed::<super::prepared::DomainFailure>(binding, || {
+            checkpoint().map_err(super::prepared::DomainFailure::Caller)
+        })
+        .map_err(ExecutionFailure::from)?
+    {
+        return Err(invariant(ValueViolation::Layout));
     }
     checkpoint()
 }

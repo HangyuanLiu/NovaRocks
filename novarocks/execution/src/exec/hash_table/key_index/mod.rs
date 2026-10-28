@@ -19,6 +19,8 @@
 //! set markers and distributed hash identities remain with their own authors.
 
 mod canonical_store;
+mod compact;
+mod export;
 mod fixed_store;
 mod local_hash;
 mod owned_batch;
@@ -30,6 +32,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use export::ExportedKeys;
 pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
 pub(crate) use prepared::{
     IndexPurpose, KeyId, KeyInput, KeySpec, KeyStrategy, NullPolicy, PreparedKeyBatch,

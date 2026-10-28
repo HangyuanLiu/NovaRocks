@@ -340,7 +340,7 @@ pub(super) fn sort_by_key<T: Copy, K: Ord>(
     Ok(())
 }
 
-enum DomainFailure {
+pub(super) enum DomainFailure {
     Type(novarocks_type_contract::ValueTypeError),
     Caller(ExecutionFailure),
 }

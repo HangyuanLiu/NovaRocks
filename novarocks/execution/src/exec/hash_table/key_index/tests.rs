@@ -16,6 +16,11 @@
 // under the License.
 
 use super::*;
+
+#[path = "compact_tests.rs"]
+mod compact_tests;
+#[path = "export_tests.rs"]
+mod export_tests;
 use crate::{
     exec::{
         hash_table::allocation::AggregateAllocator,
@@ -40,6 +45,26 @@ use std::{alloc::Layout, cell::Cell, sync::Arc};
 
 fn owner() -> Box<dyn InputConstructionOwner> {
     owner_with_tracker().0
+}
+
+fn assert_value_failure(
+    error: &ExecutionFailure,
+    expected: novarocks_value_arrays::ValueViolation,
+) {
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_value_arrays::ValueError;
+    assert_eq!(
+        error.failure_fact(),
+        ValueError::Invariant(expected).failure_fact()
+    );
+    let ExecutionFailureCause::Domain(original) = error.cause() else {
+        panic!("the original value-array error must remain a domain cause")
+    };
+    let Some(ValueError::Invariant(actual)) = original.downcast_ref::<ValueError>() else {
+        panic!("the original typed value invariant must remain recoverable")
+    };
+    assert_eq!(*actual, expected);
 }
 fn owner_with_tracker() -> (Box<dyn InputConstructionOwner>, Arc<MemTracker>) {
     let tracker = MemTracker::new_root("local key test construction");

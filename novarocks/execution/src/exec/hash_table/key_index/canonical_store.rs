@@ -37,7 +37,7 @@ use novarocks_type_contract::FunctionValueType;
 use novarocks_value_arrays::{
     ByteLayout, ValueViolation,
     batch::OwnedBytesPage,
-    build::{ValueBuilder, WriteFailure},
+    build::{BuiltArray, ValueBuilder, WriteFailure},
     reachability::ReachableRows,
 };
 use std::sync::Arc;
@@ -69,6 +69,90 @@ pub(super) struct CanonicalKeyRead<'a> {
     pub(super) payload: Option<&'a [u8]>,
 }
 impl OwnedCanonicalColumn {
+    pub(super) fn from_compacted(
+        built: Vec<BuiltArray>,
+        binding: FunctionValueType,
+        construction: &super::compact::Construction<'_>,
+    ) -> ExecutionResult<Self> {
+        let owner = construction.owner;
+        let checkpoint = || {
+            construction
+                .control
+                .checkpoint(0)
+                .map_err(ExecutionFailure::from)
+        };
+        checkpoint()?;
+        super::owned_batch::validate_compacted_binding(
+            construction.spec,
+            construction.column,
+            &binding,
+            &checkpoint,
+        )?;
+        let expected = construction
+            .spec
+            .types()
+            .get(construction.column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if !expected
+            .typed_binding()
+            .layout()
+            .equals_observed(binding.typed_binding().layout(), &checkpoint)?
+        {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        let mut pages = vector(owner, built.len())?;
+        let mut locations = Vec::new();
+        for (page, mut built) in built.into_iter().enumerate() {
+            checkpoint()?;
+            let values = built
+                .array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .ok_or_else(|| invariant(ValueViolation::Carrier))?;
+            for row in 0..values.len() {
+                checkpoint_at(row, &checkpoint)?;
+                if values.is_null(row) {
+                    return Err(invariant(ValueViolation::Carrier));
+                }
+                let is_null = canonical_component_payload(values.value(row))?.is_none();
+                if is_null && !binding.nullable() {
+                    return Err(invariant(ValueViolation::RequiredNull));
+                }
+                reserve_push(&mut locations, owner, &checkpoint)?;
+                locations.push(Location { page, row, is_null });
+            }
+            built.array = super::store::retain_created_array(
+                built.array,
+                &binding,
+                &owner.storage_lifetime(),
+                Arc::clone(&construction.host),
+                construction.control,
+            )?;
+            let array = Arc::clone(&built.array);
+            let defined = ReachableRows::all(array.len())
+                .materialize_observed(
+                    &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                    &mut |_| checkpoint(),
+                )
+                .map_err(original)?;
+            let page = OwnedBytesPage::new(
+                built,
+                defined,
+                &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                &mut |_| checkpoint(),
+            )
+            .map_err(original)?;
+            pages.push(CanonicalPage { array, page });
+        }
+        checkpoint()?;
+        Ok(Self {
+            pages,
+            locations,
+            binding,
+            spec: construction.spec.clone(),
+            column: construction.column,
+        })
+    }
     pub(super) fn copy_selected(
         input: &PreparedKeyBatch<'_>,
         column: usize,

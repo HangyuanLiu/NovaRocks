@@ -35,7 +35,7 @@ use novarocks_type_contract::{FunctionValueType, ValueLayout, ValueTypeStorageLi
 use novarocks_value_arrays::{
     ByteLayout, ValueViolation,
     batch::{OwnedBytesPage, compare::compare_owned_pairs_into, selected::visit_selected},
-    build::{ValueBuilder, WriteFailure},
+    build::{BuiltArray, ValueBuilder, WriteFailure},
     hash_eq::NullEquality,
     reachability::{ReachableRows, SelectionSet},
 };
@@ -58,6 +58,65 @@ struct KeyColumnCreator {
     _storage: ValueTypeStorageLifetime,
 }
 impl OwnedByteColumn {
+    pub(super) fn from_compacted(
+        mut built: BuiltArray,
+        binding: FunctionValueType,
+        construction: &super::compact::Construction<'_>,
+    ) -> ExecutionResult<Self> {
+        let owner = construction.owner;
+        let checkpoint = || {
+            construction
+                .control
+                .checkpoint(0)
+                .map_err(ExecutionFailure::from)
+        };
+        checkpoint()?;
+        super::owned_batch::validate_compacted_binding(
+            construction.spec,
+            construction.column,
+            &binding,
+            &checkpoint,
+        )?;
+        if !ByteLayout::from_data_type(binding.data_type()).is_some_and(ByteLayout::is_view)
+            || binding.data_type() != built.array.data_type()
+        {
+            return Err(invariant(ValueViolation::Carrier));
+        }
+        if !binding.nullable() && built.array.null_count() != 0 {
+            return Err(invariant(ValueViolation::RequiredNull));
+        }
+        let storage = owner.storage_lifetime();
+        built.array = retain_created_array(
+            built.array,
+            &binding,
+            &storage,
+            Arc::clone(&construction.host),
+            construction.control,
+        )?;
+        let array = Arc::clone(&built.array);
+        let defined = ReachableRows::all(array.len())
+            .materialize_observed(
+                &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                &mut |_| checkpoint(),
+            )
+            .map_err(original)?;
+        let page = OwnedBytesPage::new(
+            built,
+            defined,
+            &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+            &mut |_| checkpoint(),
+        )
+        .map_err(original)?;
+        checkpoint()?;
+        Ok(Self {
+            array,
+            binding,
+            spec: construction.spec.clone(),
+            column: construction.column,
+            page,
+            storage,
+        })
+    }
     #[cfg(test)]
     pub(super) fn page_target_for_test() -> usize {
         BYTE_PAGE_TARGET

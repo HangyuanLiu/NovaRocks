@@ -40,6 +40,49 @@ pub(super) struct OwnedFixedColumn {
     storage: ValueTypeStorageLifetime,
 }
 impl OwnedFixedColumn {
+    pub(super) fn from_compacted(
+        array: ArrayRef,
+        binding: FunctionValueType,
+        construction: &super::compact::Construction<'_>,
+    ) -> ExecutionResult<Self> {
+        let checkpoint = || {
+            construction
+                .control
+                .checkpoint(0)
+                .map_err(ExecutionFailure::from)
+        };
+        checkpoint()?;
+        super::owned_batch::validate_compacted_binding(
+            construction.spec,
+            construction.column,
+            &binding,
+            &checkpoint,
+        )?;
+        if !super::prepared::is_fixed(binding.data_type())
+            || binding.data_type() != array.data_type()
+        {
+            return Err(invariant(ValueViolation::Carrier));
+        }
+        if !binding.nullable() && array.null_count() != 0 {
+            return Err(invariant(ValueViolation::RequiredNull));
+        }
+        let storage = construction.owner.storage_lifetime();
+        let array = super::store::retain_created_array(
+            array,
+            &binding,
+            &storage,
+            Arc::clone(&construction.host),
+            construction.control,
+        )?;
+        checkpoint()?;
+        Ok(Self {
+            array,
+            binding,
+            spec: construction.spec.clone(),
+            column: construction.column,
+            storage,
+        })
+    }
     pub(super) fn copy_selected(
         input: &PreparedKeyBatch<'_>,
         column: usize,

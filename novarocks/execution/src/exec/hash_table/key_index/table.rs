@@ -225,11 +225,22 @@ impl KeyIndex {
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<super::read::OwnedKeyReadBatch<'_>> {
         self.check()?;
-        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
-        checkpoint()?;
         if self.purpose != IndexPurpose::KeyIds {
             return Err(invariant(ValueViolation::Layout));
         }
+        self.read_representatives(ids, owner, control)
+    }
+    // Private class coordinates also serve hash-presence compaction. They are
+    // never exported as public IDs or caller row assignments for that purpose.
+    fn read_representatives(
+        &self,
+        ids: &[KeyId],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::read::OwnedKeyReadBatch<'_>> {
+        self.check()?;
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
         let mut requests = vector(owner, ids.len())?;
         for (ordinal, id) in ids.iter().enumerate() {
             checkpoint_at(ordinal, &checkpoint)?;
@@ -287,6 +298,80 @@ impl KeyIndex {
             return Err(invariant(ValueViolation::Layout));
         }
         hashes.validate(input.input, &self.policy)
+    }
+    /// Construct complete typed output in the caller's requested ID order.
+    /// Refusal does not poison this immutable index.
+    pub(crate) fn export_keys(
+        &self,
+        ids: &[KeyId],
+        targets: &[novarocks_type_contract::FunctionValueType],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::ExportedKeys> {
+        self.check()?;
+        super::export::validate_targets(&self.spec, targets, control)?;
+        let read = self.read_keys(ids, owner, control)?;
+        super::export::construct(
+            &read,
+            &self.spec,
+            targets,
+            owner,
+            Arc::clone(&self.host),
+            control,
+        )
+    }
+    /// Rebuild immutable representative pages without rehashing or resigning
+    /// classes. Escaped Arrow aliases continue to own their previous creators.
+    pub(crate) fn compact(
+        &mut self,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<()> {
+        self.check()?;
+        let result = self.compact_pages(owner, control);
+        if let Err(cause) = &result {
+            if self.failed.is_none() {
+                self.failed = Some(cause.clone());
+            }
+        }
+        result
+    }
+    fn compact_pages(
+        &mut self,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<()> {
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
+        if self.classes.is_empty() {
+            return checkpoint();
+        }
+        let mut ids = vector(owner, self.classes.len())?;
+        for id in 0..self.classes.len() {
+            checkpoint_at(id, &checkpoint)?;
+            ids.push(KeyId(id));
+        }
+        let read = self.read_representatives(&ids, owner, control)?;
+        let batch =
+            super::compact::gather(&read, &self.spec, owner, Arc::clone(&self.host), control)?;
+        if batch.len() != self.classes.len() {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        let batch = shared(owner, batch)?;
+        let mut replacement = AggregateVec::new_in(self.allocator.clone());
+        reserve_state(&mut replacement, 1, &checkpoint)?;
+        replacement.push(batch);
+        drop(read);
+        // Only locations change. The immutable full/table hashes, collision
+        // links and class IDs remain exact. Failure during this commit latches
+        // the entire index; its partially changed prefix is never readable.
+        checkpoint()?;
+        for (row, class) in self.classes.iter_mut().enumerate() {
+            checkpoint_at(row, &checkpoint)?;
+            class.key = StoredKey { batch: 0, row };
+        }
+        self.batches = replacement;
+        checkpoint()
     }
     /// Mutation publishes a complete result or permanently latches its first
     /// failure. Partially committed internals can never be retried as success.
