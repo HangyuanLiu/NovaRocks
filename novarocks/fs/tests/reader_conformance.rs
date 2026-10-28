@@ -27,6 +27,7 @@ use novarocks_fs::{
     FileProjection, FileRangeScope, FileRangeService, FileReadRange, MinMaxPredicateOp,
     MinMaxPredicateValue, PhysicalPageSelection, PreparedFileInput, ScanPredicate,
     ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata, open_file_reader,
+    open_file_reader_async,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -769,22 +770,60 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     assert!(metrics.cache_misses > 0);
 }
 
+// The bound fixture supplies authorized input only. Unsupported format dispatch
+// must refuse before interpreting its bytes, in both entry points.
 #[test]
-fn orc_projects_physical_columns_and_honors_row_budget() {
-    let fixture = Fixture::orc();
-    let mut reader = open_file_reader(fixture.request(
-        FileFormat::Orc,
-        FileProjection::RootNames(vec!["name".to_string()]),
-        3,
-        1024 * 1024,
-    ))
-    .expect("open ORC reader");
-    let batches = collect(reader.as_mut()).expect("read ORC");
-    assert!(batches.iter().all(|batch| batch.batch.num_rows() <= 3));
-    assert!(batches[0].batch.column(0).as_any().is::<StringArray>());
+fn orc_physical_reads_are_refused_with_a_recovery_condition() {
+    let fixture = Fixture::parquet();
+    let request = fixture.request(FileFormat::Orc, FileProjection::All, 3, 1024 * 1024);
+    let error = match open_file_reader(request) {
+        Ok(_) => panic!("suspended ORC reads must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), FileErrorKind::Unsupported);
     assert!(
-        batches
-            .iter()
-            .all(|batch| batch.physical_row_positions.is_none())
+        error
+            .to_string()
+            .contains("ORC physical reads are suspended")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("orc-rust releases Arrow 60 and Zstd 0.14 support")
+    );
+    assert_eq!(
+        fixture.io.block_on_bytes_calls(),
+        0,
+        "dispatch must not read the input"
+    );
+}
+
+#[test]
+fn awaited_orc_physical_reads_are_refused_with_a_recovery_condition() {
+    let fixture = Fixture::parquet();
+    let request = fixture.request(FileFormat::Orc, FileProjection::All, 3, 1024 * 1024);
+    let error = match fixture
+        .io
+        .handle()
+        .block_on(open_file_reader_async(request, None))
+    {
+        Ok(_) => panic!("suspended ORC reads must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), FileErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("ORC physical reads are suspended")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("orc-rust releases Arrow 60 and Zstd 0.14 support")
+    );
+    assert_eq!(
+        fixture.io.block_on_bytes_calls(),
+        0,
+        "dispatch must not read the input"
     );
 }

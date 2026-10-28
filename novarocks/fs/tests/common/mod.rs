@@ -32,7 +32,6 @@ use novarocks_fs::{
     FsAccessResolver, PhysicalPruning,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
-use orc_rust::ArrowWriterBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
@@ -103,13 +102,6 @@ impl Fixture {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("three-groups.parquet");
         write_parquet_groups(&path, 3);
-        Self::from_path(directory, path)
-    }
-
-    pub fn orc() -> Self {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("sample.orc");
-        write_orc(&path);
         Self::from_path(directory, path)
     }
 
@@ -199,17 +191,6 @@ fn write_parquet_groups(path: &std::path::Path, groups: usize) {
         }
     }
     writer.close().expect("close Parquet");
-}
-
-fn write_orc(path: &std::path::Path) {
-    let schema = fixture_schema();
-    let file = File::create(path).expect("create ORC");
-    let mut writer = ArrowWriterBuilder::new(file, Arc::clone(&schema))
-        .try_build()
-        .expect("ORC writer");
-    writer.write(&fixture_batch(&schema, 0)).expect("write ORC");
-    writer.write(&fixture_batch(&schema, 4)).expect("write ORC");
-    writer.close().expect("close ORC");
 }
 
 fn fixture_schema() -> Arc<Schema> {
