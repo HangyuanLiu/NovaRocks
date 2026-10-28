@@ -208,8 +208,12 @@ impl OwnedLocalResult {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let schema = Arc::new(
-            ClientRenderSchema::try_new(columns, fields.len())
-                .map_err(|error| error.to_string())?,
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                columns,
+                fields.len(),
+            )
+            .map_err(|error| error.to_string())?,
         );
         let LocalSourceInput { result, window } = input;
         Ok(Self {

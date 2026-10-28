@@ -2870,6 +2870,7 @@ mod terminal_observation_tests {
             let output = if client {
                 FrozenRootOutput::ClientRows(
                     ClientRenderSchema::try_new(
+                        novarocks_result_contract::ClientPresentationFamily::MysqlText,
                         vec![RenderColumn {
                             source_ordinal: 0,
                             source_slot: Some(1),

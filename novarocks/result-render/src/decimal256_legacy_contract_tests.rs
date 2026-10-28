@@ -100,6 +100,7 @@ fn public_encoder(value: i256, precision: u8, scale: i8) -> ArrowMysqlTextEncode
         nullable: true,
     };
     let schema = ClientRenderSchema::try_new(
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
         vec![RenderColumn {
             source_ordinal: 0,
             source_slot: None,

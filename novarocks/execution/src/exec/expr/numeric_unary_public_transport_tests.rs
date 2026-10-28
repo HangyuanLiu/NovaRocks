@@ -220,8 +220,12 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
         let mut wrong_columns = render.columns().to_vec();
         wrong_columns[0].field.nullable = false;
         wrong_columns[2].field.nullable = false;
-        let wrong_render =
-            novarocks_result_contract::ClientRenderSchema::try_new(wrong_columns, 3).unwrap();
+        let wrong_render = novarocks_result_contract::ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            wrong_columns,
+            3,
+        )
+        .unwrap();
         let refusal = wrong_candidate
             .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
                 wrong_render,

@@ -53,7 +53,14 @@ fn make(value: String, with_float: bool) -> ArrowMysqlTextEncoder {
         })
         .collect();
     ArrowMysqlTextEncoder::try_new(
-        Arc::new(ClientRenderSchema::try_new(cols, batch.num_columns()).unwrap()),
+        Arc::new(
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                cols,
+                batch.num_columns(),
+            )
+            .unwrap(),
+        ),
         batch,
     )
     .unwrap()
@@ -134,6 +141,7 @@ fn single_cell_body(array: ArrayRef, native_type: N, name: &str) -> Vec<u8> {
     )
     .unwrap();
     let schema = ClientRenderSchema::try_new(
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
         vec![RenderColumn {
             source_ordinal: 0,
             source_slot: None,
@@ -240,6 +248,7 @@ fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schem
         novarocks_result_contract::RootProfileId::V1,
         FrozenRootOutput::ClientRows(
             ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
                 vec![RenderColumn {
                     source_ordinal: 0,
                     source_slot: Some(7),

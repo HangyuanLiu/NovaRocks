@@ -98,6 +98,7 @@ fn prepare(array: ArrayRef, render: RenderField) -> (Arc<ClientRenderSchema>, Re
     .unwrap();
     let schema = Arc::new(
         ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,

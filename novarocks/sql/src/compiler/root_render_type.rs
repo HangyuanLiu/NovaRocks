@@ -97,7 +97,12 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
             field: build(field.ty.value_type(), field.ty.data_type(), true, offset)?,
         });
     }
-    ClientRenderSchema::try_new(columns, fields.len()).map_err(|error| error.to_string())
+    ClientRenderSchema::try_new(
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        columns,
+        fields.len(),
+    )
+    .map_err(|error| error.to_string())
 }
 /// Qualify the complete public declaration without imposing a renderer's
 /// carrier profile or recovering domains from source annotations.
