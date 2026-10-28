@@ -623,7 +623,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
 
 - `[standalone_server]`
-  `mysql_port`, `user`, MV scheduler settings, and Iceberg maintenance settings.
+  `mysql_port`、`trino_port`（默认 `8080`）、`trino_client_timeout_ms`（默认 `300000`）、
+  `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，与 MySQL
+  复用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
+  Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
   Process-local object-store credentials for Iceberg and Paimon connector
@@ -727,9 +730,11 @@ done
 grep -q '^NOVAROCKS_READY ' "$LOG" || { echo "timed out waiting for NOVAROCKS_READY" >&2; kill -9 "$SRV_PID"; exit 1; }
 ```
 
-The marker line is emitted on stdout immediately after a successful bind:
-`NOVAROCKS_READY mysql_port=23223 pid=<pid>`. Any orchestration that
-backgrounds the server **must** gate its first connection on this line.
+FE 绑定 Trino 与 MySQL 客户端监听后，在 stdout 输出：
+`NOVAROCKS_READY mysql_port=23223 pid=<pid> trino_port=<actual-port>`。
+字段 `trino_port` 追加在末尾，原 `NOVAROCKS_READY mysql_port=` 前缀保留。
+后台启动的编排必须等到这一行再连接，端口取本次实际 marker；不能只探测一个可能已被其他进程占用的端口。
+`NOVA_ENV_TRINO_PORT` 是本地 fixture 导出的 Trino 端口。
 
 Run SQL tests with the generated runner config:
 

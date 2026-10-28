@@ -222,6 +222,7 @@ code-anchors:
 
 资源沿用原 executor、Transport 和结果预算；普通 Full 是可取消背压。完整依赖事实约束来源与责任，不构成另一套工作类别或依赖域配额。计算位置、仍活数据和残留责任分别退出，超时不证明实际退出。公平推进以资源可用、依赖能够返回为条件；共享 worker 全部永久阻塞时，健康请求与结算也可能不可用，不据此承诺故障隔离或新增 worker 最低数。
 
+- [ADR-0200](ADR-0200-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对，ADR-0172 继续有效）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据，单一接受事务、细化及其余规则保留）
@@ -293,6 +294,7 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
+- [ADR-0200](ADR-0200-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对，ADR-0172 继续有效）
 - ADR-0090 — MV/View定义为何持久化用户有效SQL原文与解析上下文，而不是AST Display（active）
 - ADR-0101 — native SQL language authority 为何分离 parser、SQL semantic value 与 Frontend application request（active）
 
@@ -311,6 +313,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 StarRocks 已废弃且没有 active read capability。
 
 
+- [ADR-0200](ADR-0200-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对，ADR-0172 继续有效）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0121 — FE serving lifecycle 为何用单向 admission drain、而不是 connection shutdown 或远程 management mutation（active）
