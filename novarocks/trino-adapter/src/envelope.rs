@@ -72,7 +72,8 @@ pub(crate) fn envelope<'a>(
         stats: Stats {
             state,
             queued: state == "QUEUED",
-            scheduled: state != "QUEUED",
+            // The original statement owner does not expose stage-scheduling telemetry.
+            scheduled: false,
             nodes: 0,
             total_splits: 0,
             queued_splits: 0,

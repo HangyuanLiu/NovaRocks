@@ -514,6 +514,7 @@ async fn final_data_page_retains_original_scope_until_ack_and_terminal_replays_e
     let fixture = Fixture::standard();
     let (entry, queued) = fixture.register();
     assert_eq!(queued["stats"]["state"], "QUEUED");
+    assert_eq!(queued["stats"]["scheduled"], false);
     assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
     let data = get(&fixture.registry, &entry, 0).await;
     assert_eq!(
@@ -772,6 +773,7 @@ async fn draining_rejects_registered_and_new_submissions_without_creating_work()
         json(&terminal)["error"]["errorName"],
         "SERVER_SHUTTING_DOWN"
     );
+    assert_eq!(json(&terminal)["stats"]["scheduled"], false);
     let headers = HeaderMap::from_iter([(
         axum::http::HeaderName::from_static("x-trino-user"),
         HeaderValue::from_static("root"),
@@ -781,6 +783,7 @@ async fn draining_rejects_registered_and_new_submissions_without_creating_work()
         .registry
         .register(request, "http://localhost:8080".into());
     assert_eq!(json(&page)["error"]["errorName"], "SERVER_SHUTTING_DOWN");
+    assert_eq!(json(&page)["stats"]["scheduled"], false);
     assert!(json(&page).get("nextUri").is_none());
     assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
     assert_eq!(
@@ -805,6 +808,7 @@ async fn terminal_session_headers_come_from_executor_effects_not_input_name_diff
     assert_eq!(terminal.headers["x-trino-set-schema"], "resolved_schema");
     assert!(!terminal.headers.contains_key("x-trino-set-session"));
     assert_eq!(json(&terminal)["updateType"], "USE");
+    assert_eq!(json(&terminal)["stats"]["scheduled"], false);
     let captured = fixture.captured();
     assert_eq!(captured.input_catalog.as_deref(), Some("input_lake"));
     assert_eq!(captured.input_schema, "input_schema");

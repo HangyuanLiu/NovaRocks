@@ -9,7 +9,7 @@ date: 2026-10-28
 implementation-status: in-progress
 provenance:
   - "discussion: 2026-10-27 and 2026-10-28 client result presentation, session values and acknowledged HTTP pages"
-  - "reference: Trino 483, commit 32d4f28e8311ea6f67edca209df59a0493d869fa"
+  - "reference: Trino 483, commit 50b0b50b75abd47f830b7805ee1b51716eb4065e (annotated tag object 32d4f28e8311ea6f67edca209df59a0493d869fa)"
 code-anchors:
   - "novarocks/result-contract/src/render_schema.rs (ClientPresentationFamily, TrinoJsonFacts, ClientRenderSchema)"
   - "idl/novarocks/result.proto (ClientRenderSchema family and RenderPresentation)"
@@ -73,10 +73,11 @@ MySQL 仍保留自己的连接、写出和终结模型。ADR-0172 的原查询�
 3. **首次拉取准入规则。** `POST /v1/statement` 只校验 HTTP 输入、取得核心分配的查询 ID 并登记。首次 `GET` 才以会话值构造语句会话、准入并执行。Query Application 以不复用的 `ClientSessionKey` 保存所有会话，MySQL 连接另经索引供 `KILL` 查找。客户端查询 ID 与内部执行尝试 ID 保持不同职责；MySQL 的 `KILL <connection id>` 只寻址 MySQL 会话，服务排空及全体取消仍覆盖全部来源。
 4. **页确认规则。** 请求 token n+1 才确认第 n 页。相同 token 返回保留的同一份响应字节；更旧 token 返回 410，未知位置返回 404。所有带数据的页都提供 `nextUri`，包括结果读完时的最后一个数据页。正常结束页只在数据都已确认后生成，不带 `data` 和 `nextUri`；无数据的语句可直接结束。根段一经复制进页缓冲便按原投递协议确认，不能为 HTTP 重放扣住 BE 根段。
 5. **唯一结算规则。** 结果读到末尾时封存成功可见性；客户端请求结束页时才 `complete`。执行失败、客户端显式取消、放弃、结束页请求和服务取消之间只允许一次结算。`DELETE` 以 `ClientCancelRequested` 取消并返回 204，后续错误页为 `USER_CANCELED`；放弃以 `ClientDisconnected` 结算，后续为 `ABANDONED_QUERY`。已封存后的取消或放弃记为送达未完成，不推翻已决定的语句成功或已发生的外部效果。
-6. **结果窗口规则。** 保留页与正在组装的页共用该语句已经领取的结果窗口，扣除常驻根段、列描述与两个页信封后进行静态总额核对。达到页目标或总额不足时使用背压；没有保留页可释放、单行仍无法容纳时，以 `GENERIC_INSUFFICIENT_RESOURCES` 拒绝。结算后窗口随原语句释放，墓碑只保留结束页响应；登记与墓碑按放弃期限回收，不另设查询数量配额。资源退款仍以实际持有者退出为准。
+6. **结果窗口规则。** 保留页与正在组装的页共用该语句已经领取的结果窗口，Client 根段路径扣除两个常驻根段；Local / Internal 本地结果路径扣除原图 buffer 容量、schema backing、编码器暂存与适配器输出块，再扣列描述与两个页信封并进行静态总额核对。构造阶段原有 93 MiB 峰值检查保持不变。达到页目标或总额不足时使用背压；没有保留页可释放、单行仍无法容纳时，以 `GENERIC_INSUFFICIENT_RESOURCES` 拒绝。结算后窗口随原语句释放，墓碑只保留结束页响应；登记与墓碑按放弃期限回收，不另设查询数量配额。资源退款仍以实际持有者退出为准。
 7. **三类时间规则。** 执行等待只观察原查询期限与取消。每个 HTTP 响应 body 从首次 poll 起有 30 秒写出期限；写出失败或到期只中止这个响应，页继续保留，不向语句驱动发送取消。两次客户端请求间由独立的放弃期限约束，默认 300000 ms，针对查询的 `HEAD` 也刷新它；长轮询最多等待一秒新的完整行或状态。结算墓碑沿同一放弃期限移除。
-8. **会话值与变化规则。** catalog/schema 请求头只写入规范化名称，在真正解析或执行 `USE` 时检查存在性。请求头中的属性由原属性语义作者校验，时区校验后保存在会话值中。`USE` / `SET` 的实际执行者产出类型化变化，Trino 适配器投影 `X-Trino-Set-Catalog`、`Set-Schema`、`Set-Session`、`Clear-Session`；MySQL 连接会话在内部应用同一变化。查询返回的语句种类决定 `updateType`，不能从 SQL 前缀重猜；没有真实逻辑写计数时不填 `updateCount`。错误沿类型化映射投影，保留 NovaRocks 稳定错误码，不按错误文本分类。
-9. **本机服务规则。** Trino 监听固定绑定 `127.0.0.1`，只接受主机名为 `localhost`、`127.0.0.1` 或 `[::1]` 的 Host，允许可选数字端口；其余 Host 返回 403。语句用户须等于同一 `[standalone_server].user`，不匹配返回 401。通过检查后生成 URI，保留原本机名称和是否显式指定端口，数字端口规范化，例如 `localhost:0000008080` 生成 `localhost:8080`。该规范化界定输出信封，不能反向成为请求头长度限制。FE 先绑定 Trino 监听，再发出整体就绪标记；排空拒绝新的提交及尚未执行查询的首次拉取，已执行查询继续服务。最终清空登记并等待监听实际退出，不以发送关闭信号代替 Join。
+8. **会话值与变化规则。** catalog/schema 请求头只写入规范化名称，在真正解析或执行 `USE` 时检查存在性。请求头中的属性由原属性语义作者校验，时区校验后保存在会话值中。`USE` / `SET` 的实际执行者产出类型化变化，Trino 适配器投影 `X-Trino-Set-Catalog`、`Set-Schema`、`Set-Session`、`Clear-Session`；MySQL 连接会话在内部应用同一变化。查询返回的语句种类决定 `updateType`，不能从 SQL 前缀重猜；没有真实逻辑写计数时不填 `updateCount`。`USE` 同时清除旧 catalog 伪属性，`SET` 写回规范属性名并清理旧别名，不增加 SQL `RESET SESSION`。错误沿类型化映射投影，保留 NovaRocks 稳定错误码，不按错误文本分类。Trino 适配器只截断展示 detail，消息的 JSON 线上表示（含引号）最多 16 KiB；核心原始错误保持完整，截断时 FE 日志记录原文与客户端查询 ID。
+9. **统计事实规则。** 查询状态、排队和经过时间来自适配器实际生命周期；原语句 owner 尚未暴露 stage 调度遥测，因此 `scheduled` 为 `false`，不由驱动启动或非排队状态推断，其他无来源的数值保持 0。
+10. **本机服务规则。** Trino 监听固定绑定 `127.0.0.1`，只接受主机名为 `localhost`、`127.0.0.1` 或 `[::1]` 的 Host，允许可选数字端口；其余 Host 返回 403。语句用户须等于同一 `[standalone_server].user`，不匹配返回 401。通过检查后生成 URI，保留原本机名称和是否显式指定端口，数字端口规范化，例如 `localhost:0000008080` 生成 `localhost:8080`。该规范化界定输出信封，不能反向成为请求头长度限制。FE 先绑定 Trino 监听，再发出整体就绪标记；排空拒绝新的提交及尚未执行查询的首次拉取，已执行查询继续服务。最终清空登记并等待监听实际退出，不以发送关闭信号代替 Join。
 
 ## 接受的妥协（诚实记录）
 
