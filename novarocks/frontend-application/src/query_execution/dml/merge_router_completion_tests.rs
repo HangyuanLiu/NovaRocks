@@ -273,6 +273,90 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
         assertions, 1,
         "the frozen graph has one scoped target assertion"
     );
+    // The production sink-fact author retains the independent summary role
+    // and edge even while the complete production Router path stays refused.
+    let physical = finalized.physical_plan();
+    let router = physical
+        .fragments()
+        .values()
+        .find(|fragment| {
+            matches!(
+                fragment.sink(),
+                novarocks_physical_plan::FragmentSink::Router { .. }
+            )
+        })
+        .unwrap();
+    let novarocks_physical_plan::FragmentSink::Router {
+        routes, summary, ..
+    } = router.sink()
+    else {
+        unreachable!()
+    };
+    let sink_facts =
+        crate::native::fragment_encoder::frozen::tests::sink_targets_for_completed_fragment(
+            router,
+            physical.edges(),
+        )
+        .expect("the exact completed Router output facts");
+    assert_eq!(sink_facts.len(), routes.len() + 1);
+    for (route, target) in routes.iter().zip(sink_facts.iter()) {
+        assert_eq!(target.edge(), route.edge);
+        assert_eq!(
+            target.role(),
+            novarocks_physical_plan::OutputRole::ProviderRoute {
+                target: route.write_target_ordinal,
+            }
+        );
+    }
+    let summary_fact = sink_facts.last().unwrap();
+    let summary_edge = &physical.edges()[&summary.edge];
+    assert_eq!(summary_fact.edge(), summary.edge);
+    assert_eq!(
+        summary_fact.role(),
+        novarocks_physical_plan::OutputRole::LogicalSummary
+    );
+    assert_eq!(
+        summary_fact.target_fragment_id(),
+        summary_edge.destination.fragment.get()
+    );
+    assert_eq!(
+        summary_fact.target_exchange_node_id(),
+        i32::try_from(summary_edge.destination.node.get()).unwrap()
+    );
+    assert_eq!(
+        summary_fact.delivery(),
+        novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+    );
+    let mut wrong_role = physical.edges().clone();
+    wrong_role.get_mut(&summary.edge).unwrap().role =
+        novarocks_physical_plan::OutputRole::WriterResults;
+    assert!(
+        crate::native::fragment_encoder::frozen::tests::sink_targets_for_completed_fragment(
+            router,
+            &wrong_role
+        )
+        .is_err()
+    );
+    let mut wrong_port = physical.edges().clone();
+    wrong_port.get_mut(&summary.edge).unwrap().source.port =
+        novarocks_physical_plan::FragmentOutputPort::Root;
+    assert!(
+        crate::native::fragment_encoder::frozen::tests::sink_targets_for_completed_fragment(
+            router,
+            &wrong_port
+        )
+        .is_err()
+    );
+    let mut missing_summary = physical.edges().clone();
+    missing_summary.remove(&summary.edge);
+    assert!(
+        crate::native::fragment_encoder::frozen::tests::sink_targets_for_completed_fragment(
+            router,
+            &missing_summary
+        )
+        .is_err()
+    );
+
     let (plan, writer_routes) = finalized.into_parts();
     assert_eq!(writer_routes.len(), 2);
     let candidate = CompletedPhysicalPlanCandidate::for_sql_program(plan, &control)

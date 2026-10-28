@@ -155,6 +155,43 @@ impl CompiledWriterBindings {
                 "Task finish bindings do not cover exactly the program's table finishes",
             ));
         }
+        for (id, binding) in &self.finishers {
+            let ProgramNodeKind::TableFinish {
+                inputs,
+                input_roles,
+                count_mode,
+                ..
+            } = program.graph().nodes()[id.index()].kind()
+            else {
+                unreachable!("finish binding set was checked above");
+            };
+            let receiver = input_roles
+                .logical_summary
+                .and_then(|ordinal| inputs.get(ordinal as usize))
+                .and_then(|input| program.exchange_inputs().get(input));
+            let valid =
+                match (count_mode, receiver, &binding.logical_summary) {
+                    (
+                        novarocks_local_program::FinishCountMode::LogicalChanges,
+                        Some(receiver),
+                        Some(bound),
+                    ) => !bound.sources.is_empty()
+                        && receiver.role
+                            == novarocks_local_program::ProgramOutputRole::LogicalSummary
+                        && receiver.delivery
+                            == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                        && i32::try_from(receiver.receiver_node).ok() == Some(bound.receiver_node),
+                    (novarocks_local_program::FinishCountMode::LogicalChanges, _, _) => false,
+                    (_, None, None) => true,
+                    _ => false,
+                };
+            if !valid {
+                return Err(crate::exec::fragment::error::program_binding_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    "Task finish summary binding differs from its exact input role",
+                ));
+            }
+        }
         for (node, binding) in &self.writers {
             let recipe = &program.write_recipes()[node];
             if binding.handle().binding() != recipe.draft().binding() {
@@ -533,6 +570,7 @@ fn prepare_compiled_fragment_in(
             profiler: context.profiler.clone(),
             mem_tracker: context.mem_tracker.clone(),
             start_failure: context.start_failure(),
+            success_validator: None,
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
     }

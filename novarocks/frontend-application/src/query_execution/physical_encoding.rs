@@ -532,11 +532,10 @@ fn completed_plan_submission_fragments(
     let mut stream_edge_sources = BTreeSet::new();
     for edge in plan.edges().values() {
         match edge.kind {
-            EdgeKind::Stream => {
+            EdgeKind::Stream | EdgeKind::ChangeStreamRouter => {
                 stream_edge_sources.insert(edge.source.fragment.get());
             }
             EdgeKind::CteMulticast => {}
-            EdgeKind::ChangeStreamRouter => {}
         }
     }
     let mut fragments = Vec::with_capacity(plan.fragments().len());
@@ -566,9 +565,9 @@ fn completed_plan_submission_fragments(
 
 /// What submission encoding reads about a plan frozen into compiled packages.
 ///
-/// It is derived from the physical plan alone. The compiled carrier refuses
-/// CTE multicast and change-stream routing, so there is no consumer to patch
-/// and no router edge to carry.
+/// It is derived from the physical plan alone. Every declared routed output
+/// keeps its original producer; no placement or receiver is patched into the
+/// shared package. Unsupported sinks retain their separate admission refusal.
 fn compiled_plan_submission_facts(
     candidate: &novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     topology: &CompletedPlanTopology,
