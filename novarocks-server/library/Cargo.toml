@@ -40,7 +40,6 @@ novarocks-worker.workspace = true
 novarocks-workload-control.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
-atty = "0.2"
 chrono.workspace = true
 hex.workspace = true
 libc.workspace = true
