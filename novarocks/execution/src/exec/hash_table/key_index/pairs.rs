@@ -136,7 +136,7 @@ pub(super) fn compare_prepared_pairs(
     checkpoint()
 }
 
-fn physical_row(mapping: Option<&[usize]>, row: usize) -> ExecutionResult<usize> {
+pub(super) fn physical_row(mapping: Option<&[usize]>, row: usize) -> ExecutionResult<usize> {
     match mapping {
         Some(mapping) => mapping
             .get(row)
@@ -151,7 +151,7 @@ fn null_equal(a: bool, b: bool, policy: NullPolicy) -> Option<bool> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compare_fixed_pairs(
+pub(super) fn compare_fixed_pairs(
     a: &ArrayRef,
     am: Option<&[usize]>,
     left_rows: &[usize],

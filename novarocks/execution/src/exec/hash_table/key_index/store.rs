@@ -53,7 +53,7 @@ pub(super) struct OwnedByteColumn {
     page: OwnedBytesPage,
     storage: ValueTypeStorageLifetime,
 }
-struct ByteCreator {
+struct KeyColumnCreator {
     _binding: FunctionValueType,
     _storage: ValueTypeStorageLifetime,
 }
@@ -312,20 +312,8 @@ fn emit_pages<T: ByteLoan>(
         .map_err(|cause| ExecutionFailure::from(novarocks_functions::KernelFailure::from(cause)))?;
         // Attach this real finite creator to every exported Buffer alias, not
         // just to the page struct. The envelope never holds an input array.
-        let authority = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
-        let _prefix =
-            authority.reserve_operation(source_custody_prefix_facts().requests().bytes())?;
-        let mut work = EvaluationCheckpoints::new(control);
-        let creator = SourceBackingOwner::try_from_owned_direct(
-            ByteCreator {
-                _binding: binding.clone(),
-                _storage: storage.clone(),
-            },
-            Arc::clone(&host),
-            &mut work,
-        )?;
-        built.array = retain_source_backing(built.array, &creator, control)?;
-        work.finish()?;
+        built.array =
+            retain_created_array(built.array, &binding, &storage, Arc::clone(&host), control)?;
         let array = Arc::clone(&built.array);
         let defined = ReachableRows::all(array.len())
             .materialize_observed(
@@ -355,6 +343,32 @@ fn emit_pages<T: ByteLoan>(
     }
     checkpoint()?;
     Ok(pages)
+}
+
+/// Attach only this newly constructed column and its real finite creator.
+/// The caller already funded this same array's payload; the supplied original
+/// host pays the added custody metadata, never another payload invoice.
+pub(super) fn retain_created_array(
+    array: ArrayRef,
+    binding: &FunctionValueType,
+    storage: &ValueTypeStorageLifetime,
+    host: Arc<dyn AggregateStateAllocator>,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<ArrayRef> {
+    let authority = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
+    let _prefix = authority.reserve_operation(source_custody_prefix_facts().requests().bytes())?;
+    let mut work = EvaluationCheckpoints::new(control);
+    let creator = SourceBackingOwner::try_from_owned_direct(
+        KeyColumnCreator {
+            _binding: binding.clone(),
+            _storage: storage.clone(),
+        },
+        host,
+        &mut work,
+    )?;
+    let result = retain_source_backing(array, &creator, control)?;
+    work.finish()?;
+    Ok(result)
 }
 
 enum BindingFailure {

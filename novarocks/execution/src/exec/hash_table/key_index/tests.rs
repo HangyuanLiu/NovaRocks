@@ -1055,6 +1055,247 @@ impl novarocks_functions::KernelEvaluationControl for CopyControl {
     }
 }
 
+#[test]
+fn owned_fixed_decimal_rows_are_selected_copied_and_keep_exact_signed_parameters() {
+    use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Source {
+        values: Vec<i128>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(Source {
+        values: vec![0, 1230, 4560],
+        drops: drops.clone(),
+    });
+    let ptr = std::ptr::NonNull::new(source.values.as_ptr().cast_mut().cast::<u8>()).unwrap();
+    let bytes = source.values.len() * std::mem::size_of::<i128>();
+    // SAFETY: the immutable Vec<i128> provides correct alignment and extent;
+    // the custom owner keeps it alive for every Buffer clone and slice.
+    let payload = unsafe { Buffer::from_custom_allocation(ptr, bytes, source) };
+    let values: ArrayRef = Arc::new(
+        Decimal128Array::new(
+            ScalarBuffer::new(payload, 0, 3),
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .with_precision_and_scale(18, 3)
+        .unwrap(),
+    );
+    let ty = FunctionValueType::new(DataType::Decimal128(18, 3), true);
+    let keys = input(
+        &[values],
+        std::slice::from_ref(&ty),
+        &[2, 0, 1],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let stored = {
+        let prepared = PreparedKeyBatch::new(
+            &spec,
+            &keys,
+            AggregateAllocator::new(tracker.clone()),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let stored = super::fixed_store::OwnedFixedColumn::copy_selected(
+            &prepared,
+            0,
+            &[1, 0, 1],
+            owner.as_ref(),
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+            &CopyControl,
+        )
+        .unwrap();
+        let mut out = [0; 3];
+        stored
+            .compare_pairs(&prepared, 0, &[0, 2, 1], &[1, 0, 2], &mut out, &|| Ok(()))
+            .unwrap();
+        assert_eq!(out, [1, 0, 1]);
+        stored
+    };
+    drop(keys);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(
+        stored
+            .binding()
+            .exactly_equals_observed::<novarocks_type_contract::ValueTypeError>(&ty, || Ok(()))
+            .unwrap()
+    );
+    let values = stored
+        .array()
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 1230);
+    assert!(values.is_null(1));
+    assert_eq!(values.value(2), 1230);
+    assert!(!stored.storage().is_pure());
+}
+
+#[test]
+fn owned_fixed_float_and_non_uuid_fixed_binary_keep_values_and_canonical_equality() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Float64, false);
+    let keys = input(
+        &[Arc::new(Float64Array::from(vec![
+            -0.0,
+            0.0,
+            f64::from_bits(0x7ff8_0000_0000_0011),
+            f64::from_bits(0x7ff8_0000_0000_0022),
+        ]))],
+        std::slice::from_ref(&ty),
+        &[0, 1, 2, 3],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let stored = super::fixed_store::OwnedFixedColumn::copy_selected(
+        &prepared,
+        0,
+        &[0, 2],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &CopyControl,
+    )
+    .unwrap();
+    let mut out = [0; 3];
+    stored
+        .compare_pairs(&prepared, 0, &[1, 3, 1], &[0, 1, 1], &mut out, &|| Ok(()))
+        .unwrap();
+    assert_eq!(out, [1, 1, 0]);
+    let actual = stored
+        .array()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(actual.value(0).to_bits(), (-0.0f64).to_bits());
+    assert_eq!(actual.value(1).to_bits(), 0x7ff8_0000_0000_0011);
+    let a = [1u8; 32];
+    let mut b = a;
+    b[31] = 2;
+    let array: ArrayRef = Arc::new(
+        FixedSizeBinaryArray::try_from_iter([a.as_slice(), b.as_slice()].into_iter()).unwrap(),
+    );
+    let ty = FunctionValueType::new(DataType::FixedSizeBinary(32), false);
+    let keys = input(&[array], std::slice::from_ref(&ty), &[0, 1], owner.as_ref());
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let stored = super::fixed_store::OwnedFixedColumn::copy_selected(
+        &prepared,
+        0,
+        &[1],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+        &CopyControl,
+    )
+    .unwrap();
+    assert_eq!(stored.binding().data_type(), &DataType::FixedSizeBinary(32));
+    assert_eq!(
+        stored
+            .array()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap()
+            .value(0),
+        b
+    );
+    let mut out = [0; 2];
+    stored
+        .compare_pairs(&prepared, 0, &[0, 1], &[0, 0], &mut out, &|| Ok(()))
+        .unwrap();
+    assert_eq!(out, [0, 1]);
+}
+
+#[test]
+fn owned_fixed_copy_preserves_original_control_and_construction_refusals() {
+    struct Stop;
+    impl novarocks_functions::KernelEvaluationControl for Stop {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Err(novarocks_functions::KernelFailure::DeadlineExceeded)
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("copy never waits")
+        }
+    }
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::UInt64, false);
+    let keys = input(
+        &[Arc::new(UInt64Array::from(vec![u64::MAX, 7]))],
+        std::slice::from_ref(&ty),
+        &[0, 1],
+        owner.as_ref(),
+    );
+    let spec = KeySpec::new(&[ty], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let error = super::fixed_store::OwnedFixedColumn::copy_selected(
+        &prepared,
+        0,
+        &[0],
+        owner.as_ref(),
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone()),
+        &Stop,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error,
+        ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded)
+    );
+    let cause: ExecutionFailure = ConstructionFailure::Control(
+        novarocks_type_contract::CompileControlError::ResourceExhausted,
+    )
+    .into();
+    let refusing = RefusingOwner(owner.as_ref(), cause.clone());
+    let error = super::fixed_store::OwnedFixedColumn::copy_selected(
+        &prepared,
+        0,
+        &[0],
+        &refusing,
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker),
+        &CopyControl,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&error),
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause)
+    );
+}
+
 struct TaggedCreator<'a> {
     original: &'a dyn InputConstructionOwner,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
