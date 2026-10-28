@@ -30,6 +30,7 @@ mod owned_batch;
 mod pairs;
 mod prepared;
 mod read;
+mod sizing;
 mod statistics;
 mod store;
 mod table;
