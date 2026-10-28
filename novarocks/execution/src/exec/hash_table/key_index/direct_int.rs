@@ -352,6 +352,7 @@ pub(super) struct Storage {
     null_present: AtomicBool,
     null_id: AtomicUsize,
     null_representative: OnceLock<Option<ArrayRef>>,
+    completed_ids: OnceLock<usize>,
     failed: Mutex<Option<ExecutionFailure>>,
     _storage: ValueTypeStorageLifetime,
 }
@@ -397,6 +398,7 @@ impl Storage {
                 null_present: AtomicBool::new(false),
                 null_id: AtomicUsize::new(0),
                 null_representative: OnceLock::new(),
+                completed_ids: OnceLock::new(),
                 failed: Mutex::new(None),
                 _storage: work.owner.storage_lifetime(),
             },
@@ -579,7 +581,7 @@ impl Storage {
                 return Err(invariant(ValueViolation::RowTransaction));
             }
             let has_null = self.null_present.load(Ordering::Acquire);
-            nonnull_classes
+            let class_count = nonnull_classes
                 .checked_add(usize::from(has_null))
                 .ok_or_else(arithmetic)?;
             let array = if has_null {
@@ -621,12 +623,151 @@ impl Storage {
             self.null_representative
                 .set(array)
                 .map_err(|_| invariant(ValueViolation::RowTransaction))?;
-            checkpoint(work)
+            checkpoint(work)?;
+            self.completed_ids
+                .set(class_count)
+                .map_err(|_| invariant(ValueViolation::RowTransaction))
         })();
         if let Err(cause) = &result {
             self.latch(cause.clone());
         }
         result
+    }
+}
+
+// This private coordinate keeps REPRESENTATIVE_ROWS inside its constructing
+// author. A NULL page is the original typed one-row array, never a fake value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum DirectPageId {
+    Values { shard: usize, page: usize },
+    Null,
+}
+impl Storage {
+    /// This records constructed representative data only. Main still owns the
+    /// complete input/task barriers and immutable Ready publication.
+    pub(super) fn id_count_after_fill(&self) -> ExecutionResult<usize> {
+        self.check_failure()?;
+        if self.geometry.purpose != IndexPurpose::KeyIds {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        self.completed_ids
+            .get()
+            .copied()
+            .ok_or_else(|| invariant(ValueViolation::RowTransaction))
+    }
+    fn locate_id(
+        &self,
+        id: KeyId,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<(DirectPageId, usize)> {
+        checkpoint()?;
+        let count = self.id_count_after_fill()?;
+        if id.index() >= count {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        if self.null_array()?.is_some() && id.index() == self.null_id.load(Ordering::Acquire) {
+            return Ok((DirectPageId::Null, 0));
+        }
+        // Find the first exclusive class end above this ID. Empty shards may
+        // share bases/ends, so searching only by base would choose the wrong one.
+        let mut lower = 0usize;
+        let mut upper = self.geometry.shards;
+        while lower < upper {
+            checkpoint()?;
+            let middle = lower + (upper - lower) / 2;
+            let representatives = self.representatives(middle)?;
+            let end = representatives
+                .base
+                .checked_add(representatives.len)
+                .ok_or_else(arithmetic)?;
+            if end <= id.index() {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        let representatives = self.representatives(lower)?;
+        let local = id
+            .index()
+            .checked_sub(representatives.base)
+            .filter(|local| *local < representatives.len)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        Ok((
+            DirectPageId::Values {
+                shard: lower,
+                page: local / REPRESENTATIVE_ROWS,
+            },
+            local % REPRESENTATIVE_ROWS,
+        ))
+    }
+    fn read_array(&self, page: DirectPageId) -> ExecutionResult<&ArrayRef> {
+        match page {
+            DirectPageId::Values { shard, page } => self
+                .representatives(shard)?
+                .pages
+                .get(page)
+                .ok_or_else(|| invariant(ValueViolation::Bounds)),
+            DirectPageId::Null => self
+                .null_array()?
+                .ok_or_else(|| invariant(ValueViolation::Bounds)),
+        }
+    }
+    /// Borrow exact immutable representative arrays in requested ID order.
+    /// Every location is O(log W); no slot scan, per-key Arrow array or codec.
+    pub(super) fn read_keys(
+        &self,
+        ids: &[KeyId],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::read::OwnedKeyReadBatch<'_>> {
+        self.id_count_after_fill()?;
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
+        let mut coordinates = vector(owner, ids.len())?;
+        for (ordinal, &id) in ids.iter().enumerate() {
+            checkpoint_at(ordinal, &checkpoint)?;
+            let (page, row) = self.locate_id(id, &checkpoint)?;
+            coordinates.push(super::read::PositionedRow {
+                page,
+                selected: super::read::KeyReadRow { ordinal, row },
+            });
+        }
+        let mut pages = Vec::new();
+        super::read::append_positioned_pages(
+            coordinates,
+            |page| {
+                Ok(super::read::KeyReadValues::Fixed {
+                    array: self.read_array(page)?,
+                    binding: &self.binding,
+                })
+            },
+            &mut pages,
+            owner,
+            &checkpoint,
+        )?;
+        let mut columns = vector(owner, 1)?;
+        columns.push(super::read::KeyReadColumn { pages });
+        checkpoint()?;
+        Ok(super::read::OwnedKeyReadBatch {
+            columns,
+            len: ids.len(),
+            _storage: owner.storage_lifetime(),
+        })
+    }
+    /// The existing output author enforces exact signed target/NULL semantics
+    /// and owns actual selected copy plus result/Buffer creator custody.
+    pub(super) fn export_keys(
+        &self,
+        ids: &[KeyId],
+        targets: &[FunctionValueType],
+        owner: &dyn InputConstructionOwner,
+        host: Arc<dyn AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::ExportedKeys> {
+        self.check_failure()?;
+        super::export::validate_targets(&self.spec, targets, control)?;
+        let read = self.read_keys(ids, owner, control)?;
+        super::export::construct(&read, &self.spec, targets, owner, host, control)
     }
 }
 
@@ -1341,3 +1482,7 @@ fn copy_error(cause: CopyConstructionError<ExecutionFailure>) -> ExecutionFailur
 #[cfg(test)]
 #[path = "direct_int_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "direct_read_tests.rs"]
+mod read_tests;

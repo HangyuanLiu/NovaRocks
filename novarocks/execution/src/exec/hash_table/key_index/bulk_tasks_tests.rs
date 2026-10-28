@@ -261,6 +261,39 @@ fn direct_graph_uses_multiple_real_workers_and_preserves_all_physical_occurrence
         .enumerate()
         .map(|(id, value)| (*value, KeyId(id)))
         .collect();
+    let requested = [
+        KeyId(values.len()),
+        KeyId(0),
+        KeyId(values.len() - 1),
+        KeyId(0),
+    ];
+    let read = ready
+        .read_keys(&requested, owner.as_ref(), &Control)
+        .unwrap();
+    assert_eq!(read.len(), requested.len());
+    drop(read);
+    let exported = ready
+        .export_keys(
+            &requested,
+            &[FunctionValueType::new(DataType::Int64, true)],
+            owner.as_ref(),
+            expression_allocation_host(tracker.clone()),
+            &Control,
+        )
+        .unwrap();
+    assert_eq!(
+        exported.arrays()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap(),
+        &Int64Array::from(vec![
+            None,
+            values.first().copied(),
+            values.last().copied(),
+            values.first().copied()
+        ])
+    );
+    drop(exported);
     assert_eq!(
         ready.lookup_integer(None).unwrap(),
         KeyMatch::Found(KeyId(values.len()))
@@ -336,6 +369,10 @@ fn presence_graph_publishes_after_mark_without_ranking_representatives_or_assign
     assert!(ready.contains_integer(Some(0)).unwrap());
     assert!(!ready.contains_integer(Some(100_000)).unwrap());
     assert_eq!(ready.assignments().count(), 0);
+    assert_eq!(
+        error(ready.read_keys(&[], owner.as_ref(), &Control)).failure_fact(),
+        ValueError::Invariant(ValueViolation::Layout).failure_fact()
+    );
     assert_eq!(
         error(ready.lookup_integer(Some(0))).failure_fact(),
         ValueError::Invariant(ValueViolation::Layout).failure_fact()

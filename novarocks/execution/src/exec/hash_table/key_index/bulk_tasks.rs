@@ -30,10 +30,11 @@ use super::{
     vector,
 };
 use crate::{
-    exec::pipeline::operator::ConstructionFailure,
+    exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
     runtime::fragment::{ExecutionFailure, ExecutionResult},
 };
-use novarocks_type_contract::ValueTypeStorageLifetime;
+use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl};
+use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::ValueViolation;
 use std::{
     num::NonZeroUsize,
@@ -675,6 +676,24 @@ pub(super) struct DirectReady {
     store: Arc<direct_int::Storage>,
 }
 impl DirectReady {
+    pub(super) fn read_keys(
+        &self,
+        ids: &[super::KeyId],
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::OwnedKeyReadBatch<'_>> {
+        self.store.read_keys(ids, owner, control)
+    }
+    pub(super) fn export_keys(
+        &self,
+        ids: &[super::KeyId],
+        targets: &[FunctionValueType],
+        owner: &dyn InputConstructionOwner,
+        host: Arc<dyn AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::ExportedKeys> {
+        self.store.export_keys(ids, targets, owner, host, control)
+    }
     pub(super) fn contains_integer(&self, value: Option<i64>) -> ExecutionResult<bool> {
         self.store.contains_value_after_mark(value)
     }

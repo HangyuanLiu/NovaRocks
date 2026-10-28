@@ -542,3 +542,246 @@ fn compact_preserves_actual_nullable_page_declarations_when_spec_root_is_require
         assert_value_failure(&error, novarocks_value_arrays::ValueViolation::RequiredNull);
     }
 }
+
+fn location_texts(read: &OwnedKeyReadBatch<'_>) -> Vec<Option<String>> {
+    let mut ordered = vec![None; read.len()];
+    for page in read.columns()[0].pages() {
+        let KeyReadValues::Bytes { array, .. } = page.values() else {
+            panic!("expected the original typed byte page")
+        };
+        let values = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+        for selected in page.rows() {
+            let value =
+                (!values.is_null(selected.row)).then(|| values.value(selected.row).to_owned());
+            assert!(ordered[selected.ordinal].replace(value).is_none());
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|v| v.expect("every requested ordinal is present"))
+        .collect()
+}
+
+#[test]
+fn class_location_compact_tail_and_recompact_keep_collision_ids_and_ordered_values() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index = KeyIndex::new(
+        spec.clone(),
+        IndexPurpose::KeyIds,
+        tracker.clone(),
+        owner.as_ref(),
+    )
+    .unwrap();
+    for values in [
+        vec![Some("gamma"), None],
+        vec![Some("alpha"), Some("gamma")],
+    ] {
+        let keys = input(
+            &[Arc::new(StringArray::from(values))],
+            std::slice::from_ref(&ty),
+            &[0, 1],
+            owner.as_ref(),
+        );
+        insert(&mut index, &keys, &tracker, owner.as_ref());
+    }
+    assert_eq!(index.len(), 3);
+    let before = super::super::local_hash::BYTE_HASH_INITS.with(Cell::get);
+    index.compact(owner.as_ref(), &CopyControl).unwrap();
+    assert_eq!(
+        super::super::local_hash::BYTE_HASH_INITS.with(Cell::get),
+        before
+    );
+    let ids = [KeyId(2), KeyId(0), KeyId(2), KeyId(1)];
+    let read = index.read_keys(&ids, owner.as_ref(), &CopyControl).unwrap();
+    assert_eq!(
+        location_texts(&read),
+        vec![
+            Some("alpha".into()),
+            Some("gamma".into()),
+            Some("alpha".into()),
+            None
+        ]
+    );
+    drop(read);
+
+    let keys = input(
+        &[Arc::new(StringArray::from(vec![
+            Some("delta"),
+            Some("alpha"),
+            Some("epsilon"),
+            Some("delta"),
+            None,
+        ]))],
+        std::slice::from_ref(&ty),
+        &[2, 0, 1, 4, 3, 0],
+        owner.as_ref(),
+    );
+    let prepared = PreparedKeyBatch::new(
+        &spec,
+        &keys,
+        AggregateAllocator::new(tracker.clone()),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let hashes = index_hash(&keys, &index, &tracker, owner.as_ref()).force_hash(0);
+    let before = super::super::local_hash::BYTE_HASH_INITS.with(Cell::get);
+    let inserted = index
+        .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+        .unwrap();
+    let expected = [
+        KeyMatch::Found(KeyId(3)),
+        KeyMatch::Found(KeyId(4)),
+        KeyMatch::Found(KeyId(2)),
+        KeyMatch::Found(KeyId(1)),
+        KeyMatch::Found(KeyId(4)),
+        KeyMatch::Found(KeyId(4)),
+    ];
+    assert_eq!(inserted.matches(), &expected);
+    assert_eq!(
+        inserted.new_keys(),
+        &[
+            NewKey {
+                occurrence: 0,
+                row: 2,
+                id: KeyId(3)
+            },
+            NewKey {
+                occurrence: 1,
+                row: 0,
+                id: KeyId(4)
+            },
+        ]
+    );
+    assert_eq!(index.len(), 5);
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &expected
+    );
+    let prefix_and_tail = index
+        .read_class_range(1..4, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(
+        location_texts(&prefix_and_tail),
+        vec![None, Some("alpha".into()), Some("epsilon".into())]
+    );
+    drop(prefix_and_tail);
+    index.compact(owner.as_ref(), &CopyControl).unwrap();
+    assert_eq!(
+        index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+            .unwrap()
+            .matches(),
+        &expected
+    );
+    let range = index
+        .read_class_range(1..4, owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(
+        location_texts(&range),
+        vec![None, Some("alpha".into()), Some("epsilon".into())]
+    );
+    drop(range);
+    let ids = [KeyId(4), KeyId(2), KeyId(0), KeyId(3), KeyId(1), KeyId(4)];
+    let read = index.read_keys(&ids, owner.as_ref(), &CopyControl).unwrap();
+    let expected_values = vec![
+        Some("delta".to_owned()),
+        Some("alpha".to_owned()),
+        Some("gamma".to_owned()),
+        Some("epsilon".to_owned()),
+        None,
+        Some("delta".to_owned()),
+    ];
+    assert_eq!(location_texts(&read), expected_values);
+    drop(read);
+    let exported = index
+        .export_keys(&ids, &[ty], owner.as_ref(), &CopyControl)
+        .unwrap();
+    assert_eq!(
+        exported.arrays()[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(str::to_owned))
+            .collect::<Vec<_>>(),
+        expected_values
+    );
+    assert_eq!(
+        super::super::local_hash::BYTE_HASH_INITS.with(Cell::get),
+        before
+    );
+}
+
+#[test]
+fn class_range_fixed_reads_keep_local_ordinals_and_refuse_only_invalid_coordinates() {
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let spec = KeySpec::new(
+        std::slice::from_ref(&ty),
+        &[NullPolicy::Equal],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index =
+        KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
+    for value in [40, 10, 30, 20] {
+        let keys = input(
+            &[Arc::new(Int32Array::from(vec![value]))],
+            std::slice::from_ref(&ty),
+            &[0],
+            owner.as_ref(),
+        );
+        insert(&mut index, &keys, &tracker, owner.as_ref());
+    }
+    for compacted in [false, true] {
+        if compacted {
+            index.compact(owner.as_ref(), &CopyControl).unwrap();
+        }
+        let range = index
+            .read_class_range(1..3, owner.as_ref(), &CopyControl)
+            .unwrap();
+        let mut values = vec![None; range.len()];
+        for page in range.columns()[0].pages() {
+            let KeyReadValues::Fixed { array, .. } = page.values() else {
+                panic!("expected a typed fixed loan")
+            };
+            let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            for selected in page.rows() {
+                assert!(
+                    values[selected.ordinal]
+                        .replace(array.value(selected.row))
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(values, vec![Some(10), Some(30)]);
+        drop(range);
+        assert_eq!(
+            index
+                .read_class_range(4..4, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .len(),
+            0
+        );
+        for invalid in [std::ops::Range { start: 3, end: 2 }, 0..5] {
+            let error = index
+                .read_class_range(invalid, owner.as_ref(), &CopyControl)
+                .err()
+                .unwrap();
+            assert_value_failure(&error, ValueViolation::Bounds);
+        }
+    }
+}

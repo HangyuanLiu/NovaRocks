@@ -91,9 +91,9 @@ pub(super) struct ReadRequest {
     pub(super) row: usize,
 }
 #[derive(Clone, Copy)]
-struct PageRequest {
-    page: usize,
-    selected: KeyReadRow,
+pub(super) struct PositionedRow<P> {
+    pub(super) page: P,
+    pub(super) selected: KeyReadRow,
 }
 
 /// Both closures are monomorphized after the column strategy has been chosen.
@@ -111,7 +111,7 @@ pub(super) fn append_pages<'a>(
     for (i, request) in requests.iter().enumerate() {
         checkpoint_at(i, checkpoint)?;
         let (page, row) = position(request.row)?;
-        ordered.push(PageRequest {
+        ordered.push(PositionedRow {
             page,
             selected: KeyReadRow {
                 ordinal: request.ordinal,
@@ -119,6 +119,20 @@ pub(super) fn append_pages<'a>(
             },
         });
     }
+    append_positioned_pages(ordered, page, output, owner, checkpoint)
+}
+
+/// Group already-resolved real page coordinates. Hash and direct stores share
+/// this author; the coordinate type does not grant access or fabricate a batch.
+/// The caller funded the moved coordinate Vec through the same actual owner.
+pub(super) fn append_positioned_pages<'a, P: Copy + Ord>(
+    mut ordered: Vec<PositionedRow<P>>,
+    page: impl Fn(P) -> ExecutionResult<KeyReadValues<'a>>,
+    output: &mut Vec<KeyReadPage<'a>>,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
     sort_by_key(&mut ordered, owner, checkpoint, |r| {
         (r.page, r.selected.ordinal)
     })?;

@@ -40,7 +40,7 @@ use hashbrown::HashTable;
 use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl};
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use novarocks_value_arrays::ValueViolation;
-use std::sync::Arc;
+use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
 // Work segmentation only. All further occurrences and collision candidates
 // continue in subsequent turns; no input or collision limit follows from it.
@@ -107,6 +107,13 @@ struct StoredKey {
 struct Class {
     key: StoredKey,
     next: Option<usize>,
+}
+/// Immutable coordinates for the already compacted class prefix. Chunk rows
+/// are work/storage geometry, never a limit on legal keys or input rows.
+#[derive(Clone, Copy)]
+struct CompactedPrefix {
+    classes: usize,
+    chunk_rows: NonZeroUsize,
 }
 struct Pending {
     row: usize,
@@ -179,6 +186,7 @@ pub(crate) struct KeyIndex {
     directory: HashTable<Directory, AggregateAllocator>,
     classes: AggregateVec<Class>,
     batches: AggregateVec<Arc<OwnedKeyBatch>>,
+    compacted: Option<CompactedPrefix>,
     allocator: AggregateAllocator,
     host: Arc<dyn AggregateStateAllocator>,
     failed: Option<ExecutionFailure>,
@@ -236,6 +244,7 @@ impl KeyIndex {
             directory: HashTable::new_in(allocator.clone()),
             classes: AggregateVec::new_in(allocator.clone()),
             batches: AggregateVec::new_in(allocator.clone()),
+            compacted: None,
             allocator,
             host: expression_allocation_host(tracker),
             failed: None,
@@ -250,6 +259,24 @@ impl KeyIndex {
     }
     pub(crate) fn len(&self) -> usize {
         self.classes.len()
+    }
+    /// The sole owner of class-to-representative coordinates. Old Class.key
+    /// values in a compacted prefix are only dormant numeric coordinates;
+    /// later incremental classes keep their original append-tail locations.
+    fn key_location(&self, handle: usize) -> ExecutionResult<StoredKey> {
+        let class = self
+            .classes
+            .get(handle)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if let Some(prefix) = self.compacted
+            && handle < prefix.classes
+        {
+            return Ok(StoredKey {
+                batch: handle / prefix.chunk_rows.get(),
+                row: handle % prefix.chunk_rows.get(),
+            });
+        }
+        Ok(class.key)
     }
     fn check(&self) -> ExecutionResult<()> {
         match &self.failed {
@@ -285,16 +312,51 @@ impl KeyIndex {
         let mut requests = vector(owner, ids.len())?;
         for (ordinal, id) in ids.iter().enumerate() {
             checkpoint_at(ordinal, &checkpoint)?;
-            let class = self
-                .classes
-                .get(id.index())
-                .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+            let location = self.key_location(id.index())?;
             requests.push(super::read::ReadRequest {
                 ordinal,
-                batch: class.key.batch,
-                row: class.key.row,
+                batch: location.batch,
+                row: location.row,
             });
         }
+        self.read_requests(requests, ids.len(), owner, control)
+    }
+    /// Borrow one contiguous class interval in local output-ordinal order.
+    /// This avoids an intermediate KeyId vector; materialization remains with
+    /// the original compact author and no task/Ready protocol is created here.
+    pub(super) fn read_class_range(
+        &self,
+        classes: Range<usize>,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::read::OwnedKeyReadBatch<'_>> {
+        self.check()?;
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
+        checkpoint()?;
+        if classes.start > classes.end || classes.end > self.classes.len() {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        let len = classes.end - classes.start;
+        let mut requests = vector(owner, len)?;
+        for (ordinal, handle) in classes.enumerate() {
+            checkpoint_at(ordinal, &checkpoint)?;
+            let location = self.key_location(handle)?;
+            requests.push(super::read::ReadRequest {
+                ordinal,
+                batch: location.batch,
+                row: location.row,
+            });
+        }
+        self.read_requests(requests, len, owner, control)
+    }
+    fn read_requests(
+        &self,
+        mut requests: Vec<super::read::ReadRequest>,
+        len: usize,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::read::OwnedKeyReadBatch<'_>> {
+        let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
         super::prepared::sort_by_key(&mut requests, owner, &checkpoint, |r| (r.batch, r.ordinal))?;
         let mut columns = vector(owner, self.spec.types().len())?;
         for column in 0..self.spec.types().len() {
@@ -325,7 +387,7 @@ impl KeyIndex {
         checkpoint()?;
         Ok(super::read::OwnedKeyReadBatch {
             columns,
-            len: ids.len(),
+            len,
             _storage: owner.storage_lifetime(),
         })
     }
@@ -387,12 +449,7 @@ impl KeyIndex {
         if self.classes.is_empty() {
             return checkpoint();
         }
-        let mut ids = vector(owner, self.classes.len())?;
-        for id in 0..self.classes.len() {
-            checkpoint_at(id, &checkpoint)?;
-            ids.push(KeyId(id));
-        }
-        let read = self.read_representatives(&ids, owner, control)?;
+        let read = self.read_class_range(0..self.classes.len(), owner, control)?;
         let batch =
             super::compact::gather(&read, &self.spec, owner, Arc::clone(&self.host), control)?;
         if batch.len() != self.classes.len() {
@@ -403,15 +460,19 @@ impl KeyIndex {
         reserve_state(&mut replacement, 1, &checkpoint)?;
         replacement.push(batch);
         drop(read);
-        // Only locations change. The immutable full/table hashes, collision
-        // links and class IDs remain exact. Failure during this commit latches
-        // the entire index; its partially changed prefix is never readable.
+        // This synchronous path still gathers one batch. Installing its
+        // prefix geometry avoids rewriting every Class.key; full/table hashes,
+        // collision links and first-occurrence dense IDs remain unchanged.
+        // Parallel chunk tasks and resumable materialization are not provided
+        // by this location prerequisite.
+        let prefix = CompactedPrefix {
+            classes: self.classes.len(),
+            chunk_rows: NonZeroUsize::new(self.classes.len().max(1))
+                .expect("class chunk size is positive"),
+        };
         checkpoint()?;
-        for (row, class) in self.classes.iter_mut().enumerate() {
-            checkpoint_at(row, &checkpoint)?;
-            class.key = StoredKey { batch: 0, row };
-        }
         self.batches = replacement;
+        self.compacted = Some(prefix);
         checkpoint()
     }
     /// Mutation publishes a complete result or permanently latches its first
@@ -631,10 +692,11 @@ impl KeyIndex {
                     .classes
                     .get(handle)
                     .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+                let location = self.key_location(handle)?;
                 Ok(Node {
                     handle,
-                    batch: class.key.batch,
-                    row: class.key.row,
+                    batch: location.batch,
+                    row: location.row,
                     next: class.next,
                 })
             },
