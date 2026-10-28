@@ -688,6 +688,19 @@ impl NativeTaskExecutionHost {
                 "local compiler rejected a fragment invariant"
             );
         }
+        if let Err(CompiledPackageError::Compile(
+            novarocks_local_compiler::FragmentCompileError::Unsupported { node, feature },
+        )) = &compiled
+        {
+            // Both fields are static compiler vocabulary, never Provider payload.
+            tracing::warn!(
+                task = %identity,
+                pipeline_dop = descriptor.pipeline_dop().get(),
+                node = ?node,
+                feature = *feature,
+                "local compiler rejected an unsupported fragment"
+            );
+        }
         let compiled = compiled.map_err(|error| compiled_package_rejection(identity, error))?;
         let program = compiled.program();
         let runtime_filters = &compiled.runtime_filters;

@@ -446,6 +446,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel::try_new(&control)
             .unwrap();
     let mut actual_writers = std::collections::BTreeSet::new();
+    let mut compiled_finishes = 0;
     for fragment in encoded.native.fragment_ids() {
         let artifact = encoded.native.get(fragment).unwrap();
         let carried = novarocks_task_codec::creation::decode_static_package(
@@ -477,7 +478,123 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             assert_eq!(recipe.input(), sealed.input());
             actual_writers.insert((fragment, node, target.write_target_ordinal));
         }
+        let root = &package.fragment().nodes()[&package.fragment().root()];
+        if let novarocks_physical_plan::NodeKind::TableFinish(spec) = &root.kind {
+            use novarocks_functions::{
+                EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
+            };
+            use novarocks_local_program::{ProgramNodeKind, ProgramOutputRole};
+            let expected_roles = spec.inputs;
+            let expected_targets = spec.expected_target_ordinals.clone();
+            assert!(
+                package.writes().is_empty(),
+                "finish carries no provider recipe"
+            );
+
+            // The finish binds no function. Retain a real sealed nonempty
+            // subset, using the original catalog's installed declarations.
+            let definition = functions.definition("rand", FunctionKind::Scalar).unwrap();
+            let declaration = definition.binding_declaration().unwrap();
+            let installed = declaration
+                .overloads()
+                .iter()
+                .map(|overload| {
+                    let pure = functions
+                        .pure_overload_declaration_observed(
+                            declaration.function_id(),
+                            declaration.kind(),
+                            &overload.identity,
+                            &control,
+                        )
+                        .unwrap();
+                    InstalledPureKernel {
+                        function: declaration.function_id().clone(),
+                        kind: declaration.kind(),
+                        implementation: pure.implementation().clone(),
+                        aggregate_state_format: overload
+                            .aggregate
+                            .as_ref()
+                            .map(|aggregate| aggregate.state_format.clone()),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut subset = EngineFunctionCatalogBuilder::new();
+            subset.register(definition.clone()).unwrap();
+            let pure_functions = subset.seal_pure(installed).unwrap();
+            let providers = novarocks_connector_contract::PureProviderProgramCatalog::<
+                std::io::Error,
+            >::try_new(&[], vec![], &control)
+            .unwrap();
+            let validated = novarocks_local_compiler::validate_fragment_providers(
+                std::sync::Arc::new(package),
+                &providers,
+                &control,
+            )
+            .expect("the real decoded finish requires no provider capability");
+            let program = novarocks_local_compiler::compile_fragment(
+                validated,
+                &pure_functions,
+                novarocks_local_compiler::LocalCompileOptions {
+                    pipeline_dop: std::num::NonZeroUsize::new(1).unwrap(),
+                    root_sink_dop: std::num::NonZeroUsize::new(1),
+                    kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
+                    constants: crate::application::test_constant_policy(),
+                    exchange_wait: std::time::Duration::from_secs(60),
+                },
+                &control,
+            )
+            .expect("the production SQL finish compiles from its normal Native package");
+            let ProgramNodeKind::TableFinish {
+                inputs,
+                input_roles,
+                expected_targets: actual_targets,
+                writer_multiplex_layout,
+                ..
+            } = program.graph().nodes()[program.graph().root().index()].kind()
+            else {
+                panic!("the compiled finish retains its root purpose")
+            };
+            assert_eq!(*input_roles, expected_roles);
+            assert_eq!(actual_targets.as_slice(), expected_targets.as_ref());
+            assert_eq!(actual_targets.len(), 2);
+            let writer =
+                &program.graph().nodes()[inputs[input_roles.writer_results as usize].index()];
+            assert!(matches!(writer.kind(), ProgramNodeKind::UnionAll { .. }));
+            let expected_relation =
+                novarocks_spi::connector::write_stack::WriterMultiplexSchema::try_new(vec![])
+                    .expect("the original statement requests no auxiliary statistics");
+            expected_relation
+                .validate_exact_arrow_schema(writer.output_layout().schema())
+                .expect("the real SQL merger publishes the exact writer protocol purpose");
+            expected_relation
+                .validate_exact_arrow_schema(writer_multiplex_layout.schema())
+                .expect("the real SQL finish consumes the exact writer protocol purpose");
+            assert_eq!(
+                writer.output_layout().slots(),
+                writer_multiplex_layout.slots()
+            );
+            assert_eq!(
+                writer.output_layout().schema(),
+                writer_multiplex_layout.schema()
+            );
+            let summary_port = input_roles.logical_summary.unwrap();
+            assert_ne!(summary_port, input_roles.writer_results);
+            let summary = inputs[summary_port as usize];
+            assert!(matches!(
+                program.graph().nodes()[summary.index()].kind(),
+                ProgramNodeKind::ExchangeSource { .. }
+            ));
+            assert_eq!(
+                program.exchange_inputs()[&summary].role,
+                ProgramOutputRole::LogicalSummary
+            );
+            compiled_finishes += 1;
+        }
     }
+    assert_eq!(
+        compiled_finishes, 1,
+        "the actual SQL author emits one finish"
+    );
     assert_eq!(actual_writers, expected_writers.iter().copied().collect());
     crate::query_execution::artifact::TaskManifestBinding::assert_completed_router_placements_for_test(
         encoded, router_fragment, expected_summary, &expected_writers,
