@@ -21,6 +21,8 @@ use super::*;
 mod compact_tests;
 #[path = "export_tests.rs"]
 mod export_tests;
+#[path = "hash_layout_index_tests.rs"]
+mod hash_layout_index_tests;
 #[path = "statistics_tests.rs"]
 mod statistics_tests;
 use crate::{

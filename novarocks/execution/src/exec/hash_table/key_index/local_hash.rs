@@ -111,6 +111,12 @@ pub(crate) struct LocalHashBatch {
 }
 impl LocalHashBatch {
     #[cfg(test)]
+    pub(super) fn with_hashes_for_test(mut self, hashes: &[u64]) -> Self {
+        assert_eq!(self.hashes.len(), hashes.len());
+        self.hashes.copy_from_slice(hashes);
+        self
+    }
+    #[cfg(test)]
     pub(super) fn force_hash(mut self, value: u64) -> Self {
         self.hashes.fill(value);
         self

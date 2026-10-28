@@ -22,6 +22,9 @@ mod canonical_store;
 mod compact;
 mod export;
 mod fixed_store;
+mod hash_layout;
+#[cfg(test)]
+mod hash_layout_public_tests;
 mod local_hash;
 mod owned_batch;
 mod pairs;

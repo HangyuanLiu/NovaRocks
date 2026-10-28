@@ -19,6 +19,7 @@
 //! cached integers; fallible equality runs in bounded candidate batches outside
 //! hashbrown. This is not a join row chain or a distributed hash identity.
 
+use super::hash_layout::HashLayout;
 use super::owned_batch::{CompareScratch, OwnedKeyBatch};
 use super::{
     IndexPurpose, KeyId, KeySpec, LocalHashBatch, LocalHashPolicy, PreparedKeyBatch, checkpoint_at,
@@ -111,6 +112,7 @@ struct Pending {
     row: usize,
     occurrence: usize,
     hash: u64,
+    table: u64,
     next: Option<usize>,
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -124,6 +126,7 @@ struct Chunk {
     start: usize,
     rows: Vec<usize>,
     hashes: Vec<u64>,
+    table_hashes: Vec<u64>,
     valid: Vec<u8>,
 }
 #[derive(Clone, Copy)]
@@ -172,6 +175,7 @@ pub(crate) struct KeyIndex {
     spec: KeySpec,
     purpose: IndexPurpose,
     policy: LocalHashPolicy,
+    layout: HashLayout,
     directory: HashTable<Directory, AggregateAllocator>,
     classes: AggregateVec<Class>,
     batches: AggregateVec<Arc<OwnedKeyBatch>>,
@@ -187,9 +191,46 @@ impl KeyIndex {
         tracker: Arc<MemTracker>,
         owner: &dyn InputConstructionOwner,
     ) -> ExecutionResult<Self> {
+        let policy = LocalHashPolicy::new(&spec, owner)?;
+        Self::new_with_layout(
+            spec,
+            purpose,
+            policy,
+            HashLayout::incremental(),
+            tracker,
+            owner,
+        )
+    }
+    /// Private mutable construction for one closed bulk input. The task graph
+    /// retains this value until it publishes an immutable Ready index.
+    pub(super) fn new_for_bulk_hash(
+        spec: KeySpec,
+        purpose: IndexPurpose,
+        policy: LocalHashPolicy,
+        layout: HashLayout,
+        tracker: Arc<MemTracker>,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Self> {
+        if layout.closed_input_bound().is_none() {
+            return Err(invariant(ValueViolation::Layout));
+        }
+        Self::new_with_layout(spec, purpose, policy, layout, tracker, owner)
+    }
+    fn new_with_layout(
+        spec: KeySpec,
+        purpose: IndexPurpose,
+        policy: LocalHashPolicy,
+        layout: HashLayout,
+        tracker: Arc<MemTracker>,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Self> {
+        if !policy.accepts(&spec) {
+            return Err(invariant(ValueViolation::Layout));
+        }
         let allocator = AggregateAllocator::new(tracker.clone());
         Ok(Self {
-            policy: LocalHashPolicy::new(&spec, owner)?,
+            policy,
+            layout,
             spec,
             purpose,
             directory: HashTable::new_in(allocator.clone()),
@@ -431,7 +472,7 @@ impl KeyIndex {
         let mut output = vector(owner, input.len())?;
         for start in (0..input.len()).step_by(WORK_ROWS) {
             checkpoint()?;
-            let chunk = Chunk::load(input, hashes, start, owner, &checkpoint)?;
+            let chunk = Chunk::load(input, hashes, start, self.layout, owner, &checkpoint)?;
             let mut found = chunk.matches(owner, &checkpoint)?;
             self.probe_existing(input, &chunk, &mut found, owner, &checkpoint)?;
             for (i, found) in found.into_iter().enumerate() {
@@ -460,7 +501,7 @@ impl KeyIndex {
         let mut participates = vector(owner, input.len())?;
         for start in (0..input.len()).step_by(WORK_ROWS) {
             checkpoint()?;
-            let chunk = Chunk::load(input, hashes, start, owner, &checkpoint)?;
+            let chunk = Chunk::load(input, hashes, start, self.layout, owner, &checkpoint)?;
             let mut found = chunk.matches(owner, &checkpoint)?;
             self.probe_existing(input, &chunk, &mut found, owner, &checkpoint)?;
             for (i, found) in found.into_iter().enumerate() {
@@ -548,7 +589,7 @@ impl KeyIndex {
         };
         for start in (0..input.len()).step_by(WORK_ROWS) {
             checkpoint()?;
-            let chunk = Chunk::load(input, hashes, start, owner, &checkpoint)?;
+            let chunk = Chunk::load(input, hashes, start, self.layout, owner, &checkpoint)?;
             let mut found = chunk.matches(owner, &checkpoint)?;
             self.probe_existing(input, &chunk, &mut found, owner, &checkpoint)?;
             let mut buffers = PairBuffers::new(chunk.rows.len(), owner)?;
@@ -591,6 +632,7 @@ impl KeyIndex {
                 &mut pending,
                 &mut directory,
                 base,
+                self.layout,
                 owner,
                 &checkpoint,
             )?;
@@ -640,7 +682,7 @@ impl KeyIndex {
                 let handle = self.classes.len();
                 let next = self
                     .directory
-                    .find(value.hash, |old| old.full == value.hash)
+                    .find(value.table, |old| old.full == value.hash)
                     .map(|old| old.head);
                 self.classes.push(Class {
                     key: StoredKey {
@@ -651,15 +693,15 @@ impl KeyIndex {
                 });
                 if let Some(entry) = self
                     .directory
-                    .find_mut(value.hash, |old| old.full == value.hash)
+                    .find_mut(value.table, |old| old.full == value.hash)
                 {
                     entry.head = handle;
                 } else {
                     self.directory.insert_unique(
-                        value.hash,
+                        value.table,
                         Directory {
                             full: value.hash,
-                            table: value.hash,
+                            table: value.table,
                             head: handle,
                         },
                         |entry| entry.table,
@@ -687,23 +729,28 @@ impl Chunk {
         input: &PreparedKeyBatch<'_>,
         hashes: &LocalHashBatch,
         start: usize,
+        layout: HashLayout,
         owner: &dyn InputConstructionOwner,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
         let end = start.saturating_add(WORK_ROWS).min(input.len());
         let mut rows = vector(owner, end - start)?;
         let mut full = vector(owner, end - start)?;
+        let mut table_hashes = vector(owner, end - start)?;
         let mut valid = vector(owner, end - start)?;
         for occurrence in start..end {
             checkpoint_at(occurrence, checkpoint)?;
             rows.push(input.input.row(occurrence)?);
-            full.push(hashes.hash(occurrence)?);
+            let hash = hashes.hash(occurrence)?;
+            full.push(hash);
+            table_hashes.push(layout.table_hash(hash));
             valid.push(u8::from(hashes.participates(occurrence)?));
         }
         Ok(Self {
             start,
             rows,
             hashes: full,
+            table_hashes,
             valid,
         })
     }
@@ -746,7 +793,7 @@ fn probe_chains(
     for (probe, value) in output.iter().enumerate() {
         checkpoint_at(probe, checkpoint)?;
         if *value == Match::Miss {
-            if let Some(entry) = directory.find(chunk.hashes[probe], |entry| {
+            if let Some(entry) = directory.find(chunk.table_hashes[probe], |entry| {
                 entry.full == chunk.hashes[probe]
             }) {
                 active.push(Candidate {
@@ -804,6 +851,7 @@ fn deduplicate_chunk(
     pending: &mut AggregateVec<Pending>,
     directory: &mut HashTable<Directory, AggregateAllocator>,
     base: usize,
+    layout: HashLayout,
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<()> {
@@ -874,28 +922,39 @@ fn deduplicate_chunk(
         checkpoint_at(i, checkpoint)?;
         let probe = representatives[temp];
         let hash = chunk.hashes[probe];
+        let table = chunk.table_hashes[probe];
         let handle = pending.len();
+        let additional = handle
+            .checked_add(1)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if !layout.admits_reservation(base, additional) {
+            // A closed graph cannot produce more classes than its actual
+            // eligible input occurrences. This is a bookkeeping defect,
+            // never a user quota or a resource fallback condition.
+            return Err(invariant(ValueViolation::Layout));
+        }
         reserve_state(pending, 1, checkpoint)?;
-        if directory.find(hash, |entry| entry.full == hash).is_none() {
+        if directory.find(table, |entry| entry.full == hash).is_none() {
             reserve_directory(directory, 1, checkpoint)?;
         }
         let previous = directory
-            .find(hash, |entry| entry.full == hash)
+            .find(table, |entry| entry.full == hash)
             .map(|entry| entry.head);
         pending.push(Pending {
             row: chunk.rows[probe],
             occurrence: chunk.start + probe,
             hash,
+            table,
             next: previous,
         });
-        if let Some(entry) = directory.find_mut(hash, |entry| entry.full == hash) {
+        if let Some(entry) = directory.find_mut(table, |entry| entry.full == hash) {
             entry.head = handle;
         } else {
             directory.insert_unique(
-                hash,
+                table,
                 Directory {
                     full: hash,
-                    table: hash,
+                    table,
                     head: handle,
                 },
                 |entry| entry.table,
