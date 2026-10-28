@@ -1332,7 +1332,7 @@ impl FrontendQueryService {
 }
 
 impl QuerySessionFactory for FrontendQueryService {
-    // Design: ADR-0200 (docs/adr/ADR-0200-client-result-presentation-and-trino-paged-delivery.md)
+    // Design: ADR-0203 (docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md)
     fn open_statement_session(
         &self,
         request: StatementSessionRequest,

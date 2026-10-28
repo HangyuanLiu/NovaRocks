@@ -91,7 +91,7 @@ fn root_domain_matches(field: &ResultField) -> bool {
             | (Domain::Percentile, V::Percentile)
     )
 }
-// Design: ADR-0200 (docs/adr/ADR-0200-client-result-presentation-and-trino-paged-delivery.md)
+// Design: ADR-0203 (docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md)
 fn family_schema(
     fields: &[ResultField],
     family: RenderFamilyRequest<'_>,

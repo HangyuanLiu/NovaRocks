@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Design: docs/adr/ADR-0200-client-result-presentation-and-trino-paged-delivery.md
+//! Design: docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md
 //! Request serialization decides protocol ownership; socket writes never settle statements.
 use crate::{
     entry::{EntryState, Outcome, Page, Phase, Production, QueryEntry},
