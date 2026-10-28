@@ -555,6 +555,18 @@ impl QueryContextOwner {
             .then(|| expiry.saturating_duration_since(now))
     }
 
+    /// Existing effective Worker lease at a correlated Create refusal. This
+    /// grants no work and introduces no new timeout; the caller snapshots it
+    /// once so a later renewal cannot extend replacement observation.
+    pub(crate) fn create_refusal_observation_expiry(&self) -> Option<MonotonicInstant> {
+        (self.establish_acknowledged
+            && !self.terminal_cleanup_started
+            && !self.released
+            && self.quiesce_receipt.is_none())
+        .then(|| self.renew_schedule.map(RenewSchedule::conservative_expiry))
+        .flatten()
+    }
+
     /// The next renewal, if one is due.
     ///
     /// This deliberately consults nothing but the lease schedule. It never

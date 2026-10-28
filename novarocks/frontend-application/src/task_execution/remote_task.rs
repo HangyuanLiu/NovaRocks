@@ -248,6 +248,9 @@ pub struct RemoteTask {
     state: RemoteTaskState,
     create_in_flight: Option<TaskOperationId>,
     create_remote_unknown: bool,
+    // The exact rejected Create and the already-effective context lease cut.
+    // This is immutable observation evidence, never authority for new work.
+    rejected_create_observation: Option<(TaskOperationId, MonotonicInstant)>,
     create_ownership_proven: bool,
     normal_stand_down: bool,
     fenced_out: bool,
@@ -350,6 +353,7 @@ impl RemoteTask {
             state: RemoteTaskState::Creating,
             create_in_flight: None,
             create_remote_unknown: false,
+            rejected_create_observation: None,
             create_ownership_proven: false,
             normal_stand_down: false,
             fenced_out: false,
@@ -412,6 +416,15 @@ impl RemoteTask {
     /// Create acknowledgement was lost or is still in flight.
     pub const fn create_ownership_proven(&self) -> bool {
         self.create_ownership_proven
+    }
+
+    pub(crate) fn rejected_create_observation_remaining(
+        &self,
+        operation_id: TaskOperationId,
+        now: MonotonicInstant,
+    ) -> Option<Duration> {
+        let (original, expiry) = self.rejected_create_observation?;
+        (original == operation_id).then(|| expiry.saturating_duration_since(now))
     }
 
     /// A deployment position survives the Accepted RPC and unknown outcomes.
@@ -1110,8 +1123,11 @@ impl RemoteTask {
         ack: &OperationAcknowledgement,
         now: MonotonicInstant,
         context_established: bool,
+        observation_expiry: Option<MonotonicInstant>,
     ) -> Result<CreateSettlement, TaskExecutionError> {
-        if self.create_in_flight != Some(ack.operation_id()) {
+        if ack.kind() != OperationKind::CreateTask
+            || self.create_in_flight != Some(ack.operation_id())
+        {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.create_in_flight = None;
@@ -1213,6 +1229,27 @@ impl RemoteTask {
                         OperationKind::CreateTask,
                     ));
                 };
+                if !self.create_ownership_proven
+                    && context_established
+                    && outcome == OperationOutcome::IdentityMismatch
+                    && matches!(
+                        ack.worker_header(),
+                        Some(
+                            novarocks_execution_contract::operation::OperationResult::Verdict {
+                                outcome: OperationOutcome::IdentityMismatch,
+                                ..
+                            }
+                        )
+                    )
+                    && let Some(expiry) = observation_expiry
+                    && !now.has_reached(expiry)
+                {
+                    // on_create_ack has matched the original in-flight Task
+                    // operation. Capture the original lease before closing;
+                    // neither replay nor a late renewal can replace it.
+                    self.rejected_create_observation
+                        .get_or_insert((ack.operation_id(), expiry));
+                }
                 self.enter_terminal();
                 Ok(CreateSettlement::FailedClosed(outcome))
             }
@@ -1498,6 +1535,7 @@ mod destination_close_tests {
                 state: RemoteTaskState::Created,
                 create_in_flight: None,
                 create_remote_unknown: false,
+                rejected_create_observation: None,
                 create_ownership_proven: true,
                 normal_stand_down: false,
                 fenced_out: false,
@@ -1520,6 +1558,53 @@ mod destination_close_tests {
             target,
             sibling,
         )
+    }
+
+    #[test]
+    fn rejected_create_snapshot_is_not_renewed_by_late_receipts_or_owned_tasks() {
+        for (owned, established, expiry) in [
+            (false, true, Some(Duration::from_secs(9))),
+            (true, true, Some(Duration::from_secs(9))),
+            (false, false, Some(Duration::from_secs(9))),
+            (false, true, None),
+            (false, true, Some(Duration::ZERO)),
+        ] {
+            let (mut task, _, _, _) = producer_with_two_destinations();
+            let operation = task.create_envelope.operation_id();
+            task.create_in_flight = Some(operation);
+            task.create_ownership_proven = owned;
+            let ack = OperationAcknowledgement::worker_receipt(
+                operation,
+                OperationKind::CreateTask,
+                OperationOutcome::IdentityMismatch,
+                AckPayload::None,
+            );
+            let old = expiry.map(MonotonicInstant::from_origin);
+            task.on_create_ack(&ack, MonotonicInstant::ORIGIN, established, old)
+                .unwrap();
+            let before =
+                task.rejected_create_observation_remaining(operation, MonotonicInstant::ORIGIN);
+            assert_eq!(
+                before,
+                (!owned && established && expiry == Some(Duration::from_secs(9)))
+                    .then_some(Duration::from_secs(9))
+            );
+            // A later effective lease cannot be used by a duplicate Create
+            // receipt: the original in-flight operation was already consumed.
+            assert!(
+                task.on_create_ack(
+                    &ack,
+                    MonotonicInstant::ORIGIN,
+                    true,
+                    Some(MonotonicInstant::from_origin(Duration::from_secs(90)))
+                )
+                .is_err()
+            );
+            assert_eq!(
+                task.rejected_create_observation_remaining(operation, MonotonicInstant::ORIGIN),
+                before
+            );
+        }
     }
 
     #[test]

@@ -101,6 +101,7 @@ enum PendingPreReadyObservation {
     RejectedIdentity {
         context: novarocks_execution_contract::QueryContextRef,
         operation_id: novarocks_execution_contract::TaskOperationId,
+        kind: novarocks_execution_contract::OperationKind,
     },
 }
 impl PendingPreReadyObservation {
@@ -402,6 +403,28 @@ impl ManifestAssembledRound {
                 Some(PendingPreReadyObservation::RejectedIdentity {
                     context: *context,
                     operation_id: *operation_id,
+                    kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                })
+            }
+            TaskExecutionError::OperationFailed {
+                context,
+                operation_id,
+                kind: novarocks_execution_contract::OperationKind::CreateTask,
+                rejection:
+                    novarocks_execution_contract::operation::OperationResult::Verdict {
+                        outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
+                        ..
+                    },
+            } if self
+                .round
+                .execution()
+                .rejected_create_observation_remaining(*context, *operation_id)
+                .is_some_and(|remaining| !remaining.is_zero()) =>
+            {
+                Some(PendingPreReadyObservation::RejectedIdentity {
+                    context: *context,
+                    operation_id: *operation_id,
+                    kind: novarocks_execution_contract::OperationKind::CreateTask,
                 })
             }
             _ => None,
@@ -446,14 +469,24 @@ impl ManifestAssembledRound {
             PendingPreReadyObservation::RejectedIdentity {
                 context,
                 operation_id,
+                kind,
             } => {
-                // This is the original Context owner's clock/horizon, preserved
-                // before it retired the definitive rejection. Never renew it.
+                // Both paths retain their original horizon on the Task clock.
+                // Create uses the existing effective context lease captured at
+                // its exact rejection, never a newly started grace interval.
                 let within_horizon = |this: &Self| {
-                    this.round
-                        .execution()
-                        .rejected_establish_observation_remaining(context, operation_id)
-                        .is_some_and(|remaining| !remaining.is_zero())
+                    let execution = this.round.execution();
+                    match kind {
+                        novarocks_execution_contract::OperationKind::UpdateQueryContext => {
+                            execution
+                                .rejected_establish_observation_remaining(context, operation_id)
+                        }
+                        novarocks_execution_contract::OperationKind::CreateTask => {
+                            execution.rejected_create_observation_remaining(context, operation_id)
+                        }
+                        _ => None,
+                    }
+                    .is_some_and(|remaining| !remaining.is_zero())
                 };
                 if !within_horizon(self) {
                     self.pending_pre_ready = None;
@@ -2115,6 +2148,179 @@ mod tests {
         } if *observed == operation_id)
         );
         (round, error, logical, drive, cancellation, requester, abort)
+    }
+
+    async fn original_rejected_create_drive(
+        recovery: bool,
+    ) -> (
+        TaskRound,
+        TaskExecutionError,
+        novarocks_query_application::test_support::LogicalExecutionTestHarness,
+        NativeAttemptDrive,
+        CancellationView,
+        novarocks_workload_control::WorkCancellationRequester,
+        super::super::abort_effect::NativeAbortEffectIntake,
+    ) {
+        use novarocks_query_application::coordination::{
+            AdmissionIssueSettlement, EstablishIssueIdentity, EstablishIssueSubmit,
+            EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
+            EstablishTransportSubmission,
+        };
+        #[derive(Debug)]
+        struct AppliedTransport;
+        impl EstablishTransportSink for AppliedTransport {
+            fn try_reserve(&self, _: EstablishIssueIdentity) -> EstablishTransportAdmission {
+                EstablishTransportAdmission::Admitted(Box::new(Self))
+            }
+        }
+        impl EstablishTransportReservation for AppliedTransport {
+            fn submit(self: Box<Self>, submission: EstablishTransportSubmission) {
+                submission
+                    .worker_settled(novarocks_execution_contract::OperationOutcome::Accepted)
+                    .unwrap();
+            }
+        }
+        let (round, _clock, error, trace) =
+            super::super::tests::pre_ready_original_create_refusal();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, requester, abort) =
+            terminal_regression_drive_with_recovery(context, recovery).await;
+        let mut native_compatibility_id = None;
+        for (intent, ack) in trace {
+            match intent {
+                super::super::intent::OperationIntent::AcquireQueryContextAdmissionTicket(
+                    request,
+                ) => {
+                    let super::super::intent::AckPayload::AdmissionTicket(ticket) = ack.payload()
+                    else {
+                        panic!("original admission receipt")
+                    };
+                    native_compatibility_id = Some(request.native_compatibility_id());
+                    let issue = drive.begin_admission_issue(request).await.unwrap();
+                    drive
+                        .settle_admission_issue(
+                            issue,
+                            AdmissionIssueSettlement::applied(
+                                issue.operation_id(),
+                                novarocks_execution_contract::OperationOutcome::Accepted,
+                                *ticket,
+                            )
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                super::super::intent::OperationIntent::EstablishQueryContext(request) => {
+                    let issue = drive
+                        .authorize_establish(
+                            request,
+                            native_compatibility_id.expect("original admission precedes Establish"),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        issue.try_submit(&AppliedTransport).unwrap(),
+                        EstablishIssueSubmit::Accepted
+                    );
+                }
+                _ => panic!("startup trace contains only original context operations"),
+            }
+        }
+        (round, error, logical, drive, cancellation, requester, abort)
+    }
+
+    #[tokio::test]
+    async fn rejected_create_waits_for_positive_replacement_under_current_qa_policy() {
+        // Distinguish policy-closed and cancellation-closed from a positive
+        // process observation; the original public Invariant never changes.
+        for case in 0..3 {
+            let (round, error, logical, drive, cancellation, requester, _abort) =
+                original_rejected_create_drive(case != 1).await;
+            let context = *round.execution().graph().contexts().next().unwrap();
+            let original = error.preparation_input();
+            let source = Arc::new(PendingProcessObservation::new(
+                context.backend_process_id(),
+                BackendProcessObservation::Unobservable,
+            ));
+            let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
+            let change = async {
+                if case != 1 {
+                    while source.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    if case == 2 {
+                        requester.request(CancellationReason::Requested).unwrap();
+                    } else {
+                        source.replace();
+                    }
+                }
+            };
+            let (terminal, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(
+                    assembled.run(
+                        &drive,
+                        cancellation,
+                        ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                    ),
+                    change
+                )
+            })
+            .await
+            .unwrap();
+            let NativeAttemptTerminal::Failed(failure) = terminal else {
+                panic!("original Create rejection")
+            };
+            assert_eq!(failure.input(), &original);
+            assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+            assert_eq!(failure.pre_ready_replacement().is_some(), case == 0);
+            if case == 1 {
+                assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(
+                    source
+                        .subscriptions
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+            }
+            drop(assembled);
+            drop(drive);
+            finish_pending_actor(logical, context).await;
+        }
+    }
+
+    #[test]
+    fn rejected_create_observation_ends_without_positive_replacement_at_original_expiry() {
+        for state in [
+            BackendProcessObservation::Current,
+            BackendProcessObservation::Unobservable,
+        ] {
+            let (round, clock, error, _) = super::super::tests::pre_ready_original_create_refusal();
+            let context = *round.execution().graph().contexts().next().unwrap();
+            let original = error.preparation_input();
+            let source = Arc::new(PendingProcessObservation::new(
+                context.backend_process_id(),
+                state,
+            ));
+            let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
+            assert!(assembled.pending_pre_ready_must_wait());
+            // Even positive evidence arriving after the original lease cannot
+            // revive this candidate or start another observation interval.
+            source.replace();
+            clock.advance(std::time::Duration::from_secs(30));
+            let calls = source.calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(!assembled.pending_pre_ready_must_wait());
+            assert_eq!(
+                source.calls.load(std::sync::atomic::Ordering::SeqCst),
+                calls
+            );
+            let NativeAttemptTerminal::Failed(failure) =
+                &assembled.pending_terminal.as_ref().unwrap().terminal
+            else {
+                panic!("original rejection")
+            };
+            assert_eq!(failure.input(), &original);
+            assert!(failure.pre_ready_replacement().is_none());
+        }
     }
 
     #[tokio::test]

@@ -719,6 +719,22 @@ impl QueryTaskExecution {
             .rejected_establish_observation_remaining(operation_id, self.clock.now())
     }
 
+    /// Only the Task that accepted this exact Create refusal retains its
+    /// snapshot. A context/op correlation cannot manufacture that evidence.
+    pub(crate) fn rejected_create_observation_remaining(
+        &self,
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
+    ) -> Option<Duration> {
+        self.graph
+            .tasks()
+            .filter(|task| task.context() == context)
+            .find_map(|task| {
+                self.task_by_identity_ref(task.identity())?
+                    .rejected_create_observation_remaining(operation_id, self.clock.now())
+            })
+    }
+
     /// Takes contexts whose task-operation acknowledgement requires an
     /// immediate status resubscription from the frontend's held cursors.
     pub fn take_status_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
@@ -1450,8 +1466,17 @@ impl QueryTaskExecution {
                     .owners
                     .get(&context)
                     .is_some_and(QueryContextOwner::establish_acknowledged);
+                let observation_expiry = self
+                    .owners
+                    .get(&context)
+                    .and_then(QueryContextOwner::create_refusal_observation_expiry);
                 let previous_status = task.status().map(TaskStatus::version);
-                let settlement = task.on_create_ack(ack, self.clock.now(), context_established)?;
+                let settlement = task.on_create_ack(
+                    ack,
+                    self.clock.now(),
+                    context_established,
+                    observation_expiry,
+                )?;
                 let accepted_status_changed =
                     previous_status != task.status().map(TaskStatus::version);
                 if !matches!(settlement, CreateSettlement::Created) {
