@@ -631,7 +631,7 @@ async fn run_catalog_action(
         StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((710 as u64) << 32) | (1 as u64),
+                    (710_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),

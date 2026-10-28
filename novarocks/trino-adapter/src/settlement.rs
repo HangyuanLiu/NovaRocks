@@ -24,7 +24,7 @@ use novarocks_query_application::{
 };
 pub(crate) enum SettlementOwner {
     Streaming(Box<StreamingStatementResult>),
-    Governed(GovernedProtocolOwner),
+    Governed(Box<GovernedProtocolOwner>),
     Ungoverned,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -2923,7 +2923,7 @@ mod terminal_observation_tests {
                 channel.spec().contract.kind(),
                 Some(std::num::NonZeroU64::new(1).unwrap()),
                 0,
-                Duration::ZERO,
+                Duration::from_millis(1),
             )
             .unwrap();
             let delivery = channel.read(&request).await.unwrap();

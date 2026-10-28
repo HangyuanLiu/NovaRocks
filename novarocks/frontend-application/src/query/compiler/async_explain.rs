@@ -112,14 +112,11 @@ impl FrontendQueryCompiler {
             return self
                 .complete_async_profile(
                     &query,
-                    current_catalog,
-                    current_database,
+                    context,
                     Some(query_options_for_explain_analyze(query_options)),
                     &connector_planning_context,
-                    execution,
                     scope,
                     std::time::Instant::now(),
-                    *context.session().presentation(),
                     ports,
                 )
                 .await;
@@ -309,19 +306,20 @@ impl FrontendQueryCompiler {
     async fn complete_async_profile(
         &self,
         query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
+        context: &RequestContext,
         query_options: Option<QueryOptions>,
         connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
-        execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
-        family: novarocks_result_contract::ClientPresentationFamily,
         ports: ExplainPreparationPorts<'_>,
     ) -> Result<
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
     > {
+        let execution = context.execution();
+        let current_catalog = context.session().current_catalog();
+        let current_database = context.session().current_database();
+        let family = *context.session().presentation();
         let ExplainPreparationPorts {
             provider: provider_source,
             cpu: planning_cpu,

@@ -193,7 +193,7 @@ fn sql_dependency_original_binding_record_real_grant_charge_prost_and_drop() {
                 StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((7 as u64) << 32) | (11 as u64),
+                            (7_u64 << 32) | 11_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -260,7 +260,7 @@ fn sql_dependency_original_binding_record_missing_grant_is_not_late_permission_a
                 StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((7 as u64) << 32) | (11 as u64),
+                            (7_u64 << 32) | 11_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -323,7 +323,7 @@ fn sql_dependency_original_binding_record_output_failure_releases_dto_before_sto
                 StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((7 as u64) << 32) | (11 as u64),
+                            (7_u64 << 32) | 11_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -386,7 +386,7 @@ fn sql_dependency_original_binding_record_foreign_stock_keeps_actual_authority_c
                 StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((7 as u64) << 32) | (11 as u64),
+                            (7_u64 << 32) | 11_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -402,7 +402,7 @@ fn sql_dependency_original_binding_record_foreign_stock_keeps_actual_authority_c
                 StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((7 as u64) << 32) | (11 as u64),
+                            (7_u64 << 32) | 11_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -466,7 +466,7 @@ fn sql_dependency_original_binding_record_every_control_refusal_has_no_footer_or
                 .unwrap();
                 let artifact = factory
                     .begin(
-                        StatementToken::new(SessionToken::new(novarocks_query_application::session_control::ClientSessionKey::new(((7 as u64) << 32) | (11 as u64)).expect("nonzero fixture session")), 13),
+                        StatementToken::new(SessionToken::new(novarocks_query_application::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64).expect("nonzero fixture session")), 13),
                         &[42; 32],
                         &task.owner.scope(),
                     )

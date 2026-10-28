@@ -246,12 +246,12 @@ mod tests {
     fn concurrent_requests_have_one_winner() {
         let source = Arc::new(QueryCancellationSource::new());
         let mut workers = Vec::new();
-        for connection_id in 0..16 {
+        for session_key in 1..=16 {
             let source = Arc::clone(&source);
             workers.push(std::thread::spawn(move || {
                 source.request(QueryCancellationReason::ExplicitKill {
-                    requester_session: crate::session_control::ClientSessionKey::new(connection_id)
-                        .unwrap(),
+                    requester_session: crate::session_control::ClientSessionKey::new(session_key)
+                        .expect("nonzero fixture requester"),
                 })
             }));
         }

@@ -1647,7 +1647,7 @@ pub(crate) mod tests {
         let actual = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -1656,7 +1656,7 @@ pub(crate) mod tests {
         let other_connection = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((8 as u64) << 32) | (1 as u64),
+                    (8_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -1665,7 +1665,7 @@ pub(crate) mod tests {
         let later = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -1692,7 +1692,7 @@ pub(crate) mod tests {
         let statement = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -1871,7 +1871,7 @@ pub(crate) mod tests {
         let actual = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -1938,7 +1938,7 @@ pub(crate) mod tests {
             StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((8 as u64) << 32) | (2 as u64),
+                        (8_u64 << 32) | 2_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -1973,7 +1973,7 @@ pub(crate) mod tests {
         let a = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -2011,7 +2011,7 @@ pub(crate) mod tests {
             StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((7 as u64) << 32) | (1 as u64),
+                        (7_u64 << 32) | 1_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -2020,7 +2020,7 @@ pub(crate) mod tests {
             StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((7 as u64) << 32) | (2 as u64),
+                        (7_u64 << 32) | 2_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -2029,7 +2029,7 @@ pub(crate) mod tests {
             StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((8 as u64) << 32) | (1 as u64),
+                        (8_u64 << 32) | 1_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -2093,7 +2093,7 @@ pub(crate) mod tests {
         let other = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((8 as u64) << 32) | (1 as u64),
+                    (8_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -2115,7 +2115,7 @@ pub(crate) mod tests {
         let actual = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -2272,7 +2272,7 @@ pub(crate) mod tests {
         let statement = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -2580,7 +2580,7 @@ pub(crate) mod tests {
         let actual = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((7 as u64) << 32) | (1 as u64),
+                    (7_u64 << 32) | 1_u64,
                 )
                 .expect("nonzero fixture session"),
             ),

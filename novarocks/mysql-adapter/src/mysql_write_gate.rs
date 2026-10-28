@@ -947,7 +947,7 @@ mod tests {
             StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((71 as u64) << 32) | (23 as u64),
+                        (71_u64 << 32) | 23_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),

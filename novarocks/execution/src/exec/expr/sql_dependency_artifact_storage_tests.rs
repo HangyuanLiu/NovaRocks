@@ -83,7 +83,7 @@ fn token(generation: u64) -> StatementToken {
     StatementToken::new(
         SessionToken::new(
             novarocks_query_application::session_control::ClientSessionKey::new(
-                ((7 as u64) << 32) | (11 as u64),
+                (7_u64 << 32) | 11_u64,
             )
             .expect("nonzero fixture session"),
         ),

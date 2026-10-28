@@ -832,7 +832,7 @@ mod tests {
         let statement = StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((71 as u64) << 32) | (23 as u64),
+                    (71_u64 << 32) | 23_u64,
                 )
                 .expect("nonzero fixture session"),
             ),
@@ -1019,7 +1019,7 @@ mod tests {
                 Self::OlderStatement => Some(StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((71 as u64) << 32) | (23 as u64),
+                            (71_u64 << 32) | 23_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -1028,7 +1028,7 @@ mod tests {
                 Self::WrongSession => Some(StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((72 as u64) << 32) | (23 as u64),
+                            (72_u64 << 32) | 23_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -1037,7 +1037,7 @@ mod tests {
                 Self::WrongSessionEpoch => Some(StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((71 as u64) << 32) | (24 as u64),
+                            (71_u64 << 32) | 24_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -1046,7 +1046,7 @@ mod tests {
                 Self::ZeroStatement => Some(StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((71 as u64) << 32) | (23 as u64),
+                            (71_u64 << 32) | 23_u64,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -1055,7 +1055,7 @@ mod tests {
                 Self::ZeroEpoch => Some(StatementToken::new(
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((71 as u64) << 32) | (0 as u64),
+                            71_u64 << 32,
                         )
                         .expect("nonzero fixture session"),
                     ),
@@ -1073,7 +1073,7 @@ mod tests {
             let original_statement = StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((71 as u64) << 32) | (23 as u64),
+                        (71_u64 << 32) | 23_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -1157,7 +1157,7 @@ mod tests {
             let statement = StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((71 as u64) << 32) | (23 as u64),
+                        (71_u64 << 32) | 23_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -1295,7 +1295,7 @@ mod tests {
             StatementToken::new(
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((71 as u64) << 32) | (23 as u64),
+                        (71_u64 << 32) | 23_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -1307,7 +1307,7 @@ mod tests {
         StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((71 as u64) << 32) | (23 as u64),
+                    (71_u64 << 32) | 23_u64,
                 )
                 .expect("nonzero fixture session"),
             ),

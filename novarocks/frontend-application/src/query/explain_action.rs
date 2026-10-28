@@ -102,7 +102,7 @@ async fn make_explain_preparation(
         } else {
             topology
         };
-        let presentation = input.state.presentation().clone();
+        let presentation = *input.state.presentation();
         let (catalog, database, execution, mut optimizer, semantics) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(

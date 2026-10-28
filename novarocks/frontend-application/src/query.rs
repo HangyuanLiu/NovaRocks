@@ -1929,7 +1929,7 @@ impl FrontendQuerySession {
         } else {
             topology
         };
-        let presentation = state.presentation().clone();
+        let presentation = *state.presentation();
         let (
             current_catalog,
             current_database,

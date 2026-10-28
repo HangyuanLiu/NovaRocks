@@ -431,7 +431,7 @@ fn interrupted(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()>
                 replay.body == page.body && replay.semantic_headers() == page.semantic_headers(),
                 "interrupted response changed replay bytes/headers"
             );
-            while let Some(next) = replay_next(actor, &mut uri)? {
+            while let Some(next) = replay_next(actor, &uri)? {
                 uri = next;
             }
             break;
@@ -443,7 +443,7 @@ fn interrupted(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()>
     context.action("dropped a partial HTTP response, replayed identical full bytes, and completed the same query");
     Ok(())
 }
-fn replay_next(actor: &TrinoClient, uri: &mut String) -> Result<Option<String>> {
+fn replay_next(actor: &TrinoClient, uri: &str) -> Result<Option<String>> {
     let page = actor.get(uri)?;
     let value = page.assert_success()?;
     let next = page.next_uri()?;

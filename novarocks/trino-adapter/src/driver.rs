@@ -278,15 +278,16 @@ pub(crate) async fn run(
                 Ok(())
             }
             .await;
-            (SettlementOwner::Governed(owner), produced)
+            (SettlementOwner::Governed(Box::new(owner)), produced)
         }
-        QuerySessionOutput::GovernedCompletion(result) => {
-            (SettlementOwner::Governed(result.into_protocol()), Ok(()))
-        }
+        QuerySessionOutput::GovernedCompletion(result) => (
+            SettlementOwner::Governed(Box::new(result.into_protocol())),
+            Ok(()),
+        ),
         QuerySessionOutput::GovernedError(result) => {
             let (error, owner) = result.into_parts();
             (
-                SettlementOwner::Governed(owner),
+                SettlementOwner::Governed(Box::new(owner)),
                 Err(DriverFailure::Originating(query_error_for_query(
                     entry.id.as_str(),
                     TrinoErrorSource::Service {

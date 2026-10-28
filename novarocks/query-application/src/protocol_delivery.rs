@@ -713,6 +713,8 @@ mod execution_handoff_tests {
                 .unwrap();
             let owner = statement.take_execution_owner().unwrap();
             let scope = statement.scope().clone();
+            // Keep the original read-only facts before settlement releases Work.
+            let cancellation = scope.cancellation().unwrap();
             owner.complete();
             let mut protocol = GovernedProtocolOwner::new(statement);
             if sealed {
@@ -733,13 +735,14 @@ mod execution_handoff_tests {
                 }
             );
             assert_eq!(
-                scope.cancellation().unwrap().reason(),
+                cancellation.reason(),
                 if sealed {
                     None
                 } else {
                     Some(CancellationReason::ClientCancelRequested)
                 }
             );
+            drop(cancellation);
             while let Some(permit) = workload.next_control() {
                 permit.acknowledge();
             }

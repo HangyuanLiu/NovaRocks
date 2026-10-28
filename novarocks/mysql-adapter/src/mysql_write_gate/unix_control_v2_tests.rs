@@ -177,7 +177,7 @@ fn maximal_fixed_projection_matches_independent_literal_744_bytes() {
         statement: Some(StatementToken::new(
             SessionToken::new(
                 novarocks_query_application::session_control::ClientSessionKey::new(
-                    ((0x01020304 as u64) << 32) | (9 as u64),
+                    ((0x01020304 as u64) << 32) | 9_u64,
                 )
                 .expect("nonzero fixture session"),
             ),

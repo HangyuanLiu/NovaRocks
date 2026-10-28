@@ -358,7 +358,7 @@ mod tests {
                         .unwrap(),
                 },
                 WorkCancellationReason::ExplicitKill {
-                    requester_session: u64::from(request_id),
+                    requester_session: request_id,
                 },
                 "Query execution was interrupted",
             ),
@@ -368,7 +368,7 @@ mod tests {
                         .unwrap(),
                 },
                 WorkCancellationReason::ExplicitKillConnection {
-                    requester_session: u64::from(request_id),
+                    requester_session: request_id,
                 },
                 "Query execution was interrupted because the connection was killed",
             ),

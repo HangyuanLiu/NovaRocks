@@ -714,7 +714,7 @@ mod authorization_tests {
                 },
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((91 as u64) << 32) | (1 as u64),
+                        (91_u64 << 32) | 1_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -779,12 +779,13 @@ mod statement_observation_tests {
     #[test]
     fn statement_observation_matches_exact_connection_sql_and_statement_owner() {
         let mut state = StatementObservers::default();
+        let session_key = (7_u64 << 32) | 9;
         state
             .arm(
                 arm_request("selected", 7, "SELECT k FROM t"),
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((7 as u64) << 32) | (9 as u64),
+                        session_key,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -828,7 +829,10 @@ mod statement_observation_tests {
         state.bind_attempt(&handle, exact);
         state.bind_attempt(&handle, execution(-19, 99, 2));
         let response = state.response("selected").unwrap();
-        assert_eq!(response.work_id.as_deref(), Some("statement:7:9:12"));
+        assert_eq!(
+            response.work_id,
+            Some(format!("statement:7:{session_key}:12"))
+        );
         assert_eq!(response.logical_execution_id.as_deref(), Some("-19:41"));
         assert_eq!(response.execution_id.as_deref(), Some("-19:41:1"));
         assert_eq!(
@@ -847,7 +851,7 @@ mod statement_observation_tests {
                 arm_request("selected", 7, "SELECT k FROM t"),
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((7 as u64) << 32) | (9 as u64),
+                        (7_u64 << 32) | 9_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -938,10 +942,8 @@ mod statement_observation_tests {
                 .arm(
                     arm_request("zero", 0, "SELECT 1"),
                     SessionToken::new(
-                        novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((0 as u64) << 32) | (1 as u64)
-                        )
-                        .expect("nonzero fixture session")
+                        novarocks_query_application::session_control::ClientSessionKey::new(1_u64)
+                            .expect("nonzero fixture session")
                     )
                 )
                 .is_err()
@@ -965,7 +967,7 @@ mod statement_observation_tests {
                     arm_request("run-1", 100, "SELECT 1"),
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((100 as u64) << 32) | (1 as u64)
+                            (100_u64 << 32) | 1_u64
                         )
                         .expect("nonzero fixture session")
                     )
@@ -978,7 +980,7 @@ mod statement_observation_tests {
                     arm_request("another", 1, "SELECT 1"),
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((1 as u64) << 32) | (1 as u64)
+                            (1_u64 << 32) | 1_u64
                         )
                         .expect("nonzero fixture session")
                     )
@@ -991,7 +993,7 @@ mod statement_observation_tests {
                     arm_request("overflow", 100, "SELECT 1"),
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((100 as u64) << 32) | (1 as u64)
+                            (100_u64 << 32) | 1_u64
                         )
                         .expect("nonzero fixture session")
                     )
@@ -1016,7 +1018,7 @@ mod statement_observation_tests {
                 arm_request("run-1", 1, "SELECT 1"),
                 SessionToken::new(
                     novarocks_query_application::session_control::ClientSessionKey::new(
-                        ((1 as u64) << 32) | (1 as u64),
+                        (1_u64 << 32) | 1_u64,
                     )
                     .expect("nonzero fixture session"),
                 ),
@@ -1036,7 +1038,7 @@ mod statement_observation_tests {
                     arm_request("exhausted", 1, "SELECT 1"),
                     SessionToken::new(
                         novarocks_query_application::session_control::ClientSessionKey::new(
-                            ((1 as u64) << 32) | (1 as u64)
+                            (1_u64 << 32) | 1_u64
                         )
                         .expect("nonzero fixture session")
                     )

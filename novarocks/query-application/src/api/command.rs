@@ -411,7 +411,7 @@ mod tests {
         .unwrap();
         let statement_token = StatementToken::new(
             SessionToken::new(
-                crate::session_control::ClientSessionKey::new(((7 as u64) << 32) | (11 as u64))
+                crate::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64)
                     .expect("nonzero fixture session"),
             ),
             13,
@@ -477,10 +477,8 @@ mod tests {
                 .unwrap(),
                 StatementToken::new(
                     SessionToken::new(
-                        crate::session_control::ClientSessionKey::new(
-                            ((7 as u64) << 32) | (11 as u64),
-                        )
-                        .expect("nonzero fixture session"),
+                        crate::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64)
+                            .expect("nonzero fixture session"),
                     ),
                     13,
                 ),

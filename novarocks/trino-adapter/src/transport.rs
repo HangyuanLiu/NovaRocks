@@ -215,7 +215,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[tokio::test]
     async fn blocked_tcp_write_exits_without_waiting_for_another_body_poll() {
-        const CHUNK: [u8; 32768] = [b'x'; 32768];
+        static CHUNK: [u8; 32768] = [b'x'; 32768];
         let router = Router::new().route(
             "/",
             get(|| async {

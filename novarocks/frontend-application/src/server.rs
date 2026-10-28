@@ -1136,19 +1136,21 @@ where
             );
         }
     };
-    let server_result = run_mysql_with_listener_supervision(
+    let server_result = run_client_listeners_with_supervision(
         #[cfg(any(
             feature = "mem-1-m07-exact-mysql-write",
             feature = "mem-1-m07-root-observation",
             feature = "mem-1-m07-closing-pressure"
         ))]
         Arc::clone(&config.native_trust),
-        config.mysql_listener,
-        config.trino_listener,
-        config.server_version,
-        session_factory,
-        products.query_control.clone(),
-        client_connections,
+        ClientListenerInputs {
+            mysql_listener: config.mysql_listener,
+            trino_listener: config.trino_listener,
+            server_version: config.server_version,
+            session_factory,
+            query_control: products.query_control.clone(),
+            client_connections,
+        },
         shutdown,
         &mut report_server,
         management_server,
@@ -1171,19 +1173,23 @@ where
     )
 }
 
-async fn run_mysql_with_listener_supervision<F>(
-    #[cfg(any(
-        feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation",
-        feature = "mem-1-m07-closing-pressure"
-    ))]
-    native_trust: Arc<NativeTrust>,
+struct ClientListenerInputs {
     mysql_listener: ResolvedMysqlListenerSettings,
     trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
     server_version: String,
     session_factory: Arc<dyn QuerySessionFactory>,
     query_control: novarocks_query_application::session_control::QueryControlService,
     client_connections: Arc<MysqlClientConnectionRegistry>,
+}
+
+async fn run_client_listeners_with_supervision<F>(
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-root-observation",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
+    native_trust: Arc<NativeTrust>,
+    listeners: ClientListenerInputs,
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut FrontendManagementServer,
@@ -1194,6 +1200,14 @@ async fn run_mysql_with_listener_supervision<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let ClientListenerInputs {
+        mysql_listener,
+        trino_listener,
+        server_version,
+        session_factory,
+        query_control,
+        client_connections,
+    } = listeners;
     let mut trino_server = novarocks_trino_adapter::TrinoServerHandle::bind(
         &trino_listener,
         server_version.clone(),
