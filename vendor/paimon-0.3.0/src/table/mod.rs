@@ -108,7 +108,7 @@ pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
 pub use global_index_types::{
-    normalize_global_index_type_for_drop, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP, normalize_global_index_type_for_drop,
 };
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
@@ -125,7 +125,7 @@ pub use schema_manager::{ExecutionTableSchema, SchemaManager};
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
 pub use source::{
-    merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
+    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange, merge_row_ranges,
 };
 pub use table_commit::TableCommit;
 pub use table_read::{ExecutionTableRead, TableRead};
@@ -137,7 +137,7 @@ pub use vector_search_builder::{BatchVectorSearchBuilder, VectorSearchBuilder};
 pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
-use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
+use crate::catalog::{DEFAULT_MAIN_BRANCH, Identifier, validate_branch_name};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
@@ -480,3 +480,6 @@ pub(crate) fn query_auth_table() -> Table {
         None,
     )
 }
+
+/// Pure fact of the original table-scan manifest read program.
+pub use table_scan::MANIFEST_READ_CONCURRENCY;

@@ -32,8 +32,9 @@ Control is one JSON line per stdin command, one safe stdout JSON response:
   {"command":"snapshot"}
   {"command":"reset","phase":"catalog_admission"}
   {"command":"stop"}
-EOF stops the observer. Reset succeeds only with actual active requests AND
-accepted connections both zero, under the same lock used by admission.
+EOF stops the observer. Reset requires all actual in-flight request work to
+exit under the same audit lock; idle persistent sockets remain process-owned
+and counted. STOPPED requires their actual handler/socket exit as well.
 
 Observer freeze schema (exact keys; main must freeze before actual execution):
   schema_version: 1, frozen_before_execution: true,
@@ -58,8 +59,9 @@ isolation, and observer-process exclusion from FE allocator samples. No producer
 or independent verification client may use the observer during native phases.
 
 Semantic headers/status/reason/payload bytes are preserved. HTTP hop framing
-(Host, Connection, transfer chunk framing) is adapted for direct close-delimited
-connections. No JSON, names, tokens, credentials, errors or status are rewritten.
+(Host, Connection, transfer chunk framing) is adapted on each direct hop.
+An admitted handler reuses its one upstream connection only after a complete
+self-delimited response; idle keepalive has no in-flight request deadline. No JSON, names, tokens, credentials, errors or status are rewritten.
 Observer bound/transport failures close the socket and taint the phase; they
 never generate a substitute HTTP error, retry, partial-success or fake catalog.
 Compressed listing bodies are observed with bounded gzip decode, then the exact
@@ -288,6 +290,8 @@ class Audit:
         self.connections = 0
         self.active = 0
         self.upstream_active = 0
+        self.upstream_connections = 0
+        self.http_requests = 0
         self.list_active = 0
         self.sequence = 0
         self.phase = "unclassified"
@@ -301,6 +305,9 @@ class Audit:
             "upstream_active_peak", "listing_active_peak", "failures", "admission_refusals",
             "pages", "names", "name_bytes", "upstream_body_bytes", "emitted_body_bytes",
             "metadata_loads", "mutations", "successful_mutations")}
+        # Phase counters start from real process-owned sockets already alive;
+        # reset does not erase their inventory or peak contribution.
+        self.counters["observer_connections_peak"] = self.connections
         self.routes = {}
         self.statuses = {}
 
@@ -319,12 +326,37 @@ class Audit:
             self.connections -= 1
             need(self.connections >= 0, "connection ownership underflow")
 
-    def failure(self, reason, admission=False):
+    def request_enter(self):
+        with self.lock:
+            self.http_requests += 1
+
+    def request_exit(self):
+        with self.lock:
+            self.http_requests -= 1
+            need(self.http_requests >= 0, "HTTP request ownership underflow")
+
+    def upstream_open(self):
+        with self.lock:
+            self.upstream_connections += 1
+
+    def upstream_close(self):
+        with self.lock:
+            self.upstream_connections -= 1
+            need(self.upstream_connections >= 0, "upstream socket ownership underflow")
+
+    def failure(self, reason, admission=False, *, operation=None, error=None):
         with self.lock:
             self.counters["failures"] += 1
             self.total_failures += 1
             self.counters["admission_refusals"] += int(admission)
-            self.event({"event": "failure", "phase": self.phase, "generation": self.generation, "reason": reason})
+            event = {"event": "failure", "phase": self.phase, "generation": self.generation, "reason": reason}
+            if error is not None:
+                # Retain only structural exception facts, never message/body,
+                # request headers, target or credential-bearing diagnostics.
+                event["error"] = {"type": type(error).__name__,
+                                  "errno": error.errno if isinstance(error, OSError) else None,
+                                  "operation": operation}
+            self.event(event)
 
     def begin(self, method, target, category, peer):
         with self.lock:
@@ -389,6 +421,8 @@ class Audit:
                 os.fsync(self.ledger.fileno())
             return {"phase": self.phase, "generation": self.generation,
                     "active_connections": self.connections, "active_requests": self.active,
+                    "active_http_requests": self.http_requests,
+                    "active_upstream_connections": self.upstream_connections,
                     "active_upstream_requests": self.upstream_active,
                     "active_upstream_listings": self.list_active,
                     "valid_observation": self.counters["failures"] == 0,
@@ -399,7 +433,7 @@ class Audit:
     def reset(self, phase):
         need(isinstance(phase, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", phase), "invalid phase label")
         with self.lock:
-            need(self.connections == self.active == self.upstream_active == self.list_active == 0,
+            need(self.http_requests == self.active == self.upstream_active == self.list_active == 0,
                  "phase reset requires actual owner idle")
             previous = self.snapshot()
             self.event({"event": "phase-finished", "snapshot": previous})
@@ -424,6 +458,9 @@ class HeaderReader:
         self.remaining -= len(raw)
         need(self.remaining >= 0, "request line/headers exceed cap")
         return raw
+
+    def peek(self, count=0):
+        return self.wrapped.peek(count)
 
     def read(self, count=-1):
         return self.wrapped.read(count)
@@ -450,7 +487,7 @@ class BoundedResponse(http.client.HTTPResponse):
         # detecting an extension is safer than losing a semantic header while
         # claiming transparency. No response is substituted on this refusal.
         line = self.fp.readline(65537)
-        need(len(line) <= 65536 and line in (b"", b"\r\n", b"\n"),
+        need(len(line) <= 65536 and line in (b"\r\n", b"\n"),
              "downstream trailers outside frozen normal contract")
 
 
@@ -504,35 +541,32 @@ class ObserverHandler(BaseHTTPRequestHandler):
     wbufsize = 0
 
     def setup(self):
-        self.started = time.monotonic()
-        self.deadline = self.started + self.server.bounds["request_absolute_deadline_seconds"]
+        self.upstream_connection = None
         self.upstream_socket = None
+        self.upstream_counted = False
+        self.request_held = False
+        self.timer = None
         self.socket_lock = threading.Lock()
-        self.connection = self.request
-        self.connection.settimeout(self.server.bounds["request_absolute_deadline_seconds"])
         super().setup()
         self.rfile = HeaderReader(self.rfile, self.server.bounds["max_header_bytes"])
 
-        def expire():
-            self.server.audit.failure("observer accepted connection absolute deadline expired")
+    def close_upstream(self):
+        try:
+            if self.upstream_connection is not None:
+                self.upstream_connection.close()
+        finally:
+            self.upstream_connection = None
             with self.socket_lock:
-                sockets = [self.connection, self.upstream_socket]
-                for sock in sockets:
-                    if sock is not None:
-                        try:
-                            sock.shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass
-                        sock.close()
-
-        self.timer = threading.Timer(max(0, self.deadline - time.monotonic()), expire)
-        self.timer.daemon = True
-        self.timer.start()
+                self.upstream_socket = None
+            if self.upstream_counted:
+                self.server.audit.upstream_close()
+                self.upstream_counted = False
 
     def finish(self):
-        self.timer.cancel()
-        self.timer.join()
-        super().finish()
+        try:
+            self.close_upstream()
+        finally:
+            super().finish()
 
     def log_message(self, format_string, *args):
         pass
@@ -542,26 +576,64 @@ class ObserverHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def handle(self):
-        # Exactly one RPC per admitted physical connection; no idle keepalive
-        # window can survive reset or retain an unclassified future request.
-        try:
-            self.handle_one_request()
-            self.check()
-        except (Refusal, OSError, ValueError, http.client.HTTPException):
-            self.server.audit.failure("request parse/transport refusal")
-        self.close_connection = True
+        self.close_connection = False
+        while not self.close_connection:
+            try:
+                # Idle sockets belong to this handler, not to a phase RPC.
+                # Start the original absolute RPC deadline at its first byte;
+                # the stdlib remains the sole HTTP request parser.
+                self.connection.settimeout(None)
+                if not self.rfile.peek(1):
+                    break
+                self.started = time.monotonic()
+                self.deadline = self.started + self.server.bounds["request_absolute_deadline_seconds"]
+                self.server.audit.request_enter()
+                self.request_held = True
+                self.connection.settimeout(max(0.001, self.deadline - time.monotonic()))
+                self.rfile.remaining = self.server.bounds["max_header_bytes"]
+                self.rfile.header_mode = True
+
+                def expire():
+                    self.server.audit.failure("observer RPC absolute deadline expired")
+                    with self.socket_lock:
+                        for sock in (self.connection, self.upstream_socket):
+                            if sock is not None:
+                                try:
+                                    sock.shutdown(socket.SHUT_RDWR)
+                                except OSError:
+                                    pass
+                                sock.close()
+
+                self.timer = threading.Timer(max(0, self.deadline - time.monotonic()), expire)
+                self.timer.daemon = True
+                self.timer.start()
+                self.handle_one_request()
+                self.check()
+            except (Refusal, OSError, ValueError, http.client.HTTPException):
+                self.server.audit.failure("request parse/transport refusal")
+                self.close_connection = True
+            finally:
+                if self.timer is not None:
+                    self.timer.cancel()
+                    self.timer.join()
+                    self.timer = None
+                if self.request_held:
+                    self.server.audit.request_exit()
+                    self.request_held = False
 
     def check(self):
         need(time.monotonic() < self.deadline, "observer RPC absolute deadline expired")
 
     def forward(self):
-        self.close_connection = True
+        reusable = False
         audit = self.server.audit
         record = None
         connection = None
         response = None
         upstream_held = False
+        observation_complete = True
         category = "other"
+        operation = "validate_request"
         try:
             self.check()
             self.rfile.header_mode = False
@@ -569,6 +641,8 @@ class ObserverHandler(BaseHTTPRequestHandler):
             category = route(self.command, self.path)
             headers = list(self.headers.raw_items())
             hop, length, chunked = header_facts(headers, self.server.bounds["max_header_bytes"])
+            self.close_connection = (self.close_connection or "close" in hop
+                                     or self.request_version != "HTTP/1.1")
             need(not chunked, "chunked request outside frozen normal client contract")
             need(not any(k.lower() == "expect" for k, _ in headers), "Expect request outside frozen normal contract")
             hosts = [v for k, v in headers if k.lower() == "host"]
@@ -576,31 +650,47 @@ class ObserverHandler(BaseHTTPRequestHandler):
             length = 0 if length is None else length
             need(length + len(self.path.encode()) <= self.server.bounds["max_request_bytes"], "request bytes exceed cap")
             record = audit.begin(self.command, self.path, category, self.client_address)
+            operation = "read_request_body"
             body = self.rfile.read(length)
             need(len(body) == length, "truncated request body")
             self.check()
             record["request_body_bytes"] = len(body)
             record["request_body_sha256"] = sha(body)
             upstream = self.server.downstream
-            connection = http.client.HTTPConnection(upstream.hostname, upstream.port,
-                                                    timeout=max(0.001, self.deadline - time.monotonic()))
-            connection.response_class = lambda *a, **kw: BoundedResponse(
-                *a, header_cap=self.server.bounds["max_header_bytes"], **kw)
-            connection.connect()
-            with self.socket_lock:
-                self.upstream_socket = connection.sock
+            operation = "connect_upstream"
+            connection = self.upstream_connection
+            if connection is None:
+                connection = http.client.HTTPConnection(upstream.hostname, upstream.port,
+                                                        timeout=max(0.001, self.deadline - time.monotonic()))
+                # Explicit initial connect only. A failed/closed socket must
+                # never trigger http.client's automatic connection opening.
+                connection.auto_open = 0
+                self.upstream_connection = connection
+                connection.response_class = lambda *a, **kw: BoundedResponse(
+                    *a, header_cap=self.server.bounds["max_header_bytes"], **kw)
+                connection.connect()
+                with self.socket_lock:
+                    self.upstream_socket = connection.sock
+                audit.upstream_open()
+                self.upstream_counted = True
+            else:
+                need(connection.sock is not None, "retained upstream socket is closed")
+                connection.sock.settimeout(max(0.001, self.deadline - time.monotonic()))
             self.check()
             audit.upstream_begin(category)
             upstream_held = True
+            operation = "send_upstream_headers"
             connection.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
             for name, value in headers:
                 if name.lower() not in hop and name.lower() != "host":
                     connection.putheader(name, value)
             connection.putheader("Host", upstream.netloc)
-            connection.putheader("Connection", "close")
+            if self.close_connection:
+                connection.putheader("Connection", "close")
             connection.endheaders(body)
             record["upstream_request_sent"] = True
             audit.sent(self.command)
+            operation = "receive_upstream_headers"
             response = connection.getresponse()
             record["status"] = response.status
             if 300 <= response.status < 400:
@@ -608,17 +698,27 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 # could bypass this observer. Such a phase is not an actual
                 # complete-traffic receipt for the frozen downstream owner.
                 audit.failure("actual redirect creates an observer coverage gap")
+                observation_complete = False
             response_headers = list(response.headers.raw_items())
             response_hop, declared, transfer = header_facts(response_headers, self.server.bounds["max_header_bytes"])
             need(response.status >= 200 and response.version in (10, 11)
                  and not any(c in response.reason for c in ("\r", "\n", "\x00")), "unsupported downstream status line")
             if self.command != "HEAD" and declared is not None:
                 need(declared <= self.server.bounds["max_response_bytes"], "declared response body exceeds cap")
+            operation = "receive_upstream_body"
             raw = response.read(self.server.bounds["max_response_bytes"] + 1)
             self.check()
             need(len(raw) <= self.server.bounds["max_response_bytes"], "response body exceeds cap")
             if self.command != "HEAD" and declared is not None:
                 need(len(raw) == declared, "truncated downstream body")
+            # EOF-delimited responses are forwarded, but never reused. Both
+            # hops must permit persistence and the parser must have consumed
+            # the complete message, including a chunk terminator when present.
+            reusable = (observation_complete and not self.close_connection and response.version == 11
+                        and "close" not in response_hop and not response.will_close and response.isclosed()
+                        and (declared is not None or transfer or self.command == "HEAD"
+                             or response.status in (204, 304)))
+            self.close_connection = not reusable
             record["status"] = response.status
             record["response_body_bytes"] = len(raw)
             record["response_body_sha256"] = sha(raw)
@@ -632,6 +732,8 @@ class ObserverHandler(BaseHTTPRequestHandler):
                                       self.server.bounds["max_decoded_json_bytes"])
             except (Refusal, UnicodeError, ValueError):
                 audit.failure("actual listing body cannot be observed; forwarded unchanged")
+                reusable = False
+                self.close_connection = True
             record["listing"] = facts
             audit.received(record, facts)
             version = "HTTP/1.0" if response.version == 10 else "HTTP/1.1"
@@ -643,8 +745,13 @@ class ObserverHandler(BaseHTTPRequestHandler):
             # original Content-Length string or expose exact dechunked body size.
             original_lengths = [v for k, v in response_headers if k.lower() == "content-length"]
             forwarded_length = original_lengths[0] if original_lengths else str(len(raw))
-            lines.extend(["Content-Length: " + forwarded_length + "\r\n", "Connection: close\r\n", "\r\n"])
+            lines.append("Content-Length: " + forwarded_length + "\r\n")
+            if self.close_connection:
+                lines.append("Connection: close\r\n")
+            lines.append("\r\n")
+            operation = "send_client_headers"
             self.connection.sendall("".join(lines).encode("latin-1"))
+            operation = "send_client_body"
             remaining = memoryview(raw)
             while remaining:
                 self.check()
@@ -656,8 +763,11 @@ class ObserverHandler(BaseHTTPRequestHandler):
             self.check()
             record["outcome"] = "actual-response-forwarded"
             audit.complete()
-        except (Refusal, OSError, ValueError, http.client.HTTPException):
-            audit.failure("bounded forwarding failed; no substitute response or retry")
+        except (Refusal, OSError, ValueError, http.client.HTTPException) as error:
+            reusable = False
+            self.close_connection = True
+            audit.failure("bounded forwarding failed; no substitute response or retry",
+                          operation=operation, error=error)
         finally:
             if upstream_held:
                 audit.upstream_end(category)
@@ -666,8 +776,8 @@ class ObserverHandler(BaseHTTPRequestHandler):
                     response.close()
             finally:
                 try:
-                    if connection is not None:
-                        connection.close()
+                    if not reusable:
+                        self.close_upstream()
                 finally:
                     if record is not None:
                         record["elapsed_ms"] = round((time.monotonic() - self.started) * 1000, 3)
@@ -732,7 +842,11 @@ class PureTests(unittest.TestCase):
     def test_reset_requires_actual_idle(self):
         audit = Audit()
         audit.accept()
+        audit.reset("idle_connection")
+        self.assertEqual(audit.snapshot()["active_connections"], 1)
+        audit.request_enter()
         self.reject(lambda: audit.reset("native_fe"))
+        audit.request_exit()
         audit.release()
         record = audit.begin("GET", "/v1/config", "other", ("127.0.0.1", 1))
         self.reject(lambda: audit.reset("native_fe"))
@@ -746,13 +860,65 @@ class PureTests(unittest.TestCase):
         self.reject(lambda: route("GET", "http://other/v1/namespaces"))
         self.reject(lambda: route("GET", "/not-a-catalog"))
 
+    def test_forward_connect_failure_retains_errno_without_private_diagnostics(self):
+        import errno
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import tempfile
+
+        ledger = self.enterContext(tempfile.TemporaryFile())
+        audit = Audit(ledger)
+        handler = object.__new__(ObserverHandler)
+        handler.server = SimpleNamespace(audit=audit, bounds=BOUNDS,
+                                         downstream=urlsplit("http://127.0.0.1:1"))
+        handler.upstream_connection = None
+        handler.upstream_socket = None
+        handler.upstream_counted = False
+        handler.request_held = False
+        handler.socket_lock = threading.Lock()
+        handler.close_connection = False
+        handler.request_version = "HTTP/1.1"
+        handler.command = "GET"
+        handler.path = "/v1/namespaces/private/tables/literal?token=private-token"
+        handler.headers = http.client.parse_headers(io.BytesIO(
+            b"Host: 127.0.0.1\r\nAuthorization: Bearer private-token\r\n\r\n"))
+        handler.rfile = io.BytesIO()
+        handler.client_address = ("127.0.0.1", 1)
+        handler.started = time.monotonic()
+        handler.deadline = handler.started + BOUNDS["request_absolute_deadline_seconds"]
+        connection = mock.Mock()
+        connection.connect.side_effect = OSError(errno.EADDRNOTAVAIL,
+                                                 "private-message", "private-filename")
+        with mock.patch.object(http.client, "HTTPConnection", return_value=connection):
+            handler.forward()
+        connection.connect.assert_called_once()
+        connection.close.assert_called_once()
+        connection.putrequest.assert_not_called()
+        ledger.seek(0)
+        recorded = ledger.read()
+        events = [parse_json(line) for line in recorded.splitlines()]
+        failure = next(event for event in events if event["event"] == "failure")
+        self.assertEqual(failure["error"], {"type": "OSError", "errno": errno.EADDRNOTAVAIL,
+                                           "operation": "connect_upstream"})
+        self.assertEqual(failure["reason"], "bounded forwarding failed; no substitute response or retry")
+        self.assertEqual(audit.snapshot()["counters"]["completed"], 0)
+        self.assertEqual(audit.snapshot()["active_requests"], 0)
+        self.assertFalse(audit.snapshot()["valid_observation"])
+        for private in (b"private-token", b"private-message", b"private-filename", b"Authorization"):
+            self.assertNotIn(private, recorded)
+
 
 class LoopbackTests(unittest.TestCase):
     """Synthetic HTTP byte transparency only, deliberately outside provider gates."""
 
     def setUp(self):
         self.captured = []
+        self.upstream_peers = []
+        self.upstream_closed = threading.Event()
         captured = self.captured
+        upstream_peers = self.upstream_peers
+        upstream_closed = self.upstream_closed
         literal = b'{ "identifiers" : [ {"namespace":["ns"],"name":"literal"} ], "next-page-token":null }\n'
         self.literal = literal
 
@@ -760,6 +926,7 @@ class LoopbackTests(unittest.TestCase):
             protocol_version = "HTTP/1.1"
 
             def handle_literal(inner):
+                upstream_peers.append(inner.client_address)
                 length = int(inner.headers.get("Content-Length", "0"))
                 captured.append((inner.command, inner.path, inner.rfile.read(length),
                                  inner.headers.get("Authorization"), inner.headers.get_all("X-Exact")))
@@ -776,7 +943,9 @@ class LoopbackTests(unittest.TestCase):
                 inner.send_header("X-Downstream", "unchanged")
                 inner.send_header("Set-Cookie", "one=1")
                 inner.send_header("Set-Cookie", "two=2")
-                inner.send_header("Connection", "close")
+                persistent = "keepalive" in inner.path and not inner.close_connection
+                if not persistent:
+                    inner.send_header("Connection", "close")
                 inner.end_headers()
                 if inner.command != "HEAD":
                     try:
@@ -784,12 +953,24 @@ class LoopbackTests(unittest.TestCase):
                             for start in range(0, len(literal), 7):
                                 chunk = literal[start:start + 7]
                                 inner.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-                            inner.wfile.write(b"0\r\n\r\n")
+                            if "truncated" not in inner.path:
+                                inner.wfile.write(b"0\r\n\r\n")
+                            elif "trailer" in inner.path:
+                                inner.wfile.write(b"0\r\n")
                         else:
-                            inner.wfile.write(literal)
+                            inner.wfile.write(literal[:-1] if "truncated" in inner.path else literal)
                     except OSError:
                         pass
-                inner.close_connection = True
+                inner.close_connection = (not persistent or "truncated" in inner.path
+                                          or "silent_close" in inner.path)
+
+            def finish(inner):
+                try:
+                    super().finish()
+                finally:
+                    if "silent_close" in getattr(inner, "path", ""):
+                        inner.connection.shutdown(socket.SHUT_RDWR)
+                        upstream_closed.set()
 
             do_GET = handle_literal
             do_POST = handle_literal
@@ -898,6 +1079,187 @@ class LoopbackTests(unittest.TestCase):
         self.assertEqual(len(self.captured), 1)
         self.assertGreater(self.audit.snapshot()["lifetime_failures"], 0)
 
+    def await_audit(self, predicate):
+        deadline = time.monotonic() + 2
+        while True:
+            snapshot = self.audit.snapshot()
+            if predicate(snapshot):
+                return snapshot
+            need(time.monotonic() < deadline, "local audit predicate did not become true")
+            threading.Event().wait(0.001)
+
+    def test_two_requests_reuse_both_sockets_and_preserve_phase_body_sha(self):
+        import tempfile
+        from contextlib import closing
+
+        self.audit.ledger = self.enterContext(tempfile.TemporaryFile())
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1")
+            first_socket = client.sock
+            first = client.getresponse()
+            self.assertEqual((first.status, first.read()), (200, self.literal))
+            first.close()
+            idle = self.await_audit(lambda a: a["active_http_requests"] == 0)
+            self.assertEqual((idle["active_connections"], idle["active_upstream_connections"]), (1, 1))
+            self.audit.reset("second_rpc")
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=2")
+            self.assertIs(client.sock, first_socket)
+            second = client.getresponse()
+            self.assertEqual((second.status, second.read()), (200, self.literal))
+            second.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            self.assertEqual(self.upstream_peers[0], self.upstream_peers[1])
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(final["active_upstream_connections"], 0)
+        self.audit.ledger.seek(0)
+        events = [parse_json(line) for line in self.audit.ledger.read().splitlines()]
+        requests = [e for e in events if e["event"] == "request"]
+        self.assertEqual([e["phase"] for e in requests], ["unclassified", "second_rpc"])
+        self.assertEqual([e["response_body_sha256"] for e in requests], [sha(self.literal)] * 2)
+        self.assertEqual([e["request_body_sha256"] for e in requests], [sha(b"")] * 2)
+        self.assertEqual([e["peer_port"] for e in requests], [requests[0]["peer_port"]] * 2)
+        self.assertTrue(final["valid_observation"])
+
+    def test_chunk_terminator_and_head_complete_before_socket_reuse(self):
+        from contextlib import closing
+
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            for method, suffix, expected in (
+                ("GET", "?keepalive=1&chunked=1", self.literal),
+                ("HEAD", "?keepalive=1", b""),
+                ("GET", "?keepalive=1", self.literal),
+            ):
+                client.request(method, "/v1/namespaces/ns/tables" + suffix)
+                response = client.getresponse()
+                self.assertEqual((response.status, response.read()), (200, expected))
+                response.close()
+                self.await_audit(lambda a: a["active_http_requests"] == 0)
+            self.assertEqual(len(self.upstream_peers), 3)
+            self.assertEqual(len(set(self.upstream_peers)), 1)
+        self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertTrue(self.audit.snapshot()["valid_observation"])
+
+    def test_partial_headers_and_body_prevent_phase_reset(self):
+        from contextlib import closing
+
+        for prefix, suffix in (
+            (b"GET /v1/namespaces/ns/tables HTTP/1.1\r\nHost: localhost\r\nX-Part:",
+             b" complete\r\nConnection: close\r\n\r\n"),
+            (b"POST /v1/namespaces/ns/error HTTP/1.1\r\nHost: localhost\r\n"
+             b"Connection: close\r\nContent-Length: 2\r\n\r\nx", b"y"),
+        ):
+            with closing(socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)) as client:
+                client.sendall(prefix)
+                busy = self.await_audit(lambda a: a["active_http_requests"] == 1)
+                self.assertEqual(busy["active_connections"], 1)
+                with self.assertRaises(Refusal):
+                    self.audit.reset("must_not_reset")
+                client.sendall(suffix)
+                response = http.client.HTTPResponse(client)
+                response.begin()
+                self.assertEqual(response.read(), self.literal)
+                response.close()
+            self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertTrue(self.audit.snapshot()["valid_observation"])
+
+    def test_idle_has_no_rpc_timer_but_each_request_keeps_its_absolute_deadline(self):
+        from contextlib import closing
+
+        self.restart_observer({"request_absolute_deadline_seconds": 0.1})
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            for index in range(2):
+                client.request("GET", "/v1/namespaces/ns/tables?keepalive=1")
+                response = client.getresponse()
+                self.assertEqual(response.read(), self.literal)
+                response.close()
+                self.await_audit(lambda a: a["active_http_requests"] == 0)
+                if index == 0:
+                    # Exceeds the old connection watchdog, not the next RPC's
+                    # original deadline; this is deliberately idle time.
+                    threading.Event().wait(0.15)
+            self.assertEqual(len(set(self.upstream_peers)), 1)
+        self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertTrue(self.audit.snapshot()["valid_observation"])
+
+    def test_stop_waits_for_actual_idle_handler_and_upstream_exit(self):
+        from contextlib import closing
+
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1")
+            response = client.getresponse()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            self.observer.shutdown()
+            joined = threading.Event()
+            def close_observer():
+                self.observer.server_close()
+                joined.set()
+            closer = threading.Thread(target=close_observer)
+            closer.start()
+            try:
+                self.assertFalse(joined.wait(0.05))
+                self.assertEqual(self.audit.snapshot()["active_connections"], 1)
+                self.assertEqual(self.audit.snapshot()["active_upstream_connections"], 1)
+            finally:
+                client.close()
+                closer.join(2)
+            self.assertFalse(closer.is_alive())
+            self.assertTrue(joined.is_set())
+            self.assertTrue(all(self.audit.snapshot()[key] == 0 for key in (
+                "active_connections", "active_upstream_connections", "active_http_requests",
+                "active_requests", "active_upstream_requests", "active_upstream_listings")))
+
+    def test_truncated_length_or_chunked_mutation_closes_without_retry(self):
+        from contextlib import closing
+
+        for shape in ("length", "chunked", "chunked_trailer"):
+            with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+                client.request("POST", "/v1/namespaces/ns/error?truncated=1&" + shape, body=b"literal")
+                with self.assertRaises(http.client.RemoteDisconnected):
+                    client.getresponse()
+            final = self.await_audit(lambda a: a["active_connections"] == 0)
+            self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(len(self.captured), 3)
+        self.assertEqual(self.audit.snapshot()["counters"]["upstream_mutations_sent"], 3)
+        self.assertEqual(self.audit.snapshot()["counters"]["completed"], 0)
+        self.assertFalse(self.audit.snapshot()["valid_observation"])
+
+    def test_stale_persistent_upstream_does_not_reconnect_or_replay_mutation(self):
+        from contextlib import closing
+
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("GET", "/v1/namespaces/ns/tables?keepalive=1&silent_close=1")
+            response = client.getresponse()
+            self.assertEqual(response.read(), self.literal)
+            response.close()
+            self.assertTrue(self.upstream_closed.wait(2))
+            self.await_audit(lambda a: a["active_http_requests"] == 0)
+            client.request("POST", "/v1/namespaces/ns/error", body=b"literal")
+            with self.assertRaises(http.client.RemoteDisconnected):
+                client.getresponse()
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(len(self.upstream_peers), 1)
+        self.assertEqual([request[0] for request in self.captured], ["GET"])
+        self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(final["counters"]["completed"], 1)
+        self.assertFalse(final["valid_observation"])
+
+    def test_upstream_connection_close_is_not_reused_or_retried(self):
+        from contextlib import closing
+
+        with closing(http.client.HTTPConnection("127.0.0.1", self.observer.server_port, timeout=2)) as client:
+            client.request("POST", "/v1/namespaces/ns/error", body=b"literal")
+            response = client.getresponse()
+            self.assertTrue(response.will_close)
+            self.assertEqual((response.status, response.read()), (409, self.literal))
+            response.close()
+        final = self.await_audit(lambda a: a["active_connections"] == 0)
+        self.assertEqual(len(self.captured), 1)
+        self.assertEqual(final["active_upstream_connections"], 0)
+        self.assertEqual(final["counters"]["upstream_mutations_sent"], 1)
+        self.assertTrue(final["valid_observation"])
+
     def test_connection_admission_and_reuse(self):
         self.restart_observer({"max_observers": 1})
         first = socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)
@@ -906,7 +1268,8 @@ class LoopbackTests(unittest.TestCase):
             while self.audit.snapshot()["active_connections"] != 1:
                 need(time.monotonic() < deadline, "local admission not observed")
                 time.sleep(0.001)
-            self.reject_reset_busy()
+            self.audit.reset("idle_connection")
+            self.assertEqual(self.audit.snapshot()["active_connections"], 1)
             second = socket.create_connection(("127.0.0.1", self.observer.server_port), timeout=2)
             try:
                 self.assertEqual(second.recv(1), b"")
@@ -922,11 +1285,6 @@ class LoopbackTests(unittest.TestCase):
             need(time.monotonic() < deadline, "local admission not released")
             time.sleep(0.001)
         self.assertEqual(self.call("GET", "/v1/namespaces/ns/tables")[0], 200)
-
-    def reject_reset_busy(self):
-        with self.assertRaises(Refusal):
-            self.audit.reset("native_fe")
-
 
 def stdout(value):
     print(encode(value).decode(), flush=True)
@@ -987,7 +1345,12 @@ def main():
         server.shutdown()
         server.server_close()
         thread.join()
-        stdout({"state": "OBSERVER_STOPPED", "audit": audit.snapshot()})
+        stopped = audit.snapshot()
+        need(all(stopped[key] == 0 for key in (
+            "active_connections", "active_upstream_connections", "active_http_requests",
+            "active_requests", "active_upstream_requests", "active_upstream_listings")),
+            "observer stopped before actual socket/request exit")
+        stdout({"state": "OBSERVER_STOPPED", "audit": stopped})
         ledger.close()
     return 0 if audit.snapshot()["lifetime_failures"] == 0 else 1
 

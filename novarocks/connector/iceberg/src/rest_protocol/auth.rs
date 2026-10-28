@@ -202,6 +202,7 @@ async fn exchange_token(
     persistent: Arc<PersistentRestConfig>,
     client_id: String,
     client_secret: SecretValue,
+    context: RequestContext,
 ) -> Result<HeaderValue, BindingFailure> {
     let mut form = vec![
         ("grant_type", "client_credentials"),
@@ -221,9 +222,7 @@ async fn exchange_token(
         persistent.token_request_headers(),
     )
     .with_form_body(form);
-    let (stage, body) = http
-        .send_once(Ok(request), &[200], &RequestContext::for_read())
-        .await;
+    let (stage, body) = http.send_once(Ok(request), &[200], &context).await;
     match (stage, body) {
         (DispatchStage::Status { .. }, Some(body)) => {
             let bytes = body
@@ -362,6 +361,12 @@ impl RestAuthOwner {
     /// configured token for a bearer identity, otherwise the exchanged token.
     /// Concurrent callers share one exchange; a failure is not kept.
     pub(crate) async fn authorization(&self) -> Result<Option<HeaderValue>, AttemptFailure> {
+        self.authorization_in(&RequestContext::for_read()).await
+    }
+    pub(crate) async fn authorization_in(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Option<HeaderValue>, AttemptFailure> {
         let (client_id, client_secret) = match &self.credential {
             Credential::Anonymous => return Ok(None),
             Credential::Bearer(value) => return Ok(Some(value.clone())),
@@ -377,13 +382,14 @@ impl RestAuthOwner {
                 let client_id = client_id.clone();
                 let client_secret = client_secret.clone();
                 let activity = self.activity.clone();
+                let context=context.clone();
                 async move {
                     let _initializer = activity.as_ref().map(|owner| {
                         owner.enter(
                             novarocks_spi::connector::CatalogActivityPhase::AuthorizationInitializer,
                         )
                     });
-                    exchange_token(http, persistent, client_id, client_secret)
+                    exchange_token(http, persistent, client_id, client_secret, context)
                         .await
                         .map_err(|step| AttemptFailure { attempt, step })
                 }
@@ -395,7 +401,15 @@ impl RestAuthOwner {
 
     /// Writes `Authorization` for a NovaRocks request of this role.
     pub(crate) async fn authorize(&self, headers: &mut HeaderMap) -> Result<(), AttemptFailure> {
-        if let Some(value) = self.authorization().await? {
+        self.authorize_in(headers, &RequestContext::for_read())
+            .await
+    }
+    pub(crate) async fn authorize_in(
+        &self,
+        headers: &mut HeaderMap,
+        context: &RequestContext,
+    ) -> Result<(), AttemptFailure> {
+        if let Some(value) = self.authorization_in(context).await? {
             headers.insert(AUTHORIZATION, value);
         }
         Ok(())

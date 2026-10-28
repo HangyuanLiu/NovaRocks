@@ -347,7 +347,7 @@ impl WorkScope {
                     generation: record.generation,
                 });
             }
-            node.check()?;
+            node.check(&state.cancellations)?;
             let config = &self.inner.config;
             if state.obligations >= config.obligation_records_limit {
                 return Err(WorkError::Capacity("obligation records"));

@@ -26,6 +26,7 @@ publish = false
 workspace = true
 
 [dependencies]
+novarocks-transport-io.workspace = true
 anyhow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
@@ -55,8 +56,10 @@ novarocks-result-contract.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-secret.workspace = true
+novarocks-spi.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
+parquet.workspace = true
 prost.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

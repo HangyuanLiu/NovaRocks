@@ -225,6 +225,7 @@ fn hadoop_fencing_child_process_entry() {
         .expect("execute prepared create publication");
     let (outcome, applied_version) = match result {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect,
             receipt,
             finalization,

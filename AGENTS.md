@@ -66,7 +66,7 @@ SQL client
   `- MySQL protocol -----------> NovaRocks role=fe
                                       |
                                       v
-                            Frontend SQL/coordinator application
+                            Frontend SQL / logical execution
                                       |
                                       v
                             Native gRPC fragment submission
@@ -139,8 +139,10 @@ SQL client
 
 - `novarocks/frontend-application/src/**`
   FE application composition, SQL admission, catalog projection, native query
-  execution adapter and distributed task coordination. Query-local semantic
-  policy remains in `novarocks/query-application/src/**`; long-lived Catalog
+  adapter, supervised statement orchestration and domain publication.
+  `task_execution/**` owns Native attempt protocol facts; the common logical
+  execution owner and recovery policy remain in `novarocks/query-application/src/**`.
+  Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
   family: it owns each family's classification (`ExternalProjection` /
@@ -160,6 +162,14 @@ SQL client
   kernels shared by FE and BE application owners. `execution-contract` owns the
   identities and contracts both roles must agree on; `execution` owns the
   runtime that runs under them.
+
+- `novarocks/coordination-contract/src/**`
+  仅共享 FE owner 之间实际使用的身份、时间、消息与中立事实；无 Tokio、领域载荷、
+  session、closure、资源 owner 或恢复算法。Query Application 的 `coordination/supervisor.rs`
+  拥有唯一 query-id 来源、逻辑驱动和恢复政策，`runtime_registry.rs` 与
+  `runtime_registry/health.rs` 保管原任务、真实退出和原始 health；writer/统计完成证明属于
+  Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
+  源码结构与局部测试不证明整族原生或最终全工作区验证完成。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
@@ -188,6 +198,44 @@ SQL client
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
   `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
   `iceberg_writer.rs` (INSERT INTO / INSERT OVERWRITE).
+
+- `novarocks/frontend-application/src/query/{statement_action,read_action,write_action,mutation_action,ctas_action}.rs`
+  当前 governed 语句接缝：普通 Read 保留 Client 窗口与流式 handle；Internal 写入由稳定 Action
+  编排 prepare、计算、publication 和必要 finalize。共享阶段/计算在 `query/statement_computation.rs`，
+  共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
+  成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
+
+- `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
+  Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
+  静默移交给同 job 的稳定接收格，再通知原串行 worker。计算沿共享 `statement_computation.rs`，
+  Ready 在 payload 移交前保留原 statement retention；publication 与 residual 继续保管同原 Session。
+  scoped CPU 作者在 `query_execution/internal_result_cpu/scoped_statistics.rs`，准备访问保管在
+  `query_execution/statistics/preparation.rs`。普通业务拒绝、actual quiescence 与 raw health 分别保留，
+  不能用其中一项代替另一项；这些源码入口不证明整族或原生验收完成。
+
+- `novarocks/workload-control/src/result_window.rs` 与
+  `novarocks/workload-control/src/result_window/retained_bytes.rs`、
+  `novarocks/query-application/src/cpu.rs` 与
+  `novarocks/query-application/src/cpu/bounded_worker.rs`、
+  `novarocks/frontend-application/src/native/task_transport.rs`
+  分别拥有结果数据预算、实际 worker/队列和 Transport bytes/items。scope、完整 D 与
+  factory 身份不能自行授予资源；普通 Full 沿原队列可取消等待，不当作资源失败。
+  出队归还队列位置，已开始工作及结果析构仍按实际退出归还原运行资源。
+  Client 复用原结果窗口，Internal 计算位置与保留数据分开，不与 worker 数绑定。
+  复制前按实际 buffer 的 old+new 并存峰取得同一预算回执，最后实际 alias 退出才退款；
+  额外 schema lifetime 不授予 byte author。same Root 自持数据导致预算不足时 typed 拒绝，
+  不等待自己、不建立递归 SDK invoice。当前实现沿上述 owner 接线；原生/最终全工作区验证范围、
+  失败处置与验收资格分别核对。
+
+- `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs` 与
+  `novarocks/frontend-application/src/mv/service/background_original.rs`
+  MV 的 CREATE、DROP、普通 ALTER、Refresh/Repartition 与 SHOW/EXPLAIN 分别走原 Root 的
+  控制、数据或只读 Action；后台沿原 scheduler/runtime 的稳定 Source 提交同一执行 owner。
+  `novarocks/mv-application/src/service.rs` 的 `MvProductOperations` 保同一业务闸门与调度状态，
+  process wrapper 独持 `process_runtime.rs` 的异步后台任务和原 Join；不让活动 Source 强持
+  wrapper 形成循环。借用 future 的取消不丢原 owner，停止等待不替代真实 close。
+  旧同步 runner、协调器及其第二身份来源已退役；未触及的 CALL/Host 辅助入口不能据此称为全域
+  异步完成。ADR-0198 所述架构已实施；既有基线失败、能力限制与正式准入资格仍须独立核对。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
@@ -418,7 +466,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 1. A MySQL client connects to a `role=fe` process through the native SQL
    entrypoint.
 2. The frontend owns session admission, catalog resolution, planning, and
-   coordinator lifecycle assembly.
+   supervised statement orchestration and common logical execution assembly.
 3. Persistent tables belong to external providers. Iceberg owns its catalog and
    mutation truth; Paimon owns its external snapshots and exposes only its
    supported read capability.
@@ -449,15 +497,22 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.3 Native Distributed Task Execution Path
 
-1. `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs` freezes a
-   `QueryExecutionId` and, from one live backend snapshot, a task graph:
-   `novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
+1. Query Application 的 `coordination/supervisor.rs` 统一预留 query 与 attempt 身份；
+   `novarocks/frontend-application/src/query_execution/logical_execution.rs` 从同一 reservation
+   续接原凭据与 attempt 责任。`native_execution_adapter.rs` 从一个实际 backend snapshot 冻结
+   Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
    `QueryContextRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
-2. `execute_round_on_task_protocol` establishes every context and creates every
+2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
+   Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
+   稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
+   业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
+   结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
+   ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
+   `execute_round_on_task_protocol` establishes every context and creates every
    task through a bounded, fair dispatcher
    (`novarocks/frontend-application/src/task_execution/{round,dispatch,context_owner}.rs`).
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
@@ -497,8 +552,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    task's terminal *is* its own status.
 6. Client cancellation is `KILL QUERY` through the Query Application query-control
    owner, delivered as `AbortQueryContext`. The Frontend Application withholds the
-   interrupt until its coordinator worker unwinds, so the next statement on
-   that connection cannot race the statement generation.
+   interrupt until this statement's local supervised orchestration exits, so the
+   next statement cannot race its generation. This does not require remote
+   Unknown publication or residual cleanup to disappear; its stable owner retains
+   the actual responsibility and capacity. See ADR-0198.
 
 ## 6. Core Data Structures (Current Implementation)
 
@@ -912,7 +969,7 @@ unless you edited them.
 | `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
 | `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
 | `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
-| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
 
 **SQL: choose suites from native declarations** and their generated map in
 `tests/sql/correctness/README.md`. Direct `--only <case>` is useful for diagnosis;
@@ -966,11 +1023,26 @@ suspected case against a clean server before attributing it to the change.
   `delete/**`, `mutation_flow.rs`, `truncate.rs`, `add_files.rs`,
   `iceberg_writer.rs`); catalog/table DDL is in
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
+  Current governed statement custody starts at `novarocks/frontend-application/src/query/statement_action.rs`;
+  inspect the read/write/mutation/CTAS/MV Actions, shared `statement_computation.rs` and
+  `statement_publication.rs` in that directory. Provider rewrite session custody is in
+  `query_execution/distributed_rewrite.rs`; the former empty `QueryExecutionService` injection
+  chain is retired.
+  Common logical execution policy and identity are in `novarocks/query-application/src/coordination/**`.
+  Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
+  and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
+  资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
+  局部组件通过不证明原生调用面或最终全工作区验证完成。
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
-  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 与 [ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 后再改身份、字段继承、派发生命周期或清理授权。
+  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
+  BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
+  精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
+  必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
+  `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
+  NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。
 - **Execution semantics/operator behavior**：先核对 `novarocks/local-compiler/src/**` 和
   `novarocks/local-program/src/**`，再看 Execution `exec/pipeline/builder/compiled.rs`、
   `exec/operators/**`；`exec/node/**` 仍有共享值类型和运行能力，不能当旧树整片删除。
@@ -979,10 +1051,21 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/execution/src/runtime/fragment/io/**`,
   `novarocks/execution/src/exec/operators/exchange_source.rs`, and
   `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,fragment_exchange_receiver}.rs`.
-- **Materialized views**: inspect `novarocks/mv-application/src/**` and
-  `novarocks/frontend-application/src/mv/**`; MV query rewrite is an optimizer
-  concern under `novarocks/sql/src/optimizer/**`.
-- **Native distributed task execution**: inspect
+- **Statistics collection/publication**: inspect
+  `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`,
+  `query_execution/statistics/preparation.rs`, and `query_execution/internal_result_cpu/scoped_statistics.rs`.
+  Follow the original Root, query-permit handoff, CPU/Provider source and retained result through actual exit;
+  `query_execution/maintenance/io_admission.rs` separates ordinary refusal from actual quiescence.
+  Structural migration does not establish whole-family Native qualification or resolve recorded failures.
+- **Materialized views**: inspect `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs`,
+  `novarocks/mv-application/src/{service,process_runtime}.rs` and
+  `novarocks/frontend-application/src/mv/service/background_original.rs` for original Action,
+  business-gate and async background custody. Provider publication, Current projection,
+  cumulative effect, necessary finalization and physical retirement retain separate facts.
+  MV query rewrite is an optimizer concern under `novarocks/sql/src/optimizer/**`.
+- **Native distributed task execution**: start with the common execution owner in
+  `novarocks/query-application/src/coordination/**` and the minimal boundary in
+  `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
   `novarocks/frontend-application/src/task_execution/**`,
   `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,

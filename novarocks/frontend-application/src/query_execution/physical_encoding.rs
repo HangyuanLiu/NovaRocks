@@ -30,6 +30,8 @@
 
 // Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
+#[cfg(test)]
+use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_physical_plan::PlanVersionId;
@@ -160,7 +162,7 @@ pub(crate) fn encode_completed_plan(
 ///
 /// The capability moves rather than copies, because a capability cannot be
 /// copied; the encoding stays behind for whichever carrier reads it.
-fn split_frozen_reads(
+pub(crate) fn split_frozen_reads(
     reads: novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
 ) -> (
     BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
@@ -194,11 +196,199 @@ fn encode_completed_packages(
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
-    let semantic_candidate = paired.candidate().clone();
     let (candidate, reads) = paired.into_parts();
+    let (encodings, capabilities) = split_frozen_reads(reads);
+    let parts = encode_static_packages(
+        candidate,
+        &encodings,
+        carrier,
+        statement_constant_policy,
+        write_targets,
+        control,
+    )?;
+    parts.bind_capabilities(capabilities)
+}
+
+/// Static output only. The original linear Provider access stays in its
+/// caller's stable Source throughout the closed worker call and its unwind.
+pub(crate) struct EncodedStaticPlan {
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    native: NativeFragmentAttachment,
+    #[cfg(test)]
+    topology: CompletedPlanTopology,
+    plan_facts: AttemptPlanFacts,
+}
+/// A neutral static plan with its exact linear-read mapping checked while the
+/// original access still resides in the caller's stable source.
+pub(crate) struct PreparedStaticPlan {
+    encoded: EncodedStaticPlan,
+    access: crate::query_execution::preparation::attempt_access::PreparedAttemptAccess,
+}
+impl PreparedStaticPlan {
+    pub(crate) fn candidate(
+        &self,
+    ) -> &novarocks_query_application::preparation::CompletedPhysicalPlanCandidate {
+        &self.encoded.candidate
+    }
+    pub(crate) fn scheduling_facts(
+        &self,
+        version: PlanVersionId,
+    ) -> Result<novarocks_query_application::api::ExecutionSchedulingFacts, String> {
+        self.encoded
+            .plan_facts
+            .scheduling()
+            .attempt_scheduling_facts(novarocks_query_application::api::PlanSeal::Version(version))
+    }
+    pub(crate) fn bind_access(
+        self,
+        access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+            FrozenProviderRead,
+        >,
+    ) -> EncodedCompletedPlan {
+        let (_, capabilities) = split_frozen_reads(access);
+        self.bind_capabilities(capabilities)
+    }
+    /// The original Source retired the encodings on its CPU turn and retains
+    /// these same capabilities until that turn's actual exit. This checked
+    /// receiving step performs no opaque encoding destructor.
+    pub(crate) fn bind_capabilities(
+        self,
+        capabilities: BTreeMap<ProviderReadOccurrenceId, FrozenReadCapability>,
+    ) -> EncodedCompletedPlan {
+        let access = self
+            .access
+            .bind(self.encoded.candidate.plan(), capabilities);
+        EncodedCompletedPlan {
+            semantic_candidate: self.encoded.candidate,
+            native: self.encoded.native,
+            #[cfg(test)]
+            topology: self.encoded.topology,
+            plan_facts: self.encoded.plan_facts,
+            access,
+        }
+    }
+}
+impl EncodedStaticPlan {
+    pub(crate) fn prepare_access(
+        self,
+        access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+            FrozenProviderRead,
+        >,
+    ) -> Result<PreparedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+        let mapping =
+            crate::query_execution::preparation::attempt_access::PreparedAttemptAccess::prepare(
+                self.candidate.plan(),
+                access,
+            )?;
+        Ok(PreparedStaticPlan {
+            encoded: self,
+            access: mapping,
+        })
+    }
+    fn bind_capabilities(
+        self,
+        capabilities: BTreeMap<ProviderReadOccurrenceId, FrozenReadCapability>,
+    ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+        let access = attempt_access_for_completed_plan(self.candidate.plan(), capabilities)?;
+        Ok(EncodedCompletedPlan {
+            semantic_candidate: self.candidate,
+            native: self.native,
+            #[cfg(test)]
+            topology: self.topology,
+            plan_facts: self.plan_facts,
+            access,
+        })
+    }
+}
+
+/// The same encoder with borrowed original access. Only neutral encoding facts
+/// are copied; no Provider access/generation owner moves onto the CPU stack.
+pub(crate) fn encode_completed_plan_borrowed(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_borrowed_original(candidate, access, carrier, policy, None, control)
+}
+
+pub(crate) fn encode_completed_write_plan_borrowed(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: &WriteTargetFacts<'_>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_borrowed_original(
+        candidate,
+        access,
+        carrier,
+        policy,
+        Some(write_targets),
+        control,
+    )
+}
+
+fn encode_borrowed_original(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    let mut encodings = BTreeMap::new();
+    for fragment in candidate.plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            if let NodeKind::Scan { occurrence, .. } = &node.kind {
+                let read = access.get(*occurrence).ok_or_else(|| {
+                    novarocks_plan_codec::PhysicalEncodeError::from(
+                        "completed plan has no original read access".to_owned(),
+                    )
+                })?;
+                encodings
+                    .entry(*occurrence)
+                    .or_insert_with(|| read.access.encoding.clone());
+            }
+        }
+    }
+    if encodings.len() != access.len() {
+        return Err("completed plan has unused original read access"
+            .to_owned()
+            .into());
+    }
+    let result = encode_static_packages(
+        candidate,
+        &encodings,
+        carrier,
+        policy,
+        write_targets,
+        control,
+    );
+    if matches!(
+        &result,
+        Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
+    ) {
+        return result;
+    }
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    result
+}
+
+// Sole package/Native fact author for both consuming and borrowing callers.
+fn encode_static_packages(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    carrier: &CompiledPackageCarrier,
+    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let plan = candidate.plan();
     refuse_uncompiled_plan_shapes(plan)?;
-    let (encodings, capabilities) = split_frozen_reads(reads);
     let topology = completed_plan_topology(plan)?;
     // Each written target's frozen recipe comes from the session that sealed
     // it; a plan that writes with no sealing session has no recipe author.
@@ -216,7 +406,7 @@ fn encode_completed_packages(
     };
     let packages = extract_checked_packages(
         &candidate,
-        &encodings,
+        encodings,
         &writes,
         statement_constant_policy,
         carrier.admission(),
@@ -237,11 +427,11 @@ fn encode_completed_packages(
     )?;
     // Scan scheduling and the attempt's scan facts are read from the plan and
     // the freezes; no wire encoding is consulted.
-    let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
+    let scheduling = completed_plan_scheduling_facts(plan, encodings, &topology, provenance)?;
     let plan_facts = AttemptPlanFacts::from_completed(
         scheduling,
         completed_plan_edge_facts(plan)?,
-        completed_plan_scan_facts(plan, &encodings)?,
+        completed_plan_scan_facts(plan, encodings)?,
         submission,
         // The attempt deploys the plan's filters by the same plan-global
         // binding numbering each package's cuts carry.
@@ -250,14 +440,12 @@ fn encode_completed_packages(
         // that is what the commit is taken over; a read plan says none.
         Some(written).filter(|targets| !targets.is_empty()),
     );
-    let access = attempt_access_for_completed_plan(plan, capabilities)?;
-    Ok(EncodedCompletedPlan {
-        semantic_candidate,
+    Ok(EncodedStaticPlan {
+        candidate,
         native,
         #[cfg(test)]
         topology,
         plan_facts,
-        access,
     })
 }
 
@@ -757,7 +945,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request(), &scope),
+            )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let plan_fragments = completed.candidate().plan().fragments().len();
 
@@ -823,7 +1014,7 @@ mod tests {
         let completed = runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql), &scope),
+                    .complete_for_test(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
         let control = SqlCompileControl::unbounded();
@@ -952,7 +1143,7 @@ mod tests {
         runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql), &scope),
+                    .complete_for_test(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"))
     }
@@ -1350,7 +1541,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request, &scope),
+            )
             .unwrap_or_else(|error| panic!("wide statistics source completion: {error:#?}"));
         let plan = completed.candidate().plan();
         assert_eq!(
@@ -1674,7 +1868,8 @@ mod tests {
             let (_root, scope) = query_scope();
             let completed = runtime
                 .block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                        .complete_for_test(request(), &scope),
                 )
                 .expect("the actual admitted VALUES plan completes");
             let fragments = completed.candidate().plan().fragments().len();
@@ -1717,7 +1912,8 @@ mod tests {
             );
             let completed = runtime
                 .block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                        .complete_for_test(request(), &scope),
                 )
                 .expect("the actual admitted VALUES plan completes");
             let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
@@ -1750,7 +1946,8 @@ mod tests {
 
             let completed = runtime
                 .block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                        .complete_for_test(request(), &scope),
                 )
                 .unwrap();
             let freezes_before_refusal =
@@ -1805,7 +2002,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request(), &scope),
+            )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let version = completed.candidate().plan().version();
         let encoded = encode_completed_plan(
@@ -1819,8 +2019,8 @@ mod tests {
         let template = encoded.into_attempt_template(version);
 
         let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-        let first = template.instantiate();
-        let recovery = template.instantiate();
+        let first = template.instantiate_static_fragment_fixture();
+        let recovery = template.instantiate_static_fragment_fixture();
         assert_eq!(
             crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
             freezes,
@@ -1843,7 +2043,10 @@ mod tests {
             .expect("runtime");
         let (_root, scope) = query_scope();
         let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request(), &scope),
+            )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let topology = completed_plan_topology(completed.candidate().plan())
             .expect("a completed plan has a topology");
@@ -2010,7 +2213,7 @@ mod tests {
             .build()
             .unwrap();
         let (_root, scope) = query_scope();
-        let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(
+        let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete_for_test(
             request_for("SELECT hll_hash('x') AS h,bitmap_agg(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_string(bitmap_agg(1)) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();

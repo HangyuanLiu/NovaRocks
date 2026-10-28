@@ -119,6 +119,20 @@ impl QueryCancellationView {
         }
     }
 
+    pub(crate) fn governed_timeout_for_scope(
+        &self,
+        scope: &novarocks_workload_control::WorkScope,
+    ) -> Result<Option<u64>, novarocks_workload_control::WorkError> {
+        match &self.inner {
+            QueryCancellationViewInner::Governed { view, timeout_ms }
+                if view.is_for_scope(scope) =>
+            {
+                Ok(*timeout_ms)
+            }
+            _ => Err(novarocks_workload_control::WorkError::Conflict),
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.reason().is_some()
     }

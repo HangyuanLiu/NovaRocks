@@ -65,27 +65,8 @@ fn current_parameters() -> ListingStartupParameters {
     }
 }
 
-/// Validated values read from the original SDK/listing owners at startup.
-/// Its private field prevents another Server module constructing a verdict.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ValidatedListingStartup {
-    parameters: ListingStartupParameters,
-}
-
-impl ValidatedListingStartup {
-    pub(crate) fn owned_bound(&self) -> ConnectorListingBound {
-        self.parameters.owned
-    }
-}
-
-pub(crate) fn validated_current() -> Result<ValidatedListingStartup> {
-    let parameters = current_parameters();
-    validate_parameters(parameters)?;
-    Ok(ValidatedListingStartup { parameters })
-}
-
 pub(crate) fn validate_current() -> Result<()> {
-    validated_current().map(|_| ())
+    validate_parameters(current_parameters())
 }
 
 fn exact_milliseconds(duration: Duration, name: &'static str) -> Result<u64> {

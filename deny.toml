@@ -104,6 +104,16 @@ skip = [
     { crate = "digest@0.11.3", reason = "transitive through opendal-core and md-5 0.11" },
     { crate = "md-5@0.11.0", reason = "transitive through opendal-core" },
 
+    # The public OpenDAL/HDFS migration retains disjoint upstream API lines.
+    { crate = "aes@0.9.3", reason = "hdfs-native 0.14.6 requires aes 0.9; Iceberg aes-gcm 0.10 retains aes 0.8" },
+    { crate = "cipher@0.5.2", reason = "hdfs-native 0.14.6 and its crypto family require cipher 0.5; Iceberg aes-gcm retains cipher 0.4" },
+    { crate = "ctr@0.10.1", reason = "hdfs-native 0.14.6 requires ctr 0.10; Iceberg aes-gcm retains ctr 0.9" },
+    { crate = "hmac@0.13.0", reason = "hdfs-native 0.14.6 and Reqsign 3 require hmac 0.13; native trust, Paimon and Reqsign 0.16 retain hmac 0.12" },
+    { crate = "inout@0.2.5", reason = "cipher 0.5 requires inout 0.2; the Iceberg cipher 0.4 family retains inout 0.1" },
+    { crate = "sha1@0.11.0", reason = "Reqsign 3 requires sha1 0.11; MySQL, Paimon and Reqsign 0.16 retain sha1 0.10" },
+    { crate = "sha2@0.11.1", reason = "Reqsign 3 requires sha2 0.11; workspace consumers and retained SDKs use sha2 0.10" },
+    { crate = "wasi@0.14.7+wasi-0.2.4", reason = "HDFS whoami 2 uses wasite 1 and WASI 0.13-0.14; mio and getrandom retain the WASI 0.11 ABI" },
+
     # Macro ecosystems are pinned by upstream provider versions.
     { crate = "darling@0.20.11", reason = "transitive through derive_builder and mysql-common-derive" },
     { crate = "darling_core@0.20.11", reason = "transitive through darling 0.20" },
@@ -142,7 +152,7 @@ skip = [
     { crate = "prost-derive@0.14.3", reason = "transitive through prost 0.14" },
     { crate = "prost-types@0.14.3", reason = "transitive through the HDFS provider" },
     { crate = "quick-xml@0.37.5", reason = "transitive through reqsign" },
-    { crate = "quick-xml@0.38.4", reason = "transitive through OpenDAL 0.55" },
+    { crate = "quick-xml@0.42.0", reason = "Reqsign AWS 3 requires quick-xml 0.42; OpenDAL 0.58 core and S3 retain quick-xml 0.41" },
     { crate = "roaring@0.11.3", reason = "transitive through Iceberg and Paimon" },
     { crate = "snafu@0.8.9", reason = "transitive through orc-rust" },
     { crate = "snafu-derive@0.8.9", reason = "transitive through snafu 0.8" },

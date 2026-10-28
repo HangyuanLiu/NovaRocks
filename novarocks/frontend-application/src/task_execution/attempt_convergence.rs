@@ -139,17 +139,30 @@ impl NativeAttemptConvergenceOwner {
     }
 
     pub(crate) fn process_replaced(&self, backend: novarocks_types::BackendProcessId) -> bool {
-        let Some(target) = self
+        self.replacement_process(backend).is_some()
+    }
+
+    /// Preserve the observed replacement identity from the same frozen
+    /// endpoint. Missing, unhealthy or equal identities are not replacement.
+    pub(crate) fn replacement_process(
+        &self,
+        backend: novarocks_types::BackendProcessId,
+    ) -> Option<novarocks_types::BackendProcessId> {
+        let target = self
             .targets
             .iter()
-            .find(|target| target.context.backend_process_id() == backend)
-        else {
-            return false;
-        };
-        matches!(
-            self.source.observe_process_at_endpoint(backend, &target.endpoint),
-            Ok(BackendProcessObservation::Replaced { current_process }) if current_process != backend
-        )
+            .find(|target| target.context.backend_process_id() == backend)?;
+        match self
+            .source
+            .observe_process_at_endpoint(backend, &target.endpoint)
+        {
+            Ok(BackendProcessObservation::Replaced { current_process })
+                if current_process != backend =>
+            {
+                Some(current_process)
+            }
+            _ => None,
+        }
     }
 
     /// Read only facts already accepted by the original covered owner, plus
@@ -241,16 +254,34 @@ impl NativeAttemptConvergenceOwner {
         mode: NativeAttemptConvergenceMode,
         request: NativeActiveConvergenceRequest,
         notify: &tokio::sync::Notify,
+        mut profile: Option<&mut super::profile_diagnostics::TaskFinalInfoCollector>,
     ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
         let deadline = self.retain_remote_deadline(request.remote_observation_deadline());
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            if let Some(profile) = profile.as_deref_mut() {
+                let now = round.execution().monotonic_now();
+                let cancelled = request.cancellation().reason().is_some();
+                let round_poll = &mut *round;
+                let profile_poll = &mut *profile;
+                std::future::poll_fn(move |cx| {
+                    profile_poll.poll_profile_observation(round_poll, now, cancelled, cx);
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                if profile.final_info_closed() || profile.observation_deadline().is_none() {
+                    round.execution_mut().release_profile_diagnostics();
+                }
+            }
             self.begin(round, split_delivery, mode);
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
             if round.pumps_closed()
+                && profile.as_ref().is_none_or(|profile| {
+                    profile.is_closed() && profile.observation_deadline().is_none()
+                })
                 && let Some(closure) = &self.remote_closure
             {
                 return Ok(closure.clone());
@@ -261,13 +292,18 @@ impl NativeAttemptConvergenceOwner {
                 mode,
                 request.cancellation().reason().is_some(),
             ) {
-                Ok(NativeAttemptConvergenceStep::Ready) => true,
+                // A retained remote fact is not fresh progress while an
+                // independent original diagnostic read still has to exit.
+                Ok(NativeAttemptConvergenceStep::Ready) => false,
                 Ok(NativeAttemptConvergenceStep::Pending { moved }) => moved,
                 Err(_) => false,
             };
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
             if round.pumps_closed()
+                && profile.as_ref().is_none_or(|profile| {
+                    profile.is_closed() && profile.observation_deadline().is_none()
+                })
                 && let Some(closure) = &self.remote_closure
             {
                 return Ok(closure.clone());
@@ -280,6 +316,137 @@ impl NativeAttemptConvergenceOwner {
                 _ = tokio::time::sleep(IDLE_RECHECK) => {}
             }
         }
+    }
+
+    /// Closes the SAME unstarted round without obtaining a remote budget.
+    /// Every frozen context must still have its original never-issued proof;
+    /// local jobs/diagnostics nevertheless have to actually close and join.
+    pub(crate) async fn drive_unstarted(
+        &mut self,
+        round: &mut TaskRound,
+        split_delivery: &SplitDeliveryBridge,
+        notify: &tokio::sync::Notify,
+        mut profile: Option<&mut super::profile_diagnostics::TaskFinalInfoCollector>,
+    ) -> Result<(), StatementNativeHealthFailure> {
+        if !round.pumps_declared() {
+            return Err(self.retain_unstarted_failure(
+                "Native dormant cleanup requires its original source declaration",
+                "the original unstarted round never declared its per-turn owners",
+            ));
+        }
+        self.verify_unstarted(round)?;
+        self.begin(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.stop_starting();
+        }
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.verify_unstarted(round)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                let now = round.execution().monotonic_now();
+                let round_poll = &mut *round;
+                let profile_poll = &mut *profile;
+                std::future::poll_fn(move |cx| {
+                    profile_poll.poll_profile_observation(round_poll, now, true, cx);
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                if profile.final_info_closed() || profile.observation_deadline().is_none() {
+                    round.execution_mut().release_profile_diagnostics();
+                }
+            }
+            self.observe_local_close(round)?;
+            if round.pumps_closed()
+                && profile
+                    .as_ref()
+                    .is_none_or(|p| p.is_closed() && p.observation_deadline().is_none())
+            {
+                // Reuse the original positive-fact author, then check the
+                // exact nonempty frozen set; None/empty/remote timeout is not proof.
+                let facts = self
+                    .observed_contexts(round)
+                    .ok_or_else(|| self.unstarted_failure())?;
+                if facts.len() != self.targets.len()
+                    || facts.iter().zip(self.targets.iter()).any(|(fact, target)| {
+                        fact.context() != target.context
+                            || fact.kind() != novarocks_query_application::api::NativeContextConvergenceKind::NeverEstablished
+                    })
+                {
+                    return Err(self.unstarted_failure());
+                }
+                return Ok(());
+            }
+            let moved = match self.step(
+                round,
+                split_delivery,
+                NativeAttemptConvergenceMode::Cleanup,
+                true,
+            ) {
+                Ok(NativeAttemptConvergenceStep::Ready) => false,
+                Ok(NativeAttemptConvergenceStep::Pending { moved }) => moved,
+                Err(_) => false,
+            };
+            self.observe_local_close(round)?;
+            self.verify_unstarted(round)?;
+            if moved {
+                continue;
+            }
+            // Same original attempt-local wait policy as drive(), with no
+            // extra service, remote deadline, task, or independent timer owner.
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(IDLE_RECHECK) => {}
+            }
+        }
+    }
+
+    fn verify_unstarted(&mut self, round: &TaskRound) -> Result<(), StatementNativeHealthFailure> {
+        if let Some(original) = &self.local_unresolved {
+            return Err(original.clone());
+        }
+        if self.targets.is_empty()
+            || self
+                .targets
+                .iter()
+                .any(|target| !round.execution().context_never_established(target.context))
+        {
+            return Err(self.unstarted_failure());
+        }
+        Ok(())
+    }
+
+    fn unstarted_failure(&mut self) -> StatementNativeHealthFailure {
+        self.retain_unstarted_failure(
+            "Native dormant cleanup requires every exact context to be never established",
+            "the original unstarted round lost its exact never-established proof",
+        )
+    }
+
+    pub(crate) fn retain_unstarted_gate_failure(&mut self) -> StatementNativeHealthFailure {
+        self.retain_unstarted_failure(
+            "Native dormant cleanup found outstanding actor transport authority",
+            "the original unstarted actor gate still owns transport effects",
+        )
+    }
+
+    fn retain_unstarted_failure(
+        &mut self,
+        detail: &'static str,
+        message: &'static str,
+    ) -> StatementNativeHealthFailure {
+        // The same pre-existing first-health slot owns this Arc before any
+        // borrowed F or CancellationView can Drop and raise a secondary panic.
+        if let Some(original) = &self.local_unresolved {
+            return original.clone();
+        }
+        let failure = StatementNativeHealthFailure::actual_exit_unproven(
+            detail,
+            std::sync::Arc::new(TaskExecutionError::Schedule(message.to_owned())),
+        );
+        self.local_unresolved = Some(failure.clone());
+        failure
     }
 
     fn observe_local_close(
@@ -303,18 +470,6 @@ impl NativeAttemptConvergenceOwner {
             return Err(error);
         }
         Ok(())
-    }
-
-    /// Observe only the original remote facts. This never supplies local pump
-    /// exit, normal production, Task acceptance, or a fresh observation budget.
-    pub(crate) fn observe_remote(
-        &mut self,
-        round: &TaskRound,
-        incoming_deadline: std::time::Instant,
-    ) -> Option<NativeActiveConvergenceClosure> {
-        let deadline = self.retain_remote_deadline(incoming_deadline);
-        self.observe_remote_closure(round, deadline);
-        self.remote_closure.clone()
     }
 
     fn retain_remote_deadline(&mut self, incoming: std::time::Instant) -> std::time::Instant {
@@ -833,6 +988,7 @@ mod tests {
                 NativeAttemptConvergenceMode::Cleanup,
                 request,
                 &notify,
+                None,
             ),
         )
         .await
@@ -854,6 +1010,7 @@ mod tests {
                     std::time::Instant::now(),
                 ),
                 &notify,
+                None,
             ),
         )
         .await
@@ -873,6 +1030,7 @@ mod tests {
                     std::time::Instant::now() + std::time::Duration::from_secs(60),
                 ),
                 &notify,
+                None,
             ),
         )
         .await
@@ -935,8 +1093,11 @@ mod tests {
             "positive original facts precede the expired request"
         );
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let deadline = owner.retain_remote_deadline(expired);
+        owner.observe_remote_closure(&round, deadline);
         let closure = owner
-            .observe_remote(&round, expired)
+            .remote_closure
+            .clone()
             .expect("already accepted evidence");
         match closure {
             NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Contexts(
@@ -953,8 +1114,10 @@ mod tests {
         }
         // A later shutdown/re-entry cannot replace the previously frozen
         // positive evidence with a second remote disposition either.
+        let deadline = owner.retain_remote_deadline(expired - std::time::Duration::from_secs(1));
+        owner.observe_remote_closure(&round, deadline);
         assert!(matches!(
-            owner.observe_remote(&round, expired - std::time::Duration::from_secs(1)),
+            owner.remote_closure.clone(),
             Some(NativeActiveConvergenceClosure::Evidence(_))
         ));
         let contributions = round.execution().released_runtime_filter_contributions();
@@ -964,4 +1127,6 @@ mod tests {
             &[(context.backend_process_id(), contribution)]
         );
     }
+
+    include!("attempt_convergence_diagnostic_exit_tests.rs");
 }

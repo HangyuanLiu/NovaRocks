@@ -40,7 +40,55 @@ pub fn validate_required_observed<E>(
 ) -> Result<(), ValueFailure<E>> {
     validate_with_options(source, binding, HydrateOptions::default(), work, observe)
 }
+/// Check the original value promise using the caller's exact frozen projection.
+pub fn validate_required_with_options_observed<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    validate_with_options(source, binding, options, work, observe)
+}
+
+/// Observe a target requirement without treating it as an input value promise.
+/// The same logical-NULL traversal keeps dictionary and active-parent rules.
+/// Invalid structure/keys and caller failures remain their original errors.
+pub fn required_values_satisfied_observed<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<bool, ValueFailure<E>> {
+    validate_structure(source, binding, options, work, observe)?;
+    let mut satisfied = true;
+    let mut missing = || {
+        satisfied = false;
+        Ok(())
+    };
+    for row in 0..source.len() {
+        validate_row(source, binding.borrowed(), options, row, work, &mut missing)?;
+    }
+    Ok(satisfied)
+}
+
 pub(super) fn validate_with_options<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    validate_structure(source, binding, options, work, observe)?;
+    let mut missing = || Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
+    for row in 0..source.len() {
+        validate_row(source, binding.borrowed(), options, row, work, &mut missing)?;
+    }
+    Ok(())
+}
+
+fn validate_structure<E>(
     source: &ArrayRef,
     binding: &TypedValueBinding,
     options: HydrateOptions,
@@ -75,11 +123,9 @@ pub(super) fn validate_with_options<E>(
         return Err(ValueError::Invariant(ValueViolation::Layout).into());
     }
     inspect(source, work, observe, 0)?;
-    for row in 0..source.len() {
-        validate_row(source, binding.borrowed(), options, row, work)?;
-    }
     Ok(())
 }
+
 fn inspect<E>(
     source: &ArrayRef,
     work: &mut Work<'_, E>,
@@ -158,6 +204,7 @@ fn validate_row<E>(
     options: HydrateOptions,
     row: usize,
     work: &mut Work<'_, E>,
+    missing: &mut dyn FnMut() -> Result<(), ValueFailure<E>>,
 ) -> Result<(), ValueFailure<E>> {
     work(1).map_err(ValueFailure::Caller)?;
     let is_null = if matches!(source.data_type(), DataType::Dictionary(..)) {
@@ -172,7 +219,7 @@ fn validate_row<E>(
     };
     if is_null {
         if !binding.value_type().nullable() {
-            return Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
+            return missing();
         }
         return Ok(());
     }
@@ -196,7 +243,7 @@ fn validate_row<E>(
         };
         let binding = child(binding, index)?;
         for row in start..end {
-            validate_row(input, binding, options, row, work)?;
+            validate_row(input, binding, options, row, work, missing)?;
         }
         Ok(())
     })

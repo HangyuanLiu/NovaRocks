@@ -61,7 +61,6 @@ pub mod cgroup_memory;
 mod compiled_composition;
 pub mod composition;
 mod env_reference;
-mod joint_startup_report;
 pub mod launch;
 pub mod logging;
 pub mod memory_limit;

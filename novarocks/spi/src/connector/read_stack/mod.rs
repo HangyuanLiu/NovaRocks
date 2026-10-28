@@ -88,10 +88,13 @@ pub use runtime::{
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
     ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
-    ConnectorReadPageSourceProvider, ConnectorReadRegistrationLease, ConnectorReadRelation,
-    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadRequestControl,
-    ConnectorReadRequestControlFactory, ConnectorReadSplit, ConnectorReadSplitFacts,
-    ConnectorReadSplitManager, ConnectorReadSplitSource, ConnectorReadSystemTablePlan,
+    ConnectorReadOpenedRelation, ConnectorReadPageSourceProvider, ConnectorReadRegistrationLease,
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationPreparation,
+    ConnectorReadRelationPreparationFuture, ConnectorReadRelationPreparationKind,
+    ConnectorReadRelationPreparationRequest, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitOpenFuture,
+    ConnectorReadSplitOpenRequest, ConnectorReadSplitSource, ConnectorReadSystemTablePlan,
     ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};

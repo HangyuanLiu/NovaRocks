@@ -254,6 +254,26 @@ impl ViewService for QueryViewService {
         crate::view_rewrite::expand_external_views(engine, query, context, sql_semantics)
     }
 
+    fn rewrite_query_async<'a>(
+        &'a self,
+        engine: &'a dyn ViewEngine,
+        query: &'a mut Query,
+        context: ViewRequestContext<'a>,
+        sql_semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let registry = self.registry_snapshot()?;
+            crate::view_rewrite::expand_session_views(
+                query,
+                &registry,
+                context.current_database,
+                sql_semantics,
+            )?;
+            crate::view_rewrite::expand_external_views_async(engine, query, context, sql_semantics)
+                .await
+        })
+    }
+
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String> {
         if !catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
             return Ok(());

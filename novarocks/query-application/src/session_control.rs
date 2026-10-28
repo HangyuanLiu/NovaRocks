@@ -17,7 +17,23 @@
 
 //! Query-application session cancellation control contract.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+mod background_source;
+mod statement_action;
+pub use background_source::{
+    BackgroundActionCustody, BackgroundActionReady, BackgroundActionReceipt,
+    BackgroundActionResultView, BackgroundActionSourceGeometry, GovernedBackgroundAction,
+};
+pub(crate) use statement_action::StatementProgressCursor;
+pub use statement_action::{
+    BackgroundActionResultGuard, GovernedStatementAction, GovernedStatementResidual,
+    StatementActionAttempt, StatementActionFailure, StatementActionReady, StatementActionReceipt,
+    StatementActionValue, StatementActionWaitError, StatementActionWaiter,
+    StatementProgressGeometry,
+};
+#[doc(hidden)]
+pub use statement_action::{StatementActionSource, StatementProgressSlot};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -205,6 +221,7 @@ pub enum QueryControlError {
     UnknownSession,
     StaleSession,
     StatementBusy,
+    StatementActionCapacity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -333,6 +350,12 @@ pub trait QueryControlPort: Send + Sync + 'static {
         &self,
         statement: StatementToken,
     ) -> GovernedStatementVisibilitySealOutcome;
+    /// Internal same-source dispatch for the original SQL action's poll loan.
+    #[doc(hidden)]
+    fn seal_governed_statement_action_visibility(
+        &self,
+        request: &StatementActionVisibilityRequest<'_>,
+    ) -> GovernedStatementVisibilitySealOutcome;
     fn fail_governed_statement(&self, statement: StatementToken) -> GovernedStatementFinishOutcome;
     fn cancel_governed_statement(
         &self,
@@ -351,6 +374,56 @@ pub trait QueryControlPort: Send + Sync + 'static {
         target_connection_id: u32,
     ) -> ConnectionKillAuthorization;
     fn cancel_all(&self, reason: QueryCancellationReason);
+
+    /// Composition installs one original supervisor before publishing actions.
+    fn attach_statement_progress(
+        &self,
+        _slot: &Arc<StatementProgressSlot>,
+        _source_slots: std::num::NonZeroUsize,
+    ) -> Result<(), QueryControlError> {
+        Err(QueryControlError::UnknownSession)
+    }
+    fn statement_progress_slot(&self) -> Option<Arc<StatementProgressSlot>> {
+        None
+    }
+    fn publish_statement_action_in(
+        &self,
+        _owner: &mut Option<GovernedQueryStatementOwner>,
+        _action: &mut Option<Box<dyn GovernedStatementAction>>,
+        _source: &Arc<StatementActionSource>,
+    ) -> Result<(), QueryControlError> {
+        Err(QueryControlError::UnknownSession)
+    }
+    fn next_statement_action(
+        &self,
+        _after: Option<usize>,
+    ) -> Option<(usize, Option<Arc<StatementActionSource>>)> {
+        None
+    }
+    fn retire_statement_action_source(&self, _source: &Arc<StatementActionSource>) -> bool {
+        false
+    }
+    fn detach_statement_action(
+        &self,
+        _token: StatementToken,
+        _source: &Arc<StatementActionSource>,
+    ) -> bool {
+        false
+    }
+    fn settle_statement_action_silent(
+        &self,
+        _token: StatementToken,
+        _source: &Arc<StatementActionSource>,
+    ) -> bool {
+        false
+    }
+    fn close_statement_actions(&self) {}
+    fn has_statement_actions(&self) -> bool {
+        false
+    }
+    fn statement_action_failure(&self) -> Option<Arc<StatementActionFailure>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -440,10 +513,9 @@ impl QueryControlService {
         .await
     }
 
-    /// Like [`Self::begin_queued_governed_query_statement`], but the warehouse
-    /// dequeue also takes one complete result window of `class` together with
-    /// the computation permit, before any dispatch. The owner retains the
-    /// window through the protocol's terminal outcome and its last alias.
+    /// Acquire the declared result custody with the query permit. Client and
+    /// local results retain their original window. Internal statements retain
+    /// the Root's actual byte budget; only a later computation takes a position.
     pub async fn begin_queued_governed_query_statement_with_result(
         &self,
         session: SessionToken,
@@ -502,11 +574,25 @@ impl QueryControlService {
                 Box::pin(async move { admission.await.map(|permit| (permit, None)) })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
             }),
+            Some(ResultWindowClass::Internal) => ResultWindowAlias::from_root_owner(&root.owner)
+                .and_then(|retention| {
+                    scope.admit_query().map(|admission| {
+                        Box::pin(async move {
+                            admission.await.map(|permit| {
+                                (
+                                    permit,
+                                    Some(StatementResultCapacity::RootRetention(retention)),
+                                )
+                            })
+                        })
+                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+                    })
+                }),
             Some(class) => scope.admit_query_with_result(class).map(|admission| {
                 Box::pin(async move {
-                    admission
-                        .await
-                        .map(|(permit, window)| (permit, Some(window)))
+                    admission.await.map(|(permit, window)| {
+                        (permit, Some(StatementResultCapacity::Window(window)))
+                    })
                 }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
             }),
         };
@@ -532,7 +618,7 @@ impl QueryControlService {
             }
         };
         Ok(GovernedQueryStatementOwner {
-            service: self.clone(),
+            service: GovernedControlLink::Strong(self.clone()),
             registration,
             scope,
             execution_owner: Some(root.owner),
@@ -574,8 +660,8 @@ impl QueryControlService {
         )
     }
 
-    /// Acquire the complete result position together with nonqueued business
-    /// admission, before registering or starting the statement's producer.
+    /// Acquire declared result custody with nonqueued business admission.
+    /// Internal statement custody does not take a computation position.
     pub fn begin_governed_statement_with_result(
         &self,
         session: SessionToken,
@@ -611,9 +697,24 @@ impl QueryControlService {
         request.deadline = deadline;
         let (root, result_window) = match window {
             None => admission.try_begin_root(request).map(|root| (root, None)),
+            Some(ResultWindowClass::Internal) => {
+                admission.try_begin_root(request).and_then(|root| {
+                    match ResultWindowAlias::from_root_owner(&root.owner) {
+                        Ok(retention) => Ok((
+                            root,
+                            Some(StatementResultCapacity::RootRetention(retention)),
+                        )),
+                        Err(error) => {
+                            root.owner.complete_after_terminal_cancel_settled();
+                            root.business.release();
+                            Err(error)
+                        }
+                    }
+                })
+            }
             Some(window) => admission
                 .try_begin_root_with_result(request, window)
-                .map(|(root, window)| (root, Some(window))),
+                .map(|(root, window)| (root, Some(StatementResultCapacity::Window(window)))),
         }
         .map_err(GovernedQueryStatementBeginError::Admission)?;
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
@@ -637,7 +738,7 @@ impl QueryControlService {
             }
         };
         Ok(GovernedQueryStatementOwner {
-            service: self.clone(),
+            service: GovernedControlLink::Strong(self.clone()),
             registration,
             scope: root.owner.scope(),
             execution_owner: Some(root.owner),
@@ -754,16 +855,202 @@ impl Drop for ActiveStatementLease {
 /// Move-only owner spanning query admission, async execution start, and the
 /// final protocol outcome. The business permit and statement generation remain
 /// live after the execution owner is handed to the query application.
+enum GovernedControlLink {
+    Strong(QueryControlService),
+    Stable(Weak<dyn QueryControlPort>),
+}
+impl GovernedControlLink {
+    fn port(&self) -> Arc<dyn QueryControlPort> {
+        match self {
+            Self::Strong(service) => Arc::clone(&service.port),
+            Self::Stable(port) => port
+                .upgrade()
+                .expect("original statement supervisor retains query control"),
+        }
+    }
+}
+
+/// A synchronous request borrowed only from the original SQL poll loan.
+/// Read-only access serves the trusted control implementation; neither an
+/// observer's Source alias nor a statement token can construct this request.
+#[doc(hidden)]
+pub struct StatementActionVisibilityRequest<'a> {
+    statement: StatementToken,
+    source: &'a Arc<StatementActionSource>,
+}
+impl StatementActionVisibilityRequest<'_> {
+    pub fn statement(&self) -> StatementToken {
+        self.statement
+    }
+
+    pub fn source(&self) -> &Arc<StatementActionSource> {
+        self.source
+    }
+}
+
+// This synchronous loan borrows the original owner's visibility fields. Its
+// registered form also borrows the exact Source; a scope or token alone cannot
+// construct it, and neither a Background owner nor a public view supplies it.
+struct StatementVisibilityLoan<'a> {
+    service: &'a GovernedControlLink,
+    token: StatementToken,
+    source: Option<&'a Arc<StatementActionSource>>,
+    finished: &'a bool,
+    accepted_delivery_cut: &'a Option<ResultClosingCut>,
+    cancellation: &'a CancellationView,
+    success_visibility_sealed: &'a mut bool,
+}
+impl StatementVisibilityLoan<'_> {
+    fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
+        if *self.finished {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        match self.accepted_delivery_cut {
+            Some(ResultClosingCut::OriginatingFailure) => {
+                return GovernedStatementVisibilitySealOutcome::Failed;
+            }
+            Some(ResultClosingCut::AcceptedCancellation) => {
+                return GovernedStatementVisibilitySealOutcome::Cancelled(
+                    self.cancellation
+                        .reason()
+                        .expect("accepted cancellation cut retains its reason"),
+                );
+            }
+            None => {}
+        }
+        if *self.success_visibility_sealed {
+            return GovernedStatementVisibilitySealOutcome::Sealed;
+        }
+        let outcome = match self.source {
+            Some(source) => self
+                .service
+                .port()
+                .seal_governed_statement_action_visibility(&StatementActionVisibilityRequest {
+                    statement: self.token,
+                    source,
+                }),
+            None => self
+                .service
+                .port()
+                .seal_governed_statement_visibility(self.token),
+        };
+        if outcome == GovernedStatementVisibilitySealOutcome::Sealed {
+            *self.success_visibility_sealed = true;
+        }
+        outcome
+    }
+}
+
+/// A synchronous borrow of one original action's existing root slots.
+/// This view owns no Work, result alias, registration, permit or authority;
+/// constructing it neither admits work nor manufactures a background root.
+/// The source author supplies its exact existing scope, owner slot and facts.
+pub struct GovernedActionContext<'a> {
+    scope: &'a WorkScope,
+    execution_owner: &'a mut Option<WorkOwner>,
+    cancellation: &'a CancellationView,
+    timeout_ms: Option<u64>,
+    result_window: Option<&'a ResultWindowAlias>,
+    query_permit: Option<&'a mut Option<QueryConcurrencyPermit>>,
+    visibility: Option<StatementVisibilityLoan<'a>>,
+}
+
+impl<'a> GovernedActionContext<'a> {
+    pub fn new(
+        scope: &'a WorkScope,
+        execution_owner: &'a mut Option<WorkOwner>,
+        cancellation: &'a CancellationView,
+        timeout_ms: Option<u64>,
+        result_window: Option<&'a ResultWindowAlias>,
+    ) -> Self {
+        Self {
+            scope,
+            execution_owner,
+            cancellation,
+            timeout_ms,
+            result_window,
+            query_permit: None,
+            visibility: None,
+        }
+    }
+
+    /// Seal only this original registered SQL action's visibility boundary.
+    /// A plain view or Background action has no statement visibility loan.
+    pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
+        match self.visibility.as_mut() {
+            Some(visibility) => visibility.seal_success_visibility(),
+            None => GovernedStatementVisibilitySealOutcome::Stale,
+        }
+    }
+
+    fn with_query_permit(mut self, permit: &'a mut Option<QueryConcurrencyPermit>) -> Self {
+        self.query_permit = Some(permit);
+        self
+    }
+
+    /// A synchronous handoff from this exact SQL source after its active
+    /// preparation has actually exited. A plain observer/context has no grant.
+    pub fn handoff_query_permit_in(
+        &mut self,
+        receiver: &WorkOwner,
+        destination: &mut Option<QueryConcurrencyPermit>,
+    ) -> Result<novarocks_workload_control::WorkloadProgressNotification, WorkError> {
+        QueryConcurrencyPermit::handoff_in(
+            self.query_permit
+                .as_deref_mut()
+                .ok_or(WorkError::NotReady)?,
+            self.scope,
+            receiver,
+            destination,
+        )
+    }
+
+    pub fn scope(&self) -> &WorkScope {
+        self.scope
+    }
+
+    pub fn cancellation(&self) -> &CancellationView {
+        self.cancellation
+    }
+
+    pub const fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+    }
+
+    /// Retain only the same original window when the actual result needs it.
+    /// A missing alias remains missing; this view cannot acquire a new window.
+    pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
+        self.result_window.cloned()
+    }
+
+    pub fn execution_owner_slot(&mut self) -> &mut Option<WorkOwner> {
+        self.execution_owner
+    }
+}
+
+enum StatementResultCapacity {
+    Window(ResultWindowGrant),
+    RootRetention(ResultWindowAlias),
+}
+impl StatementResultCapacity {
+    fn retain_alias(&self) -> ResultWindowAlias {
+        match self {
+            Self::Window(window) => window.retain_alias(),
+            Self::RootRetention(retention) => retention.clone(),
+        }
+    }
+}
+
 pub struct GovernedQueryStatementOwner {
-    service: QueryControlService,
+    service: GovernedControlLink,
     registration: GovernedStatementRegistration,
     scope: WorkScope,
     execution_owner: Option<WorkOwner>,
     business: Option<BusinessPermit>,
     query_concurrency: Option<QueryConcurrencyPermit>,
-    /// The complete result window taken with the permit, when the statement
-    /// declared one. Its position follows the last alias, not this owner.
-    result_window: Option<ResultWindowGrant>,
+    /// The original result policy. Root data retention carries the configured
+    /// byte budget without occupying the later computation's position.
+    result_window: Option<StatementResultCapacity>,
     accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
@@ -771,6 +1058,60 @@ pub struct GovernedQueryStatementOwner {
 }
 
 impl GovernedQueryStatementOwner {
+    /// Borrow protocol-owned facts for one synchronous action poll. The
+    /// caller's original window alias remains outside this non-owning view.
+    pub fn action_context<'a>(
+        &'a mut self,
+        result_window: Option<&'a ResultWindowAlias>,
+    ) -> GovernedActionContext<'a> {
+        GovernedActionContext::new(
+            &self.scope,
+            &mut self.execution_owner,
+            self.registration.cancellation(),
+            self.timeout_ms,
+            result_window,
+        )
+        .with_query_permit(&mut self.query_concurrency)
+    }
+
+    // Only the SQL ActionBody in its original poll loan supplies this Source.
+    fn registered_action_context<'a>(
+        &'a mut self,
+        result_window: Option<&'a ResultWindowAlias>,
+        source: &'a Arc<StatementActionSource>,
+    ) -> GovernedActionContext<'a> {
+        GovernedActionContext {
+            scope: &self.scope,
+            execution_owner: &mut self.execution_owner,
+            cancellation: self.registration.cancellation(),
+            timeout_ms: self.timeout_ms,
+            result_window,
+            query_permit: Some(&mut self.query_concurrency),
+            visibility: Some(StatementVisibilityLoan {
+                service: &self.service,
+                token: self.registration.token(),
+                source: Some(source),
+                finished: &self.finished,
+                accepted_delivery_cut: &self.accepted_delivery_cut,
+                cancellation: self.registration.cancellation(),
+                success_visibility_sealed: &mut self.success_visibility_sealed,
+            }),
+        }
+    }
+
+    fn park_control_link(&mut self) {
+        let port = self.service.port();
+        self.service = GovernedControlLink::Stable(Arc::downgrade(&port));
+    }
+    fn restore_control_link(&mut self, service: &QueryControlService) {
+        let original = self.service.port();
+        assert!(
+            Arc::ptr_eq(&original, &service.port),
+            "same statement control authority"
+        );
+        self.service = GovernedControlLink::Strong(service.clone());
+    }
+
     pub const fn token(&self) -> StatementToken {
         self.registration.token()
     }
@@ -787,18 +1128,33 @@ impl GovernedQueryStatementOwner {
         self.timeout_ms
     }
 
-    /// An alias of the statement's result window for one relay or delivery
-    /// owner; `None` when the statement took no window at admission.
+    /// Retain the statement's original result author. Internal retention alone
+    /// cannot create computation, manifest, or Native action authority.
     pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
         self.result_window
             .as_ref()
-            .map(ResultWindowGrant::retain_alias)
+            .map(StatementResultCapacity::retain_alias)
     }
 
     pub(crate) fn release_transferred_result_window(&mut self) {
         // Fetch and transport aliases retain their own short-tail position.
         // The protocol has already moved its owned bytes into closing capacity.
         self.result_window.take();
+    }
+
+    pub(crate) fn execution_owner_matches_scope(&self) -> bool {
+        // Both fields are minted together by the same statement constructor.
+        // The WorkOwner is move-only; this read grants no capacity or locator.
+        self.execution_owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_for_scope(&self.scope))
+    }
+
+    /// Borrow the original stable slot for a synchronous, in-place QA start.
+    /// A refusal must leave this slot intact; a successful start installs the
+    /// same owner in QA before returning any notification tail.
+    pub fn execution_owner_slot(&mut self) -> &mut Option<WorkOwner> {
+        &mut self.execution_owner
     }
 
     /// Transfer the unique root owner into `QueryExecutionClient::start`.
@@ -871,33 +1227,16 @@ impl GovernedQueryStatementOwner {
     /// Atomically wins the terminal success boundary against every later
     /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
-        if self.finished {
-            return GovernedStatementVisibilitySealOutcome::Stale;
+        StatementVisibilityLoan {
+            service: &self.service,
+            token: self.registration.token(),
+            source: None,
+            finished: &self.finished,
+            accepted_delivery_cut: &self.accepted_delivery_cut,
+            cancellation: self.registration.cancellation(),
+            success_visibility_sealed: &mut self.success_visibility_sealed,
         }
-        match self.accepted_delivery_cut {
-            Some(ResultClosingCut::OriginatingFailure) => {
-                return GovernedStatementVisibilitySealOutcome::Failed;
-            }
-            Some(ResultClosingCut::AcceptedCancellation) => {
-                return GovernedStatementVisibilitySealOutcome::Cancelled(
-                    self.cancellation()
-                        .reason()
-                        .expect("accepted cancellation cut retains its reason"),
-                );
-            }
-            None => {}
-        }
-        if self.success_visibility_sealed {
-            return GovernedStatementVisibilitySealOutcome::Sealed;
-        }
-        let outcome = self
-            .service
-            .port
-            .seal_governed_statement_visibility(self.registration.token());
-        if outcome == GovernedStatementVisibilitySealOutcome::Sealed {
-            self.success_visibility_sealed = true;
-        }
-        outcome
+        .seal_success_visibility()
     }
 
     pub fn finish(mut self) -> GovernedStatementFinishOutcome {
@@ -918,7 +1257,7 @@ impl GovernedQueryStatementOwner {
         } else {
             let _ = self
                 .service
-                .port
+                .port()
                 .cancel_governed_statement(self.registration.token(), reason);
         }
         self.finish_inner()
@@ -932,6 +1271,18 @@ impl GovernedQueryStatementOwner {
         self.protocol_fail_inner()
     }
 
+    /// Only the same stable Source uses this after its actual action/result
+    /// exit. Keep the original registry entry until every callback here returns.
+    fn cleanup_abandoned_action_in_place(&mut self) {
+        assert!(!self.finished, "one original statement cleanup attempt");
+        self.finished = true;
+        self.complete_local_owner_after_terminal();
+        self.release_terminal_concurrency();
+        // This grant may notify WC on actual last exit too. It is part of this
+        // borrowed cleanup, never an implicit owner Drop after Source removal.
+        self.result_window.take();
+    }
+
     fn protocol_fail_inner(&mut self) -> GovernedStatementFinishOutcome {
         if self.finished {
             return GovernedStatementFinishOutcome::Stale;
@@ -941,7 +1292,7 @@ impl GovernedQueryStatementOwner {
         self.release_terminal_concurrency();
 
         self.service
-            .port
+            .port()
             .fail_governed_statement(self.registration.token())
     }
 
@@ -957,7 +1308,7 @@ impl GovernedQueryStatementOwner {
         self.release_terminal_concurrency();
 
         self.service
-            .port
+            .port()
             .finish_governed_statement(self.registration.token())
     }
 
@@ -980,10 +1331,10 @@ impl Drop for GovernedQueryStatementOwner {
                 self.release_terminal_concurrency();
                 let _ = self
                     .service
-                    .port
+                    .port()
                     .fail_governed_statement(self.registration.token());
             } else {
-                let _ = self.service.port.cancel_governed_statement(
+                let _ = self.service.port().cancel_governed_statement(
                     self.registration.token(),
                     CancellationReason::OwnerDropped,
                 );
@@ -1046,6 +1397,14 @@ impl QueryControlPort for TestQueryControlPort {
         &self,
         _statement: StatementToken,
     ) -> GovernedStatementVisibilitySealOutcome {
+        GovernedStatementVisibilitySealOutcome::Stale
+    }
+
+    fn seal_governed_statement_action_visibility(
+        &self,
+        _request: &StatementActionVisibilityRequest<'_>,
+    ) -> GovernedStatementVisibilitySealOutcome {
+        // This fixture does not publish or supervise SQL Actions.
         GovernedStatementVisibilitySealOutcome::Stale
     }
 

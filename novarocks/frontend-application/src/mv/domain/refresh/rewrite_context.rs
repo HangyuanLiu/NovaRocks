@@ -35,7 +35,6 @@ use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExactSemanticRevision,
     ConnectorReadSelector, ConnectorRequestContext, ConnectorScanAdmission,
-    ConnectorTableResolution,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
@@ -109,10 +108,27 @@ pub(crate) struct RefreshRewriteInputs<'a> {
     pub aggregate: Option<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout)>,
 }
 
-/// Freeze this attempt's rewrite context from already-observed facts.
-pub(crate) fn freeze_refresh_rewrite_context(
+/// The current rewrite sources are exactly this attempt's frozen pin. No
+/// second observation and no FQN keying: one entry per D occurrence.
+pub(crate) fn rewrite_current_sources(pin: &RefreshSnapshotPin) -> Vec<MvRewriteSourceSnapshot> {
+    pin.occurrences()
+        .iter()
+        .map(|occurrence| MvRewriteSourceSnapshot {
+            occurrence_id: occurrence.occurrence_id(),
+            snapshot_id: occurrence.snapshot_id(),
+            table_object_id: occurrence.table_object_id().clone(),
+            semantic_revision: occurrence.semantic_revision().clone(),
+        })
+        .collect()
+}
+
+pub(crate) async fn freeze_refresh_rewrite_context_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
     inputs: RefreshRewriteInputs<'_>,
-) -> Result<Arc<IcebergMvRewriteContext>, String> {
+) -> Result<
+    Arc<IcebergMvRewriteContext>,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
     let (previous_sources, baseline_target_uuid, baseline_target_snapshot_id) =
         match inputs.state_baseline {
             RefreshStateBaseline::SnapshotBacked {
@@ -128,15 +144,15 @@ pub(crate) fn freeze_refresh_rewrite_context(
         };
     if let Some(expected_uuid) = baseline_target_uuid {
         if inputs.target_binding.table_uuid() != expected_uuid {
-            return Err("MV refresh target UUID drifted after planning".to_string());
+            return Err("MV refresh target UUID drifted after planning".into());
         }
         if inputs.target_binding.current_snapshot_id() != baseline_target_snapshot_id {
-            return Err("MV refresh target snapshot drifted after planning".to_string());
+            return Err("MV refresh target snapshot drifted after planning".into());
         }
     }
     if inputs.target_observation.table() != inputs.target_binding.identity() {
         return Err(
-            "MV refresh target binding and schema observation name different tables".to_string(),
+            "MV refresh target binding and schema observation name different tables".into(),
         );
     }
     let analysis = freeze_rewrite_analysis_facts(MvRewriteAnalysisInput {
@@ -149,64 +165,53 @@ pub(crate) fn freeze_refresh_rewrite_context(
     build_neutral_refresh_rewrite_context(
         Arc::clone(&inputs.projection),
         rewrite_current_sources(inputs.pin),
-        rewrite_history_sources(
+        rewrite_history_sources_original(
+            io,
             previous_sources,
             inputs.connector_control,
             inputs.connector_context,
-        )?,
+        )
+        .await?,
         inputs.target_binding.table_uuid().to_string(),
         inputs.target_binding.physical_write_schema()?,
         inputs.target_binding.write_input_fields()?,
         inputs.target_observation.exact_schema().clone(),
         analysis,
     )
+    .map_err(Into::into)
 }
 
-/// The current rewrite sources are exactly this attempt's frozen pin. No
-/// second observation and no FQN keying: one entry per D occurrence.
-pub(crate) fn rewrite_current_sources(pin: &RefreshSnapshotPin) -> Vec<MvRewriteSourceSnapshot> {
-    pin.occurrences()
-        .iter()
-        .map(|occurrence| MvRewriteSourceSnapshot {
-            occurrence_id: occurrence.occurrence_id(),
-            snapshot_id: occurrence.snapshot_id(),
-            table_object_id: occurrence.table_object_id().clone(),
-            semantic_revision: occurrence.semantic_revision().clone(),
-        })
-        .collect()
-}
-
-/// The published baseline records each source as an exact semantic revision,
-/// and the change window this rewrite plans needs a read point.
-///
-/// The provider validates and interprets each opaque revision on a retained
-/// exact table generation. The later scan still admits the change window.
-pub(crate) fn rewrite_history_sources(
+pub(crate) async fn rewrite_history_sources_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
     previous_sources: &[RefreshStateBaselineSource],
     connector_control: &dyn ConnectorControlRegistry,
     connector_context: &ConnectorRequestContext,
-) -> Result<Vec<MvRewriteSourceSnapshot>, String> {
-    previous_sources
-        .iter()
-        .map(|source| {
-            let snapshot_id =
-                crate::mv::domain::refresh_io::snapshot_from_exact_revision_with_ports(
-                    connector_control,
-                    &source.table,
-                    &source.semantic_revision,
-                    connector_context,
-                )?;
-            Ok(MvRewriteSourceSnapshot {
-                occurrence_id: source.occurrence_id,
-                snapshot_id,
-                table_object_id: source.table_object_id()?,
-                semantic_revision: source.semantic_revision.clone(),
-            })
-        })
-        .collect()
+) -> Result<
+    Vec<MvRewriteSourceSnapshot>,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let mut result = Vec::with_capacity(previous_sources.len());
+    for source in previous_sources {
+        let snapshot_id = io
+            .snapshot_from_revision(
+                connector_control,
+                &source.table,
+                &source.semantic_revision,
+                connector_context,
+            )
+            .await?;
+        result.push(MvRewriteSourceSnapshot {
+            occurrence_id: source.occurrence_id,
+            snapshot_id,
+            table_object_id: source.table_object_id()?,
+            semantic_revision: source.semantic_revision.clone(),
+        });
+    }
+    Ok(result)
 }
 
-pub(crate) fn observe_and_admit_change_window_for_table(
+pub(crate) async fn observe_and_admit_change_window_for_table_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
     connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
@@ -219,61 +224,45 @@ pub(crate) fn observe_and_admit_change_window_for_table(
         ConnectorChangeWindowAdmission,
         MvSchemaValidationObservation,
     ),
-    String,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
 > {
-    let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        connector_context.clone(),
-        &table.namespace,
-        &table.table,
-        ConnectorTableResolution::StrictBaseTable,
+    use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
+    let (lease, metadata) = io
+        .table_metadata(connector_control, table, connector_context)
+        .await?;
+    let provider = lease.binding().metadata();
+    let to_revision =
+        provider.exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)?;
+    let window = provider.change_window_from_exact_revisions(
+        &metadata.table,
+        from_revision,
+        &to_revision,
     )?;
-    let provider = exact_lease.binding().metadata();
-    let to_revision = provider
-        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
-        .map_err(|error| {
-            format!(
-                "observe exact change-window end for {}: {error}",
-                table.fqn()
-            )
-        })?;
-    let window = provider
-        .change_window_from_exact_revisions(&metadata.table, from_revision, &to_revision)
-        .map_err(|error| {
-            format!(
-                "admit exact change-window revisions for {}: {error}",
-                table.fqn()
-            )
-        })?;
     if window.from_exclusive() != from_snapshot_id || window.to_inclusive() != to_snapshot_id {
-        return Err(format!(
+        return Err(PreparationError::user(format!(
             "MV change-window revision and frozen numeric pin disagree for {}",
             table.fqn()
-        ));
+        )));
     }
-    let scan = crate::connector::scan_admission::admit_connector_change_window(
-        &metadata.table,
-        metadata.schema(),
-        &exact_lease,
-        connector_context.clone(),
-        window,
-    )?;
+    let scan = io
+        .change_window(
+            &lease,
+            &metadata.table,
+            Arc::new(metadata.schema().clone()),
+            connector_context.clone(),
+            window,
+        )
+        .await?;
     let ConnectorScanAdmission::ChangeWindow(admission) = scan.admission() else {
-        return Err("connector returned a snapshot admission for a change-window scan".to_string());
+        return Err(PreparationError::user(
+            "connector returned a snapshot admission for a change-window scan",
+        ));
     };
     let observation = crate::mv::domain::storage_observation::observe_schema_validation(
         storage_observation,
-        &exact_lease,
+        &lease,
         &metadata,
         connector_context.clone(),
-    )
-    .map_err(|error| {
-        format!(
-            "observe MV schema validation facts for {}: {error}",
-            table.fqn()
-        )
-    })?;
+    )?;
     Ok((admission.clone(), observation))
 }

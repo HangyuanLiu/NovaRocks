@@ -234,7 +234,7 @@ impl Observer {
         let value = self.command(&json!({"command":"reset","phase":phase}))?;
         ensure!(
             value["command"] == "reset" && value["current"]["phase"] == phase,
-            "observer phase reset refused while requests or connections are live"
+            "observer phase reset refused while HTTP request work is live"
         );
         Ok(())
     }
@@ -243,21 +243,36 @@ impl Observer {
         self.input.write_all(b"{\"command\":\"stop\"}\n")?;
         self.input.flush()?;
         let value = self.receive(Duration::from_secs(35))?;
-        write_json(&self.stopped_receipt, &value)?;
-        ensure!(
-            value["state"] == "OBSERVER_STOPPED" && value["audit"]["valid_observation"] == true,
-            "observer shutdown did not retain a valid actual traffic audit"
-        );
+        // Preserve the original observation independently of physical exit.
+        // Even an invalid audit must not bypass the original wait/join path.
+        let saved_audit = write_json(&self.stopped_receipt, &value);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = self.child.try_wait()? {
-                ensure!(status.success(), "observer process exited with a failure");
                 drop(self.replies.take());
-                if let Some(reader) = self.reader.take() {
-                    reader
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("observer output owner panicked"))?;
-                }
+                let reader_joined = self
+                    .reader
+                    .take()
+                    .is_none_or(|reader| reader.join().is_ok());
+                write_json(
+                    &self.stopped_receipt.with_file_name("observer-exit.json"),
+                    &json!({"child_pid":self.child.id(), "status":status.to_string(),
+                        "exit_code":status.code(), "success":status.success(), "reader_joined":reader_joined}),
+                )?;
+                saved_audit?;
+                ensure!(reader_joined, "observer output owner panicked");
+                ensure!(
+                    value["state"] == "OBSERVER_STOPPED"
+                        && value["audit"]["valid_observation"] == true,
+                    "observer shutdown did not retain a valid actual traffic audit"
+                );
+                ensure!(status.success(), "observer process exited with a failure");
+                ensure!(
+                    idle(&value["audit"])
+                        && value["audit"]["active_connections"].as_u64() == Some(0)
+                        && value["audit"]["active_upstream_connections"].as_u64() == Some(0),
+                    "observer stopped before actual socket/request exit"
+                );
                 return Ok(());
             }
             ensure!(
@@ -373,7 +388,7 @@ impl PreparedListing {
 
 fn idle(audit: &Value) -> bool {
     [
-        "active_connections",
+        "active_http_requests",
         "active_requests",
         "active_upstream_requests",
         "active_upstream_listings",
@@ -730,5 +745,94 @@ impl Scenario for RealRestListing {
             (Err(error), Ok(())) => Err(error).context("stop and join real REST observer"),
             (Ok(()), Err(error)) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_observer_audit_keeps_child_exit_and_reader_join_receipts() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut spawn_owner = ChildOwner(Some(
+            Command::new("python3")
+                .args([
+                    "-c",
+                    r#"import json, sys
+command = json.loads(sys.stdin.readline())
+if command != {"command": "stop"}:
+    sys.exit(2)
+print(json.dumps({"state": "OBSERVER_STOPPED", "audit": {
+    "valid_observation": False, "lifetime_failures": 1,
+    "active_connections": 0, "active_upstream_connections": 0,
+    "active_http_requests": 0, "active_requests": 0,
+    "active_upstream_requests": 0, "active_upstream_listings": 0
+}}), flush=True)
+sys.exit(1)
+"#,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        ));
+        let child = spawn_owner
+            .0
+            .as_mut()
+            .context("test observer child missing")?;
+        let pid = child.id();
+        let input = child.stdin.take().context("test observer stdin missing")?;
+        let output = child
+            .stdout
+            .take()
+            .context("test observer stdout missing")?;
+        let (sent, replies) = sync_channel(1);
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let parsed = BufReader::new(output)
+                .read_line(&mut line)
+                .context("read test observer STOPPED")
+                .and_then(|_| serde_json::from_str(&line).context("parse test observer STOPPED"));
+            let _ = sent.send(parsed);
+        });
+        let stopped_receipt = root.path().join("observer-stopped.json");
+        let mut observer = Observer {
+            child: spawn_owner
+                .0
+                .take()
+                .context("test observer child missing")?,
+            input,
+            replies: Some(replies),
+            reader: Some(reader),
+            uri: String::new(),
+            stopped_receipt: stopped_receipt.clone(),
+        };
+
+        let error = observer
+            .stop()
+            .expect_err("invalid observation must remain a failure");
+        assert_eq!(
+            error.to_string(),
+            "observer shutdown did not retain a valid actual traffic audit"
+        );
+        let stopped: Value = serde_json::from_reader(File::open(stopped_receipt)?)?;
+        assert_eq!(stopped["state"], "OBSERVER_STOPPED");
+        assert_eq!(stopped["audit"]["valid_observation"], false);
+        assert_eq!(stopped["audit"]["lifetime_failures"], 1);
+        let exit: Value =
+            serde_json::from_reader(File::open(root.path().join("observer-exit.json"))?)?;
+        assert_eq!(exit["child_pid"], pid);
+        assert_eq!(exit["exit_code"], 1);
+        assert_eq!(exit["success"], false);
+        assert_eq!(exit["reader_joined"], true);
+        let status = observer
+            .child
+            .try_wait()?
+            .context("test observer was not actually reaped")?;
+        assert_eq!(status.code(), Some(1));
+        assert!(observer.reader.is_none());
+        assert!(observer.replies.is_none());
+        Ok(())
     }
 }

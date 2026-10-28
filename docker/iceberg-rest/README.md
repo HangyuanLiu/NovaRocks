@@ -46,6 +46,14 @@ docker/iceberg-rest/fixture-runtime.sh upgrade
 docker/iceberg-rest/fixture-runtime.sh --timeout 5 sweep
 ```
 
+失败的只读 Docker 观察与未知 mutation 分别保留。确认 status 中准确 journal 后，可显式处置该观察的 mutation 责任：
+
+```bash
+docker/iceberg-rest/fixture-runtime.sh resolve-readonly-observation --journal /absolute/control-root/machine-id/operations/control-id.json
+```
+
+此命令只在原机器维护锁内核对当前 daemon、机器身份和该 journal 的原请求，以原 owner 共用的只读命令分类验证后记录处置；重复调用返回已验证的原处置，不重写记录。它不运行 start、upgrade、sweep，不遍历或结算其他操作。原失败、phase 及原进程退出事实完整保留，缺少退出证明仍为 Unknown；status 分别展示失败和处置。未知 mutation、外来或不可信请求继续报错。该处置不证明 CLI 或远程 writer 已退出，不提供 scratch 清理权限，也不改写旧运行的 cleanup violation；后续运行清理仍须满足原 context、期限、writer 退出及准确 scope 条件。
+
 `start` 幂等恢复同一输入定义，版本不同要求显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；JSON字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
 
 完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、核实资源/image/端点/健康后才提交ready。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。

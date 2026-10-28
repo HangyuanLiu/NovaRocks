@@ -325,7 +325,7 @@ pub enum QuerySessionOutput {
     /// until the application wraps it with the original governed owner.
     Query(QueryResult),
     GovernedQuery(GovernedImmediateStatementResult),
-    StreamingQuery(StreamingStatementResult),
+    StreamingQuery(Box<StreamingStatementResult>),
     GovernedCompletion(GovernedCompletionStatementResult),
     GovernedError(GovernedErrorStatementResult),
     Ok,
@@ -353,6 +353,16 @@ pub struct GovernedImmediateStatementResult {
 }
 
 impl GovernedImmediateStatementResult {
+    pub(crate) fn from_verified_owned_local(
+        result: OwnedLocalResult,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            result,
+            protocol: GovernedProtocolOwner::new(statement),
+        }
+    }
+
     /// Transfer a freshly produced, closed Local graph while the admitted
     /// statement still retains the exact producer window. The application
     /// source audit, not the graph's runtime shape, establishes exclusivity.
@@ -435,6 +445,21 @@ pub struct StreamingStatementResult {
 }
 
 impl StreamingStatementResult {
+    pub(crate) fn from_verified_execution(
+        mut execution: ExecutionHandle,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        let Some(ExecutionOutput::Rows(stream)) = execution.take_output() else {
+            unreachable!("same verified original output");
+        };
+        Self {
+            execution,
+            stream,
+            protocol: GovernedProtocolOwner::new(statement),
+            settled: false,
+        }
+    }
+
     pub fn try_from_execution(
         mut execution: ExecutionHandle,
         statement: GovernedQueryStatementOwner,

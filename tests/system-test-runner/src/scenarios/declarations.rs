@@ -31,6 +31,7 @@ pub(super) fn for_module(
     let domains: &[&str] = match module {
         "backend_membership" => &[
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/worker/**",
             "novarocks/native-adapter/**",
             "novarocks/execution-contract/**",
@@ -41,6 +42,7 @@ pub(super) fn for_module(
             "novarocks/native-adapter/**",
             "novarocks/worker/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/execution-contract/**",
             "novarocks-server/**",
         ],
@@ -51,6 +53,7 @@ pub(super) fn for_module(
         | "listing_real_rest" => &[
             "novarocks/catalog-application/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/sql/**",
             "novarocks/connector/**",
@@ -66,6 +69,7 @@ pub(super) fn for_module(
             "novarocks/connector/**",
             "novarocks/fs/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/worker/**",
             "novarocks/execution/**",
             "novarocks/sql/**",
@@ -76,6 +80,7 @@ pub(super) fn for_module(
             "novarocks/connector/iceberg/**",
             "novarocks/fs/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/sql/**",
             "novarocks/execution/**",
@@ -86,11 +91,13 @@ pub(super) fn for_module(
             "novarocks/memory/**",
             "novarocks/execution/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/worker/**",
             "novarocks-server/**",
         ],
         module if module.starts_with("mv_") => &[
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/catalog-application/**",
             "novarocks/connector/iceberg/**",
@@ -100,6 +107,7 @@ pub(super) fn for_module(
         ],
         _ => &[
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/mysql-adapter/**",
             "novarocks/worker/**",

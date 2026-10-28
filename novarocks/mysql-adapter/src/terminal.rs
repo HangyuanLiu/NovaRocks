@@ -261,6 +261,18 @@ async fn write_typed_error<'writer, W: AsyncWrite + Unpin>(
         None
     };
     let selected = cancellation.as_ref().unwrap_or(&error);
+    if let Some(input) = selected.execution_failure() {
+        let fact = input.fact();
+        tracing::debug!(
+            target: "novarocks_mysql_adapter::statement_error",
+            failure_class = ?fact.class(),
+            failure_evidence = ?fact.evidence(),
+            failure_domain = fact.reason().domain(),
+            failure_reason = fact.reason().code(),
+            failure_site = ?input.site(),
+            "Selected statement execution failure"
+        );
+    }
     let prepared = prepare_closing(
         protocol,
         writer,

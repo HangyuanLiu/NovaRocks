@@ -852,10 +852,36 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn load_table_for_read_with_snapshots(
         &self,
         table: CatalogTableName,
-        _binding: crate::access_binding::IcebergReadBinding,
+        binding: crate::access_binding::IcebergReadBinding,
         snapshots: super::SnapshotLoading,
     ) -> Result<IcebergLoadedTable, ConnectorError> {
-        self.load_table_with_snapshots(table, snapshots).await
+        let ident = super::delegate::table_ident(&table)?;
+        let context =
+            crate::rest_protocol::http::RequestContext::for_binding(binding.request_context());
+        let delegated = self.access_delegation == RestAccessDelegationMode::Vended;
+        let (frozen, delegation) = self
+            .endpoints
+            .load_table_with_snapshots_in(&ident, delegated, snapshots, &context)
+            .await?;
+        match self.access_delegation {
+            RestAccessDelegationMode::Static => {
+                let file_io = crate::fs_io::build_file_io_for_location(
+                    frozen.metadata_location().unwrap_or(""),
+                    binding,
+                );
+                let table = frozen.materialize(file_io).map_err(|error| {
+                    super::error::map_read_error(&sanitize_upstream_error(&error, "table load"))
+                })?;
+                Ok(IcebergLoadedTable::new(
+                    table,
+                    IcebergAccessDelegation::static_binding(),
+                ))
+            }
+            RestAccessDelegationMode::Vended => Ok(IcebergLoadedTable::deferred_rest(
+                frozen,
+                parse_rest_delegation(delegation)?,
+            )),
+        }
     }
 
     async fn load_complete_metadata_for_read(

@@ -221,6 +221,13 @@ impl IcebergMetadata {
                 &mut creation,
             )
             .map_err(metadata_creation_error)?;
+        self.table_object_binding_from_metadata(metadata)
+    }
+
+    fn table_object_binding_from_metadata(
+        &self,
+        metadata: ConnectorTableMetadata,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
         // Design: ADR-0085 (docs/adr/ADR-0085-connector-physical-table-object-bindings.md)
         // Reuse the UUID frozen into this exact metadata observation instead of
         // issuing a second catalog lookup or deriving identity from a name.
@@ -236,6 +243,32 @@ impl IcebergMetadata {
             metadata,
             object_id,
         })
+    }
+
+    async fn current_table_object_binding_async(
+        &self,
+        table: ConnectorTableIdentity,
+        resolution: ConnectorTableResolution,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        let preparation = self
+            .prepare_table(ConnectorTableRequest {
+                table,
+                resolution,
+                context: context.clone(),
+            })
+            .await?;
+        let mut request_observer = |_: std::alloc::Layout| pure_catalog_control(&context);
+        let mut work_observer = |_: usize| pure_catalog_control(&context);
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request_observer,
+            &mut work_observer,
+        );
+        let metadata = self
+            .create_prepared_table(preparation, &mut creation)
+            .map_err(metadata_creation_error)?;
+        self.table_object_binding_from_metadata(metadata)
     }
 
     pub(crate) fn table_payload(
@@ -314,6 +347,23 @@ impl IcebergMetadata {
 }
 
 impl ConnectorMetadata for IcebergMetadata {
+    fn provider_metadata_cpu_author(
+        &self,
+    ) -> Option<(
+        novarocks_spi::connector::ConnectorProviderBindingKey,
+        std::any::TypeId,
+    )> {
+        Some((
+            novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            std::any::TypeId::of::<
+                crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+            >(),
+        ))
+    }
+
     fn admit_table_job(
         &self,
         request: novarocks_spi::connector::ConnectorTableJobAdmissionRequest,
@@ -494,6 +544,33 @@ impl ConnectorMetadata for IcebergMetadata {
             .collect()
     }
 
+    fn list_namespaces_async(
+        &self,
+        request: ConnectorListNamespacesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorNamespaceIdentity>, ConnectorError>>
+    {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.instance_id)?;
+            let namespaces = self
+                .runtime
+                .list_namespaces_for_request_async(&request.context, request.bound)
+                .await;
+            self.validate_context(&request.context)?;
+            namespaces
+                .map_err(classified_control_error)?
+                .into_iter()
+                .map(|namespace| {
+                    self.validate_context(&request.context)?;
+                    Ok(ConnectorNamespaceIdentity {
+                        instance_id: self.descriptor.instance_id.clone(),
+                        namespace: Arc::from(namespace),
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.namespace.instance_id)?;
@@ -502,6 +579,24 @@ impl ConnectorMetadata for IcebergMetadata {
             .namespace_exists_for_request(&request.namespace.namespace, &request.context);
         self.validate_context(&request.context)?;
         result.map_err(unavailable)
+    }
+
+    fn namespace_exists_async(
+        &self,
+        request: ConnectorNamespaceRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.namespace.instance_id)?;
+            let result = self
+                .runtime
+                .namespace_exists_for_request_async(&request.namespace.namespace, &request.context)
+                .await;
+            self.validate_context(&request.context)?;
+            result.map_err(unavailable)
+        })
     }
 
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
@@ -525,6 +620,38 @@ impl ConnectorMetadata for IcebergMetadata {
         );
         self.validate_context(&request.context)?;
         result.map_err(unavailable)
+    }
+
+    fn table_exists_async(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.table.instance_id)?;
+            let (table, metadata_type) =
+                resolve_table_request(&request.table.table, request.resolution)?;
+            if metadata_type.is_some() {
+                let result = self
+                    .runtime
+                    .table_exists_for_request_async(
+                        &request.table.namespace,
+                        &table,
+                        &request.context,
+                    )
+                    .await;
+                self.validate_context(&request.context)?;
+                return result.map_err(unavailable);
+            }
+            let result = self
+                .runtime
+                .table_exists_for_request_async(&request.table.namespace, &table, &request.context)
+                .await;
+            self.validate_context(&request.context)?;
+            result.map_err(unavailable)
+        })
     }
 
     fn list_tables(
@@ -553,6 +680,37 @@ impl ConnectorMetadata for IcebergMetadata {
             .collect()
     }
 
+    fn list_tables_async(
+        &self,
+        request: ConnectorListTablesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>> {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.namespace.instance_id)?;
+            let tables = self
+                .runtime
+                .list_tables_for_request_async(
+                    &request.namespace.namespace,
+                    &request.context,
+                    request.bound,
+                )
+                .await;
+            self.validate_context(&request.context)?;
+            tables
+                .map_err(classified_control_error)?
+                .into_iter()
+                .map(|table| {
+                    self.validate_context(&request.context)?;
+                    Ok(ConnectorTableIdentity {
+                        instance_id: self.descriptor.instance_id.clone(),
+                        namespace: request.namespace.namespace.clone(),
+                        table: Arc::from(table),
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn read_reference_facts(
         &self,
         request: ConnectorReadReferenceFactsRequest,
@@ -575,12 +733,64 @@ impl ConnectorMetadata for IcebergMetadata {
         read_reference_facts(loaded.table.metadata(), &request.context)
     }
 
+    fn read_reference_facts_async(
+        &self,
+        request: ConnectorReadReferenceFactsRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorReadReferenceFacts, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.table.instance_id)?;
+            // A new statement must resolve a named ref against current catalog
+            // metadata. Keep the request-local snapshot frozen after this load.
+            self.runtime
+                .control_state()
+                .invalidate_table(&request.table.namespace, &request.table.table);
+            let loaded = self
+                .runtime
+                .load_table_for_request_async(
+                    &request.table.namespace,
+                    &request.table.table,
+                    &request.context,
+                )
+                .await
+                .map_err(unavailable)?;
+            read_reference_facts(loaded.table.metadata(), &request.context)
+        })
+    }
+
     fn capture_table_object_binding(
         &self,
         request: ConnectorTableObjectCaptureRequest,
     ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
         self.require_current_table_object_selector(request.selector)?;
         self.current_table_object_binding(request.table, request.resolution, request.context)
+    }
+
+    fn capture_table_object_binding_async(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.require_current_table_object_selector(request.selector)?;
+            self.current_table_object_binding_async(
+                request.table,
+                request.resolution,
+                request.context,
+            )
+            .await
+        })
     }
 
     fn rebind_table_object_binding(
@@ -608,6 +818,190 @@ impl ConnectorMetadata for IcebergMetadata {
             ));
         }
         Ok(binding)
+    }
+
+    fn rebind_table_object_binding_async(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.require_current_table_object_selector(request.selector)?;
+            let expected_object_id = request.expected_object_id;
+            let binding = self
+                .current_table_object_binding_async(
+                    request.table,
+                    request.resolution,
+                    request.context,
+                )
+                .await
+                .map_err(|error| {
+                    if error.kind() == ConnectorErrorKind::NotFound {
+                        ConnectorError::table_object_binding(
+                            ConnectorTableObjectBindingFailure::Missing,
+                            "Iceberg table no longer resolves for its durable object binding",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if binding.object_id != expected_object_id {
+                return Err(ConnectorError::table_object_binding(
+                    ConnectorTableObjectBindingFailure::Replaced,
+                    "Iceberg table no longer matches its durable object binding",
+                ));
+            }
+            Ok(binding)
+        })
+    }
+
+    fn capture_table_object_with_snapshot_cpu(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.require_current_table_object_selector(request.selector)?;
+            let preparation = self
+                .prepare_table(ConnectorTableRequest {
+                    table: request.table,
+                    resolution: request.resolution,
+                    context: request.context,
+                })
+                .await?;
+            let facts = preparation
+                .into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+            self.validate_metadata_binding_generation(&facts)?;
+            let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::metadata_binding(self.clone(), facts, None);
+            let mut input = Some(novarocks_spi::connector::ProviderMetadataCpuInput(
+                source.clone(),
+            ));
+            cpu.submit_metadata_in(&mut input)?;
+            std::future::poll_fn(|cx| cpu.poll_finished(cx)).await?;
+            source.take_binding_with_snapshot_result()
+        })
+    }
+
+    fn capture_table_object_with_snapshot_cpu_in<'a>(
+        &'a self,
+        request: ConnectorTableObjectCaptureRequest,
+        cpu: &'a Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        owner: &'a mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        if owner.is_some() {
+            return Box::pin(async {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "metadata capture original owner receiver is occupied",
+                ))
+            });
+        }
+        if let Err(error) = self.require_current_table_object_selector(request.selector) {
+            return Box::pin(async move { Err(error) });
+        }
+        let source = crate::catalog_control::statistics::scoped_cpu::scoped_capture::MetadataCaptureOriginal::new(
+            self.clone(), request, Arc::clone(cpu),
+        );
+        *owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            Arc::clone(&source),
+        ));
+        Box::pin(async move { source.drive().await })
+    }
+
+    fn capture_table_object_binding_for_statistics_async(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.statistics_table_object_binding_original(
+            request.table,
+            request.resolution,
+            request.selector,
+            request.context,
+            None,
+            cpu,
+        ))
+    }
+
+    fn rebind_table_object_binding_for_statistics_async(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.statistics_table_object_binding_original(
+            request.table,
+            request.resolution,
+            request.selector,
+            request.context,
+            Some(request.expected_object_id),
+            cpu,
+        ))
+    }
+
+    fn prepare_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+        Box::pin(self.prepare_table_original(request))
+    }
+
+    fn create_prepared_table(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorTablePreparation,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let facts =
+            preparation.into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table preparation belongs to another exact generation",
+            )
+            .into());
+        }
+        creation.work(1)?;
+        self.validate_context(&facts.request.context)?;
+        self.create_table_from_observation(facts, creation)
     }
 
     fn load_table(
@@ -643,6 +1037,226 @@ impl ConnectorMetadata for IcebergMetadata {
                 },
             )
             .map_err(classified_control_error)?;
+        self.create_table_from_observation(
+            IcebergPreparedTableFacts {
+                request,
+                loaded,
+                table_name,
+                metadata_table_type,
+                incarnation: self.incarnation,
+                generation_owner: Arc::clone(&self.generation_owner),
+            },
+            creation,
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IcebergPreparedTableFacts {
+    request: ConnectorTableRequest,
+    loaded: crate::loaded_table::IcebergPhysicalTable,
+    table_name: String,
+    metadata_table_type: Option<MetadataTableType>,
+    incarnation: ProviderBindingEpoch,
+    generation_owner: Arc<GenerationOwner>,
+}
+
+impl IcebergPreparedTableFacts {
+    pub(crate) fn rewrite_physical_table(&self) -> &crate::iceberg::table::Table {
+        &self.loaded.table
+    }
+}
+
+impl IcebergMetadata {
+    async fn statistics_table_object_binding_original(
+        &self,
+        table: ConnectorTableIdentity,
+        resolution: ConnectorTableResolution,
+        selector: ConnectorTableObjectSelector,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        expected: Option<ConnectorTableObjectId>,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        self.require_current_table_object_selector(selector)?;
+        let preparation = self
+            .prepare_table(ConnectorTableRequest {
+                table,
+                resolution,
+                context,
+            })
+            .await
+            .map_err(|error| {
+                if expected.is_some() && error.kind() == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        ConnectorTableObjectBindingFailure::Missing,
+                        "Iceberg table no longer resolves for its durable object binding",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        // The one physical preparation is transferred, never cloned out of
+        // an opaque Any. The worker only borrows this stable typed source.
+        let facts =
+            preparation.into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+        self.validate_metadata_binding_generation(&facts)?;
+        let source =
+            crate::catalog_control::statistics::scoped_cpu::StatisticsCpuOriginal::metadata_binding(
+                self.clone(),
+                facts,
+                expected,
+            );
+        crate::catalog_control::statistics::scoped_cpu::run_binding(&cpu, &source).await?;
+        source.take_binding_result()
+    }
+    fn validate_metadata_binding_generation(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+    ) -> Result<(), ConnectorError> {
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Statistics table preparation belongs to another exact generation",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn create_binding_with_snapshot_borrowed(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+        expected: &Option<ConnectorTableObjectId>,
+    ) -> Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError> {
+        self.validate_metadata_binding_generation(facts)?;
+        let metadata = with_pure_schema_creation(&facts.request.context, |creation| {
+            self.create_table_from_observation(facts.clone(), creation)
+                .map_err(metadata_creation_error)
+        })?;
+        let binding = self.table_object_binding_from_metadata(metadata)?;
+        if expected.as_ref().is_some_and(|id| id != &binding.object_id) {
+            return Err(ConnectorError::table_object_binding(
+                ConnectorTableObjectBindingFailure::Replaced,
+                "Iceberg table no longer matches its durable object binding",
+            ));
+        }
+        // Same immutable loaded observation, read on this SAME original CPU
+        // phase. No handle-token interpretation or second Catalog observation.
+        Ok((binding, facts.loaded.table.metadata().current_snapshot_id()))
+    }
+    async fn prepare_table_original(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.table.instance_id)?;
+        let (table_name, metadata_table_type) =
+            resolve_table_request(&request.table.table, request.resolution)?;
+        self.runtime
+            .control_state()
+            .invalidate_table(&request.table.namespace, &table_name);
+        let loaded = self
+            .runtime
+            .observe_table_original_for_request_with_snapshots_async(
+                &request.table.namespace,
+                &table_name,
+                &request.context,
+                if metadata_table_type.is_none() {
+                    crate::catalog::SnapshotLoading::Refs
+                } else {
+                    crate::catalog::SnapshotLoading::All
+                },
+            )
+            .await?;
+        Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
+            self.descriptor.instance_id.clone(),
+            IcebergPreparedTableFacts {
+                request,
+                loaded,
+                table_name,
+                metadata_table_type,
+                incarnation: self.incarnation,
+                generation_owner: Arc::clone(&self.generation_owner),
+            },
+        ))
+    }
+    pub(crate) fn statistics_read_preparation_bytes() -> Result<usize, ConnectorError> {
+        fn bytes<A, B, F>(_: fn(A, B) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        bytes(Self::prepare_table_original)
+            .checked_add(std::mem::size_of::<IcebergPreparedTableFacts>())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "statistics preparation layout overflow",
+                )
+            })
+    }
+    pub(crate) fn statistics_read_metadata(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Statistics read preparation has a foreign exact generation",
+            ));
+        }
+        with_pure_schema_creation(&facts.request.context, |creation| {
+            self.create_table_from_observation(facts.clone(), creation)
+                .map_err(metadata_creation_error)
+        })
+    }
+    pub(crate) fn create_rewrite_table_borrowed(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Rewrite preparation has a foreign exact generation",
+            )
+            .into());
+        }
+        self.create_table_from_observation(facts.clone(), creation)
+    }
+    pub(crate) fn statistics_read_physical(
+        facts: &IcebergPreparedTableFacts,
+    ) -> &crate::iceberg::table::Table {
+        &facts.loaded.table
+    }
+    pub(crate) fn statistics_binding_future_bytes() -> usize {
+        fn bytes<A, B, C, D, E, F, G, H: std::future::Future>(
+            _: fn(A, B, C, D, E, F, G) -> H,
+        ) -> usize {
+            std::mem::size_of::<H>()
+        }
+        bytes(Self::statistics_table_object_binding_original)
+    }
+    fn create_table_from_observation(
+        &self,
+        facts: IcebergPreparedTableFacts,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let IcebergPreparedTableFacts {
+            request,
+            loaded,
+            table_name,
+            metadata_table_type,
+            ..
+        } = facts;
         let metadata = loaded.table.metadata();
         let definition_schema = metadata.current_schema().clone();
         let table_comment = metadata.properties().get("comment").cloned();
@@ -782,9 +1396,163 @@ impl ConnectorMetadata for IcebergMetadata {
     }
 }
 
+pub(crate) struct PreparedChangeWindowScan {
+    pub(crate) table: IcebergTablePayload,
+    pub(crate) output_schema: SchemaRef,
+    pub(crate) window: ConnectorChangeWindow,
+}
+impl IcebergMetadata {
+    /// Decode and check only the exact original value input. No Provider I/O.
+    pub(crate) fn prepare_change_window_scan(
+        &self,
+        table: &ConnectorTableHandle,
+        request: &ConnectorBeginScanRequest,
+    ) -> Result<PreparedChangeWindowScan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        validate_static_predicates(&request.static_predicates)?;
+        let ConnectorScanSelection::ChangeWindow(window) = request.selection else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg asynchronous scan planning currently requires a change window",
+            ));
+        };
+        let table = self.table_payload(table)?;
+        if table.metadata_table_type.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata aliases do not support change-window scans",
+            ));
+        }
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            corrupt("Iceberg change-window scan is missing its resolved table pin")
+        })?;
+        if table_info.current_snapshot_id != Some(window.to_inclusive()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg change-window upper endpoint does not match the exact table pin",
+            ));
+        }
+        let output_schema = projected_schema(&table, &request.projection)?;
+        Ok(PreparedChangeWindowScan {
+            table,
+            output_schema,
+            window,
+        })
+    }
+    pub(crate) fn validate_change_window_physical(
+        &self,
+        prepared: &PreparedChangeWindowScan,
+        physical: &crate::iceberg::table::Table,
+    ) -> Result<String, ConnectorError> {
+        let table_info = prepared.table.table_info.as_ref().ok_or_else(|| {
+            corrupt("Iceberg change-window scan is missing its resolved table pin")
+        })?;
+        let metadata = physical.metadata();
+        let uuid = metadata.uuid().to_string();
+        if metadata.current_snapshot_id() != Some(prepared.window.to_inclusive())
+            || table_info.table_uuid.as_deref() != Some(uuid.as_str())
+            || table_info.location != metadata.location()
+        {
+            return Err(corrupt(
+                "Iceberg change-window scan drifted from its exact table pin",
+            ));
+        }
+        Ok(uuid)
+    }
+    pub(crate) fn finish_change_window_scan(
+        &self,
+        prepared: &PreparedChangeWindowScan,
+        request: &ConnectorBeginScanRequest,
+        admission: novarocks_spi::connector::ConnectorChangeWindowAdmission,
+        metadata_uuid: String,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        let window = prepared.window;
+        let predicate_dispositions = request
+            .static_predicates
+            .iter()
+            .map(|predicate| ConnectorPredicateDisposition {
+                predicate_id: predicate.id,
+                kind: ConnectorPredicateDispositionKind::Unsupported,
+            })
+            .collect();
+        let fact_columns = scan_fact_columns(
+            &prepared.output_schema,
+            &request.projection,
+            &prepared.table,
+        )?;
+        let payload = IcebergScanPayload {
+            table: prepared.table.clone(),
+            snapshot_id: Some(window.to_inclusive()),
+            table_uuid: Some(metadata_uuid),
+            projection: request.projection.clone(),
+            limit: request.limit,
+            purpose: request.purpose.into(),
+            fact_columns,
+            physical_predicates: Vec::new(),
+            mode: IcebergScanModeV1::ChangeWindowAdmission,
+        };
+        ConnectorScan::try_new_change_window(
+            ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            window,
+            admission,
+            ConnectorScanHandle::try_new(
+                self.descriptor.instance_id.clone(),
+                encode_payload(
+                    &payload,
+                    "scan handle",
+                    request.context.max_handle_payload_bytes(),
+                )?,
+            )?,
+            prepared.output_schema.clone(),
+            predicate_dispositions,
+            &request.context,
+        )
+    }
+}
+
 impl ConnectorScanPlanning for IcebergMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
+    }
+
+    fn begin_scan_async_in<'a>(
+        &'a self,
+        table: &'a ConnectorTableHandle,
+        request: ConnectorBeginScanRequest,
+        cpu: &'a Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        original: &'a novarocks_spi::connector::ConnectorOriginalResultScope,
+        owner: &'a mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ConnectorScan, ConnectorError>> + Send + 'a>,
+    > {
+        if owner.is_some() {
+            return Box::pin(async {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "change-window original owner receiver is occupied",
+                ))
+            });
+        }
+        // The actual caller's original receiver holds the SAME Source before
+        // any foreign/worker poll. Neither F exit nor CPU retirement can drop
+        // its SDK inputs before the caller receives and validates the result.
+        let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::change_window_source(
+            self.clone(), table.clone(), request, original.clone(),
+        );
+        *owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            source.clone(),
+        ));
+        Box::pin(async move {
+            source.drive_change_window(cpu).await?;
+            source.take_change_window_result()
+        })
     }
 
     fn begin_scan(
@@ -837,45 +1605,12 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 self.runtime.resources().catalog_runtime(),
                 &request.context,
             )?;
-            let predicate_dispositions = request
-                .static_predicates
-                .iter()
-                .map(|predicate| ConnectorPredicateDisposition {
-                    predicate_id: predicate.id,
-                    kind: ConnectorPredicateDispositionKind::Unsupported,
-                })
-                .collect();
-            let fact_columns = scan_fact_columns(&output_schema, &request.projection, &table)?;
-            let payload = IcebergScanPayload {
+            let prepared = PreparedChangeWindowScan {
                 table,
-                snapshot_id: Some(window.to_inclusive()),
-                table_uuid: Some(metadata_uuid),
-                projection: request.projection,
-                limit: request.limit,
-                purpose: request.purpose.into(),
-                fact_columns,
-                physical_predicates: Vec::new(),
-                mode: IcebergScanModeV1::ChangeWindowAdmission,
-            };
-            return ConnectorScan::try_new_change_window(
-                ConnectorProviderBindingKey {
-                    instance_id: self.descriptor.instance_id.clone(),
-                    incarnation: self.incarnation,
-                },
-                window,
-                admission,
-                ConnectorScanHandle::try_new(
-                    self.descriptor.instance_id.clone(),
-                    encode_payload(
-                        &payload,
-                        "scan handle",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
-                )?,
                 output_schema,
-                predicate_dispositions,
-                &request.context,
-            );
+                window,
+            };
+            return self.finish_change_window_scan(&prepared, &request, admission, metadata_uuid);
         }
 
         let ConnectorScanSelection::Snapshot(selector) = request.selection else {
@@ -1314,8 +2049,7 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
     ),
     novarocks_spi::connector::ConnectorCowBeginCause,
 > {
-    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
-    use std::mem::size_of;
+    use crate::commit::write_stack::control::cow_begin::projection_error;
     scope.active()?;
     let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
         corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
@@ -1327,61 +2061,8 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
     })?;
     let plan = existing_serde_projection::Plan::inspect(metadata, &schema, scope)
         .map_err(projection_error)?;
-    let mut other = (size_of::<IcebergTablePayload>()
-        + size_of::<IcebergTableInfo>()
-        + size_of::<IcebergDataFileInfo>()) as u64;
-    for text in [
-        catalog.as_str(),
-        namespace,
-        namespace,
-        table_name,
-        table_name,
-        metadata.location(),
-    ] {
-        other = add(other, text.len() as u64)?;
-    }
-    other = add(other, 36)?;
-    // Fixed lineage identities plus growable metadata/hidden-name vectors.
-    // Reserve old+new Vec growth and every property-derived String before the
-    // original builders perform their case folding/splitting.
-    let identities = ["_file", "_pos", "_row_id", "_last_updated_sequence_number"];
-    for name in identities {
-        other = add(
-            other,
-            add(name.len() as u64, (2 * size_of::<String>()) as u64)?,
-        )?;
-    }
-    let node = (size_of::<usize>()
-        + 4
-        + 11 * 2 * size_of::<String>()
-        + 12 * size_of::<usize>()
-        + 9 * (std::mem::align_of::<usize>() - 1)) as u64;
-    for (key, value) in metadata.properties() {
-        let chars = value.split(',').count() as u64;
-        other = add(
-            other,
-            add(
-                mul((key.len() + value.len()) as u64, 3)?,
-                add(mul(chars, (3 * size_of::<String>()) as u64)?, mul(node, 2)?)?,
-            )?,
-        )?;
-    }
-    let shape = plan.shape();
-    let prospective = add(
-        add(
-            shape.owned_upper().map_err(projection_error)?,
-            shape.maximum_field_temporary,
-        )?,
-        other,
-    )?;
-    let existing = scope.upper();
-    // The same prospective recipe authorizes the complete overlap once; it is
-    // carried conservatively through the subsequent branch and compiler owners.
-    let mut checked = plan
-        .authorize(1, existing, other, scope)
-        .map_err(projection_error)?;
+    let mut checked = plan.for_copies(1, scope).map_err(projection_error)?;
     let output = checked.build_one().map_err(projection_error)?;
-    scope.cover_total(add(existing, prospective)?)?;
     let (serialized_metadata, schema, guard) = output.into_guarded_parts();
     let payload = IcebergTablePayload {
         namespace: namespace.to_string(),
@@ -1410,117 +2091,6 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
     };
     scope.active()?;
     Ok((payload, guard))
-}
-
-/// Borrowed layout for the Nova-owned Arrow projection/annotation passes.
-/// Library schema conversion internals remain under the original call owner;
-/// every explicit Field/name/metadata clone and vector pass is included here.
-pub(crate) fn cow_projected_schema_upper(
-    metadata: &crate::iceberg::spec::TableMetadata,
-    snapshot_id: i64,
-    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
-) -> Result<u64, novarocks_spi::connector::ConnectorCowBeginCause> {
-    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
-    use crate::iceberg::spec::{NestedField, Type};
-    use std::mem::size_of;
-    fn field_upper(
-        field: &NestedField,
-        scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
-    ) -> Result<u64, novarocks_spi::connector::ConnectorCowBeginCause> {
-        scope.active()?;
-        let defaults = existing_serde_projection::count(field, scope).map_err(projection_error)?;
-        let own =
-            (size_of::<Field>() + 2 * size_of::<usize>() + 3 * size_of::<Arc<Field>>()) as u64;
-        // Arrow field metadata includes field ids, defaults, logical-domain
-        // facts and hidden markers. The public map's next resize coexistence
-        // is covered by 16 possible entries and controls per field/pass.
-        let mut n = add(
-            own,
-            add(
-                field.name.len() as u64,
-                add(
-                    defaults,
-                    crate::read_snapshot::cow_capture::geometry::hash_max::<
-                        novarocks_spi::connector::ConnectorCowBeginCause,
-                        (String, String),
-                    >(16)
-                    .map_err(crate::commit::write_stack::control::cow_begin::geometry_error)?,
-                )?,
-            )?,
-        )?;
-        match field.field_type.as_ref() {
-            Type::Struct(ty) => {
-                for child in ty.fields() {
-                    n = add(n, field_upper(child, scope)?)?;
-                }
-            }
-            Type::List(ty) => {
-                n = add(n, field_upper(&ty.element_field, scope)?)?;
-            }
-            Type::Map(ty) => {
-                n = add(n, field_upper(&ty.key_field, scope)?)?;
-                n = add(n, field_upper(&ty.value_field, scope)?)?;
-                n = add(
-                    n,
-                    (size_of::<Field>()
-                        + 3 * size_of::<Arc<Field>>()
-                        + 2 * size_of::<usize>()
-                        + "entries".len()) as u64,
-                )?;
-            }
-            Type::Primitive(_) | Type::Variant(_) => {}
-        }
-        Ok(n)
-    }
-    let schema = metadata
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| corrupt("Iceberg exact table source snapshot is absent"))?
-        .schema(metadata)
-        .map_err(|_| corrupt("Iceberg exact table source schema is unavailable"))?;
-    let mut n = (size_of::<arrow::datatypes::Schema>() + 2 * size_of::<usize>()) as u64;
-    for f in schema.as_struct().fields() {
-        n = add(n, field_upper(f, scope)?)?;
-    }
-    // SQL carrier adaptation, scalar/nominal-domain projection, default and
-    // hidden annotation and final projection retain old/new graphs. The added
-    // nominal pass owns another field-reference vector and schema/field graph.
-    n = mul(n, 7)?;
-    for (key, value) in metadata.properties() {
-        n = add(n, mul((key.len() + value.len()) as u64, 6)?)?;
-    }
-    let scalar_nodes = metadata
-        .properties()
-        .values()
-        .try_fold(0u64, |n, s| add(n, s.len() as u64))?;
-    n = add(
-        n,
-        crate::commit::write_stack::control::cow_begin::tree_upper::<i32, (i64, i64)>(
-            scalar_nodes,
-        )?,
-    )?;
-    let roots = schema.as_struct().fields().len() as u64;
-    // The shared nominal author inserts at most one declaration per exact root.
-    // Its ordinal tree coexists with scalar declarations and the Arrow output.
-    n = add(
-        n,
-        crate::commit::write_stack::control::cow_begin::tree_upper::<
-            usize,
-            novarocks_type_contract::ValueLogicalType,
-        >(roots)?,
-    )?;
-    // Price the new key/longest canonical label through each retained graph;
-    // existing property-string work also covers lowercase validation temporaries.
-    n = add(
-        n,
-        mul(
-            mul(
-                roots,
-                (novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len() + "largeint".len()) as u64,
-            )?,
-            7,
-        )?,
-    )?;
-    Ok(n)
 }
 
 /// The frozen target one staged write session opens on.
@@ -2339,6 +2909,347 @@ mod plan_splits_pruning_tests {
     }
 
     #[test]
+    fn async_namespace_exists_preserves_real_catalog_observation_and_owner_fence() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            let request = ConnectorNamespaceRequest {
+                namespace: ConnectorNamespaceIdentity {
+                    instance_id: metadata.descriptor.instance_id.clone(),
+                    namespace: Arc::from("prepared_test"),
+                },
+                context: context(),
+            };
+            assert!(
+                !metadata
+                    .namespace_exists_async(request.clone())
+                    .await
+                    .unwrap()
+            );
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                metadata
+                    .namespace_exists_async(request.clone())
+                    .await
+                    .unwrap()
+            );
+            let mut foreign = request;
+            foreign.namespace.instance_id = ConnectorInstanceId::parse("foreign").unwrap();
+            let error = metadata.namespace_exists_async(foreign).await.unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        });
+    }
+
+    #[test]
+    fn async_object_rebind_keeps_the_real_frozen_uuid_and_typed_replacement() {
+        use crate::catalog::CatalogNamespaceName;
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use crate::iceberg::TableCreation;
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let request = ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: metadata.descriptor.instance_id.clone(),
+                    namespace: "prepared_test".into(),
+                    table: "t".into(),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            };
+            let first = metadata
+                .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                    table: request.table.clone(),
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+                .unwrap();
+            let mut foreign = request.table.clone();
+            foreign.instance_id = ConnectorInstanceId::parse("foreign").unwrap();
+            let Err(error) = metadata
+                .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                    table: foreign,
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+            else {
+                panic!("foreign instance must not capture a physical object");
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            let mut missing = request.table.clone();
+            missing.table = Arc::from("missing");
+            let Err(error) = metadata
+                .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                    table: missing,
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+            else {
+                panic!("missing table must not capture a physical object");
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+            let retained = first.object_id.clone();
+            let rebound = metadata
+                .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {
+                    table: request.table.clone(),
+                    expected_object_id: retained.clone(),
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(rebound.object_id, retained);
+            assert_eq!(rebound.metadata.identity, first.metadata.identity);
+            let refused = metadata
+                .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {
+                    table: request.table,
+                    expected_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                        b"replaced",
+                    ))
+                    .unwrap(),
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context,
+                })
+                .await;
+            let Err(error) = refused else {
+                panic!("foreign physical UUID must be rejected");
+            };
+            assert_eq!(
+                error.table_object_binding_failure(),
+                Some(novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced)
+            );
+        });
+    }
+
+    // Executes the real closed Provider CPU input after removing its original
+    // catalog files. This fixture tests phase/input semantics, not thread-pool
+    // capacity or the physical worker's exit protocol.
+    struct CaptureAfterOriginalIo {
+        path: std::path::PathBuf,
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for CaptureAfterOriginalIo {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            use std::sync::atomic::Ordering;
+            let original = input.as_ref().expect("original metadata input");
+            assert_eq!(original.descriptor(), &self.descriptor);
+            assert_eq!(original.incarnation(), self.incarnation);
+            assert_eq!(
+                original.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            std::fs::remove_dir_all(&self.path).unwrap();
+            input.take().unwrap().run_original_phase();
+            Ok(())
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_closed(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+
+    #[test]
+    fn completed_async_observation_creates_the_original_schema_without_further_io() {
+        use crate::catalog::CatalogNamespaceName;
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use crate::iceberg::TableCreation;
+        let (executor, warehouse, metadata) = provider();
+        let (_other_executor, _other_warehouse, other_generation) = provider();
+        let (prepared, foreign) = executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let request = ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: metadata.descriptor.instance_id.clone(),
+                    namespace: "prepared_test".into(),
+                    table: "t".into(),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            };
+            let prepared = metadata.prepare_table(request.clone()).await.unwrap();
+            let foreign = metadata.prepare_table(request.clone()).await.unwrap();
+            let cpu = Arc::new(CaptureAfterOriginalIo {
+                path: warehouse.path().to_path_buf(),
+                descriptor: metadata.descriptor.clone(),
+                incarnation: metadata.incarnation,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let (binding, snapshot) = metadata
+                .capture_table_object_with_snapshot_cpu(
+                    ConnectorTableObjectCaptureRequest {
+                        table: request.table.clone(),
+                        resolution: request.resolution,
+                        selector: ConnectorTableObjectSelector::Current,
+                        context: request.context,
+                    },
+                    cpu.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cpu.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(binding.metadata.identity, request.table);
+            assert_eq!(snapshot, None, "the real new table has no snapshot");
+            assert_eq!(
+                metadata
+                    .table_payload(&binding.metadata.table)
+                    .unwrap()
+                    .table_info
+                    .unwrap()
+                    .current_snapshot_id,
+                snapshot
+            );
+            (prepared, foreign)
+        });
+        // The actual tuple capture removed storage before its original CPU
+        // phase. These earlier observations also remain usable without I/O.
+        assert!(!warehouse.path().exists());
+        let mut request = |_: std::alloc::Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        assert!(
+            other_generation
+                .create_prepared_table(foreign, &mut creation)
+                .is_err()
+        );
+        let table = metadata
+            .create_prepared_table(prepared, &mut creation)
+            .unwrap();
+        assert_eq!(table.identity.namespace.as_ref(), "prepared_test");
+        assert_eq!(table.identity.table.as_ref(), "t");
+        assert_eq!(table.schema().field(0).name(), "id");
+        let payload = metadata.table_payload(&table.table).unwrap();
+        assert_eq!(payload.namespace, "prepared_test");
+        assert_eq!(payload.table, "t");
+        assert!(payload.table_info.unwrap().table_uuid.is_some());
+    }
+
+    #[test]
     fn table_job_admission_uses_the_exact_owner_without_any_external_io() {
         use novarocks_spi::connector::{
             ConnectorTableJobAdmission, ConnectorTableJobAdmissionRequest, ConnectorTableJobKind,
@@ -2731,6 +3642,878 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.candidate_units_considered, 2);
         assert_eq!(metrics.candidate_units_pruned, 2);
         assert_eq!(metrics.scan_units_planned, 0);
+    }
+    #[test]
+    fn original_async_change_window_uses_loaded_exact_pin_without_cpu_catalog_io() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        use novarocks_spi::connector::{
+            ConnectorBatchBudget, ConnectorChangeWindowAdmission,
+            ConnectorChangeWindowFullRebuildReason, ConnectorOriginalResultScope,
+            ConnectorOriginalResultScopeCheck, OriginalResultCheckError, ProviderMetadataCpuInput,
+            ProviderMetadataCpuPort,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct OriginalScope(Instant);
+        impl ConnectorOriginalResultScopeCheck for OriginalScope {
+            fn original_deadline(&self) -> Instant {
+                self.0
+            }
+            fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+                Ok(())
+            }
+        }
+        // Like CaptureAfterOriginalIo above, this is a real-input phase fixture,
+        // not a physical CPU admission/exit oracle. The second pure phase must
+        // finish from the exact already-loaded facts after the catalog is gone.
+        struct LoadedPhasePort {
+            path: std::path::PathBuf,
+            descriptor: ConnectorInstanceDescriptor,
+            incarnation: ProviderBindingEpoch,
+            calls: AtomicUsize,
+        }
+        impl ProviderMetadataCpuPort for LoadedPhasePort {
+            fn submit_metadata_in(
+                &self,
+                input: &mut Option<ProviderMetadataCpuInput>,
+            ) -> Result<(), ConnectorError> {
+                let original = input.as_ref().unwrap();
+                assert_eq!(original.descriptor(), &self.descriptor);
+                assert_eq!(original.incarnation(), self.incarnation);
+                assert_eq!(
+                    original.original_source_type_id(),
+                    std::any::TypeId::of::<
+                        crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                    >()
+                );
+                let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+                assert!(turn < 2, "resolved lineage uses only Prepare and Inspect");
+                if turn == 1 {
+                    std::fs::remove_dir_all(&self.path).unwrap();
+                }
+                input.take().unwrap().run_original_phase();
+                Ok(())
+            }
+            fn poll_finished(
+                &self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), ConnectorError>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_closed(
+                &self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), ConnectorError>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+                None
+            }
+        }
+        for missing_from in [false, true] {
+            let (executor, warehouse, provider) = provider();
+            executor.block_on(async {
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                    provider.runtime(),
+                    provider.incarnation,
+                    CatalogPublicationRequest::CreateNamespace {
+                        namespace: CatalogNamespaceName::new("async_window"),
+                        properties: HashMap::new(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                    "{outcome:?}"
+                );
+                let schema = Schema::builder()
+                    .with_fields(vec![Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    ))])
+                    .build()
+                    .unwrap();
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                    provider.runtime(),
+                    provider.incarnation,
+                    CatalogPublicationRequest::CreateTable {
+                        namespace: CatalogNamespaceName::new("async_window"),
+                        creation: crate::iceberg::TableCreation::builder()
+                            .name("t".into())
+                            .schema(schema)
+                            .format_version(FormatVersion::V2)
+                            .build(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                    "{outcome:?}"
+                );
+                let loaded = provider
+                    .runtime()
+                    .load_table_for_request_async("async_window", "t", &context())
+                    .await
+                    .unwrap();
+                let snapshot = crate::commit::run::append_snapshot_for_test(
+                    provider.clone(),
+                    loaded.table,
+                    Vec::new(),
+                    "main".into(),
+                    std::collections::BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+                provider
+                    .runtime()
+                    .control_state()
+                    .invalidate_table_cache("async_window", "t");
+                let table = provider
+                    .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: provider.descriptor.instance_id.clone(),
+                            namespace: "async_window".into(),
+                            table: "t".into(),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        selector: ConnectorTableObjectSelector::Current,
+                        context: context(),
+                    })
+                    .await
+                    .unwrap()
+                    .metadata;
+                let from = if missing_from {
+                    snapshot.checked_add(1).unwrap_or(snapshot - 1)
+                } else {
+                    snapshot
+                };
+                let window = ConnectorChangeWindow::new(from, snapshot);
+                let request = ConnectorBeginScanRequest {
+                    projection: vec![0],
+                    static_predicates: Vec::new(),
+                    selection: ConnectorScanSelection::ChangeWindow(window),
+                    purpose: ConnectorReadPurpose::Query,
+                    limit: None,
+                    batch: ConnectorBatchBudget {
+                        max_rows: std::num::NonZeroUsize::new(4096).unwrap(),
+                        max_bytes: std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+                    },
+                    context: context(),
+                };
+                let original = ConnectorOriginalResultScope::from_original(Arc::new(
+                    OriginalScope(request.context.deadline()),
+                ));
+                let port = Arc::new(LoadedPhasePort {
+                    path: warehouse.path().to_path_buf(),
+                    descriptor: provider.descriptor.clone(),
+                    incarnation: provider.incarnation,
+                    calls: AtomicUsize::new(0),
+                });
+                let cpu: Arc<dyn ProviderMetadataCpuPort> = port.clone();
+                let mut owner = None;
+                let result = provider
+                    .begin_scan_async_in(&table.table, request.clone(), &cpu, &original, &mut owner)
+                    .await
+                    .unwrap();
+                let key = ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor.instance_id.clone(),
+                    incarnation: provider.incarnation,
+                };
+                owner.as_ref().unwrap().validate_owner(&key).unwrap();
+                let weak = Arc::downgrade(owner.as_ref().unwrap().value::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >(provider.descriptor.instance_id.as_str()).unwrap());
+                assert!(
+                    weak.upgrade().is_some(),
+                    "actual Source outlives the completed Provider F"
+                );
+                let rejected = provider
+                    .begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner)
+                    .await
+                    .expect_err("same owner receiver cannot be overwritten");
+                assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
+                assert_eq!(
+                    rejected.message(),
+                    "change-window original owner receiver is occupied"
+                );
+                assert!(weak.upgrade().is_some());
+                assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+                result
+                    .validate(
+                        &ConnectorProviderBindingKey {
+                            instance_id: provider.descriptor.instance_id.clone(),
+                            incarnation: provider.incarnation,
+                        },
+                        ConnectorScanSelection::ChangeWindow(window),
+                    )
+                    .unwrap();
+                let expected = if missing_from {
+                    ConnectorChangeWindowAdmission::FullRebuild(
+                        ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                            from_snapshot_id: from,
+                        },
+                    )
+                } else {
+                    ConnectorChangeWindowAdmission::MetadataOnly
+                };
+                assert_eq!(
+                    result.admission(),
+                    &novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(expected)
+                );
+                // Value facts carry no runtime owner. The actual receiving
+                // slot, after result validation and F Drop above, retires it.
+                drop(owner.take());
+                assert!(weak.upgrade().is_none());
+                assert_eq!(result.output_schema().fields().len(), 1);
+            });
+        }
+    }
+    #[test]
+    fn original_async_change_window_reads_both_manifest_endpoints_across_a_rename() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
+        use novarocks_spi::connector::{
+            ConnectorBatchBudget, ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationRequest, ConnectorChangeWindowAdmission,
+            ConnectorChangeWindowPartitionImpact, ConnectorColumnPath, ConnectorIoAdmissionPort,
+            ConnectorIoCleanupFuture, ConnectorIoProgressSource, ConnectorIoRequest,
+            ConnectorIoRequestSource, ConnectorOriginalResultScope,
+            ConnectorOriginalResultScopeCheck, ConnectorPayloadRetentionGuard,
+            ConnectorSchemaChange, ExternalMutationEffect, ExternalMutationOutcome,
+            OriginalResultCheckError, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
+            SharedDependency,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+        struct OriginalScope(Instant);
+        impl ConnectorOriginalResultScopeCheck for OriginalScope {
+            fn original_deadline(&self) -> Instant {
+                self.0
+            }
+            fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+                Ok(())
+            }
+        }
+        // Explicit SPI resource-cell fixture. It observes the real FileIO
+        // requests; it does not certify a WC Root, a CPU offer or worker exit.
+        struct IoFixture {
+            in_cpu: Arc<AtomicBool>,
+            owned_reads: AtomicUsize,
+        }
+        struct IoCell;
+        impl ConnectorIoRequestSource for IoCell {
+            fn exit_waker(&self) -> Waker {
+                Waker::noop().clone()
+            }
+            fn reserve_stream(&self) -> Result<(), ConnectorError> {
+                panic!("snapshot whole-object reads do not open streams")
+            }
+            fn stream_closed(&self) {
+                panic!("no snapshot stream")
+            }
+            fn install_stream_cleanup_in(
+                &self,
+                _: &mut Option<ConnectorIoCleanupFuture>,
+            ) -> Result<(), ConnectorError> {
+                panic!("no snapshot stream cleanup")
+            }
+            fn stream_custody_lost(&self) {
+                panic!("no snapshot stream custody")
+            }
+            fn record_cleanup_failure(
+                &self,
+                original: Box<dyn std::any::Any + Send>,
+            ) -> Result<(), Box<dyn std::any::Any + Send>> {
+                Err(original)
+            }
+            fn attach_original_progress(
+                &self,
+                _: Arc<dyn ConnectorIoProgressSource>,
+            ) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            fn poll_admitted(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_include_dependency(
+                &self,
+                _: &SharedDependency,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl ConnectorIoAdmissionPort for IoFixture {
+            fn request_owned(
+                &self,
+                _: std::num::NonZeroU64,
+            ) -> Result<ConnectorIoRequest, ConnectorError> {
+                assert!(
+                    !self.in_cpu.load(Ordering::SeqCst),
+                    "raw snapshot read must be driven outside the pure CPU phase"
+                );
+                self.owned_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
+            }
+            fn request(&self, _: SharedDependency) -> Result<ConnectorIoRequest, ConnectorError> {
+                assert!(
+                    !self.in_cpu.load(Ordering::SeqCst),
+                    "selected physical I/O must not be polled by the pure CPU phase"
+                );
+                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
+            }
+            fn publication_obligation_started(&self) {
+                panic!("scan cannot publish")
+            }
+            fn retain_payload(&self) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                Ok(ConnectorPayloadRetentionGuard::new(()))
+            }
+        }
+        struct PhasePort {
+            in_cpu: Arc<AtomicBool>,
+            descriptor: ConnectorInstanceDescriptor,
+            incarnation: ProviderBindingEpoch,
+            calls: AtomicUsize,
+        }
+        impl ProviderMetadataCpuPort for PhasePort {
+            fn submit_metadata_in(
+                &self,
+                input: &mut Option<ProviderMetadataCpuInput>,
+            ) -> Result<(), ConnectorError> {
+                let source = input.as_ref().unwrap();
+                assert_eq!(source.descriptor(), &self.descriptor);
+                assert_eq!(source.incarnation(), self.incarnation);
+                assert_eq!(
+                    source.original_source_type_id(),
+                    std::any::TypeId::of::<
+                        crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                    >()
+                );
+                assert!(!self.in_cpu.swap(true, Ordering::SeqCst));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                input.take().unwrap().run_original_phase();
+                self.in_cpu.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+                None
+            }
+        }
+        fn written(
+            table: &crate::iceberg::table::Table,
+            label: &str,
+        ) -> crate::commit::WrittenFile {
+            crate::commit::WrittenFile {
+                path: format!("{}/data/{label}.parquet", table.metadata().location()),
+                format: DataFileFormat::Parquet,
+                content: DataContentType::Data,
+                partition_values: Struct::empty(),
+                partition_spec_id: table.metadata().default_partition_spec_id(),
+                record_count: 3,
+                file_size_in_bytes: 128,
+                split_offsets: Vec::new(),
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                referenced_data_file: None,
+                equality_ids: None,
+                first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            }
+        }
+        let (executor, _warehouse, provider) = provider();
+        let from = executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                provider.runtime(),
+                provider.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("endpoint_window"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                provider.runtime(),
+                provider.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("endpoint_window"),
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let loaded = provider
+                .runtime()
+                .load_table_for_request_async("endpoint_window", "t", &context())
+                .await
+                .unwrap();
+            let file = written(&loaded.table, "a");
+            crate::commit::run::append_snapshot_for_test(
+                provider.clone(),
+                loaded.table,
+                vec![file],
+                "main".into(),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+        });
+        // Seed the rename through the existing catalog mutation author outside
+        // the async driver. The scan below never calls this legacy sync route.
+        let outcome = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor.instance_id.clone(),
+                    incarnation: provider.incarnation,
+                },
+                operation: ConnectorCatalogMutationOperation::AlterSchema {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor.instance_id.clone(),
+                        namespace: "endpoint_window".into(),
+                        table: "t".into(),
+                    },
+                    changes: vec![ConnectorSchemaChange::RenameColumn {
+                        path: ConnectorColumnPath {
+                            segments: vec!["id".into()],
+                        },
+                        to: "renamed".into(),
+                    }],
+                },
+                context: context(),
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        executor.block_on(async {
+                    provider.runtime().control_state().invalidate_table_cache("endpoint_window", "t");
+                    let loaded = provider.runtime().load_table_for_request_async("endpoint_window", "t", &context()).await.unwrap();
+                    let file = written(&loaded.table, "b");
+                    let to = crate::commit::run::append_snapshot_for_test(provider.clone(), loaded.table, vec![file], "main".into(), std::collections::BTreeMap::new()).await.unwrap();
+                    provider.runtime().control_state().invalidate_table_cache("endpoint_window", "t");
+                    let physical = provider.runtime().load_table_for_request_async("endpoint_window", "t", &context()).await.unwrap();
+                    let from_schema = physical.table.metadata().snapshot_by_id(from).unwrap().schema(physical.table.metadata()).unwrap();
+                    let to_schema = physical.table.metadata().snapshot_by_id(to).unwrap().schema(physical.table.metadata()).unwrap();
+                    assert_eq!(from_schema.field_by_id(1).unwrap().name, "id");
+                    assert_eq!(to_schema.field_by_id(1).unwrap().name, "renamed");
+                    assert_ne!(from_schema.schema_id(), to_schema.schema_id());
+                    let table = provider.capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                        table: ConnectorTableIdentity { instance_id: provider.descriptor.instance_id.clone(), namespace: "endpoint_window".into(), table: "t".into() },
+                        resolution: ConnectorTableResolution::StrictBaseTable, selector: ConnectorTableObjectSelector::Current, context: context(),
+                    }).await.unwrap().metadata;
+                    let active = Arc::new(AtomicBool::new(false));
+                    let io = Arc::new(IoFixture { in_cpu: active.clone(), owned_reads: AtomicUsize::new(0) });
+                    let phase = Arc::new(PhasePort { in_cpu: active, descriptor: provider.descriptor.clone(), incarnation: provider.incarnation, calls: AtomicUsize::new(0) });
+                    let cpu: Arc<dyn ProviderMetadataCpuPort> = phase.clone();
+                    let request_context = context().with_io_admission(io.clone());
+                    let original = ConnectorOriginalResultScope::from_original(Arc::new(OriginalScope(request_context.deadline())));
+                    let window = ConnectorChangeWindow::new(from, to);
+                    let request = ConnectorBeginScanRequest {
+                        projection: vec![0], static_predicates: Vec::new(), selection: ConnectorScanSelection::ChangeWindow(window),
+                        purpose: ConnectorReadPurpose::Query, limit: None,
+                        batch: ConnectorBatchBudget { max_rows: std::num::NonZeroUsize::new(4096).unwrap(), max_bytes: std::num::NonZeroUsize::new(1024 * 1024).unwrap() },
+                        context: request_context,
+                    };
+                    // The receiving slot is installed even if its borrower is dropped
+                    // before the first CPU or foreign poll. No input was dispatched.
+                    let mut unpolled_owner = None;
+                    let borrower = provider.begin_scan_async_in(&table.table, request.clone(), &cpu, &original, &mut unpolled_owner);
+                    drop(borrower);
+                    assert!(unpolled_owner.is_some());
+                    assert_eq!(phase.calls.load(Ordering::SeqCst), 0);
+                    drop(unpolled_owner);
+                    let mut owner = None;
+                    let scan = provider.begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner).await.unwrap();
+                    assert_eq!(scan.output_schema().field(0).name(), "renamed");
+                    scan.validate(&ConnectorProviderBindingKey { instance_id: provider.descriptor.instance_id.clone(), incarnation: provider.incarnation }, ConnectorScanSelection::ChangeWindow(window)).unwrap();
+                    assert_eq!(scan.admission(), &novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::Incremental {
+                        has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                    }));
+                    assert!(phase.calls.load(Ordering::SeqCst) > 3, "both endpoint readers suspend and resume before the common Finish phase");
+                    assert!(io.owned_reads.load(Ordering::SeqCst) >= 4, "both nonempty manifest lists and their data manifests were actually read");
+                    let weak = Arc::downgrade(owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap());
+                    assert!(weak.upgrade().is_some());
+                    let endpoints = owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap().change_window_endpoint_facts_for_test();
+                    assert_eq!(endpoints[0].len(), 1);
+                    assert_eq!(endpoints[1].len(), 2);
+                    assert!(endpoints[0][0].path.ends_with("/a.parquet"));
+                    let mut to_names = endpoints[1].iter().map(|file| file.path.rsplit('/').next().unwrap()).collect::<Vec<_>>();
+                    to_names.sort_unstable();
+                    assert_eq!(to_names, ["a.parquet", "b.parquet"]);
+                    for (index, files) in endpoints.iter().enumerate() {
+                        for file in files {
+                            assert_eq!(file.record_count, Some(3));
+                            let endpoint = file.read_domain().endpoint();
+                            assert_eq!(endpoint.snapshot_id(), [from, to][index]);
+                            assert_eq!(endpoint.schema().unwrap().field_by_id(1).unwrap().name, "renamed", "both real readers use the original To schema");
+                        }
+                    }
+                    drop(endpoints);
+                    drop(owner);
+                    assert!(weak.upgrade().is_none(), "the received value does not hide a runtime Source alias");
+                });
+    }
+    #[derive(Debug)]
+    struct OriginalCaptureCatalogFailure {
+        inner: Arc<dyn crate::catalog::NovaRocksCatalog>,
+        failure: ConnectorError,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::catalog::NovaRocksCatalog for OriginalCaptureCatalogFailure {
+        fn implementation_name(&self) -> &'static str {
+            "original-capture-failure"
+        }
+        fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
+            self.inner.listing_admission()
+        }
+        async fn list_namespaces(
+            &self,
+            bound: novarocks_spi::connector::ConnectorListingBound,
+        ) -> Result<Vec<String>, ConnectorError> {
+            self.inner.list_namespaces(bound).await
+        }
+        async fn namespace_exists(
+            &self,
+            name: crate::catalog::CatalogNamespaceName,
+        ) -> Result<bool, ConnectorError> {
+            self.inner.namespace_exists(name).await
+        }
+        async fn list_tables(
+            &self,
+            name: crate::catalog::CatalogNamespaceName,
+            bound: novarocks_spi::connector::ConnectorListingBound,
+        ) -> Result<Vec<String>, ConnectorError> {
+            self.inner.list_tables(name, bound).await
+        }
+        async fn table_exists(
+            &self,
+            name: crate::catalog::CatalogTableName,
+        ) -> Result<bool, ConnectorError> {
+            self.inner.table_exists(name).await
+        }
+        async fn load_table(
+            &self,
+            _: crate::catalog::CatalogTableName,
+        ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.failure.clone())
+        }
+        async fn view_exists(
+            &self,
+            name: crate::catalog::CatalogTableName,
+        ) -> Result<bool, ConnectorError> {
+            self.inner.view_exists(name).await
+        }
+        async fn list_views(
+            &self,
+            name: crate::catalog::CatalogNamespaceName,
+            bound: novarocks_spi::connector::ConnectorListingBound,
+        ) -> Result<Vec<String>, ConnectorError> {
+            self.inner.list_views(name, bound).await
+        }
+        async fn load_view(
+            &self,
+            name: crate::catalog::CatalogTableName,
+        ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+            self.inner.load_view(name).await
+        }
+        async fn anchor_written_metadata(
+            &self,
+            name: crate::catalog::CatalogTableName,
+            location: Arc<str>,
+        ) -> crate::catalog::error::CatalogOutcome<crate::catalog::CatalogTableName> {
+            self.inner.anchor_written_metadata(name, location).await
+        }
+        fn admit_operation(
+            &self,
+            operation: &crate::catalog::admission::CatalogOperation,
+            target: &crate::catalog::admission::CatalogAdmissionTarget,
+        ) -> Result<(), crate::catalog::error::CatalogUnsupported> {
+            self.inner.admit_operation(operation, target)
+        }
+    }
+
+    struct CaptureFooterPort {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        calls: std::sync::atomic::AtomicUsize,
+        footer: std::sync::Mutex<tokio::sync::oneshot::Receiver<()>>,
+        closed: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+    }
+    // Explicit component-only inline CPU author: the real private input runs,
+    // while a separate footer gate tests handoff ordering, not physical QB exit.
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for CaptureFooterPort {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            use std::sync::atomic::Ordering;
+            let source = input.as_ref().expect("same original capture input");
+            assert_eq!(source.descriptor(), &self.descriptor);
+            assert_eq!(source.incarnation(), self.incarnation);
+            assert_eq!(
+                source.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            input.take().unwrap().run_original_phase();
+            self.started.notify_one();
+            Ok(())
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            assert_eq!(self.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_closed(
+            &self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            use std::sync::atomic::Ordering;
+            if self.closed.load(Ordering::SeqCst) {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let result = std::future::Future::poll(
+                std::pin::Pin::new(&mut *self.footer.lock().unwrap()),
+                cx,
+            );
+            std::task::ready!(result).expect("the original footer gate is released");
+            self.closed.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+    fn original_capture_request(
+        provider: &IcebergMetadata,
+        namespace: &str,
+    ) -> ConnectorTableObjectCaptureRequest {
+        ConnectorTableObjectCaptureRequest {
+            table: ConnectorTableIdentity {
+                instance_id: provider.descriptor.instance_id.clone(),
+                namespace: namespace.into(),
+                table: "t".into(),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context(),
+        }
+    }
+    fn footer_port(
+        provider: &IcebergMetadata,
+    ) -> (tokio::sync::oneshot::Sender<()>, Arc<CaptureFooterPort>) {
+        let (release, footer) = tokio::sync::oneshot::channel();
+        (
+            release,
+            Arc::new(CaptureFooterPort {
+                descriptor: provider.descriptor.clone(),
+                incarnation: provider.incarnation,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                footer: std::sync::Mutex::new(footer),
+                closed: std::sync::atomic::AtomicBool::new(false),
+                started: tokio::sync::Notify::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn actual_catalog_original_failure_survives_prepare_current_and_stable_cpu_capture() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use std::error::Error;
+        use std::sync::atomic::Ordering;
+        let (executor, _warehouse, original) = provider();
+        // The actual NovaRocksCatalog callback produces this error. It is not
+        // injected into the metadata cache or disguised as CompileControl.
+        let failure = ConnectorError::from_domain_static(
+            ConnectorErrorKind::Unavailable,
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "catalog read original refusal",
+            ),
+            "catalog original read failed",
+        );
+        let cause = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let fact = failure.failure_fact();
+        let catalog = Arc::new(OriginalCaptureCatalogFailure {
+            inner: Arc::clone(original.runtime.novarocks_catalog()),
+            failure,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(IcebergMetadataContext::with_catalog_for_test(
+            original.runtime.control_state().clone(),
+            original.runtime.resources().clone(),
+            catalog.clone(),
+        ));
+        let metadata =
+            IcebergMetadata::new(original.descriptor.clone(), original.incarnation, runtime);
+        executor.block_on(async {
+            let request = original_capture_request(&metadata, "catalog_failure");
+            let preparation = metadata
+                .prepare_table(ConnectorTableRequest {
+                    table: request.table.clone(),
+                    resolution: request.resolution,
+                    context: request.context.clone(),
+                })
+                .await
+                .expect_err("actual catalog failure");
+            let current = metadata
+                .capture_table_object_binding_async(request.clone())
+                .await
+                .err()
+                .expect("actual Current loader failure");
+            let (_release, port) = footer_port(&metadata);
+            let port: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort> = port;
+            let mut owner = None;
+            let capture = metadata
+                .capture_table_object_with_snapshot_cpu_in(request, &port, &mut owner)
+                .await
+                .err()
+                .expect("actual stable capture loader failure");
+            assert!(
+                owner.is_some(),
+                "the original Source stays in caller custody on refusal"
+            );
+            for error in [&preparation, &current, &capture] {
+                assert_eq!(error.failure_fact(), fact);
+                assert_eq!(
+                    error.source().unwrap().downcast_ref::<SharedFailureCause>(),
+                    Some(&cause)
+                );
+                let original = cause
+                    .downcast_ref::<ConnectorError>()
+                    .expect("actual catalog error type");
+                assert_eq!(original.kind(), ConnectorErrorKind::Unavailable);
+            }
+            assert_eq!(
+                catalog.reads.load(Ordering::SeqCst),
+                3,
+                "each request reached the real catalog loader; no negative-cache shortcut"
+            );
+        });
+    }
+
+    #[test]
+    fn stable_metadata_capture_keeps_original_owner_and_waits_for_cpu_footer() {
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use std::sync::atomic::Ordering;
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            for request in [
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new("capture_original"),
+                    properties: HashMap::new(), no_op_if_exists: false,
+                },
+                CatalogPublicationRequest::CreateTable {
+                    namespace: crate::catalog::CatalogNamespaceName::new("capture_original"),
+                    creation: crate::iceberg::TableCreation::builder().name("t".into()).schema(
+                        Schema::builder().with_fields(vec![Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)))]).build().unwrap()
+                    ).format_version(FormatVersion::V2).build(),
+                    no_op_if_exists: false,
+                },
+            ] {
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(&metadata.runtime, metadata.incarnation, request).await;
+                assert!(matches!(outcome, CatalogOutcome::KnownCommitted { .. }), "{outcome:?}");
+            }
+            let (release, concrete) = footer_port(&metadata);
+            let port: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort> = concrete.clone();
+            // The synchronous _in author installs its actual Source even if
+            // the returned original F has never been polled.
+            let mut unpolled_owner = None;
+            let unpolled = metadata.capture_table_object_with_snapshot_cpu_in(original_capture_request(&metadata, "capture_original"), &port, &mut unpolled_owner);
+            drop(unpolled);
+            assert!(unpolled_owner.is_some());
+            assert_eq!(concrete.calls.load(Ordering::SeqCst), 0);
+            drop(unpolled_owner);
+            let mut owner = None;
+            let mut original = metadata.capture_table_object_with_snapshot_cpu_in(original_capture_request(&metadata, "capture_original"), &port, &mut owner);
+            // Real filesystem preparation may itself yield. Wait for the actual
+            // CPU submission, without assuming one loader poll completes I/O.
+            let started = concrete.started.notified();
+            tokio::pin!(started);
+            started.as_mut().enable();
+            tokio::select! {
+                result = original.as_mut() => panic!("binding handed off before footer: {}", result.is_ok()),
+                _ = &mut started => {},
+            }
+            // Retain the SAME original Future while a temporary borrower exits.
+            let mut borrower = Box::pin(std::future::poll_fn(|cx| original.as_mut().poll(cx)));
+            assert!(futures::poll!(&mut borrower).is_pending());
+            assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
+            assert!(!concrete.closed.load(Ordering::SeqCst));
+            drop(borrower);
+            release.send(()).unwrap();
+            let (binding, snapshot) = original.await.unwrap();
+            assert_eq!(binding.metadata.identity.table.as_ref(), "t");
+            assert_eq!(snapshot, None);
+            assert!(concrete.closed.load(Ordering::SeqCst));
+            assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
+            let weak = Arc::downgrade(owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::scoped_capture::MetadataCaptureOriginal>(metadata.descriptor.instance_id.as_str()).unwrap());
+            let rejected = metadata.capture_table_object_with_snapshot_cpu_in(original_capture_request(&metadata, "capture_original"), &port, &mut owner).await.err().expect("occupied original receiver");
+            assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(weak.upgrade().is_some());
+            drop(owner);
+            assert!(weak.upgrade().is_none(), "binding result does not hide the original runtime header");
+        });
     }
 }
 

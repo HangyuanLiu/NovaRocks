@@ -1503,8 +1503,145 @@ impl ConnectorReadReferenceFacts {
     }
 }
 
+/// The completed physical observation of one table load. This value contains
+/// provider facts only: no callback, pending I/O future, or schema observer.
+/// It is consumed once by the same provider's synchronous schema author.
+/// Allocating this carrier grants no resource capacity.
+pub struct ConnectorTablePreparation {
+    owner: ConnectorInstanceId,
+    facts: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ConnectorTablePreparation {
+    pub fn new<T: std::any::Any + Send + Sync>(owner: ConnectorInstanceId, facts: T) -> Self {
+        Self {
+            owner,
+            facts: Box::new(facts),
+        }
+    }
+
+    /// Providers must also validate their private exact-generation fence.
+    pub fn into_facts<T: std::any::Any + Send + Sync>(
+        self,
+        owner: &ConnectorInstanceId,
+    ) -> Result<T, ConnectorError> {
+        if &self.owner != owner {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "table preparation belongs to another connector instance",
+            ));
+        }
+        self.facts.downcast::<T>().map(|facts| *facts).map_err(|_| {
+            ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "table preparation belongs to another provider author",
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for ConnectorTablePreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorTablePreparation")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+pub type ConnectorTablePreparationFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<ConnectorTablePreparation, ConnectorError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub type ConnectorTableObjectSnapshotFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 pub trait ConnectorMetadata: Send + Sync {
+    /// Pure selected first-party metadata CPU author, authenticated with the
+    /// original planning lease before any closed phase is accepted.
+    fn provider_metadata_cpu_author(
+        &self,
+    ) -> Option<(super::ConnectorProviderBindingKey, std::any::TypeId)> {
+        None
+    }
+
+    /// Capture the binding and current snapshot from ONE original metadata
+    /// observation and selected CPU phase. Snapshot is an actual Provider fact,
+    /// never a second catalog lookup or an interpretation of the opaque token.
+    /// The caller keeps the original CPU owner through actual exit.
+    fn capture_table_object_with_snapshot_cpu(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+        _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> ConnectorTableObjectSnapshotFuture<'_> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no governed original snapshot binding author",
+            ))
+        })
+    }
+
+    /// Install the original capture Source in the caller's stable receiver
+    /// before the returned Future may poll a catalog or CPU author. The caller
+    /// retains this receiver AND that same Future through actual exit; neither
+    /// the opaque owner nor this method grants a CPU factory or Root authority.
+    fn capture_table_object_with_snapshot_cpu_in<'a>(
+        &'a self,
+        _request: ConnectorTableObjectCaptureRequest,
+        _cpu: &'a Arc<dyn super::ProviderMetadataCpuPort>,
+        _owner: &'a mut Option<super::ConnectorProcessLocalPayload>,
+    ) -> ConnectorTableObjectSnapshotFuture<'a> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no original capture receiver author",
+            ))
+        })
+    }
+
     fn instance_id(&self) -> &ConnectorInstanceId;
+
+    /// Await the original provider's real I/O before borrowing any synchronous
+    /// schema-creation observer. No implementation may call the legacy joining
+    /// load as an async fallback.
+    fn prepare_table(&self, request: ConnectorTableRequest) -> ConnectorTablePreparationFuture<'_> {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector does not support asynchronous table preparation",
+            ))
+        })
+    }
+
+    /// Create the same public schema and opaque handle from already observed
+    /// facts. This stage performs no external I/O and retains no observer.
+    fn create_prepared_table(
+        &self,
+        preparation: ConnectorTablePreparation,
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let _ = (preparation, creation);
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector does not support prepared table schema creation",
+        )
+        .into())
+    }
 
     /// Admit a statement-submitted table job before any job state or external
     /// mutation is created. AwaitTerminal requires waiting for actual exit,
@@ -1572,9 +1709,64 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    fn list_namespaces_async(
+        &self,
+        _request: ConnectorListNamespacesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorNamespaceIdentity>, ConnectorError>>
+    {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no async namespace listing",
+            ))
+        })
+    }
+    fn list_tables_async(
+        &self,
+        _request: ConnectorListTablesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no async table listing",
+            ))
+        })
+    }
+
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError>;
 
+    /// Probe the provider's original namespace observation without joining it.
+    fn namespace_exists_async(
+        &self,
+        _request: ConnectorNamespaceRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous namespace existence",
+            ))
+        })
+    }
+
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError>;
+
+    /// Await the provider's original existence probe without a joining bridge.
+    fn table_exists_async(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous table existence",
+            ))
+        })
+    }
 
     fn list_tables(
         &self,
@@ -1591,6 +1783,26 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    /// Observe the same frozen reference facts before synchronous SQL projection.
+    fn read_reference_facts_async(
+        &self,
+        request: ConnectorReadReferenceFactsRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorReadReferenceFacts, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous read reference facts",
+            ))
+        })
+    }
+
     /// Capture a current metadata binding and its provider-owned physical object
     /// identity. Providers that cannot prove a cross-version-stable identity
     /// must reject this explicitly instead of synthesizing one from a logical
@@ -1605,6 +1817,26 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    /// Capture the same physical object after real asynchronous observation.
+    /// An implementation must not call its synchronous joining capture here.
+    fn capture_table_object_binding_async(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous physical table object binding",
+            ))
+        })
+    }
+
     /// Rebind a logical table to its current metadata only when it still denotes
     /// the expected physical object. A replacement or missing target must use
     /// `ConnectorTableObjectBindingFailure`, never an untyped message match.
@@ -1616,6 +1848,114 @@ pub trait ConnectorMetadata: Send + Sync {
             super::ConnectorErrorKind::Unsupported,
             "connector metadata does not support physical table object rebinding",
         ))
+    }
+
+    /// Rebind the same physical object after real asynchronous observation.
+    /// An implementation must not call its synchronous joining rebind here.
+    fn rebind_table_object_binding_async(
+        &self,
+        _request: ConnectorTableObjectRebindRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous physical table object rebinding",
+            ))
+        })
+    }
+
+    /// Reobserve the current physical object using the caller's original CPU source.
+    /// Missing/replaced facts remain distinct from an ordinary provider error.
+    fn rebind_table_object_with_cpu(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+        cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let expected = request.expected_object_id;
+            let (binding, _) = self
+                .capture_table_object_with_snapshot_cpu(
+                    ConnectorTableObjectCaptureRequest {
+                        table: request.table,
+                        resolution: request.resolution,
+                        selector: request.selector,
+                        context: request.context,
+                    },
+                    cpu,
+                )
+                .await
+                .map_err(|error| {
+                    if error.kind() == super::ConnectorErrorKind::NotFound {
+                        ConnectorError::table_object_binding(
+                            super::ConnectorTableObjectBindingFailure::Missing,
+                            "table no longer resolves for its original physical object binding",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if binding.object_id != expected {
+                return Err(ConnectorError::table_object_binding(
+                    super::ConnectorTableObjectBindingFailure::Replaced,
+                    "table no longer matches its original physical object binding",
+                ));
+            }
+            Ok(binding)
+        })
+    }
+
+    /// Statistics-only schema creation with the same original scoped CPU.
+    /// No implementation may fall back to an unqualified synchronous creator.
+    fn capture_table_object_binding_for_statistics_async(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+        _cpu: Arc<dyn super::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no scoped Statistics binding creator",
+            ))
+        })
+    }
+
+    /// Statistics-only schema creation with the same original scoped CPU.
+    /// No implementation may fall back to an unqualified synchronous creator.
+    fn rebind_table_object_binding_for_statistics_async(
+        &self,
+        _request: ConnectorTableObjectRebindRequest,
+        _cpu: Arc<dyn super::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no scoped Statistics binding creator",
+            ))
+        })
     }
 
     fn load_table(
@@ -1636,6 +1976,31 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn prepared_table_facts_exit_once_on_wrong_owner_or_wrong_author() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Facts(Arc<AtomicUsize>);
+        impl Drop for Facts {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let owner = ConnectorInstanceId::parse("prepared-owner").unwrap();
+        let other = ConnectorInstanceId::parse("other-owner").unwrap();
+        let exits = Arc::new(AtomicUsize::new(0));
+        let preparation = ConnectorTablePreparation::new(owner.clone(), Facts(Arc::clone(&exits)));
+        assert!(preparation.into_facts::<Facts>(&other).is_err());
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        let preparation = ConnectorTablePreparation::new(owner.clone(), Facts(Arc::clone(&exits)));
+        assert!(preparation.into_facts::<()>(&owner).is_err());
+        assert_eq!(exits.load(Ordering::SeqCst), 2);
+        let preparation = ConnectorTablePreparation::new(owner.clone(), Facts(Arc::clone(&exits)));
+        let facts = preparation.into_facts::<Facts>(&owner).unwrap();
+        assert_eq!(exits.load(Ordering::SeqCst), 2);
+        drop(facts);
+        assert_eq!(exits.load(Ordering::SeqCst), 3);
+    }
 
     fn typed_catalog_header() -> ConnectorTableMetadataHeader {
         let instance_id = ConnectorInstanceId::parse("typed-catalog").unwrap();

@@ -1150,7 +1150,12 @@ impl BackendApplicationHost {
         );
         #[cfg(novarocks_dev_controls)]
         let root_reader = root_reader
-            .with_test_controls(test_session.as_ref().map(|session| session.native.clone()));
+            .with_test_controls(test_session.as_ref().map(|session| session.native.clone()))
+            .with_observation_controls(
+                test_session
+                    .as_ref()
+                    .and_then(|session| session.observation.clone()),
+            );
         let mut grpc_server = match NativeRpcServerHandle::start_with_admission(
             &bind_host,
             grpc_port,

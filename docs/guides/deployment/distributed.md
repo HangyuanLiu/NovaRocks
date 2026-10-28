@@ -490,3 +490,21 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 ### MEM-1-M07 配置迁移
 
 `[runtime.frontend_workload]` 中的 `control_bytes`、`per_scope_bytes` 已退役，旧键会报配置错误。FE 使用计数准入与固定结果窗口；不再从进程内存上限派生通用 LRA result budget。进程 MemoryAuthority 的控制 floor 使用 `[runtime.memory].control_bytes`，默认保持 64 MiB，FE/BE 进程启动仍在 work account 之前安装该保护。需要调整控制 floor 的部署应把原控制值移到新位置；`per_scope_bytes` 无替代 FE 配置。BE retained 保护与 M03/M04 后续接线边界保持独立。
+
+### FE 分布式执行容量
+
+FE 默认将每个依赖域的累计保管上限设为 12 GiB，将原 Native 进程发送队列的累计字节上限设为 1 GiB。前者包含尚未交付的结果、写入和清理责任；后者覆盖排队及已接收发送的原始字节。它们是准入上限，不是启动时预分配量，也不代表进程 RSS 上限。默认支持目标是至少 8 个完整依赖域，同时保留前台与收尾操作的保护空间；实际支持界由启动时各资源作者的完整报价和物理容量共同验证。
+
+依赖域来自真实选中的 Provider、存储和 Native endpoint，数量不等于 BE 数。同一 BE 的 Data 与 Control endpoint 可能分别形成依赖域。计划使用的完整集合超过当前支持界时，会明确拒绝；系统不会丢弃域、猜测单机数量或自动提高显式配置。
+
+可通过正常部署配置覆盖这两项：
+
+```toml
+[runtime]
+task_backend_max_queued_bytes = 1073741824
+
+[runtime.frontend_workload.dependency_custody]
+retained_payload_bytes = 12884901888
+```
+
+较低的显式值仍按原值执行，可能减少可支持的完整依赖域数量或拒绝相应动作。部署调大上限时，应同时检查完整保管、Native 队列字节与位置、元数据、计算和未交付写入责任；只提高保管字节不能补足物理队列。新默认允许更多累计保管暴露，满载时仍由全局、每域及各执行类别的原准入保护限制。

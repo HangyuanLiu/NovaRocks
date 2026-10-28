@@ -146,6 +146,13 @@ pub(crate) async fn establish(
     owner: &RestAuthOwner,
     properties: &HashMap<String, String>,
 ) -> Result<SessionBinding, BindingFailure> {
+    establish_in(owner, properties, &RequestContext::for_read()).await
+}
+pub(crate) async fn establish_in(
+    owner: &RestAuthOwner,
+    properties: &HashMap<String, String>,
+    context: &RequestContext,
+) -> Result<SessionBinding, BindingFailure> {
     let mut url = reqwest::Url::parse(&format!("{}/v1/config", owner.persistent().uri()))
         .map_err(|_| BindingFailure::InvalidServerConfig)?;
     if let Some(warehouse) = properties.get("warehouse") {
@@ -156,7 +163,7 @@ pub(crate) async fn establish(
         headers.insert(name.clone(), value.clone());
     }
     owner
-        .authorize(&mut headers)
+        .authorize_in(&mut headers, context)
         .await
         .map_err(|failure| failure.step)?;
     let (stage, body) = owner
@@ -164,7 +171,7 @@ pub(crate) async fn establish(
         .send_once(
             Ok(RestRequest::new(Method::GET, url.to_string(), headers)),
             &[200],
-            &RequestContext::for_read(),
+            context,
         )
         .await;
     let body = match (stage, body) {

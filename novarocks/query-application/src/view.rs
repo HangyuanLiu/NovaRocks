@@ -102,6 +102,14 @@ pub trait ViewService: Send + Sync {
         sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<(), String>;
 
+    fn rewrite_query_async<'a>(
+        &'a self,
+        engine: &'a dyn ViewEngine,
+        query: &'a mut Query,
+        context: ViewRequestContext<'a>,
+        sql_semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String>;
 }
 
@@ -115,6 +123,14 @@ pub trait ViewEngine: Send + Sync {
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalViewResolution, String>;
+    fn resolve_external_view_async<'a>(
+        &'a self,
+        target: &'a ViewTarget,
+        context: &'a ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
+    >;
+
     fn create_external_view(
         &self,
         request: CreateExternalViewRequest,

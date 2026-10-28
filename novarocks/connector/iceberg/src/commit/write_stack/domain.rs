@@ -1754,9 +1754,38 @@ pub struct IcebergCommitHandle {
         BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
     document_records: std::sync::Mutex<Option<BTreeMap<String, String>>>,
     terminal_finalization: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
+    terminal_cleanup:
+        std::sync::Mutex<novarocks_spi::connector::write_stack::ConnectorWriteCleanupState>,
     recovery_evidence:
         Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
+    // The original session retains the actual operation and journal before
+    // their first poll. Neither a waiter nor an evidence projection owns exit.
+    publication: std::sync::Mutex<Option<IcebergWritePublication>>,
+    empty_cleanup_disposed: std::sync::atomic::AtomicBool,
     state: std::sync::Mutex<IcebergWriteSessionState>,
+}
+
+struct IcebergWritePublication {
+    operation: crate::commit::operation::IcebergCommitOperation,
+    journal: crate::commit::attempt::observation::PublicationJournal<
+        novarocks_spi::connector::ConnectorWriteReceipt,
+    >,
+    // Rejection can precede the first dispatch entry. Preserve its actual
+    // report here; reports after dispatch stay in the SAME original journal.
+    early_cleanup: Option<crate::commit::model::IcebergCleanupReport>,
+    // The same positive entry's finite context, received before necessary
+    // awaits. It is neither a new grant nor a restartable deadline.
+    finalization_context: Option<(
+        crate::commit::attempt::observation::JournalEntryRef,
+        novarocks_spi::connector::ConnectorRequestContext,
+    )>,
+}
+impl std::fmt::Debug for IcebergWritePublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergWritePublication")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Everything a sealed session carries besides its identity, its table
@@ -1817,7 +1846,9 @@ pub enum IcebergWriteSessionState {
     /// A commit is in flight. A second terminal call must not start another.
     Committing,
     /// The external commit is proven to have happened.
-    KnownCommitted { snapshot_id: Option<i64> },
+    KnownCommitted {
+        needed: Arc<novarocks_spi::connector::write_stack::ConnectorWriteNeededReady>,
+    },
     /// The prepared write set was sealed into a receipt and no external commit
     /// was attempted. Only a staged-create session reaches this: the single
     /// external effect belongs to the publication that owns the staged target,
@@ -1834,6 +1865,10 @@ pub enum IcebergWriteSessionState {
 }
 
 impl IcebergCommitHandle {
+    pub(crate) const fn fixed_backing_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+
     /// Seal a begin session.
     ///
     /// Target ordinals must be dense from zero and each branch must appear at
@@ -1990,7 +2025,12 @@ impl IcebergCommitHandle {
             terminal_finalization: std::sync::Mutex::new(
                 novarocks_spi::connector::ExternalMutationFinalization::Complete,
             ),
+            terminal_cleanup: std::sync::Mutex::new(
+                novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending,
+            ),
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
+            publication: std::sync::Mutex::new(None),
+            empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
     }
@@ -2334,6 +2374,226 @@ impl IcebergCommitHandle {
             .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))
     }
 
+    pub(crate) fn retain_publication(
+        &self,
+        operation: crate::commit::operation::IcebergCommitOperation,
+        journal: crate::commit::attempt::observation::PublicationJournal<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+    ) -> Result<(), ConnectorError> {
+        let mut original = self
+            .publication
+            .lock()
+            .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+        if original.is_some() {
+            return Err(invalid("Iceberg session already retains its publication"));
+        }
+        *original = Some(IcebergWritePublication {
+            operation,
+            journal,
+            early_cleanup: None,
+            finalization_context: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finalization_context_for_entry(
+        &self,
+        entry: crate::commit::attempt::observation::JournalEntryRef,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorRequestContext>, ConnectorError> {
+        let original = self
+            .publication
+            .lock()
+            .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+        match original
+            .as_ref()
+            .and_then(|source| source.finalization_context.as_ref())
+        {
+            Some((actual, context)) if *actual == entry => Ok(Some(context.clone())),
+            Some(_) => Err(invalid(
+                "Iceberg finalization context belongs to another journal entry",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn receive_finalization_context(
+        &self,
+        entry: crate::commit::attempt::observation::JournalEntryRef,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, ConnectorError> {
+        // A competing unused projection, including its retained capabilities,
+        // must be dropped outside the original receiving lock.
+        let mut context = Some(context);
+        let received = {
+            let mut original = self
+                .publication
+                .lock()
+                .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+            let source = original
+                .as_mut()
+                .ok_or_else(|| invalid("Iceberg finalization requires its original publication"))?;
+            match source.finalization_context.as_ref() {
+                Some((actual, existing)) if *actual == entry => existing.clone(),
+                Some(_) => {
+                    return Err(invalid(
+                        "Iceberg finalization context belongs to another journal entry",
+                    ));
+                }
+                None => {
+                    let received = context.take().expect("first original finalization context");
+                    source.finalization_context = Some((entry, received));
+                    source.finalization_context.as_ref().unwrap().1.clone()
+                }
+            }
+        };
+        drop(context);
+        Ok(received)
+    }
+
+    /// Pure observation: neither absence nor an expired cached context creates
+    /// another finalization grant. Positive evidence and same entry are exact.
+    pub(crate) fn existing_finalization_context(
+        &self,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorRequestContext>, ConnectorError> {
+        if !matches!(self.state()?, IcebergWriteSessionState::KnownCommitted { needed }
+            if needed.effect() == novarocks_spi::connector::ExternalMutationEffect::Applied)
+        {
+            return Ok(None);
+        }
+        let received = {
+            let original = self
+                .publication
+                .lock()
+                .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+            original.as_ref().and_then(|source| {
+                source
+                    .finalization_context
+                    .as_ref()
+                    .map(|(entry, context)| (source.journal.clone(), *entry, context.clone()))
+            })
+        };
+        let Some((journal, entry, context)) = received else {
+            return Ok(None);
+        };
+        if journal.current_entry() != Some(entry) {
+            return Err(invalid(
+                "Iceberg finalization context lost its original journal entry",
+            ));
+        }
+        Ok(Some(context))
+    }
+
+    /// Same retained publication owner, borrowed out of its lock before any
+    /// necessary finalizer, handoff notification or cleanup await.
+    pub(crate) fn retained_publication(
+        &self,
+    ) -> Result<
+        Option<(
+            crate::commit::operation::IcebergCommitOperation,
+            crate::commit::attempt::observation::PublicationJournal<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+        )>,
+        ConnectorError,
+    > {
+        let original = self
+            .publication
+            .lock()
+            .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+        Ok(original
+            .as_ref()
+            .map(|original| (original.operation.clone(), original.journal.clone())))
+    }
+    pub(crate) fn retain_early_cleanup(&self, report: crate::commit::model::IcebergCleanupReport) {
+        let mut original = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = original
+            .as_mut()
+            .expect("cleanup follows original publication custody");
+        assert!(
+            original.early_cleanup.is_none(),
+            "early cleanup is recorded once"
+        );
+        original.early_cleanup = Some(report);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn early_cleanup_report_for_test(
+        &self,
+    ) -> Option<crate::commit::model::IcebergCleanupReport> {
+        self.publication
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|original| original.early_cleanup.clone())
+    }
+
+    pub(crate) fn record_empty_cleanup_disposed(&self) {
+        self.retain_cleanup(novarocks_spi::connector::ExternalMutationFinalization::Complete);
+        self.empty_cleanup_disposed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn record_unstarted_cleanup_disposed(&self) -> Result<bool, ConnectorError> {
+        if !matches!(
+            self.state()?,
+            IcebergWriteSessionState::KnownUncommitted { .. }
+        ) {
+            return Ok(false);
+        }
+        let original = self.publication.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "write publication custody is poisoned",
+            )
+        })?;
+        if original.is_some() {
+            return Ok(false);
+        }
+        self.record_empty_cleanup_disposed();
+        Ok(true)
+    }
+
+    pub(crate) fn cleanup_responsibility(
+        &self,
+    ) -> novarocks_spi::connector::ConnectorMetadataCleanupResponsibility {
+        use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+        // Unwind, an in-flight operation and Unknown cannot authorize release.
+        if !matches!(
+            self.state(),
+            Ok(IcebergWriteSessionState::KnownCommitted { .. }
+                | IcebergWriteSessionState::KnownUncommitted { .. })
+        ) {
+            return R::Retained;
+        }
+        let original = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match original.as_ref() {
+            Some(original) if original.journal.cleanup_inventory_is_disposed() => R::Disposed,
+            Some(original)
+                if original.journal.current_entry().is_none()
+                    && matches!(
+                        &original.early_cleanup,
+                        Some(crate::commit::model::IcebergCleanupReport::Complete { .. })
+                    ) =>
+            {
+                R::Disposed
+            }
+            None if self
+                .empty_cleanup_disposed
+                .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                R::Disposed
+            }
+            _ => R::Retained,
+        }
+    }
+
     /// Claim the single commit attempt this session allows.
     ///
     /// A second claim fails: exactly one external snapshot commit may be
@@ -2381,6 +2641,32 @@ impl IcebergCommitHandle {
         &self,
     ) -> novarocks_spi::connector::ExternalMutationFinalization {
         self.terminal_finalization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn retain_cleanup(
+        &self,
+        result: novarocks_spi::connector::ExternalMutationFinalization,
+    ) {
+        let retired = {
+            let mut current = self
+                .terminal_cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(
+                &mut *current,
+                novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(result),
+            )
+        };
+        drop(retired);
+    }
+
+    pub(crate) fn terminal_cleanup(
+        &self,
+    ) -> novarocks_spi::connector::write_stack::ConnectorWriteCleanupState {
+        self.terminal_cleanup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -2714,7 +3000,16 @@ mod tests {
         assert!(handle.begin_commit().is_err());
         handle
             .settle(IcebergWriteSessionState::KnownCommitted {
-                snapshot_id: Some(7),
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        novarocks_spi::connector::ExternalMutationEffect::Applied,
+                        crate::write_codec::connector_write_receipt_with_partitioning(
+                            7, None, None,
+                        )
+                        .expect("actual fixture receipt"),
+                        novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                    ),
+                ),
             })
             .expect("settle");
         assert!(handle.begin_commit().is_err());

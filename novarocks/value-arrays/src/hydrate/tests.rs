@@ -1398,3 +1398,97 @@ fn dense_and_sparse_union_occurrences_keep_encoding_demands_and_reachable_requir
         assert!(matches!(dictionary.data_type(), DataType::Dictionary(..)));
     }
 }
+
+#[test]
+fn target_requirements_predicate_keeps_original_promise_error_and_dictionary_null_rules() {
+    let source = dictionary(vec![Some("kept"), None], vec![Some(0), Some(1), None]);
+    let target = binding(DataType::Utf8View, false);
+    assert!(
+        !required_values_satisfied_observed(
+            &source,
+            &target,
+            HydrateOptions::default(),
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+    );
+    assert!(matches!(
+        validate_required_observed(
+            &source,
+            &target,
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        ),
+        Err(ValueFailure::Value(ValueError::Invariant(
+            ValueViolation::RequiredNull
+        )))
+    ));
+    assert!(
+        required_values_satisfied_observed(
+            &source,
+            &binding(DataType::Utf8View, true),
+            HydrateOptions::default(),
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+    );
+    let error = required_values_satisfied_observed(
+        &source,
+        &target,
+        HydrateOptions::default(),
+        &mut |_| Err("original control"),
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ValueFailure::Caller("original control")));
+}
+
+#[test]
+fn target_requirements_use_the_same_active_parent_rule_without_masking_layout() {
+    let field = Arc::new(Field::new("child", DataType::Int32, true));
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>]));
+    let target = binding(
+        DataType::Struct(vec![Arc::new(Field::new("child", DataType::Int32, false))].into()),
+        true,
+    );
+    let options = HydrateOptions {
+        dictionary_value_layout: None,
+        projection: HydrateProjection::FrozenNamesAndNullability,
+    };
+    for (active, expected) in [(false, true), (true, false)] {
+        let source: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![Arc::clone(&field)].into(),
+                vec![Arc::clone(&values)],
+                Some(NullBuffer::from(vec![active])),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            required_values_satisfied_observed(
+                &source,
+                &target,
+                options,
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok(()),
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    let wrong: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>]));
+    assert!(matches!(
+        required_values_satisfied_observed(
+            &wrong,
+            &target,
+            options,
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        ),
+        Err(ValueFailure::Value(ValueError::Invariant(
+            ValueViolation::Layout
+        )))
+    ));
+}

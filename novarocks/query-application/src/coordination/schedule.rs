@@ -38,9 +38,10 @@ use crate::api::{
 
 use super::{
     AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
-    AttemptActivationIdentity, EstablishIssuePermit, LogicalExecutionActorError,
-    RunningAttemptDriveAuthority, RunningAttemptPermit,
+    EstablishIssuePermit, LogicalExecutionActorError, RunningAttemptDriveAuthority,
+    RunningAttemptPermit,
 };
+use novarocks_coordination_contract::AttemptActivationIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptScheduleError(Arc<str>);
@@ -437,6 +438,78 @@ pub(crate) fn build_attempt_schedule(
     })
 }
 
+/// Explicit finite protocol placements, without applying the production planner's
+/// parallelism policy. The real edge author still validates every exchange.
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn protocol_fixture_schedule(
+    execution: QueryExecutionId,
+    frontend: FrontendProcessId,
+    plan: &ExecutionSchedulingFacts,
+    placements: &BTreeMap<u32, Vec<BackendProcessId>>,
+) -> Result<AttemptSchedule, AttemptScheduleError> {
+    let facts = plan
+        .fragments
+        .iter()
+        .map(|f| (f.fragment_id, f))
+        .collect::<BTreeMap<_, _>>();
+    if facts.keys().copied().collect::<BTreeSet<_>>() != placements.keys().copied().collect() {
+        return Err(AttemptScheduleError::new(
+            "protocol fixture placement fragments differ from its declared DAG",
+        ));
+    }
+    let mut fragments = Vec::new();
+    let mut contexts = BTreeSet::new();
+    let mut next_task = 1_u32;
+    for (stage_index, (&fragment_id, backends)) in placements.iter().enumerate() {
+        let stage =
+            StageId::new(u32::try_from(stage_index + 1).map_err(|_| {
+                AttemptScheduleError::new("protocol fixture stage space exhausted")
+            })?)
+            .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
+        if backends.is_empty() {
+            return Err(AttemptScheduleError::new(
+                "protocol fixture fragment has no placement",
+            ));
+        }
+        let mut tasks = Vec::new();
+        for (instance_index, &backend) in backends.iter().enumerate() {
+            let id = TaskId::new(next_task)
+                .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
+            next_task = next_task.checked_add(1).ok_or_else(|| {
+                AttemptScheduleError::new("protocol fixture task space exhausted")
+            })?;
+            let context = QueryContextRef::new(execution, frontend, backend);
+            contexts.insert(context);
+            tasks.push(ScheduledTask {
+                identity: TaskIdentity::new(execution, stage, id, backend),
+                context,
+                instance_index,
+                scan_work: Box::new([]),
+            });
+        }
+        assign_scan_work(&facts[&fragment_id].scans, &mut tasks)?;
+        fragments.push(ScheduledFragment {
+            fragment_id,
+            stage_id: stage,
+            tasks: tasks.into_boxed_slice(),
+        });
+    }
+    let root = fragments
+        .iter()
+        .find(|f| f.fragment_id == plan.execution_anchor_fragment_id)
+        .and_then(|f| f.tasks.first())
+        .map(|t| t.identity)
+        .ok_or_else(|| AttemptScheduleError::new("protocol fixture root has no placement"))?;
+    let edges = schedule_edges(plan, &fragments)?;
+    Ok(AttemptSchedule {
+        execution,
+        fragments: fragments.into_boxed_slice(),
+        edges: edges.into_boxed_slice(),
+        contexts: contexts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        root,
+    })
+}
+
 fn scan_fragment_parallelism(scans: &[ScanSchedulingFacts], backend_count: usize) -> usize {
     let mut parallelism = 1;
     for scan in scans {
@@ -633,6 +706,20 @@ impl NativeAttemptDrive {
         self.authority.identity()
     }
 
+    /// Ask the current logical owner whether this exact refusal may wait for
+    /// independent process-replacement evidence within its ORIGINAL horizon.
+    /// A positive answer grants no retry, topology, terminal, or exit authority;
+    /// callers must ask again before continuing a pending observation. Refusal
+    /// or a stale drive leaves the original failure unchanged.
+    pub async fn may_observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<bool, LogicalExecutionActorError> {
+        self.authority
+            .may_observe_pre_ready_replacement(refusal)
+            .await
+    }
+
     pub async fn begin_admission_issue(
         &self,
         request: AcquireQueryContextAdmissionTicket,
@@ -727,6 +814,25 @@ mod tests {
             Ok(None),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn empty_eligible_backend_set_refuses_distributed_scheduling() {
+        let error = build_attempt_schedule(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &[],
+            &scan_edge_inputs(NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            }),
+            #[cfg(novarocks_dev_controls)]
+            Ok(None),
+        )
+        .expect_err("distributed scheduling requires an eligible backend");
+        assert_eq!(
+            error.to_string(),
+            "attempt scheduling requires at least one eligible backend",
+        );
     }
 
     #[test]

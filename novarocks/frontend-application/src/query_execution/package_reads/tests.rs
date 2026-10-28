@@ -26,6 +26,8 @@
 //! are assembled here, from the same production owners a statement uses,
 //! because the Frontend host that composes them needs a StateStore.
 
+#[cfg(test)]
+use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -201,7 +203,6 @@ struct FixtureCatalogFacts {
     catalogs: Arc<QueryCatalogService>,
     bindings: Arc<QueryTableBindingStore>,
     context: ConnectorRequestContext,
-    blocking: ConnectorBlockingIoSupervisor,
 }
 
 #[async_trait]
@@ -210,30 +211,42 @@ impl CatalogFactPort for FixtureCatalogFacts {
         &self,
         needs: &[CatalogRelationNeed],
     ) -> Result<Vec<CatalogRelationFact>, String> {
-        let needs = needs.to_vec();
-        let host = Arc::clone(&self.host);
-        let catalogs = Arc::clone(&self.catalogs);
-        let bindings = Arc::clone(&self.bindings);
-        let context = self.context.clone();
-        self.blocking
-            .spawn_ordinary(move || {
-                let loader = iceberg_table_binding_loader(host.as_ref(), context);
-                let materializer = CatalogServiceMaterializer::new(
-                    Some(CATALOG),
-                    catalogs.as_ref(),
-                    bindings,
-                    loader,
-                );
-                needs
-                    .iter()
-                    .map(|need| {
-                        crate::query_execution::completion_facts::catalog_fact(&materializer, need)
-                    })
-                    .collect()
-            })
-            .finish()
-            .await
-            .map_err(|error| format!("fixture catalog lane: {error}"))?
+        let loader = iceberg_table_binding_loader(self.host.as_ref(), self.context.clone());
+        let materializer = CatalogServiceMaterializer::new(
+            Some(CATALOG),
+            self.catalogs.as_ref(),
+            Arc::clone(&self.bindings),
+            loader,
+        );
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            let relation = need.relation();
+            let resolved = match need.target() {
+                novarocks_sql::compiler::CatalogLookupTarget::Table { .. } => {
+                    materializer
+                        .resolve_table_for_analysis_async(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                        )
+                        .await
+                }
+                novarocks_sql::compiler::CatalogLookupTarget::IcebergMetadata { kind } => {
+                    materializer
+                        .resolve_metadata_table_async(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                            kind,
+                        )
+                        .await
+                }
+            };
+            facts.push(crate::query_execution::completion_facts::catalog_fact_from(
+                need, resolved,
+            )?);
+        }
+        Ok(facts)
     }
 }
 
@@ -241,7 +254,6 @@ impl CatalogFactPort for FixtureCatalogFacts {
 struct FixtureStatisticsFacts {
     bindings: Arc<QueryTableBindingStore>,
     context: ConnectorRequestContext,
-    blocking: ConnectorBlockingIoSupervisor,
 }
 
 #[async_trait]
@@ -250,24 +262,20 @@ impl StatisticsFactPort for FixtureStatisticsFacts {
         &self,
         needs: &[StatisticsNeed],
     ) -> Result<Vec<StatisticsFact>, String> {
-        let needs = needs.to_vec();
-        let bindings = Arc::clone(&self.bindings);
-        let context = self.context.clone();
-        self.blocking
-            .spawn_ordinary(move || {
-                let resolver = crate::connector::UnifiedStatisticsResolver::default();
-                needs
-                    .iter()
-                    .map(|need| {
-                        crate::query_execution::planning::statistics::resolve_statistics_need(
-                            &resolver, &bindings, need, &context,
-                        )
-                    })
-                    .collect()
-            })
-            .finish()
-            .await
-            .map_err(|error| format!("fixture statistics lane: {error}"))?
+        let resolver = crate::connector::UnifiedStatisticsResolver::default();
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            facts.push(
+                crate::query_execution::planning::statistics::resolve_statistics_need_async(
+                    &resolver,
+                    &self.bindings,
+                    need,
+                    &self.context,
+                )
+                .await?,
+            );
+        }
+        Ok(facts)
     }
 }
 
@@ -384,35 +392,47 @@ impl PaimonFixture {
         let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
         let blocking = ConnectorBlockingIoSupervisor::new(self.runtime.handle().clone());
         let (_root, _query_permit, scope, capacity) = query_scope(&self.runtime);
+        // Explicit fault/protocol fixture: same bounded production factory,
+        // without a joint source or finite protection qualification.
+        let mut provider_cpu =
+            crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new_for_test()
+                .unwrap();
         let source = QueryCompletionFactSource::new(
             Arc::new(FixtureCatalogFacts {
                 host: Arc::clone(&self.host),
                 catalogs: Arc::new(new_query_catalog_service()),
                 bindings: Arc::clone(&bindings),
                 context: context.clone(),
-                blocking: blocking.clone(),
             }),
             Arc::new(FixtureStatisticsFacts {
                 bindings: Arc::clone(&bindings),
                 context: context.clone(),
-                blocking: blocking.clone(),
             }),
             Arc::new(NoMaterializedViews),
-            Arc::new(FrontendProviderReadFacts::new(
-                Arc::clone(&self.host),
-                bindings,
-                crate::query_execution::compiler::typed_connector_session()
-                    .expect("connector session"),
-                context,
-                blocking,
-                capacity,
-            )),
+            Arc::new(
+                FrontendProviderReadFacts::binding_only(
+                    Arc::clone(&self.host),
+                    bindings,
+                    crate::query_execution::compiler::typed_connector_session()
+                        .expect("connector session"),
+                    context,
+                    blocking,
+                    capacity,
+                )
+                .for_cpu_fixture(provider_cpu.runtime()),
+            ),
         );
-        self.runtime
+        let completed = self
+            .runtime
             .block_on(
-                FinalPlanCompletionDriver::new(Arc::new(source)).complete(request_for(sql), &scope),
+                FinalPlanCompletionDriver::new(Arc::new(source))
+                    .complete_for_test(request_for(sql), &scope),
             )
-            .unwrap_or_else(|failure| panic!("{sql}: completes against Paimon: {failure}"))
+            .unwrap_or_else(|failure| panic!("{sql}: completes against Paimon: {failure}"));
+        self.runtime
+            .block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(5)))
+            .unwrap();
+        completed
     }
 }
 

@@ -39,3 +39,6 @@ pub mod schema;
 pub mod sdk_control;
 pub mod split_source;
 pub mod wire;
+
+/// Pure geometry of the original FE read factory and its SDK scan program.
+pub use role_binding::read_io_geometry;

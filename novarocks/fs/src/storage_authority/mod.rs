@@ -53,6 +53,7 @@ mod debug_close;
 pub use debug_close::StorageAuthorityCloseControls;
 mod executor;
 pub(crate) mod failure;
+mod governed;
 mod registry;
 
 #[cfg(test)]
@@ -104,16 +105,19 @@ pub enum AuthorityCapabilityPath {
     /// has it and always names a principal and a path instead, which is what
     /// keeps the two roles' authorities apart even in a single process
     /// (CAD-1 D0 with D9).
-    InProcessProvider,
+    InProcessProvider(novarocks_spi::connector::VendedS3InProcessAcquisitionIdentity),
     /// Material was obtained once and this catalog offers no renewal path at
     /// all. A first-class shape, not a degraded fallback (CAD-1 D11).
-    SeededWithoutRenewal,
+    SeededWithoutRenewal {
+        /// None names a seedless, non-acquiring capability and grants no access.
+        grant: Option<novarocks_spi::connector::VendedS3SeedGrantId>,
+    },
 }
 
 impl AuthorityCapabilityPath {
     /// Whether this path can produce new material at all.
     pub const fn can_renew(&self) -> bool {
-        !matches!(self, Self::SeededWithoutRenewal)
+        !matches!(self, Self::SeededWithoutRenewal { .. })
     }
 
     /// Where and with which public headers a refresh along this path is sent,
@@ -122,7 +126,7 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { routing, .. }
             | Self::LoadTableDelegation { routing, .. } => Some(routing),
-            Self::InProcessProvider | Self::SeededWithoutRenewal => None,
+            Self::InProcessProvider(_) | Self::SeededWithoutRenewal { .. } => None,
         }
     }
 
@@ -133,7 +137,7 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { principal, .. }
             | Self::LoadTableDelegation { principal, .. } => Some(principal),
-            Self::InProcessProvider | Self::SeededWithoutRenewal => None,
+            Self::InProcessProvider(_) | Self::SeededWithoutRenewal { .. } => None,
         }
     }
 }
@@ -143,7 +147,9 @@ impl AuthorityCapabilityPath {
 /// It is both the provider's cache key and the credential dimension of the
 /// object-store operator pool key. Nothing in it is derived from a query
 /// attempt: an identity that carried `QueryExecutionId` would rebuild every
-/// operator on every query and defeat CAD-1 D0.
+/// operator on every query and defeat CAD-1 D0. A nonrenewing seed is instead
+/// scoped to its original grant instance: a later authorization must not reuse
+/// an expired authority that cannot acquire new material.
 ///
 /// The five dimensions CAD-1 D7 requires before an in-flight refresh may be
 /// shared map onto this type as follows:
@@ -357,6 +363,13 @@ impl AcquisitionFailure {
 /// violation, not a slow path.
 pub trait AuthorityMaterialSource: Send + Sync {
     fn acquire(&self, deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure>;
+    fn acquire_async<'a>(
+        &'a self,
+        _deadline: Instant,
+        _request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<AuthorityMaterial, AcquisitionFailure>> {
+        Box::pin(async { Err(AcquisitionFailure::NoRenewalCapability) })
+    }
 }
 
 /// Where a refresh runs.
@@ -475,6 +488,7 @@ type AcquisitionOutcome = Arc<Result<AuthorityMaterial, AcquisitionFailure>>;
 struct InflightRefresh {
     generation: u64,
     receiver: watch::Receiver<Option<AcquisitionOutcome>>,
+    asynchronous: Option<governed::GovernedRefresh>,
 }
 
 struct AuthorityState {
@@ -641,6 +655,14 @@ impl StorageAuthority {
     /// Decides one request under the state lock, returning what the request
     /// does next and the refresh job it started, if any.
     fn decide(&self, now: Instant, deadline: Instant) -> (RequestStep, Option<RefreshJob>) {
+        self.decide_in(now, deadline, None)
+    }
+    fn decide_in(
+        &self,
+        now: Instant,
+        deadline: Instant,
+        request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> (RequestStep, Option<RefreshJob>) {
         let mut state = self.shared.lock_state();
 
         if let Some(reason) = state.closed.clone() {
@@ -667,7 +689,7 @@ impl StorageAuthority {
                         .counters
                         .prefetch_started
                         .fetch_add(1, Ordering::Relaxed);
-                    self.start_refresh(&mut state, deadline)
+                    self.start_refresh_in(&mut state, deadline, request)
                 } else {
                     None
                 };
@@ -719,7 +741,7 @@ impl StorageAuthority {
                 // The job gets the effort's window; this waiter gets the
                 // smaller of that and its own deadline, so one caller giving up
                 // never ends the shared request.
-                let refresh = self.start_refresh(&mut state, window);
+                let refresh = self.start_refresh_in(&mut state, window, request);
                 let step =
                     match state.inflight.clone() {
                         Some(inflight) => RequestStep::Wait {
@@ -744,16 +766,39 @@ impl StorageAuthority {
     /// Its completion settles the refresh however the job ends -- returned,
     /// panicked, or dropped by the executor without running -- so a refresh
     /// never stays in flight and never blocks the next one.
-    fn start_refresh(&self, state: &mut AuthorityState, deadline: Instant) -> Option<RefreshJob> {
+    fn start_refresh_in(
+        &self,
+        state: &mut AuthorityState,
+        deadline: Instant,
+        request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> Option<RefreshJob> {
         if state.inflight.is_some() || !self.shared.id.capability.can_renew() {
             return None;
         }
 
         let generation = state.generation;
         let (sender, receiver) = watch::channel(None);
+        if let Some(request) = request {
+            // The original authority installs its sole fixed inflight header
+            // before constructing or polling any provider future.
+            state.inflight = Some(Arc::new(InflightRefresh {
+                generation,
+                receiver,
+                asynchronous: Some(governed::GovernedRefresh::new(
+                    Arc::downgrade(&self.shared),
+                    generation,
+                    sender,
+                    deadline,
+                    Arc::clone(&self.shared.source),
+                    request.clone(),
+                )),
+            }));
+            return None;
+        }
         state.inflight = Some(Arc::new(InflightRefresh {
             generation,
             receiver,
+            asynchronous: None,
         }));
 
         let completion = RefreshCompletion {
@@ -855,7 +900,15 @@ impl AuthorityShared {
         }
         state.generation = state.generation.wrapping_add(1);
         state.material = None;
-        state.inflight = None;
+        // A governed source retains its actual future/cause after close. The
+        // caller's request cell drives it to real exit; close is not that exit.
+        if state
+            .inflight
+            .as_ref()
+            .is_some_and(|i| i.asynchronous.is_none())
+        {
+            state.inflight = None;
+        }
     }
 
     fn metrics(&self) -> StorageAuthorityMetrics {
@@ -968,6 +1021,9 @@ impl AuthorityShared {
     /// discarded. Without this an already-observed revocation could be undone
     /// by an older refresh that happened to succeed afterwards (CAD-1 D8).
     fn apply_outcome(&self, generation: u64, outcome: &AcquisitionOutcome) {
+        self.apply_outcome_in(generation, outcome, false);
+    }
+    fn apply_outcome_in(&self, generation: u64, outcome: &AcquisitionOutcome, keep_inflight: bool) {
         let mut state = self.lock_state();
         if state.generation != generation || state.closed.is_some() {
             self.counters
@@ -977,13 +1033,16 @@ impl AuthorityShared {
                 .inflight
                 .as_ref()
                 .is_some_and(|inflight| inflight.generation == generation)
+                && !keep_inflight
             {
                 state.inflight = None;
             }
             return;
         }
 
-        state.inflight = None;
+        if !keep_inflight {
+            state.inflight = None;
+        }
         match outcome.as_ref() {
             Ok(material) => {
                 self.counters

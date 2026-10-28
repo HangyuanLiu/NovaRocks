@@ -36,6 +36,8 @@ mod access;
 mod cache;
 mod catalog_properties;
 mod error;
+mod hdfs_service;
+mod http_transport;
 mod list_body_limit;
 
 /// Read the fixed per-response byte limit used only for OpenDAL List.
@@ -57,10 +59,10 @@ mod storage_authority;
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
     FsListEntry, FsListStream, FsListingBound, FsLocation, FsScheme, ObjectStoreAccessContext,
-    ObjectStoreConfig, ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig,
-    ObjectStoreProviderPool, ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions,
-    ObjectStoreSecretMaterial, ResolvedFsPath, is_object_store_location_parse_only,
-    map_object_store_listing_error, parse_object_store_path_parse_only,
+    ObjectStoreConfig, ObjectStoreEndpointConfig, ObjectStoreProviderPool,
+    ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
+    ResolvedFsPath, is_object_store_location_parse_only, map_object_store_listing_error,
+    parse_object_store_path_parse_only,
 };
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,

@@ -37,32 +37,76 @@ use crate::catalog_application::query_bindings::{
 use crate::catalog_application::query_materializer::{
     QueryLocalTableOverlay, connector_query_binding_from_materialization,
 };
-use crate::connector::scan_admission::admit_connector_change_window;
 use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionValue};
 use crate::mv::domain::rewrite::context::{IcebergMvRewriteContext, MvRewriteSourceSnapshot};
 use novarocks_mv_application::persistence::codec::TargetPartitionTransform;
 
-/// Freeze the IMV target exactly once for one compilation request. The SQL
-/// planner receives only the returned scoped token; provider table/files and
-/// retained control generation stay in the request-local binding store.
-pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
+struct SourceGroup {
+    base: TableIdentity,
+    current: Vec<MvRewriteSourceSnapshot>,
+    previous: BTreeMap<novarocks_sql::compiler::SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>,
+}
+
+fn group_sources_by_locator(
+    rewrite: &IcebergMvRewriteContext,
+) -> Result<BTreeMap<String, SourceGroup>, String> {
+    let definition = rewrite.mv_definition.facts.definition();
+    if definition.relation_occurrences.len() != rewrite.pin.len() {
+        return Err("MV query bindings do not cover every D occurrence".to_string());
+    }
+    let previous = rewrite
+        .previous
+        .iter()
+        .map(|source| (source.occurrence_id, source))
+        .collect::<BTreeMap<_, _>>();
+    let mut matched_previous = BTreeSet::new();
+    let mut groups = BTreeMap::new();
+    for occurrence in &definition.relation_occurrences {
+        let occurrence_id =
+            novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
+        let source = rewrite.pin.get(&occurrence_id).ok_or_else(|| {
+            format!(
+                "MV query binding is missing D occurrence {}",
+                occurrence.occurrence_id
+            )
+        })?;
+        let base = TableIdentity {
+            catalog: occurrence.catalog_at_binding.clone(),
+            namespace: occurrence.namespace_at_binding.clone(),
+            table: occurrence.relation_at_binding.clone(),
+        };
+        let key = base.fqn().to_ascii_lowercase();
+        let group = groups.entry(key).or_insert_with(|| SourceGroup {
+            base: base.clone(),
+            current: Vec::new(),
+            previous: BTreeMap::new(),
+        });
+        if group.base != base {
+            return Err("MV query binding locator normalization is ambiguous".to_string());
+        }
+        group.current.push(source.clone());
+        if let Some(previous) = previous.get(&occurrence_id) {
+            matched_previous.insert(occurrence_id);
+            group.previous.insert(occurrence_id, (*previous).clone());
+        }
+    }
+    if matched_previous.len() != previous.len() {
+        return Err("MV query bindings contain history for an unknown D occurrence".to_string());
+    }
+    Ok(groups)
+}
+
+/// Binding projection is pure over the original exact metadata value.
+pub(crate) fn bind_imv_target_query_table_from_metadata(
     rewrite: &IcebergMvRewriteContext,
     store: &Arc<QueryTableBindingStore>,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    connector_context: &ConnectorRequestContext,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    metadata: novarocks_spi::connector::ConnectorTableMetadata,
     affected_partitions: Option<&AffectedTargetPartitions>,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
     let target = &rewrite.target;
     let target_table_uuid = rewrite.target_table_uuid.clone();
     let frozen_snapshot_id = rewrite.target_snapshot_id;
-    let planning_lease = planning_lease.clone();
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &planning_lease,
-        connector_context.clone(),
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
     let selector = frozen_snapshot_id
         .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
         .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
@@ -200,15 +244,45 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
     })
 }
 
-/// Materialize every pinned IMV base immediately after capture. The returned
-/// overlays retain the exact connector lease, table handle, selected files and
-/// delta facts; callers must carry them through later compilation instead of
-/// asking a provider for its current generation again.
-pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
+pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
+    rewrite: &IcebergMvRewriteContext,
+    store: &Arc<QueryTableBindingStore>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    connector_context: &ConnectorRequestContext,
+    affected_partitions: Option<&AffectedTargetPartitions>,
+) -> Result<
+    novarocks_sql::binding::SqlTableBindingId,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let metadata = io
+        .metadata(
+            planning_lease,
+            connector_context.clone(),
+            &rewrite.target.namespace,
+            &rewrite.target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .await?;
+    bind_imv_target_query_table_from_metadata(
+        rewrite,
+        store,
+        planning_lease.clone(),
+        metadata,
+        affected_partitions,
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
     connector_control: &dyn ConnectorControlRegistry,
     connector_context: &ConnectorRequestContext,
     rewrite: &IcebergMvRewriteContext,
-) -> Result<Vec<QueryLocalTableOverlay>, String> {
+) -> Result<
+    Vec<QueryLocalTableOverlay>,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
     let source_groups = group_sources_by_locator(rewrite)?;
     let mut overlays = Vec::with_capacity(source_groups.len());
     for SourceGroup {
@@ -226,23 +300,23 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
             connector_control,
             &instance_id,
-        )
-        .map_err(|error| error.to_string())?;
-        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-            &planning_lease,
-            connector_context.clone(),
-            &base.namespace,
-            &base.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
+        let metadata = io
+            .metadata(
+                &planning_lease,
+                connector_context.clone(),
+                &base.namespace,
+                &base.table,
+                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            )
+            .await?;
         let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
             metadata,
             planning_lease,
         )?;
-        validate_source_revisions(
+        validate_source_revisions_original(
             &materialization,
             current.iter().chain(previous.values()),
-            &base,
         )?;
         materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot_id);
         let mut frozen_snapshot_ids = current
@@ -259,13 +333,15 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                 previous_source.snapshot_id,
                 source.snapshot_id,
             );
-            let admitted_scan = admit_connector_change_window(
-                &materialization.read_table,
-                &materialization.read_schema,
-                &materialization.planning_lease,
-                connector_context.clone(),
-                window,
-            )?;
+            let admitted_scan = io
+                .change_window(
+                    &materialization.planning_lease,
+                    &materialization.read_table,
+                    Arc::clone(&materialization.read_schema),
+                    connector_context.clone(),
+                    window,
+                )
+                .await?;
             admitted_change_scans.insert(
                 (previous_source.snapshot_id, source.snapshot_id),
                 admitted_scan,
@@ -276,7 +352,8 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         let namespace = base.namespace.clone();
         let table = base.table.clone();
         let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &table, snapshot_id);
-        overlays.push(QueryLocalTableOverlay::new(
+        overlays.push(QueryLocalTableOverlay::for_catalog(
+            catalog.clone(),
             namespace.clone(),
             table.clone(),
             key,
@@ -307,66 +384,13 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
     Ok(overlays)
 }
 
-struct SourceGroup {
-    base: TableIdentity,
-    current: Vec<MvRewriteSourceSnapshot>,
-    previous: BTreeMap<novarocks_sql::compiler::SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>,
-}
-
-fn group_sources_by_locator(
-    rewrite: &IcebergMvRewriteContext,
-) -> Result<BTreeMap<String, SourceGroup>, String> {
-    let definition = rewrite.mv_definition.facts.definition();
-    if definition.relation_occurrences.len() != rewrite.pin.len() {
-        return Err("MV query bindings do not cover every D occurrence".to_string());
-    }
-    let previous = rewrite
-        .previous
-        .iter()
-        .map(|source| (source.occurrence_id, source))
-        .collect::<BTreeMap<_, _>>();
-    let mut matched_previous = BTreeSet::new();
-    let mut groups = BTreeMap::new();
-    for occurrence in &definition.relation_occurrences {
-        let occurrence_id =
-            novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
-        let source = rewrite.pin.get(&occurrence_id).ok_or_else(|| {
-            format!(
-                "MV query binding is missing D occurrence {}",
-                occurrence.occurrence_id
-            )
-        })?;
-        let base = TableIdentity {
-            catalog: occurrence.catalog_at_binding.clone(),
-            namespace: occurrence.namespace_at_binding.clone(),
-            table: occurrence.relation_at_binding.clone(),
-        };
-        let key = base.fqn().to_ascii_lowercase();
-        let group = groups.entry(key).or_insert_with(|| SourceGroup {
-            base: base.clone(),
-            current: Vec::new(),
-            previous: BTreeMap::new(),
-        });
-        if group.base != base {
-            return Err("MV query binding locator normalization is ambiguous".to_string());
-        }
-        group.current.push(source.clone());
-        if let Some(previous) = previous.get(&occurrence_id) {
-            matched_previous.insert(occurrence_id);
-            group.previous.insert(occurrence_id, (*previous).clone());
-        }
-    }
-    if matched_previous.len() != previous.len() {
-        return Err("MV query bindings contain history for an unknown D occurrence".to_string());
-    }
-    Ok(groups)
-}
-
-fn validate_source_revisions<'a>(
+fn validate_source_revisions_original<'a>(
     materialization: &crate::catalog_application::query_catalog::ConnectorQueryTableMaterialization,
     sources: impl Iterator<Item = &'a MvRewriteSourceSnapshot>,
-    base: &TableIdentity,
-) -> Result<(), String> {
+) -> Result<
+    (),
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
     for source in sources {
         let observed = materialization
             .planning_lease
@@ -375,19 +399,13 @@ fn validate_source_revisions<'a>(
             .exact_semantic_revision(
                 &materialization.read_table,
                 ConnectorReadSelector::SnapshotId(source.snapshot_id),
-            )
-            .map_err(|error| {
-                format!(
-                    "resolve exact MV source revision for {} at snapshot {}: {error}",
-                    base.fqn(),
-                    source.snapshot_id
-                )
-            })?;
+            )?;
         if observed != source.semantic_revision {
             return Err(format!(
                 "MV source revision drifted for D occurrence {}",
                 source.occurrence_id.get()
-            ));
+            )
+            .into());
         }
     }
     Ok(())

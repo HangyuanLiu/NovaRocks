@@ -71,13 +71,13 @@ impl QuerySession for Session {
     {
         Ok(
             novarocks_query_application::session::QuerySessionStatement::output_owned(
-                StatementResult::StreamingQuery(
+                StatementResult::StreamingQuery(Box::new(
                     self.result
                         .lock()
                         .unwrap()
                         .take()
                         .expect("single original query"),
-                ),
+                )),
             ),
         )
     }

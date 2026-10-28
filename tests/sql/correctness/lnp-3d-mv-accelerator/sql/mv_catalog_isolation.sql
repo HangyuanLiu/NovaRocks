@@ -50,9 +50,11 @@ AS SELECT k1, v1 FROM z_source;
 REFRESH MATERIALIZED VIEW a_mv;
 
 -- query 2
--- `a_mv` sorts before `z_source` in the namespace enumeration, so the one
--- proxy fault corrupts precisely the MV package rather than a base table.
+-- Bind the fault to this case's exact MV package; startup request order
+-- does not determine which table reaches the proxy first.
 -- @publication_catalog_fault=table-load,corrupt-package
+-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv
+-- @publication_catalog_fault_timing=after-frontend-exit
 -- @restart_fe_after_step=true
 -- @skip_result_check=true
 SELECT 1;

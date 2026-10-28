@@ -74,7 +74,12 @@ CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', options => map('target-file-size-bytes', '134217728'));
 
 -- query 7
--- @expect_error=V2 Parquet position delete rewrite is not supported
+-- The original V2 refusal retains its typed Data fact through safe projection.
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.v2_orders', options => map('rewrite-all', 'true'));
 
 -- query 8

@@ -34,6 +34,9 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod captured_catalog;
+mod dml_catalog;
+mod logical_explain;
 mod scalar_presence_catalog;
 pub use crate::planner::distributed::build::{
     AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
@@ -45,8 +48,11 @@ pub use crate::planner::distributed::build::{
     FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
     check_pure_call_definitions_observed,
 };
+pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
+pub use dml_catalog::SqlDmlCatalogPreparation;
+pub use logical_explain::SqlLogicalExplainCatalog;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
@@ -1344,8 +1350,7 @@ pub fn compile_imv_refresh_explain_lines(
         control,
         level,
     } = context;
-    let mut query = *canonical_query;
-    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let query = *canonical_query;
     let request = imv_refresh_explain_request(
         query,
         &imv_rewrite,

@@ -296,6 +296,31 @@ pub(super) fn load_view_metadata_for_request(
         })
 }
 
+pub(super) async fn load_view_metadata_for_request_async(
+    runtime: &IcebergMetadataContext,
+    namespace: &str,
+    view: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ViewMetadata, ConnectorError> {
+    let (_, ident) = view_ident(namespace, view).map_err(unavailable)?;
+    let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
+    let target =
+        crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+    let context = context.clone();
+    owner
+        .load_view_for_request(target, context)
+        .await
+        .map_err(|error| match error.kind() {
+            // Absence is read from the error's kind. The owner classifies it,
+            // so there is nothing here to recognize by substring.
+            ConnectorErrorKind::NotFound => ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                format!("unknown view: {ident}"),
+            ),
+            _ => error,
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn drop_view(
     runtime: &IcebergMetadataContext,
@@ -488,6 +513,58 @@ impl ConnectorViewMetadata for IcebergMetadata {
                 .collect(),
             &request.context,
         )
+    }
+
+    fn load_view_async(
+        &self,
+        request: ConnectorViewRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorViewMetadataValue, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            ensure_request(self, &request.view.instance_id, &request.context)?;
+            let (_, ident) =
+                view_ident(&request.view.namespace, &request.view.view).map_err(unavailable)?;
+            let metadata = load_view_metadata_for_request_async(
+                self.runtime(),
+                &request.view.namespace,
+                &request.view.view,
+                &request.context,
+            )
+            .await?;
+            let loaded = loaded_view_from_metadata(&ident, &metadata).map_err(unavailable)?;
+            if !loaded.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!(
+                        "Iceberg view uses unsupported SQL dialect {}",
+                        loaded.dialect
+                    ),
+                ));
+            }
+            ConnectorViewMetadataValue::try_new(
+                request.view,
+                ConnectorViewDefinition {
+                    dialect: ConnectorViewDialect::StarRocks,
+                    raw_sql: loaded.raw_sql.into(),
+                    default_catalog: loaded.default_catalog.map(Into::into),
+                    default_namespace: loaded.default_namespace.into(),
+                    source_format: loaded.source_format,
+                },
+                loaded.column_names.into_iter().map(Into::into).collect(),
+                loaded.comment.map(Into::into),
+                loaded
+                    .properties
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                &request.context,
+            )
+        })
     }
 
     fn list_views(

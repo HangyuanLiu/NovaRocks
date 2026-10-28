@@ -29,14 +29,14 @@ use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
+use novarocks_frontend_application::task_protocol_config::{
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
+};
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
 };
 use novarocks_native_trust::NativeTransportMode;
-use novarocks_query_application::coordination::{
-    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
-};
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
 use novarocks_state_store_runtime::StateStoreRunPolicy;
@@ -785,7 +785,7 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 /// should be refused where it is written, not where it is first used.
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
     if config.cluster.role == ClusterRole::Fe {
-        let _report = crate::composition::validate_frontend_joint_startup(&config.runtime)?;
+        crate::composition::validate_frontend_joint_startup(&config.runtime)?;
     } else {
         crate::sdk_listing_profile::validate_current()?;
     }
@@ -1178,13 +1178,20 @@ pub struct FrontendWorkloadRuntimeConfig {
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
+    /// FE Internal computation windows and their matching fixed CPU positions.
+    pub internal_result_positions: usize,
+    /// Complete retained backing allowance per Internal window.
+    pub internal_result_all_objects_bytes: u64,
     pub waiting_limit: usize,
     pub capacity_wait_timeout_ms: u64,
     pub restarts_per_work: usize,
     pub old_attempts_per_work: usize,
     pub old_attempts_limit: usize,
     pub unknown_creates_limit: usize,
+    /// Original global limit for live Work records, independent of Work class.
     pub scope_records_limit: usize,
+    pub joint_progress_turn_budget: usize,
+    pub retired_backing_recheck_ms: u64,
     pub obligation_records_limit: usize,
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
@@ -1204,6 +1211,10 @@ impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
             concurrency_limit: 256,
+            internal_result_positions: novarocks_workload_control::ResultCapacityConfig::V1
+                .positions[2],
+            internal_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
+                .all_objects_bytes[2],
             waiting_limit: 1024,
             capacity_wait_timeout_ms: 30_000,
             restarts_per_work: 2,
@@ -1211,6 +1222,8 @@ impl Default for FrontendWorkloadRuntimeConfig {
             old_attempts_limit: 128,
             unknown_creates_limit: 4096,
             scope_records_limit: 8192,
+            joint_progress_turn_budget: 7,
+            retired_backing_recheck_ms: 25,
             obligation_records_limit: 8192,
             control_inflight_limit: 16,
             control_ready_limit: 256,
@@ -3030,6 +3043,26 @@ mod tests {
     const P: u64 = 1024 * 1024 * 1024;
 
     #[test]
+    fn internal_result_capacity_uses_explicit_runtime_values_and_original_defaults() {
+        let configured: RuntimeConfig = toml::from_str(
+            "[frontend_workload]\ninternal_result_positions = 1\ninternal_result_all_objects_bytes = 2147483648\n"
+        ).unwrap();
+        assert_eq!(configured.frontend_workload.internal_result_positions, 1);
+        assert_eq!(
+            configured
+                .frontend_workload
+                .internal_result_all_objects_bytes,
+            2147483648
+        );
+        let defaults: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.frontend_workload.internal_result_positions, 4);
+        assert_eq!(
+            defaults.frontend_workload.internal_result_all_objects_bytes,
+            1073741824
+        );
+    }
+
+    #[test]
     fn an_absent_memory_partition_derives_a_quarter_of_the_bound_as_headroom() {
         let config = RuntimeMemoryConfig::default()
             .authority_config(P)
@@ -3618,7 +3651,7 @@ access_key_secret = ""
     }
 
     #[test]
-    fn task_execution_config_defaults_to_the_frozen_contract_values() {
+    fn task_execution_config_uses_frozen_wire_and_server_queue_policy() {
         let runtime = RuntimeConfig::default();
         let frozen = FrontendTaskTransportBudget::DEFAULT;
 
@@ -3662,10 +3695,7 @@ access_key_secret = ""
             runtime.task_backend_max_queued_operations,
             frozen.max_backend_queued_operations()
         );
-        assert_eq!(
-            runtime.task_backend_max_queued_bytes,
-            frozen.max_backend_queued_bytes()
-        );
+        assert_eq!(runtime.task_backend_max_queued_bytes, 512 * 1024 * 1024);
         assert_eq!(
             runtime.task_max_tasks_per_context,
             frozen.max_tasks_per_context()
@@ -4855,5 +4885,33 @@ mod frontend_constant_policy_tests {
         assert_eq!(policy.max_metadata_bytes, 0);
         assert_eq!(policy.max_library_validation_work, 0);
         assert_eq!(policy.max_library_validation_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod frontend_workload_runtime_config_tests {
+    use super::*;
+    #[test]
+    fn actual_global_scope_and_native_queue_configuration_are_preserved() {
+        let configured: RuntimeConfig=toml::from_str("task_backend_max_queued_bytes = 268435456\n[frontend_workload]\nscope_records_limit = 5000\n").unwrap();
+        assert_eq!(configured.task_backend_max_queued_bytes, 256 * 1024 * 1024);
+        assert_eq!(configured.frontend_workload.scope_records_limit, 5000);
+        let defaults = RuntimeConfig::default();
+        assert_eq!(defaults.frontend_workload.scope_records_limit, 8192);
+        assert_eq!(defaults.task_backend_max_queued_bytes, 512 * 1024 * 1024);
+    }
+    #[test]
+    fn retired_class_and_dependency_quota_tables_are_rejected() {
+        for document in [
+            "[scope_slots]\nquery = 20\n",
+            "[dependency_custody]\npublications = 5\n",
+            "max_claims = 99",
+            "work_per_turn = 7",
+        ] {
+            assert!(
+                toml::from_str::<FrontendWorkloadRuntimeConfig>(document).is_err(),
+                "{document}"
+            );
+        }
     }
 }

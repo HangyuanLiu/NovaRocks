@@ -40,7 +40,8 @@ use std::sync::Arc;
 
 use novarocks_execution::task_execution::FrozenBytes;
 use novarocks_physical_plan::{
-    Edge, EdgeId, Fragment, FragmentPackage, FragmentSink, NodeKind, PipelineDopDomain,
+    Edge, EdgeId, Fragment, FragmentPackage, FragmentSink, NodeId, NodeKind, PipelineDopDomain,
+    WriteTargetOrdinal,
 };
 use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
 use novarocks_proto_models::novarocks as wire;
@@ -91,14 +92,31 @@ impl StaticSinkTarget {
     }
 }
 
+/// A writer occurrence in the same checked package as its target recipe.
+/// This declares a Task writer cohort, not its BE-local drivers or objects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StaticTableWriter {
+    node: NodeId,
+    target: WriteTargetOrdinal,
+}
+impl StaticTableWriter {
+    pub(crate) const fn node(self) -> NodeId {
+        self.node
+    }
+    pub(crate) const fn target(self) -> WriteTargetOrdinal {
+        self.target
+    }
+}
+
 /// The typed facts of one frozen fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FragmentFacts {
     fragment_id: FragmentId,
     dop_domain: PipelineDopDomain,
     sink_targets: Box<[StaticSinkTarget]>,
+    #[cfg(test)]
     root_plan_node_id: i32,
-    declares_table_writer: bool,
+    table_writers: Box<[StaticTableWriter]>,
     carries_runtime_filter_bindings: bool,
 }
 
@@ -121,6 +139,7 @@ impl FragmentFacts {
     /// It is the identity EXPLAIN ANALYZE keys a fragment by: the renderer
     /// looks each `PLAN FRAGMENT` up by its sealed root node id, and the
     /// encoder copied that id onto the frozen plan unchanged.
+    #[cfg(test)]
     pub(crate) const fn root_plan_node_id(&self) -> i32 {
         self.root_plan_node_id
     }
@@ -131,8 +150,13 @@ impl FragmentFacts {
     /// distributed write's writer set is what decides whether the write
     /// completed, and an exchange or scan fragment of a write plan is not a
     /// writer.
-    pub(crate) const fn declares_table_writer(&self) -> bool {
-        self.declares_table_writer
+    #[cfg(test)]
+    pub(crate) fn declares_table_writer(&self) -> bool {
+        !self.table_writers.is_empty()
+    }
+
+    pub(crate) fn table_writers(&self) -> &[StaticTableWriter] {
+        &self.table_writers
     }
 
     /// Whether this fragment was encoded with its runtime-filter binding
@@ -174,7 +198,9 @@ impl FragmentArtifact {
     ) -> Result<Arc<Self>, PackageFreezeError> {
         let fragment = package.fragment();
         let fragment_id = fragment.id().get();
-        let root_plan_node_id = i32::try_from(fragment.root().get()).map_err(|_| {
+        // Validate the signed native representation in every build. Only tests
+        // retain an additional copy of this already encoded package fact.
+        let _validated_root_plan_node_id = i32::try_from(fragment.root().get()).map_err(|_| {
             PackageFreezeError::Facts(format!(
                 "fragment {fragment_id} root node {} exceeds the wire node identity",
                 fragment.root().get()
@@ -184,11 +210,20 @@ impl FragmentArtifact {
             fragment_id,
             dop_domain: fragment.dop_domain(),
             sink_targets: package_sink_targets(fragment, edges)?,
-            root_plan_node_id,
-            declares_table_writer: fragment
+            #[cfg(test)]
+            root_plan_node_id: _validated_root_plan_node_id,
+            table_writers: fragment
                 .nodes()
                 .values()
-                .any(|node| matches!(node.kind, NodeKind::TableWriter { .. })),
+                .filter_map(|node| match &node.kind {
+                    NodeKind::TableWriter { target } => Some(StaticTableWriter {
+                        node: node.id,
+                        target: target.write_target_ordinal,
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             // The package states the fragment's complete runtime-filter
             // participation itself; no binding table is attached to it later.
             carries_runtime_filter_bindings: true,
@@ -196,7 +231,7 @@ impl FragmentArtifact {
         let frozen = wire::FrozenFragment {
             package: encode_checked_package(package, limits, control)?.into(),
         };
-        let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
+        let content = FrozenBytes::freeze_encoded(frozen.encode_to_vec());
         #[cfg(test)]
         tests::record_freeze();
         let retained = static_fragment_frozen(content.len());

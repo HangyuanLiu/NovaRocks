@@ -201,7 +201,31 @@ impl<T> ProviderReadSystemTablePlan<T> {
 #[derive(Debug)]
 pub enum UnsupportedFrozenReadSource {}
 
+pub struct ProviderReadOpenedRelation<T> {
+    handle: T,
+    unit_hint: Option<SystemTableUnitHint>,
+}
+impl<T> ProviderReadOpenedRelation<T> {
+    pub const fn new(handle: T, unit_hint: Option<SystemTableUnitHint>) -> Self {
+        Self { handle, unit_hint }
+    }
+    pub fn into_parts(self) -> (T, Option<SystemTableUnitHint>) {
+        (self.handle, self.unit_hint)
+    }
+}
+
 pub trait ProviderReadMetadata: ProviderReadRuntime {
+    type PreparedRelation: Send + Sync + 'static;
+    fn prepare_relation<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        request: &'a super::runtime::ConnectorReadRelationPreparationRequest,
+    ) -> BoxFuture<'a, Result<Option<Self::PreparedRelation>, ConnectorError>>;
+    fn create_prepared_relation(
+        &self,
+        prepared: Self::PreparedRelation,
+    ) -> Result<Option<ProviderReadOpenedRelation<Self::Table>>, ConnectorError>;
+
     type FrozenSource: Debug + Send + Sync + 'static;
 
     /// Source validation belongs to the provider. In particular a write
@@ -369,14 +393,14 @@ pub trait ProviderReadSplitSource<P: ProviderReadRuntime>: Send {
 }
 
 pub trait ProviderReadSplitManager: ProviderReadRuntime {
-    fn get_splits(
-        &self,
-        session: &ConnectorSession,
-        table: &Self::Table,
-        columns: &[Assignment<Self::Column>],
-        dynamic_filter_columns: &BTreeSet<Self::Column>,
-        constraint: &Constraint<Self::Column>,
-    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>
+    fn get_splits<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        table: &'a Self::Table,
+        columns: &'a [Assignment<Self::Column>],
+        dynamic_filter_columns: &'a BTreeSet<Self::Column>,
+        constraint: &'a Constraint<Self::Column>,
+    ) -> BoxFuture<'a, Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>>
     where
         Self: Sized;
 }
@@ -686,7 +710,52 @@ impl<P: ProviderReadMetadata> ReadRuntimeAdapter<P> {
     }
 }
 
+struct BoundRelationPreparation<P: ProviderReadMetadata> {
+    facts: P::PreparedRelation,
+    provider: Arc<P>,
+}
+
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn prepare_relation<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        request: &'a super::runtime::ConnectorReadRelationPreparationRequest,
+    ) -> super::runtime::ConnectorReadRelationPreparationFuture<'a> {
+        Box::pin(async move {
+            self.provider
+                .prepare_relation(session, request)
+                .await
+                .map(|facts| {
+                    facts.map(|facts| {
+                        super::runtime::ConnectorReadRelationPreparation::new(
+                            self.binding.clone(),
+                            BoundRelationPreparation::<P> {
+                                facts,
+                                provider: Arc::clone(&self.provider),
+                            },
+                        )
+                    })
+                })
+        })
+    }
+    fn create_prepared_relation(
+        &self,
+        prepared: super::runtime::ConnectorReadRelationPreparation,
+    ) -> Result<Option<super::runtime::ConnectorReadOpenedRelation>, ConnectorError> {
+        let original = prepared.into_facts::<BoundRelationPreparation<P>>(&self.binding)?;
+        if !Arc::ptr_eq(&original.provider, &self.provider) {
+            return Err(binding_error());
+        }
+        self.provider
+            .create_prepared_relation(original.facts)
+            .map(|relation| {
+                relation.map(|relation| {
+                    let (handle, hint) = relation.into_parts();
+                    super::runtime::ConnectorReadOpenedRelation::new(self.wrap_table(handle), hint)
+                })
+            })
+    }
+
     fn negotiate(
         &self,
         session: &ConnectorSession,
@@ -1067,27 +1136,29 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
 
     fn get_splits(
         &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        columns: &[Assignment<ConnectorReadColumnHandle>],
-        dynamic_filter_columns: &BTreeSet<ConnectorReadColumnHandle>,
-        constraint: &ConnectorReadConstraint,
-    ) -> Result<Box<dyn ConnectorReadSplitSource>, ConnectorError> {
-        let table = self.table(table)?;
-        let columns = self.typed_assignments(columns)?;
-        let dynamic_filter_columns = self.typed_columns(dynamic_filter_columns)?;
-        let constraint = self.typed_constraint(constraint)?;
-        let source = self.provider.get_splits(
-            session,
-            table,
-            &columns,
-            &dynamic_filter_columns,
-            &constraint,
-        )?;
-        Ok(Box::new(AdapterSplitSource {
-            source,
-            adapter: self.clone(),
-        }))
+        request: super::runtime::ConnectorReadSplitOpenRequest,
+    ) -> super::runtime::ConnectorReadSplitOpenFuture {
+        let adapter = self.clone();
+        Box::pin(async move {
+            let (session, table, columns, dynamic_filter_columns, constraint) =
+                request.into_parts();
+            let columns = adapter.typed_assignments(&columns)?;
+            let dynamic_filter_columns = adapter.typed_columns(&dynamic_filter_columns)?;
+            let constraint = adapter.typed_constraint(&constraint)?;
+            let table = adapter.table(&table)?;
+            let source = adapter
+                .provider
+                .get_splits(
+                    &session,
+                    table,
+                    &columns,
+                    &dynamic_filter_columns,
+                    &constraint,
+                )
+                .await?;
+            Ok(Box::new(AdapterSplitSource { source, adapter })
+                as Box<dyn ConnectorReadSplitSource>)
+        })
     }
 }
 
@@ -1615,6 +1686,11 @@ mod tests {
         descriptor: ConnectorInstanceDescriptor,
         catalog_handle: CatalogHandle,
         public_schema_calls: AtomicU64,
+        preparation_gate: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+        prepared_calls: AtomicU64,
+        created_calls: AtomicU64,
+        split_gate: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+        split_calls: AtomicU64,
     }
 
     impl Probe {
@@ -1629,6 +1705,11 @@ mod tests {
                     crate::connector::CatalogVersion::from_bytes([3; 32]),
                 ),
                 public_schema_calls: AtomicU64::new(0),
+                preparation_gate: std::sync::Mutex::new(None),
+                prepared_calls: AtomicU64::new(0),
+                created_calls: AtomicU64::new(0),
+                split_gate: std::sync::Mutex::new(None),
+                split_calls: AtomicU64::new(0),
             }
         }
     }
@@ -1651,6 +1732,78 @@ mod tests {
     }
 
     impl ProviderReadMetadata for Probe {
+        type PreparedRelation = (
+            Self::Table,
+            Option<crate::connector::read_stack::SystemTableUnitHint>,
+        );
+        fn prepare_relation<'a>(
+            &'a self,
+            session: &'a crate::connector::read_stack::ConnectorSession,
+            request: &'a crate::connector::read_stack::ConnectorReadRelationPreparationRequest,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Option<Self::PreparedRelation>, crate::connector::ConnectorError>,
+        > {
+            Box::pin(async move {
+                self.prepared_calls.fetch_add(1, Ordering::SeqCst);
+                let gate = self.preparation_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.await.expect("preparation gate");
+                }
+                use crate::connector::read_stack::ConnectorReadRelationPreparationKind as K;
+                let name = request.name();
+                match request.kind() {
+                    K::Table { version, reference } => self
+                        .get_table_handle(session, name, *version, reference.as_deref())
+                        .map(|v| v.map(|v| (v, None))),
+                    K::Metadata { request } => match request {
+                        Some(request) => {
+                            self.get_system_table_plan_for_request(session, name, request)
+                        }
+                        None => self.get_system_table_plan(session, name),
+                    }
+                    .map(|v| {
+                        v.map(|v| {
+                            let hint = v.unit_hint();
+                            (v.into_handle(), Some(hint))
+                        })
+                    }),
+                    K::Delta { window } => self
+                        .get_change_window_plan(session, name, *window)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::MvTarget {
+                        object_id,
+                        snapshot_id,
+                    } => self
+                        .get_mv_target_handle(session, name, object_id, *snapshot_id)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::MvTargetPartition { selection } => self
+                        .get_mv_target_partition_handle(session, name, selection)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::PinnedFileSet { pinned } => self
+                        .get_pinned_file_set_handle(session, name, pinned)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::TableExecute { procedure } => self
+                        .get_table_execute_plan(session, name, procedure.clone())
+                        .map(|v| v.map(|v| (v, None))),
+                }
+            })
+        }
+        fn create_prepared_relation(
+            &self,
+            prepared: Self::PreparedRelation,
+        ) -> Result<
+            Option<crate::connector::read_stack::adapter::ProviderReadOpenedRelation<Self::Table>>,
+            crate::connector::ConnectorError,
+        > {
+            self.created_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(
+                crate::connector::read_stack::adapter::ProviderReadOpenedRelation::new(
+                    prepared.0, prepared.1,
+                ),
+            ))
+        }
+
         type FrozenSource = UnsupportedFrozenReadSource;
 
         fn get_table_handle(
@@ -1824,18 +1977,28 @@ mod tests {
     }
 
     impl ProviderReadSplitManager for Probe {
-        fn get_splits(
-            &self,
-            _session: &ConnectorSession,
-            _table: &Self::Table,
-            _columns: &[Assignment<Self::Column>],
-            _dynamic_filter_columns: &BTreeSet<Self::Column>,
-            _constraint: &Constraint<Self::Column>,
-        ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-            Err(ConnectorError::new(
-                crate::connector::ConnectorErrorKind::Unsupported,
-                "attempt-access test provider does not enumerate splits",
-            ))
+        fn get_splits<'a>(
+            &'a self,
+            _session: &'a ConnectorSession,
+            _table: &'a Self::Table,
+            _columns: &'a [Assignment<Self::Column>],
+            _dynamic_filter_columns: &'a BTreeSet<Self::Column>,
+            _constraint: &'a Constraint<Self::Column>,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>,
+        > {
+            Box::pin(async move {
+                self.split_calls.fetch_add(1, Ordering::SeqCst);
+                let gate = self.split_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.await.expect("split open gate");
+                }
+                Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::Unsupported,
+                    "attempt-access test provider does not enumerate splits",
+                ))
+            })
         }
     }
 
@@ -1992,6 +2155,144 @@ mod tests {
     fn test_session() -> ConnectorSession {
         ConnectorSession::try_new("q", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
             .expect("session")
+    }
+
+    fn current_relation_request(
+        name: SchemaTableName,
+    ) -> crate::connector::read_stack::ConnectorReadRelationPreparationRequest {
+        use crate::connector::read_stack::{
+            ConnectorReadRelationPreparationKind as K, ConnectorReadRelationPreparationRequest as R,
+        };
+        R::new(
+            name,
+            K::Table {
+                version: ConnectorReadRelationVersion::Current,
+                reference: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn relation_preparation_waits_before_the_exact_author_creates_a_handle() {
+        use futures::FutureExt;
+        let (release, gate) = futures::channel::oneshot::channel();
+        let probe = Probe::new();
+        *probe.preparation_gate.lock().unwrap() = Some(gate);
+        let provider = Arc::new(probe);
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let session = test_session();
+        let name = SchemaTableName::try_new("db", "t").unwrap();
+        let request = current_relation_request(name);
+        let mut preparing = adapter.prepare_relation(&session, &request);
+        assert!(preparing.as_mut().now_or_never().is_none());
+        assert_eq!(provider.prepared_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        let prepared = preparing.await.unwrap().unwrap();
+        assert_eq!(prepared.binding(), adapter.binding());
+        let (table, _) = adapter
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        assert_eq!(table.binding(), adapter.binding());
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_relation_cannot_cross_equal_catalog_bindings_with_distinct_authors() {
+        let original = Arc::new(Probe::new());
+        let replacement = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&original));
+        let other = ReadRuntimeAdapter::new(Arc::clone(&replacement));
+        assert_eq!(adapter.binding(), other.binding());
+        let session = test_session();
+        let name = SchemaTableName::try_new("db", "t").unwrap();
+        let request = current_relation_request(name);
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = other.create_prepared_relation(prepared).err().unwrap();
+        assert_eq!(error.kind(), binding_error().kind());
+        assert_eq!(original.created_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement.created_calls.load(Ordering::SeqCst), 0);
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        adapter.create_prepared_relation(prepared).unwrap().unwrap();
+        assert_eq!(original.created_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn full_relation_preparation_keeps_original_author_and_selection() {
+        use crate::connector::read_stack::{
+            ConnectorReadRelationPreparationKind as K, ConnectorReadRelationPreparationRequest as R,
+        };
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let other = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let session = test_session();
+        let request = R::new(
+            SchemaTableName::try_new("db", "t").unwrap(),
+            K::Table {
+                version: ConnectorReadRelationVersion::SnapshotId(41),
+                reference: Some("branch".into()),
+            },
+        );
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = other.create_prepared_relation(prepared).err().unwrap();
+        assert_eq!(error.kind(), binding_error().kind());
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 0);
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let (table, hint) = adapter
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        assert_eq!(table.binding(), adapter.binding());
+        assert!(hint.is_none());
+        assert_eq!(provider.prepared_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn owned_split_future_keeps_the_same_author_after_borrowing_wait_is_cancelled() {
+        use crate::connector::read_stack::ConnectorReadSplitOpenRequest;
+        use futures::FutureExt;
+        let (release, gate) = futures::channel::oneshot::channel();
+        let provider = Arc::new(Probe::new());
+        *provider.split_gate.lock().unwrap() = Some(gate);
+        let original = Arc::downgrade(&provider);
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let table = adapter.wrap_table(Table);
+        let mut opening = adapter.get_splits(ConnectorReadSplitOpenRequest::new(
+            test_session(),
+            table,
+            Vec::new(),
+            BTreeSet::new(),
+            Constraint::of_summary(TupleDomain::all()),
+        ));
+        assert!(opening.as_mut().now_or_never().is_none());
+        assert_eq!(provider.split_calls.load(Ordering::SeqCst), 1);
+        drop(adapter);
+        drop(provider);
+        assert!(original.upgrade().is_some());
+        // Dropping the temporary borrowing poll did not drop the stable F.
+        release.send(()).unwrap();
+        let error = opening.await.err().unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(original.upgrade().is_none());
     }
 
     fn probe_public_schema(
@@ -2174,8 +2475,7 @@ mod tests {
             )
             .expect("attempt request context"),
         );
-        source
-            .for_attempt(&attempt)
+        futures::executor::block_on(source.for_attempt(&attempt))
             .expect("same static binding rebinds for a new attempt");
 
         let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
@@ -2188,6 +2488,8 @@ mod tests {
                 ConnectorInstanceId::parse("other").expect("instance ID"),
                 crate::connector::CatalogVersion::from_bytes([4; 32]),
             ),
+
+            ..Probe::new()
         }));
         let error = match static_control.seal_attempt_access(&foreign_adapter.wrap_table(Table)) {
             Ok(_) => panic!("a foreign generation cannot enter the static access source"),
@@ -2200,11 +2502,12 @@ mod tests {
     fn provider_attempt_access_rejects_foreign_returned_generation() {
         struct ReturnRuntime(ConnectorReadAttemptRuntime);
         impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
-            fn for_attempt(
-                &self,
-                _request: &crate::connector::ConnectorAttemptContext,
-            ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
-                Ok(self.0.clone())
+            fn for_attempt<'a>(
+                &'a self,
+                _request: &'a crate::connector::ConnectorAttemptContext,
+            ) -> futures::future::BoxFuture<'a, Result<ConnectorReadAttemptRuntime, ConnectorError>>
+            {
+                Box::pin(async move { Ok(self.0.clone()) })
             }
         }
 
@@ -2230,6 +2533,8 @@ mod tests {
                 ConnectorInstanceId::parse("foreign").expect("instance ID"),
                 crate::connector::CatalogVersion::from_bytes([9; 32]),
             ),
+
+            ..Probe::new()
         }));
         let foreign = ConnectorReadAttemptRuntime::new(Arc::new(foreign_adapter.clone()));
         let control = ConnectorReadRequestControl::provider_reacquire_attempt_access(
@@ -2249,7 +2554,7 @@ mod tests {
             )
             .expect("attempt request context"),
         );
-        let error = match source.for_attempt(&request) {
+        let error = match futures::executor::block_on(source.for_attempt(&request)) {
             Ok(_) => panic!("reacquirer must not replace the sealed generation"),
             Err(error) => error,
         };
@@ -2260,11 +2565,12 @@ mod tests {
     fn provider_sealer_cannot_replay_a_source_from_an_earlier_seal() {
         struct ReturnRuntime(ConnectorReadAttemptRuntime);
         impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
-            fn for_attempt(
-                &self,
-                _request: &crate::connector::ConnectorAttemptContext,
-            ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
-                Ok(self.0.clone())
+            fn for_attempt<'a>(
+                &'a self,
+                _request: &'a crate::connector::ConnectorAttemptContext,
+            ) -> futures::future::BoxFuture<'a, Result<ConnectorReadAttemptRuntime, ConnectorError>>
+            {
+                Box::pin(async move { Ok(self.0.clone()) })
             }
         }
 
@@ -2321,6 +2627,8 @@ mod tests {
                 ConnectorInstanceId::parse("foreign").expect("instance ID"),
                 crate::connector::CatalogVersion::from_bytes([8; 32]),
             ),
+
+            ..Probe::new()
         }));
         let control = ConnectorReadRequestControl::static_attempt_access(
             Arc::new(adapter.clone()),

@@ -42,6 +42,7 @@ struct FakeViewEngine {
     created: Mutex<Vec<CreateExternalViewRequest>>,
     table_probe_failures: Mutex<HashSet<ViewTarget>>,
     analyzed_queries: Mutex<Vec<String>>,
+    async_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl FakeViewEngine {
@@ -96,6 +97,24 @@ impl ViewEngine for FakeViewEngine {
             .cloned()
             .map(ExternalViewResolution::View)
             .unwrap_or(ExternalViewResolution::Missing))
+    }
+
+    fn resolve_external_view_async<'a>(
+        &'a self,
+        target: &'a ViewTarget,
+        context: &'a ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let gate = self.async_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.await
+                    .map_err(|_| "view observation gate closed".to_string())?;
+            }
+            // This fixture's resolver only reads its local immutable test facts.
+            self.resolve_external_view(target, context)
+        })
     }
 
     fn create_external_view(
@@ -1165,4 +1184,106 @@ fn external_view_read_rejects_stored_decimal_hints() {
     assert!(error.starts_with("Unsupported:"));
     assert_eq!(print_query(&query), before);
     assert!(engine.analyzed_queries.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn asynchronous_view_rewrite_waits_for_the_original_observation_and_keeps_resolution_rules() {
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "nested".to_string(),
+        },
+        "SELECT * FROM base",
+        "db",
+    );
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "base".to_string(),
+        },
+        "SELECT 1 AS a",
+        "db",
+    );
+    service
+        .try_handle_statement(
+            &engine,
+            "CREATE VIEW local AS SELECT 7 AS a",
+            context(None, "db"),
+        )
+        .unwrap();
+    let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    *engine.async_gate.lock().unwrap() = Some(blocked);
+    let mut query = parse_query("SELECT * FROM nested");
+    let mut observation =
+        service.rewrite_query_async(&engine, &mut query, context(Some("ice"), "db"), &semantics);
+    assert!(futures::poll!(&mut observation).is_pending());
+    release.send(()).unwrap();
+    observation.await.unwrap();
+    assert_eq!(
+        print_query(&query),
+        "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) base) nested"
+    );
+    for sql in [
+        "SELECT * FROM local",
+        "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested",
+        "SELECT * FROM (SELECT * FROM nested) AS s",
+        "SELECT * FROM nested UNION ALL SELECT * FROM base",
+    ] {
+        let mut expected = parse_query(sql);
+        service
+            .rewrite_query(
+                &engine,
+                &mut expected,
+                context(Some("ice"), "db"),
+                &semantics,
+            )
+            .unwrap();
+        let mut actual = parse_query(sql);
+        service
+            .rewrite_query_async(&engine, &mut actual, context(Some("ice"), "db"), &semantics)
+            .await
+            .unwrap();
+        assert_eq!(print_query(&actual), print_query(&expected));
+    }
+}
+
+#[tokio::test]
+async fn asynchronous_view_rewrite_preserves_circular_and_unsupported_errors() {
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "cycle".to_string(),
+        },
+        "SELECT * FROM cycle",
+        "db",
+    );
+    let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+    for sql in [
+        "SELECT * FROM ice.db.cycle",
+        "SELECT * FROM undeclared.db.t",
+    ] {
+        let mut expected = parse_query(sql);
+        let expected = service
+            .rewrite_query(
+                &engine,
+                &mut expected,
+                context(Some("ice"), "db"),
+                &semantics,
+            )
+            .unwrap_err();
+        let mut actual = parse_query(sql);
+        let actual = service
+            .rewrite_query_async(&engine, &mut actual, context(Some("ice"), "db"), &semantics)
+            .await
+            .unwrap_err();
+        assert_eq!(actual, expected);
+    }
 }

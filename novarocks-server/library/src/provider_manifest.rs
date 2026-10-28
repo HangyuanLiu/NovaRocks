@@ -49,6 +49,7 @@ type ContractBuilder = fn() -> Result<ProviderContractDefinition, ConnectorCodec
 struct ProviderFactoryInput<'a> {
     config: &'a NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    filesystem: &'a novarocks_fs::FsAccessResources,
     #[cfg(novarocks_dev_controls)]
     test_slots: &'a crate::provider_test_slots::ProviderTestSlots,
 }
@@ -64,12 +65,22 @@ type ExecutionFactoryBuilder = fn(
 type PureProgramBuilder =
     fn(ConnectorProviderId) -> PureProviderProgramDefinition<ConnectorCodecError>;
 
+type MetadataIoGeometryBuilder = fn() -> Result<
+    novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+    novarocks_spi::connector::ConnectorError,
+>;
+
 #[derive(Clone, Copy)]
 struct ProviderBuilderDefinition {
     contract: ContractBuilder,
     control: Option<ControlFactoryBuilder>,
     execution: Option<ExecutionFactoryBuilder>,
     pure: PureProgramBuilder,
+    metadata_io_geometry: Option<MetadataIoGeometryBuilder>,
+    write_io_geometry: Option<MetadataIoGeometryBuilder>,
+    read_io_geometry: Option<MetadataIoGeometryBuilder>,
+    staged_create_source_bytes:
+        Option<fn() -> Result<u64, novarocks_spi::connector::ConnectorError>>,
 }
 
 struct SealedProviderBuilder {
@@ -77,6 +88,11 @@ struct SealedProviderBuilder {
     control: ControlFactoryBuilder,
     execution: ExecutionFactoryBuilder,
     pure: PureProgramBuilder,
+    metadata_io_geometry: Option<MetadataIoGeometryBuilder>,
+    write_io_geometry: Option<MetadataIoGeometryBuilder>,
+    read_io_geometry: Option<MetadataIoGeometryBuilder>,
+    staged_create_source_bytes:
+        Option<fn() -> Result<u64, novarocks_spi::connector::ConnectorError>>,
 }
 
 // Design: ADR-0139 (docs/adr/ADR-0139-sealed-active-provider-manifest.md)
@@ -86,12 +102,20 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
         control: Some(build_iceberg_control_factory),
         execution: Some(build_iceberg_execution_factory),
         pure: iceberg_pure_program,
+        metadata_io_geometry: Some(novarocks_connector_iceberg::metadata_maintenance_io_geometry),
+        write_io_geometry: Some(novarocks_connector_iceberg::write_control_io_geometry),
+        read_io_geometry: Some(novarocks_connector_iceberg::read_io_geometry),
+        staged_create_source_bytes: Some(novarocks_connector_iceberg::catalog_control::staged_create::staged_create_async_source_bytes),
     },
     ProviderBuilderDefinition {
         contract: novarocks_connector_paimon::definition::paimon_contract_definition,
         control: Some(build_paimon_control_factory),
         execution: Some(build_paimon_execution_factory),
         pure: paimon_pure_program,
+        metadata_io_geometry: None,
+        write_io_geometry: None,
+        read_io_geometry: Some(novarocks_connector_paimon::read_io_geometry),
+        staged_create_source_bytes: None,
     },
 ];
 
@@ -135,6 +159,10 @@ impl ServerProviderManifest {
                 control,
                 execution,
                 pure: definition.pure,
+                metadata_io_geometry: definition.metadata_io_geometry,
+                write_io_geometry: definition.write_io_geometry,
+                read_io_geometry: definition.read_io_geometry,
+                staged_create_source_bytes: definition.staged_create_source_bytes,
             });
         }
 
@@ -161,15 +189,95 @@ impl ServerProviderManifest {
         &self.contracts
     }
 
+    /// Pure fixed backing of the original active metadata action factory.
+    /// This does not bind a catalog generation, route, or runtime capability.
+    pub fn metadata_maintenance_io_geometry(
+        &self,
+    ) -> anyhow::Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry> {
+        let mut authors = self.builders.iter().filter_map(|builder| {
+            builder
+                .metadata_io_geometry
+                .map(|quote| (&builder.provider_id, quote))
+        });
+        let (provider, quote) = authors.next().ok_or_else(|| {
+            anyhow::anyhow!("server manifest has no metadata I/O geometry author")
+        })?;
+        anyhow::ensure!(
+            authors.next().is_none(),
+            "multiple metadata I/O factories require explicit composition"
+        );
+        quote().with_context(|| format!("quote `{}` metadata I/O factory", provider.as_str()))
+    }
+
+    /// Fixed maxima of the actual enabled statement factories. Each original
+    /// root owns one statement action; no Provider is inferred from a catalog.
+    pub fn statement_io_geometry(
+        &self,
+    ) -> anyhow::Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry> {
+        let mut maximum: Option<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry> =
+            None;
+        for builder in self.builders.iter() {
+            for quote in [
+                builder.metadata_io_geometry,
+                builder.write_io_geometry,
+                builder.read_io_geometry,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let actual = quote().with_context(|| {
+                    format!(
+                        "quote `{}` statement I/O factory",
+                        builder.provider_id.as_str()
+                    )
+                })?;
+                maximum = Some(match maximum {
+                    None => actual,
+                    Some(old) => {
+                        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(
+                            old.max_concurrent_io().max(actual.max_concurrent_io()),
+                            old.metadata_bytes().max(actual.metadata_bytes()),
+                            old.initial_owned_bytes().max(actual.initial_owned_bytes()),
+                        )
+                    }
+                });
+            }
+        }
+        maximum.ok_or_else(|| {
+            anyhow::anyhow!("server manifest has no enabled statement I/O geometry author")
+        })
+    }
+
+    /// Pure fixed Source backing from each active staged-create implementation.
+    /// No generation, SDK runtime, route or catalog session is constructed.
+    pub fn staged_create_source_bytes(&self) -> anyhow::Result<u64> {
+        let mut maximum = None;
+        for builder in self.builders.iter() {
+            if let Some(quote) = builder.staged_create_source_bytes {
+                let actual = quote().with_context(|| {
+                    format!(
+                        "quote `{}` staged-create Source backing",
+                        builder.provider_id.as_str()
+                    )
+                })?;
+                anyhow::ensure!(actual != 0, "staged-create Source backing must be positive");
+                maximum = Some(maximum.map_or(actual, |old: u64| old.max(actual)));
+            }
+        }
+        maximum.ok_or_else(|| anyhow::anyhow!("server manifest has no staged-create Source author"))
+    }
+
     pub fn compose_control_factories(
         &self,
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        filesystem: &novarocks_fs::FsAccessResources,
         #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorControlRoleBindingFactory>>> {
         let input = ProviderFactoryInput {
             config,
             runtime,
+            filesystem,
             #[cfg(novarocks_dev_controls)]
             test_slots,
         };
@@ -225,12 +333,18 @@ impl ServerProviderManifest {
         &self,
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        filesystem: &novarocks_fs::FsAccessResources,
         scan_io: &ScanIoServices,
         #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
+        #[cfg(novarocks_dev_controls)]
+        test_slots
+            .register_storage(filesystem.storage_authority_registry().clone())
+            .map_err(anyhow::Error::msg)?;
         let input = ProviderFactoryInput {
             config,
             runtime,
+            filesystem,
             #[cfg(novarocks_dev_controls)]
             test_slots,
         };
@@ -270,8 +384,10 @@ fn build_iceberg_control_factory(
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
     let config = input.config;
     let runtime = input.runtime.clone();
-    let metadata_binding =
-        crate::composition::compose_iceberg_metadata_access_template(config, runtime.clone())?;
+    let metadata_binding = crate::composition::compose_iceberg_metadata_access_template(
+        config,
+        input.filesystem.clone(),
+    )?;
     let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
         .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
     let resources = IcebergMetadataResources::new(metadata_binding, runtime);
@@ -290,13 +406,9 @@ fn build_iceberg_execution_factory(
     let resources = crate::composition::compose_iceberg_execution_resources(
         input.config,
         input.runtime.clone(),
+        input.filesystem.clone(),
         scan_io,
     )?;
-    #[cfg(novarocks_dev_controls)]
-    input
-        .test_slots
-        .register_storage(resources.test_storage_authority_registry())
-        .map_err(anyhow::Error::msg)?;
     #[cfg(novarocks_dev_controls)]
     let resources = resources.with_test_observation(input.test_slots.iceberg.clone());
     let options = iceberg_execution_reader_options(input.config);
@@ -337,7 +449,7 @@ fn build_paimon_control_factory(
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
     let access = crate::composition::compose_paimon_control_access_factory(
         input.config,
-        input.runtime.clone(),
+        input.filesystem.clone(),
     )?;
     Ok(Arc::new(PaimonControlRoleBindingFactory::new(
         access,
@@ -351,10 +463,8 @@ fn build_paimon_execution_factory(
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
     let access = crate::composition::compose_paimon_execution_access_factory(
         input.config,
-        input.runtime.clone(),
+        input.filesystem.clone(),
         scan_io,
-        #[cfg(novarocks_dev_controls)]
-        input.test_slots,
     )?;
     Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
 }
@@ -463,6 +573,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sealed_metadata_geometry_is_the_same_iceberg_factory_without_a_role_session() {
+        let manifest = ServerProviderManifest::seal().unwrap();
+        assert_eq!(
+            manifest.metadata_maintenance_io_geometry().unwrap(),
+            novarocks_connector_iceberg::metadata_maintenance_io_geometry().unwrap()
+        );
+    }
+
+    #[test]
+    fn staged_create_backing_comes_from_the_same_provider_without_a_role_session() {
+        let manifest = ServerProviderManifest::seal().unwrap();
+        let actual = manifest.staged_create_source_bytes().unwrap();
+        assert_eq!(actual, novarocks_connector_iceberg::catalog_control::staged_create::staged_create_async_source_bytes().unwrap());
+        assert!(actual > 0);
+    }
+
+    #[test]
+    fn statement_geometry_includes_the_same_write_factory_and_recovery_encoder() {
+        let manifest = ServerProviderManifest::seal().unwrap();
+        let actual = manifest.statement_io_geometry().unwrap();
+        let write = novarocks_connector_iceberg::write_control_io_geometry().unwrap();
+        let maintenance = novarocks_connector_iceberg::metadata_maintenance_io_geometry().unwrap();
+        let iceberg_read = novarocks_connector_iceberg::read_io_geometry().unwrap();
+        let paimon_read = novarocks_connector_paimon::read_io_geometry().unwrap();
+        assert_eq!(
+            actual.max_concurrent_io(),
+            write
+                .max_concurrent_io()
+                .max(maintenance.max_concurrent_io())
+                .max(iceberg_read.max_concurrent_io())
+                .max(paimon_read.max_concurrent_io())
+        );
+        assert_eq!(
+            actual.metadata_bytes(),
+            write
+                .metadata_bytes()
+                .max(maintenance.metadata_bytes())
+                .max(iceberg_read.metadata_bytes())
+                .max(paimon_read.metadata_bytes())
+        );
+        assert_eq!(
+            actual.initial_owned_bytes(),
+            write
+                .initial_owned_bytes()
+                .max(maintenance.initial_owned_bytes())
+                .max(iceberg_read.initial_owned_bytes())
+                .max(paimon_read.initial_owned_bytes())
+        );
+        assert_eq!(
+            write.initial_owned_bytes().get(),
+            (8 * 1024 * 1024) + (2 * 64 * 1024)
+        );
+        assert!(actual.initial_owned_bytes() > maintenance.initial_owned_bytes());
+    }
+
     fn drifted_control_factory(
         _input: &ProviderFactoryInput<'_>,
     ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
@@ -517,6 +683,10 @@ mod tests {
             control: Some(fixture_control_factory),
             execution: None,
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
+            write_io_geometry: None,
+            read_io_geometry: None,
+            staged_create_source_bytes: None,
         }])
         .err()
         .expect("missing BE factory must fail")
@@ -532,12 +702,20 @@ mod tests {
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
                 pure: fixture_pure_program,
+                metadata_io_geometry: None,
+                write_io_geometry: None,
+                read_io_geometry: None,
+                staged_create_source_bytes: None,
             },
             ProviderBuilderDefinition {
                 contract: duplicate_fixture_contract,
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
                 pure: fixture_pure_program,
+                metadata_io_geometry: None,
+                write_io_geometry: None,
+                read_io_geometry: None,
+                staged_create_source_bytes: None,
             },
         ])
         .err()
@@ -553,15 +731,25 @@ mod tests {
             control: Some(drifted_control_factory),
             execution: Some(fixture_execution_factory),
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
+            write_io_geometry: None,
+            read_io_geometry: None,
+            staged_create_source_bytes: None,
         }])
         .expect("contract-only sealing must not invoke factories");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let filesystem = crate::composition::compose_connector_file_planning_resources(
+            &NovaRocksConfig::default(),
+            runtime.handle().clone(),
+        )
+        .expect("explicit FS resources");
         #[cfg(novarocks_dev_controls)]
         let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         let error = manifest
             .compose_control_factories(
                 &NovaRocksConfig::default(),
                 runtime.handle().clone(),
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )
@@ -580,18 +768,28 @@ mod tests {
             control: Some(counted_control_factory),
             execution: Some(counted_execution_factory),
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
+            write_io_geometry: None,
+            read_io_geometry: None,
+            staged_create_source_bytes: None,
         }])
         .expect("manifest");
         assert_eq!(CONTROL_BUILDS.load(Ordering::Acquire), 0);
         assert_eq!(EXECUTION_BUILDS.load(Ordering::Acquire), 0);
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let filesystem = crate::composition::compose_connector_file_planning_resources(
+            &NovaRocksConfig::default(),
+            runtime.handle().clone(),
+        )
+        .expect("explicit FS resources");
         #[cfg(novarocks_dev_controls)]
         let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         manifest
             .compose_control_factories(
                 &NovaRocksConfig::default(),
                 runtime.handle().clone(),
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )
@@ -604,6 +802,11 @@ mod tests {
     fn native_carriers_and_both_role_projections_share_one_manifest() {
         let manifest = ServerProviderManifest::seal().expect("server provider manifest");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let filesystem = crate::composition::compose_connector_file_planning_resources(
+            &NovaRocksConfig::default(),
+            runtime.handle().clone(),
+        )
+        .expect("explicit FS resources");
         #[cfg(novarocks_dev_controls)]
         let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         let config = NovaRocksConfig::default();
@@ -623,6 +826,7 @@ mod tests {
             .compose_control_factories(
                 &config,
                 runtime.handle().clone(),
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )
@@ -636,6 +840,7 @@ mod tests {
             .compose_execution_factories(
                 &config,
                 runtime.handle().clone(),
+                &filesystem,
                 &scan_io.services(),
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
@@ -711,6 +916,10 @@ mod tests {
             control: Some(fixture_control_factory),
             execution: Some(fixture_execution_factory),
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
+            write_io_geometry: None,
+            read_io_geometry: None,
+            staged_create_source_bytes: None,
         }])
         .expect("manifest");
         let error = manifest
