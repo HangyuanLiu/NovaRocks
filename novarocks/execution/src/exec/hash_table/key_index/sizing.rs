@@ -86,6 +86,9 @@ impl SizingDomain {
     pub(super) fn spec(&self) -> &KeySpec {
         &self.0.spec
     }
+    pub(super) fn policy(&self) -> &LocalHashPolicy {
+        &self.0.policy
+    }
     pub(super) fn kind(&self) -> SizingDomainKind {
         self.0.kind
     }

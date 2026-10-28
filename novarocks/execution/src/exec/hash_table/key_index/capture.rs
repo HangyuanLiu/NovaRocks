@@ -67,6 +67,8 @@ struct Domain {
     policy: LocalHashPolicy,
     whole: SizingDomain,
     gate: Mutex<CaptureGate>,
+    #[cfg(test)]
+    forced_hash: Option<u64>,
     _storage: ValueTypeStorageLifetime,
 }
 /// All producers share this actual spec/policy/whole-sketch instance. Equal
@@ -93,11 +95,28 @@ impl BulkDomain {
                     closed: false,
                     failed: None,
                 }),
+                #[cfg(test)]
+                forced_hash: None,
                 _storage: owner.storage_lifetime(),
             },
         )?);
         control.checkpoint(0)?;
         Ok(result)
+    }
+    /// A build-wide test policy, installed before any capture claim exists.
+    /// Counts and HLL observe the same saved hashes as routing and indexing.
+    #[cfg(test)]
+    pub(super) fn new_forced_hash_for_test(
+        spec: &KeySpec,
+        owner: &dyn InputConstructionOwner,
+        control: &dyn KernelEvaluationControl,
+        hash: u64,
+    ) -> ExecutionResult<Self> {
+        let mut domain = Self::new(spec, owner, control)?;
+        Arc::get_mut(&mut domain.0)
+            .ok_or_else(|| invariant(ValueViolation::RowTransaction))?
+            .forced_hash = Some(hash);
+        Ok(domain)
     }
     pub(super) fn spec(&self) -> &KeySpec {
         &self.0.spec
@@ -341,6 +360,12 @@ impl CaptureBuilder {
                 work.owner,
                 &checkpoint,
             )?;
+            #[cfg(test)]
+            let hashes = if let Some(value) = self.domain.0.forced_hash {
+                hashes.force_hash(value)
+            } else {
+                hashes
+            };
             let counts = BuildRangeStats::collect_hashed(
                 &prepared,
                 &hashes,
