@@ -99,6 +99,25 @@ class LocalRustTests(unittest.TestCase):
         self.assertEqual('actual stderr\n', (self.attempt / 'stderr.log').read_text())
         self.assertEqual({'native_exit': 7}, json.loads((self.attempt / 'rust/execution-index.json').read_text()))
         self.assertEqual('final', packed[0][1])
+        import tarfile
+        import hashlib
+        with tarfile.open(packed[0][0], mode='r:gz') as archive:
+            for phase in ('start', 'end'):
+                filename=f'resources-{phase}.json'
+                archived=archive.extractfile(f'attempt/{filename}').read()
+                private=self.runtime/filename
+                self.assertEqual(0o600,private.stat().st_mode & 0o777)
+                self.assertEqual(private.read_bytes(),archived)
+                self.assertEqual(private.read_bytes(),(self.attempt/filename).read_bytes())
+                expected=result['batch']['resource_observations'][phase]
+                self.assertEqual(filename,expected['filename'])
+                self.assertEqual(hashlib.sha256(private.read_bytes()).hexdigest(),expected['sha256'])
+                fact=json.loads(archived)
+                self.assertEqual(phase, fact['phase'])
+                self.assertEqual(result['batch_pid'], fact['pid'])
+        end = json.loads((self.attempt / 'resources-end.json').read_text())
+        self.assertTrue(end['actual_process_exit_observed'])
+        self.assertEqual(7, end['actual_exit_code'])
         self.assertEqual(result, json.loads((self.runtime / 'local-status.json').read_text()))
         self.assertNotIn('private-capability', (self.attempt / 'status.json').read_text())
         self.assertNotIn('signed.invalid', str(result))
@@ -106,6 +125,19 @@ class LocalRustTests(unittest.TestCase):
         for name in ('status.json','source.json','tools-check.json','tools-check-result.json','stdout.log','stderr.log','batch.pid'):
             self.assertEqual(account.pw_uid,(self.attempt/name).stat().st_uid)
             self.assertEqual(0o640,(self.attempt/name).stat().st_mode & 0o777)
+
+    def test_resource_read_failure_does_not_replace_original_real_exit(self):
+        from unittest.mock import patch
+        self.runtime.mkdir(); self.attempt.mkdir(); self.source.mkdir()
+        with patch.object(local_rust, 'resource_snapshot', side_effect=PermissionError('controlled read failure')):
+            result = local_rust.execute_batch([sys.executable, '-c', 'raise SystemExit(7)'],
+                source_root=self.source, attempt_root=self.attempt, runtime=self.runtime,
+                account=self.account, environment={'PATH': '/usr/bin:/bin'})
+        self.assertEqual(7, result['exit_code']); self.assertTrue(result['exited'])
+        for phase in ('start', 'end'):
+            path = self.attempt / f'resources-{phase}.json'
+            self.assertEqual('PermissionError', json.loads(path.read_text())['error'])
+            self.assertEqual(0o640, path.stat().st_mode & 0o777)
 
     def test_rsproxy_config_is_read_by_real_child_and_retained_in_original_archive(self):
         from types import SimpleNamespace

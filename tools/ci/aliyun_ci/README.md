@@ -12,6 +12,8 @@ local另可显式选择 `"swap_gib":16`；省略或为0保持原行为，不关�
 
 仅worker原生任务启动前由镜像root代码在固定 `/var/lib/novarocks-ci/private-swap/swapfile` 独占创建root0700目录与root0600文件，检查ext4/xfs磁盘空间、用dd实际写满并核对精确size/已分配blocks，再执行mkswap/swapon并核验 `/proc/swaps` 和meminfo。未知已有目录/文件、软链、空间不足或激活失败均明确失败，不回退；不写fstab或修改全局参数。配置、命令原退出和内核读回进入 `swap.json` 及原状态/归档，私有swap文件禁止归档。builder不创建或启用swap且捕获前拒绝私有swap目录；worker释放时随原磁盘回收。Swap可为编译提供磁盘后备容量，SIGKILL本身仍不证明OOM。实际Linux激活与内核读回须由真实guest验证，macOS单测不替代。
 
+原batch启动与原进程观察结束后，root分别保存 `resources-start.json` / `resources-end.json`，记录实际限额、原cgroup及其祖先、内核内存/Swap/PSI和OOM计数，结束时限时读取OOM相关日志。运行时0600保护副本的实际摘要随原batch结果返回，可与取回归档核对。退出后的观察不重读可能复用的PID；缺失、权限或超时记unknown，空日志不证明没有OOM。这些观察不改变原退出码或测试选择，也不证明清理完成。
+
 ```sh
 cd tools/ci
 # 使用安装了 requirements.lock 的 operator venv；标准阿里云凭证链读取本机登录。

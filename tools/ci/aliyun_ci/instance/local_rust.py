@@ -44,6 +44,7 @@ from aliyun_ci.config import LOCAL_CARGO_REGISTRIES
 from aliyun_ci.plan import parse_time
 from aliyun_ci.source_bundle import import_bundle
 from .swap import LOCAL_SWAP_GIB, SwapSetupError, configure_swap
+from .resource_observation import snapshot as resource_snapshot
 
 RUNTIME = Path('/run/novarocks-ci')
 SOURCE = Path('/var/lib/novarocks-ci/source')
@@ -204,6 +205,32 @@ def execute_batch(command, *, source_root, attempt_root, runtime, account,
         return {'exit_code': None, 'pid': None, 'exited': True,
                 'cancel_requested': True, 'reason': 'cancelled before native batch launch'}
     process, requested = None, []
+    start_groups, observation_errors, observation_hashes = None, [], {}
+    def observe_resources(phase, result):
+        nonlocal start_groups
+        try:
+            fact = resource_snapshot(process.pid, phase, exited=result.get('exited', False),
+                exit_code=result.get('exit_code'), start_groups=start_groups if phase == 'end' else None)
+            if phase == 'start':
+                start_groups = fact.get('original_cgroups', [])
+        except Exception as error:
+            fact = {'phase': phase, 'pid': process.pid, 'time': now().isoformat(),
+                    'actual_process_exit_observed': result.get('exited'),
+                    'actual_exit_code': result.get('exit_code'), 'error': type(error).__name__}
+        filename = f'resources-{phase}.json'
+        try:
+            _atomic(runtime / filename, fact)
+            observation_hashes[phase] = {'filename': filename,
+                'sha256': hashlib.sha256((runtime / filename).read_bytes()).hexdigest()}
+        except Exception as error:
+            observation_errors.append({'phase': phase, 'copy': 'root', 'error': type(error).__name__})
+        try:
+            _atomic(attempt / filename, fact, mode=0o640,
+                    uid=account.pw_uid, gid=account.pw_gid)
+        except Exception as error:
+            observation_errors.append({'phase': phase, 'copy': 'attempt', 'error': type(error).__name__})
+        result = dict(result, resource_observations=observation_hashes)
+        return dict(result, resource_observation_errors=observation_errors) if observation_errors else result
     cancellation_deadline = None
     def stop(signum, frame):
         nonlocal cancellation_deadline
@@ -232,6 +259,7 @@ def execute_batch(command, *, source_root, attempt_root, runtime, account,
                     output.write(str(process.pid) + '\n')
             _atomic(runtime / 'batch-identity.json', {'pid': process.pid,
                 'uid': account.pw_uid, 'started_at': now().isoformat()})
+            observe_resources('start', {})
             while process.poll() is None:
                 if cancellation_deadline is None and cancellation_exists():
                     requested.append(signal.SIGTERM)
@@ -247,11 +275,11 @@ def execute_batch(command, *, source_root, attempt_root, runtime, account,
                 if cancellation_deadline is not None and time.monotonic() >= cancellation_deadline:
                     # Leave raw exit unknown; cloud auto-release owns the final
                     # machine bound. Root never claims native cleanup completed.
-                    return {'exit_code': None, 'pid': process.pid, 'exited': False,
-                            'cancel_requested': True, 'reason': 'native cancellation budget expired'}
+                    return observe_resources('end', {'exit_code': None, 'pid': process.pid, 'exited': False,
+                            'cancel_requested': True, 'reason': 'native cancellation budget expired'})
                 time.sleep(0.1)
-            return {'exit_code': process.wait(), 'pid': process.pid, 'exited': True,
-                    'cancel_requested': bool(requested)}
+            return observe_resources('end', {'exit_code': process.wait(), 'pid': process.pid, 'exited': True,
+                    'cancel_requested': bool(requested)})
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
