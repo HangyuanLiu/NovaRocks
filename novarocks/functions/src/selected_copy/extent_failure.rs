@@ -31,7 +31,6 @@ pub(crate) enum CopyLayout {
     List32 = 46,
     List64 = 47,
     ViewBufferTable = 48,
-    FixedSizeBinary = 49,
     DenseUnion = 50,
     Dictionary = 51,
     RunEnd = 52,
