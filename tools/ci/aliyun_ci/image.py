@@ -90,6 +90,8 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
     oss.put(key, source_archive, write_once=True)
     url = oss.presign('GET', key, plan.deadline)
     digest = hashlib.sha256(source_archive).hexdigest()
+    build_log_key = key.removesuffix('source.tar') + 'build.log'
+    build_log_url = oss.presign('PUT', build_log_key, plan.deadline)
     instance_id = None
     try:
         instance_id = create_once(config, plan, ecs, config['base_image_id'], now=now,
@@ -101,8 +103,12 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
             f'curl --fail --location --output "$work/source.tar" {shlex.quote(url)}',
             f'printf "%s  %s\\n" {shlex.quote(digest)} "$work/source.tar" | sha256sum -c -',
             'mkdir "$work/source"', 'tar -xf "$work/source.tar" -C "$work/source"',
-            f'"$work/source/tools/ci/aliyun_ci/image/build-image.sh" "$work/source" {preparation_sha}'])
+            f'set +e; "$work/source/tools/ci/aliyun_ci/image/build-image.sh" "$work/source" {preparation_sha} > /var/log/novarocks-ci-image-build.log 2>&1',
+            'build_exit=$?; set -e',
+            f'curl --fail --silent --show-error --request PUT --data-binary @/var/log/novarocks-ci-image-build.log {shlex.quote(build_log_url)} >/dev/null',
+            'exit "$build_exit"'])
         run_command(config, plan, ecs, instance_id, script, now=now, sleep=sleep)
+        build_log = oss.get(build_log_key)
         facts = json.loads(run_command(config, plan, ecs, instance_id,
             'cat /opt/novarocks-ci/preparation-facts.json', now=now, sleep=sleep))
         if facts.get('preparation_sha') != preparation_sha or facts.get('os') != 'ubuntu-26.04' or facts.get('arch') != 'amd64':
@@ -122,6 +128,7 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
                 raise ValueError('created image readback identity mismatch')
             if rows[0]['Status'] == 'Available':
                 release = dict(facts, image_id=image_id, region=config['region'],
+                               build_log={'key': build_log_key, 'sha256': hashlib.sha256(build_log).hexdigest()},
                                builder_run={'run_id': plan.run_id, 'run_attempt': plan.run_attempt})
                 oss.put(image_key(config, image_id, 'release.json'),
                         json.dumps(release, sort_keys=True).encode(), write_once=True)

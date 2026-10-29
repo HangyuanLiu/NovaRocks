@@ -59,6 +59,9 @@ class BuilderAPI:
 
 
 class BuilderObjects(MemoryObjects):
+    def get(self, key):
+        if key.endswith('/build.log'): return b'original builder output\n'
+        return super().get(key)
     def presign(self, *args): return 'https://public-source.invalid/archive.tar'
 
 
@@ -73,6 +76,7 @@ class ImageTests(unittest.TestCase):
         result = build_image(self.config, self.plan, api, objects, preparation_sha='a'*40,
                              source_archive=b'public source', now=self.now, sleep=lambda _: None)
         self.assertEqual('m-candidate', result['image_id'])
+        self.assertTrue(result['build_log']['key'].endswith('/build.log'))
         names = [call[0] for call in api.calls]
         self.assertLess(names.index('StopInstance'), names.index('CreateImage'))
         self.assertLess(names.index('CreateImage'), names.index('DeleteInstance'))
