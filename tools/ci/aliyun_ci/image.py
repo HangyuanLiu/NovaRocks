@@ -79,6 +79,22 @@ def wait_stopped(config, plan, ecs, instance_id, *, now=None, sleep=time.sleep):
     raise TimeoutError('builder did not stop before deadline')
 
 
+def scrub_command_history(directory='/usr/local/share/aliyun-assist/work/script'):
+    """Remove capability-bearing scripts from this disposable image builder."""
+    root=Path(directory)
+    needle=b'x-oss-' + b'signature='
+    removed=[]
+    if root.is_dir():
+        for path in root.iterdir():
+            if path.is_file() and not path.is_symlink() and needle in path.read_bytes():
+                path.unlink()
+                removed.append(path.name)
+        if any(needle in path.read_bytes() for path in root.iterdir()
+               if path.is_file() and not path.is_symlink()):
+            raise ValueError('builder command history still contains an object capability')
+    return {'removed_scripts': sorted(removed), 'remaining_capabilities': 0}
+
+
 def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: bytes,
                 now=None, sleep=time.sleep):
     if plan.role != 'builder':
@@ -113,6 +129,9 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
             'cat /opt/novarocks-ci/preparation-facts.json', now=now, sleep=sleep))
         if facts.get('preparation_sha') != preparation_sha or facts.get('os') != 'ubuntu-26.04' or facts.get('arch') != 'amd64':
             raise ValueError('builder preparation identity mismatch')
+        hygiene = json.loads(run_command(config, plan, ecs, instance_id,
+            'cd /opt/novarocks-ci; /opt/novarocks-ci/venv/bin/python -c \"import json; from aliyun_ci.image import scrub_command_history; print(json.dumps(scrub_command_history()))\"',
+            now=now, sleep=sleep))
         ecs.call('StopInstance', RegionId=config['region'], InstanceId=instance_id, ForceStop=False)
         wait_stopped(config, plan, ecs, instance_id, now=now, sleep=sleep)
         response = ecs.call('CreateImage', RegionId=config['region'], InstanceId=instance_id,
@@ -127,7 +146,7 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
             if len(rows) != 1 or rows[0].get('ImageId') != image_id:
                 raise ValueError('created image readback identity mismatch')
             if rows[0]['Status'] == 'Available':
-                release = dict(facts, image_id=image_id, region=config['region'],
+                release = dict(facts, image_id=image_id, region=config['region'], command_history_hygiene=hygiene,
                                build_log={'key': build_log_key, 'sha256': hashlib.sha256(build_log).hexdigest()},
                                builder_run={'run_id': plan.run_id, 'run_attempt': plan.run_attempt})
                 oss.put(image_key(config, image_id, 'release.json'),

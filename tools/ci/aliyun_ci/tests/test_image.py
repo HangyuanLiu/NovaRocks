@@ -48,7 +48,7 @@ class BuilderAPI:
             return {'InvokeId': str(self.commands)}
         if action == 'DescribeInvocationResults':
             output = json.dumps({'preparation_sha': 'a' * 40, 'os': 'ubuntu-26.04', 'arch': 'amd64',
-                                 'tools_check': {'rust': 'observed'}}) if params['InvokeId'] == '2' else ''
+                                 'tools_check': {'rust': 'observed'}}) if params['InvokeId'] == '2' else ('{"remaining_capabilities":0}' if params['InvokeId'] == '3' else '')
             return {'Invocation': {'InvocationResults': {'InvocationResult': [{'InstanceId': 'i-builder',
                 'InvokeId': params['InvokeId'], 'InvocationStatus': 'Success', 'ExitCode': 0, 'Output': base64.b64encode(output.encode()).decode()}]}}}
         if action == 'StopInstance': self.status = 'Stopped'; return {}
@@ -105,3 +105,16 @@ class ImageTests(unittest.TestCase):
         result = promote_image(self.config, objects, 'm-1', 'summary.json')
         self.assertEqual('42', result['validation_run']['run_id'])
         self.assertTrue(objects.writes[-1][1])
+
+    def test_image_scrub_removes_only_capability_scripts(self):
+        from pathlib import Path
+        import tempfile
+        from aliyun_ci.image import scrub_command_history
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'source.sh').write_bytes(b'curl https://example.invalid?x-oss-signature=actual-signed-value')
+            (root/'observe.sh').write_text('echo status')
+            result=scrub_command_history(root)
+            self.assertEqual(['source.sh'],result['removed_scripts'])
+            self.assertEqual(0,result['remaining_capabilities'])
+            self.assertFalse((root/'source.sh').exists())
+            self.assertEqual('echo status',(root/'observe.sh').read_text())
