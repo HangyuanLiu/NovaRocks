@@ -8,6 +8,10 @@ local服务显式提供 `LimitNOFILE=65536`，满足原生FE/BE的文件描述�
 
 选择rsproxy时，镜像必须在guest实际准备事实中报告 `local_rust_cargo_registries` 支持该值；旧镜像缺少此字段时只认crates-io，控制方会在分配前拒绝rsproxy。实例root仅在runner的Cargo_HOME中写本入口管理的 `config.toml`，未知已有配置、软链和优先级更高的旧 `config` 均拒绝且不覆盖。实际写入内容与readback SHA-256进入本次 `cargo-registry.json`，随原attempt归档取回。[Cargo source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)；[rsproxy官方配置](https://rsproxy.cn/)。
 
+local另可显式选择 `"swap_gib":16`；省略或为0保持原行为，不关闭已有swap。16从原200GiB系统盘中使用16GiB，不增加机器RAM或磁盘规格，也不降低8 jobs或修改Rust参数/范围/重试。镜像guest必须实际报告 `local_rust_swap_gib` 支持16并具备dd/mkswap/swapon；旧镜像缺字段仅支持0，分配前拒绝16。
+
+仅worker原生任务启动前由镜像root代码在固定 `/var/lib/novarocks-ci/private-swap/swapfile` 独占创建root0700目录与root0600文件，检查ext4/xfs磁盘空间、用dd实际写满并核对精确size/已分配blocks，再执行mkswap/swapon并核验 `/proc/swaps` 和meminfo。未知已有目录/文件、软链、空间不足或激活失败均明确失败，不回退；不写fstab或修改全局参数。配置、命令原退出和内核读回进入 `swap.json` 及原状态/归档，私有swap文件禁止归档。builder不创建或启用swap且捕获前拒绝私有swap目录；worker释放时随原磁盘回收。Swap可为编译提供磁盘后备容量，SIGKILL本身仍不证明OOM。实际Linux激活与内核读回须由真实guest验证，macOS单测不替代。
+
 ```sh
 cd tools/ci
 # 使用安装了 requirements.lock 的 operator venv；标准阿里云凭证链读取本机登录。

@@ -42,6 +42,7 @@ import http.client
 from urllib.parse import urlsplit
 
 from .ports import MANIFEST_SCHEMA
+from .instance.swap import SWAP_ROOT
 
 
 def _digest_file(path: Path) -> str:
@@ -66,6 +67,8 @@ class _HashingReader:
 
 
 def _files(root: Path, prefix: str):
+    if root.resolve().is_relative_to(SWAP_ROOT.resolve()):
+        raise ValueError('private worker swap storage must never be archived')
     if root.is_symlink():
         raise ValueError(f'archive input is a symbolic link: {root}')
     if root.is_file():
@@ -74,6 +77,8 @@ def _files(root: Path, prefix: str):
     if not root.is_dir():
         raise FileNotFoundError(root)
     for path in sorted(root.rglob('*')):
+        if path.resolve().is_relative_to(SWAP_ROOT.resolve()):
+            raise ValueError('private worker swap storage must never be archived')
         if path.is_symlink():
             raise ValueError(f'archive input contains a symbolic link: {path}')
         if path.is_file():

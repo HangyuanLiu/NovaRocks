@@ -189,6 +189,51 @@ raise SystemExit(7)
             self.install()
         self.assertFalse(self.runtime.exists())
 
+    def test_swap_failure_keeps_original_kernel_fact_and_never_launches_native(self):
+        from unittest.mock import patch
+        from aliyun_ci.instance.swap import SwapSetupError
+        self.payload['swap_gib'] = 16; self.install(); self.source.mkdir()
+        failed = {'requested_gib': 16, 'enabled': False, 'stage': 'activate',
+                  'commands': [{'exit_code': 1}], 'kernel_after': {'swaps': []}}
+        def forbidden(*args, **kwargs):
+            raise AssertionError('failed swap must not launch or reduce the native workload')
+        with patch.object(local_rust, 'configure_swap', side_effect=SwapSetupError(failed)):
+            result = local_rust.run(self.payload, runtime=self.runtime, source_root=self.source,
+                account=self.account,
+                source_preparer=lambda *_: {}, tools_checker=lambda *args, **kwargs: {},
+                executor=forbidden, uploader=lambda *args, **kwargs: {'uploaded': True})
+        self.assertIsNone(result['exit_code']); self.assertEqual('SwapSetupError', result['platform_error'])
+        self.assertEqual(failed, result['swap'])
+        self.assertEqual(failed, json.loads((self.attempt / 'swap.json').read_text()))
+        self.assertEqual(0o600, (self.runtime / 'swap.json').stat().st_mode & 0o777)
+
+    def test_swap_fact_precedes_original_child_and_survives_archive(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        self.payload.update(swap_gib=16, build_jobs=8); self.install(); self.source.mkdir()
+        ready = {'requested_gib': 16, 'enabled': True, 'stage': 'ready',
+                 'file': '/var/lib/novarocks-ci/private-swap/swapfile', 'kernel_after': {'swaps': []}}
+        packed = []
+        def executor(*args, **kwargs):
+            self.assertEqual(ready, json.loads((self.attempt / 'swap.json').read_text()))
+            self.assertEqual('8', kwargs['environment']['CARGO_BUILD_JOBS'])
+            return {'exit_code': 7, 'pid': 99, 'exited': True, 'cancel_requested': False}
+        def upload(attempt, **kwargs):
+            import tarfile
+            path = handoff.pack(attempt, output=self.root / 'result.tar.gz')
+            with tarfile.open(path, mode='r:gz') as archive:
+                packed.append(json.load(archive.extractfile('attempt/swap.json')))
+                self.assertFalse(any('private-swap' in name for name in archive.getnames()))
+            return {'uploaded': True}
+        account = SimpleNamespace(pw_dir=str(self.root / 'home'), pw_name=self.account.pw_name,
+            pw_uid=os.getuid(), pw_gid=os.getgid())
+        with patch.object(local_rust, 'configure_swap', return_value=ready) as configure:
+            result = local_rust.run(self.payload, runtime=self.runtime, source_root=self.source,
+                account=account, source_preparer=lambda *_: {}, tools_checker=lambda *args, **kwargs: {},
+                executor=executor, uploader=upload)
+        self.assertEqual(16, configure.call_args.args[0]); self.assertEqual(7, result['exit_code'])
+        self.assertEqual([ready], packed)
+
     def test_tools_failure_keeps_unknown_test_exit_and_upload_failure_independent(self):
         self.install()
         def bad_tools(*args, **kwargs):

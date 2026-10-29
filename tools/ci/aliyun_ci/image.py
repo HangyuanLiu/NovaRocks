@@ -160,7 +160,8 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
                 release = dict(facts, image_id=image_id, region=config['region'], command_history_hygiene=hygiene,
                                staged_nextest=None if nextest is None else {k:nextest[k] for k in ('key','sha256')},
                                build_log={'key': build_log_key, 'sha256': hashlib.sha256(build_log).hexdigest()},
-                               builder_run={'run_id': plan.run_id, 'run_attempt': plan.run_attempt})
+                               builder_run={'run_id': plan.run_id, 'run_attempt': plan.run_attempt,
+                                            'instance_id': instance_id})
                 oss.put(image_key(config, image_id, 'release.json'),
                         json.dumps(release, sort_keys=True).encode(), write_once=True)
                 return release

@@ -43,6 +43,7 @@ from aliyun_ci.handoff import pack_upload
 from aliyun_ci.config import LOCAL_CARGO_REGISTRIES
 from aliyun_ci.plan import parse_time
 from aliyun_ci.source_bundle import import_bundle
+from .swap import LOCAL_SWAP_GIB, SwapSetupError, configure_swap
 
 RUNTIME = Path('/run/novarocks-ci')
 SOURCE = Path('/var/lib/novarocks-ci/source')
@@ -82,6 +83,9 @@ def _validate(payload):
         raise ValueError('local task requires a source manifest and read capability')
     if payload.get('cargo_registry', 'crates-io') not in LOCAL_CARGO_REGISTRIES:
         raise ValueError('unsupported local Cargo registry')
+    swap_gib = payload.get('swap_gib', 0)
+    if type(swap_gib) is not int or swap_gib not in LOCAL_SWAP_GIB:
+        raise ValueError('unsupported local swap_gib')
 
 
 def configure_cargo_registry(selection, *, account):
@@ -285,6 +289,18 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
         status['cargo_registry'] = registry
         _atomic(runtime / 'cargo-registry.json', registry)
         _atomic(attempt / 'cargo-registry.json', registry, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
+        swap_fact = None
+        try:
+            swap_fact = configure_swap(payload.get('swap_gib', 0), timeout=max(0,
+                (parse_time(payload.get('work_deadline', payload['deadline'])) - now()).total_seconds()))
+        except SwapSetupError as error:
+            swap_fact = error.fact
+            raise
+        finally:
+            if swap_fact is not None:
+                status['swap'] = swap_fact
+                _atomic(runtime / 'swap.json', swap_fact)
+                _atomic(attempt / 'swap.json', swap_fact, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
         _chown_tree(source_root, account.pw_uid, account.pw_gid)
         status['state'] = 'running'
         publish()

@@ -228,6 +228,30 @@ class LocalTests(unittest.TestCase):
         self.assertEqual('rsproxy', value['config']['cargo_registry'])
         self.assertEqual(1, sum(action == 'RunInstances' for action, _ in api.calls))
 
+    def test_swap_requires_guest_capability_and_reaches_supported_worker_payload(self):
+        self.config = validate_config(dict(self.config.data, swap_gib=16, build_jobs=8))
+        key = f"{self.config['oss']['prefix']}/images/m-exact/release.json"
+        for supported in (None, [0]):
+            release = {'image_id': 'm-exact', 'region': self.config['region']}
+            if supported is not None:
+                release['local_rust_swap_gib'] = supported
+            self.store.objects[key] = json.dumps(release).encode()
+            api = ScriptAPI([])
+            with self.subTest(supported=supported), self.assertRaisesRegex(ValueError, 'does not support local swap'):
+                start_local(self.config, self.plan, api, ScriptAPI([]), self.store, image_id='m-exact',
+                    source=self.source, record_path=self.record, now=lambda: NOW)
+            self.assertEqual([], api.calls); self.assertFalse(self.record.exists())
+            self.assertFalse(any(action == 'put' for action, *_ in self.store.calls))
+        release['local_rust_swap_gib'] = [0, 16]; self.store.objects[key] = json.dumps(release).encode()
+        api = ScriptAPI([('DescribeInstances', EMPTY), ('RunInstances', CREATED),
+            ('DescribeInstances', listed(instance(self.config, self.plan))),
+            ('RunCommand', {'InvokeId': 'invoke-original'})])
+        payloads = []
+        with patch('aliyun_ci.local_run.publish_bootstrap', side_effect=lambda *args: payloads.append(args[-1])):
+            start_local(self.config, self.plan, api, ScriptAPI([]), self.store, image_id='m-exact',
+                source=self.source, record_path=self.record, now=lambda: NOW, sleep=lambda _: None)
+        self.assertEqual(16, payloads[0]['swap_gib']); self.assertEqual(8, payloads[0]['build_jobs'])
+
     def test_cancel_without_recorded_instance_has_no_cloud_effect(self):
         self.prepare_record(instance_id=None)
         value=cancel_local(self.config,ScriptAPI([]),self.record,now=lambda:NOW)

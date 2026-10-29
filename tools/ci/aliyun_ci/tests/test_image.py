@@ -76,6 +76,7 @@ class ImageTests(unittest.TestCase):
         result = build_image(self.config, self.plan, api, objects, preparation_sha='a'*40,
                              source_archive=b'public source', now=self.now, sleep=lambda _: None)
         self.assertEqual('m-candidate', result['image_id'])
+        self.assertEqual('i-builder', result['builder_run']['instance_id'])
         self.assertTrue(result['build_log']['key'].endswith('/build.log'))
         names = [call[0] for call in api.calls]
         self.assertLess(names.index('StopInstance'), names.index('CreateImage'))
@@ -84,6 +85,7 @@ class ImageTests(unittest.TestCase):
         self.assertNotIn(image_key(self.config, 'm-candidate', 'ready.json'), objects.objects)
         self.assertIn(image_key(self.config, 'm-candidate', 'release.json'), objects.objects)
         self.assertNotIn('local_rust_cargo_registries', result)
+        self.assertNotIn('local_rust_swap_gib', result)
 
     def test_release_keeps_guest_capabilities_instead_of_inventing_operator_support(self):
         class GuestCratesOnly(BuilderAPI):
@@ -93,11 +95,13 @@ class ImageTests(unittest.TestCase):
                     row = value['Invocation']['InvocationResults']['InvocationResult'][0]
                     facts = json.loads(base64.b64decode(row['Output']))
                     facts['local_rust_cargo_registries'] = ['crates-io']
+                    facts['local_rust_swap_gib'] = [0]
                     row['Output'] = base64.b64encode(json.dumps(facts).encode()).decode()
                 return value
         result = build_image(self.config, self.plan, GuestCratesOnly(self.plan), BuilderObjects(),
             preparation_sha='a' * 40, source_archive=b'source', now=self.now, sleep=lambda _: None)
         self.assertEqual(['crates-io'], result['local_rust_cargo_registries'])
+        self.assertEqual([0], result['local_rust_swap_gib'])
 
     def test_builder_is_deleted_on_prepare_stop_or_capture_failure(self):
         for failure in ('RunCommand', 'StopInstance', 'CreateImage'):

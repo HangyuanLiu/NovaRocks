@@ -83,3 +83,14 @@ class ConfigTests(unittest.TestCase):
                 validate_config(dict(data, cargo_registry=selection))
         with self.assertRaisesRegex(ValueError, 'local-rust'):
             validate_config(dict(example(), cargo_registry='rsproxy'))
+
+    def test_swap_is_explicit_local_only_with_legacy_zero_default(self):
+        data = example(); data.pop('github'); data['execution_kind'] = 'local-rust'
+        self.assertNotIn('swap_gib', validate_config(data).data)
+        for size in (0, 16):
+            self.assertEqual(size, validate_config(dict(data, swap_gib=size))['swap_gib'])
+        for size in (-1, 1, 8, 16.0, True, None, '16'):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'swap_gib'):
+                validate_config(dict(data, swap_gib=size))
+        with self.assertRaisesRegex(ValueError, 'local-rust'):
+            validate_config(dict(example(), swap_gib=16))

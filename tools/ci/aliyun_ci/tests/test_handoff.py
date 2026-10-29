@@ -34,6 +34,18 @@ from aliyun_ci import handoff
 
 
 class HandoffTests(unittest.TestCase):
+    def test_private_swap_is_rejected_even_when_requested_as_diagnostic_or_parent_input(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); private = root / 'private-swap'; private.mkdir()
+            swapfile = private / 'swapfile'; swapfile.write_bytes(b'private paging bytes')
+            attempt = root / 'attempt'; attempt.mkdir(); (attempt / 'status').write_text('original')
+            with patch.object(handoff, 'SWAP_ROOT', private):
+                with self.assertRaisesRegex(ValueError, 'must never be archived'):
+                    handoff.pack(attempt, {'swap': swapfile}, output=root / 'bad.tar.gz')
+                with self.assertRaisesRegex(ValueError, 'must never be archived'):
+                    handoff.pack(root, output=root.parent / (root.name + '.tar.gz'))
+            self.assertEqual(b'private paging bytes', swapfile.read_bytes())
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

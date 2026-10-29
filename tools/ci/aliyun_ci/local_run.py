@@ -148,6 +148,12 @@ def start_local(config, plan, ecs, oos, oss, *, image_id, source, record_path,
         raise ValueError('image Cargo registry capabilities are invalid')
     if cargo_registry not in supported:
         raise ValueError(f'image does not support local Cargo registry {cargo_registry}')
+    swap_gib = config.data.get('swap_gib', 0)
+    swap_choices = release.get('local_rust_swap_gib', [0])
+    if not isinstance(swap_choices, list) or any(type(item) is not int for item in swap_choices):
+        raise ValueError('image swap capabilities are invalid')
+    if swap_gib not in swap_choices:
+        raise ValueError(f'image does not support local swap_gib {swap_gib}')
     source_key = f"{config['oss']['prefix']}/runs/{plan.run_id}/{plan.run_attempt}/source.bundle"
     manifest_key = source_key.removesuffix('.bundle') + '.json'
     capability_deadline = timestamp(parse_time(plan.deadline) - timedelta(
@@ -179,6 +185,7 @@ def start_local(config, plan, ecs, oos, oss, *, image_id, source, record_path,
                'work_deadline': work_deadline,
                'build_jobs': config.data.get('build_jobs'),
                'cargo_registry': cargo_registry,
+               'swap_gib': swap_gib,
                'attempt_root': ATTEMPT, 'upload_urls': upload_urls, 'watcher': config['watcher'],
                'identity': {'run_id': plan.run_id, 'run_attempt': plan.run_attempt,
                             'label': plan.label, 'image_id': image_id, 'instance_id': instance_id}}

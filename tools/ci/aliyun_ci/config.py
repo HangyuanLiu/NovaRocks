@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 
 LOCAL_CARGO_REGISTRIES = ('crates-io', 'rsproxy')
+LOCAL_SWAP_GIB = (0, 16)
 
 
 def fields(value, expected, name):
@@ -49,6 +50,12 @@ def validate_config(data: dict) -> DeploymentConfig:
     build_jobs = data.pop('build_jobs', None)
     registry_requested = 'cargo_registry' in data
     cargo_registry = data.pop('cargo_registry', 'crates-io')
+    swap_requested = 'swap_gib' in data
+    swap_gib = data.pop('swap_gib', 0)
+    if type(swap_gib) is not int or swap_gib not in LOCAL_SWAP_GIB:
+        raise ValueError('swap_gib must be 0 or 16')
+    if swap_requested and execution_kind != 'local-rust':
+        raise ValueError('swap_gib is a local-rust input')
     if cargo_registry not in LOCAL_CARGO_REGISTRIES:
         raise ValueError('cargo_registry must be crates-io or rsproxy')
     if registry_requested and execution_kind != 'local-rust':
@@ -115,6 +122,8 @@ def validate_config(data: dict) -> DeploymentConfig:
         data['build_jobs'] = build_jobs
     if registry_requested:
         data['cargo_registry'] = cargo_registry
+    if swap_requested:
+        data['swap_gib'] = swap_gib
     return DeploymentConfig(json.loads(json.dumps(data)))
 
 

@@ -74,14 +74,26 @@ systemd-analyze verify /etc/systemd/system/novarocks-ci-bootstrap.service \
   --profile /opt/novarocks-ci/tools-source/tools/dev/profiles/aliyun-ubuntu26-amd64-tools.json --tools-only \
   > /opt/novarocks-ci/tools-check.json
 python3 - "$source_root" "$preparation_sha" <<'PY_FACTS'
-import hashlib, json, platform, subprocess, sys
+import hashlib, json, os, platform, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, '/opt/novarocks-ci')
 from aliyun_ci.instance.local_rust import LOCAL_CARGO_REGISTRIES
+from aliyun_ci.instance.swap import LOCAL_SWAP_GIB, SWAP_ROOT, kernel_snapshot
+if SWAP_ROOT.exists() or SWAP_ROOT.is_symlink():
+    raise SystemExit('Image capture refuses private worker swap storage')
+builder_swap = kernel_snapshot()
+print('BuilderSwapReadback: '+json.dumps(builder_swap,sort_keys=True),flush=True)
+if builder_swap['swaps'] or builder_swap['meminfo']['SwapTotal_kib'] != 0:
+    raise SystemExit('Image capture refuses active swap')
+for executable in ('/usr/bin/dd', '/usr/bin/findmnt', '/usr/sbin/mkswap', '/usr/sbin/swapon'):
+    if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+        raise SystemExit('Image swap executable is missing: '+executable)
 root=Path(sys.argv[1])
 digest=lambda path:hashlib.sha256((root/path).read_bytes()).hexdigest()
 facts={'schema':1,'preparation_sha':sys.argv[2], 'os':'ubuntu-26.04','arch':'amd64',
        'local_rust_cargo_registries':list(LOCAL_CARGO_REGISTRIES),
+       'local_rust_swap_gib':list(LOCAL_SWAP_GIB),
+       'builder_swap':builder_swap,
        'tools_profile_digest':digest('tools/dev/profiles/aliyun-ubuntu26-amd64-tools.json'),
        'inputs_digest':digest('tools/dev/linux-env.inputs.json'),
        'platform_lock_digest':digest('tools/ci/aliyun_ci/requirements.lock'),
