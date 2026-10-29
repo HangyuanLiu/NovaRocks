@@ -237,16 +237,19 @@ impl Fixture {
                     if let Some(source) = &source {
                         source.ports(readiness.clone(), entrance.clone())
                     } else {
-                        IcebergMvCorePorts::new(
+                        let host =
+                            Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+                        IcebergMvCorePorts::new_with_management_entrance(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 None,
-                Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
+                host.clone(),
+                host,
                 readiness.clone(),
                 Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+                entrance.clone(),
                 crate::application::test_constant_policy(),
             )
-            .with_management_entrance(entrance.clone())
                     };
                 ReadRequest::Explain(Box::new(MvExplainPreparationInput {
                     ports,

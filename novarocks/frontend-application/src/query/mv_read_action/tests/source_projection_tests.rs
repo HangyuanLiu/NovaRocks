@@ -53,6 +53,7 @@ pub(super) struct SourceFixture {
     revision_selectors: Mutex<Vec<ConnectorReadSelector>>,
     captured_context: Mutex<Option<ConnectorRequestContext>>,
     snapshot: i64,
+    background_composition: bool,
 }
 /// Use only the existing row-level projection capability. The pure keyed
 /// fixture supplies durable identities; SQL owns internal target labels/types.
@@ -140,7 +141,7 @@ fn row_projection(
 }
 
 impl SourceFixture {
-    fn new(self_join: bool) -> Arc<Self> {
+    fn new(self_join: bool, background_composition: bool) -> Arc<Self> {
         let mut fixture = KeyedProjectionFixture::new(
             novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
             Some(11),
@@ -172,6 +173,7 @@ impl SourceFixture {
             revision_selectors: Mutex::new(Vec::new()),
             captured_context: Mutex::new(None),
             snapshot: 18,
+            background_composition,
         })
     }
     fn object(&self) -> ConnectorTableObjectId {
@@ -392,6 +394,21 @@ impl SourceFixture {
             .unwrap(),
         )
         .unwrap();
+        if self.background_composition {
+            // Exercise the same composition factory used by the production
+            // background bindings, then the real SourceRead/public adapter path.
+            return crate::capabilities::MvBackgroundPorts::new(
+                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                None,
+                host.clone(),
+                readiness,
+                self.clone(),
+                entrance,
+                crate::application::test_constant_policy(),
+            )
+            .into_core_ports(host);
+        }
         IcebergMvCorePorts::new_with_management_entrance(
             Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
@@ -982,14 +999,18 @@ async fn seed(fixture: &mut Fixture, source: &SourceFixture) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn original_explain_union_occurrences_prepare_once_across_a_and_b_without_splits() {
-    explain_counted(false).await;
+    explain_counted(false, false).await;
 }
 #[tokio::test(flavor = "current_thread")]
 async fn original_explain_self_join_binds_one_window_before_existing_join_key_refusal() {
-    explain_counted(true).await;
+    explain_counted(true, false).await;
 }
-async fn explain_counted(self_join: bool) {
-    let source = SourceFixture::new(self_join);
+#[tokio::test(flavor = "current_thread")]
+async fn background_composed_generation_prepares_actual_source_read_once() {
+    explain_counted(false, true).await;
+}
+async fn explain_counted(self_join: bool, background_composition: bool) {
+    let source = SourceFixture::new(self_join, background_composition);
     let mut fixture = Fixture::with_source_explain(
         Some(novarocks_sql::compiler::ExplainLevel::Costs),
         Some(source.clone()),

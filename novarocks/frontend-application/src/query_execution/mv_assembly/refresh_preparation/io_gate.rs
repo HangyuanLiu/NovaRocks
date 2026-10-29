@@ -585,13 +585,7 @@ impl MvRefreshPreparationIo {
                         };
                         let control = match source
                             .typed_connector_control()
-                            .map_err(|error| {
-                                ConnectorError::new(
-                                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                                    error,
-                                )
-                            })
-                            .and_then(|host| host.typed_read_for_planning_lease(&lease))
+                            .typed_read_for_planning_lease(&lease)
                         {
                             Ok(control) => control,
                             Err(error) => return Response::SourceRead(Err(error)),

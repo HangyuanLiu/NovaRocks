@@ -356,16 +356,18 @@ mod tests {
             tokio::runtime::Handle::current(),
             entrance.clone(),
         ));
-        let ports = IcebergMvCorePorts::new(
+        let host = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+        let ports = IcebergMvCorePorts::new_with_management_entrance(
             Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
-            Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
+            host.clone(),
+            host,
             readiness,
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            entrance,
             crate::application::test_constant_policy(),
-        )
-        .with_management_entrance(entrance);
+        );
         let sql = "SELECT 1 AS id FROM ice.db.orders";
         let statement = MvCreateStatement {
             name_parts: vec!["mv".into()],
