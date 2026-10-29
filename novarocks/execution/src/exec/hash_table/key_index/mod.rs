@@ -18,7 +18,7 @@
 //! Instance-local typed key equality and storage. Join rows, aggregate state,
 //! set markers and distributed hash identities remain with their own authors.
 
-// Design: ADR-0204 (docs/adr/ADR-0204-shared-local-key-index-and-consumer-row-topology.md)
+// Design: ADR-0205 (docs/adr/ADR-0205-shared-local-key-index-and-consumer-row-topology.md)
 
 mod bulk;
 mod bulk_read;

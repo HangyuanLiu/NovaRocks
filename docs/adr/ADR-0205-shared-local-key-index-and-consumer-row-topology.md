@@ -1,5 +1,5 @@
 ---
-id: ADR-0204
+id: ADR-0205
 title: "Instance-local key indexing is shared while row topology stays consumer-owned"
 domain: [join-execution, pipeline-execution]
 status: active

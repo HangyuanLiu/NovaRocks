@@ -18,7 +18,7 @@
 //!
 //! No key bytes, hashes, equality policy or direct integer index live here.
 
-// Design: ADR-0204 (docs/adr/ADR-0204-shared-local-key-index-and-consumer-row-topology.md)
+// Design: ADR-0205 (docs/adr/ADR-0205-shared-local-key-index-and-consumer-row-topology.md)
 
 use super::join_hash_map::method::{JoinCursorFailure, arithmetic, map_contract};
 use crate::{
