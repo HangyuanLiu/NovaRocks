@@ -331,7 +331,19 @@ impl IcebergTypedBoundary {
         let sources = sources
             .lock()
             .map_err(|_| corrupt("prepared source inventory poisoned"))?;
+        let name = match relation {
+            crate::typed_read::IcebergRuntimeRelation::Table(table) => table.schema_table_name(),
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(window) => {
+                window.schema_table_name()
+            }
+            _ => return Ok(None),
+        };
+        let mut claimed = false;
         for receipt in sources.iter() {
+            if receipt.source.request.name() != name {
+                continue;
+            }
+            claimed = true;
             let matches = match (receipt.projection, relation) {
                 (
                     ConnectorReadSourceProjection::To,
@@ -361,9 +373,13 @@ impl IcebergTypedBoundary {
                 return Ok(Some(receipt.clone()));
             }
         }
+        if claimed {
+            return Err(invalid(
+                "prepared source relation differs from its original prepared inventory",
+            ));
+        }
         Ok(None)
     }
-
     fn adopted_cow_source(
         &self,
         handle: &IcebergTableHandle,
@@ -5921,6 +5937,8 @@ mod system_work_unit_tests {
 #[cfg(test)]
 mod prepared_source_relation_tests {
     use super::*;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{CatalogHandle, ConnectorExactSemanticRevision};
     use novarocks_spi::connector::{
         ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
         ConnectorChangeWindowPartitionImpact,
@@ -5964,6 +5982,306 @@ mod prepared_source_relation_tests {
         builder.build().unwrap().metadata
     }
 
+    /// Immutable owner-local matcher fixture, without CPU/IO grants.
+    fn inventory_fixture() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        Arc<IcebergTypedBoundary>,
+        Arc<IcebergPreparedSourceRead>,
+    ) {
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let warehouse = tempfile::tempdir().unwrap();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".into(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .unwrap();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+        );
+        let resources = crate::resources::IcebergMetadataResources::new(
+            binding.clone(),
+            executor.handle().clone(),
+        );
+        let runtime = Arc::new(
+            IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .unwrap(),
+        );
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse(crate::PROVIDER_ID)
+                .unwrap(),
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
+        };
+        let incarnation = ProviderBindingEpoch::from_bytes([0x67; 16]);
+        let catalog = CatalogHandle::new(
+            descriptor.instance_id.clone(),
+            novarocks_spi::connector::CatalogVersion::from_bytes([0x45; 32]),
+        );
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(metadata()).unwrap();
+        value["location"] = serde_json::json!(warehouse.path().display().to_string());
+        let metadata: TableMetadata = serde_json::from_value(value).unwrap();
+        let name = SchemaTableName::try_new("db", "t").unwrap();
+        let physical = IcebergPhysicalTable::new(
+            crate::iceberg::table::Table::builder()
+                .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+                .metadata(Arc::new(metadata.clone()))
+                .file_io(crate::fs_io::build_file_io_for_location(
+                    metadata.location(),
+                    binding,
+                ))
+                .runtime(
+                    runtime
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )
+                .build()
+                .unwrap(),
+        );
+        let observed = crate::metadata::with_pure_schema_creation(&context, |creation| {
+            crate::metadata::build_table_metadata(
+                crate::metadata::TableMetadataBuildInput {
+                    descriptor: &descriptor,
+                    incarnation,
+                    request: novarocks_spi::connector::ConnectorTableRequest {
+                        table: novarocks_spi::connector::ConnectorTableIdentity {
+                            instance_id: descriptor.instance_id.clone(),
+                            namespace: "db".into(),
+                            table: "t".into(),
+                        },
+                        resolution:
+                            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                        context: context.clone(),
+                    },
+                    loaded: physical.clone(),
+                    table_name: "t".into(),
+                    metadata_table_type: None,
+                    snapshots: crate::catalog::SnapshotLoading::All,
+                    projection: crate::metadata::TableMetadataProjection::SnapshotTo(42),
+                },
+                creation,
+            )
+            .map_err(crate::metadata::metadata_creation_error)
+        })
+        .unwrap();
+        let object = novarocks_spi::connector::ConnectorTableObjectId::try_new(bytes::Bytes::from(
+            metadata.uuid().to_string(),
+        ))
+        .unwrap();
+        let revision = |id| {
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                descriptor.provider_id.clone(),
+                &object,
+                Some(id),
+            )
+            .unwrap()
+        };
+        let request = ConnectorReadSourcePreparationRequest::change_window(
+            name.clone(),
+            observed.table.clone(),
+            observed.source_read_facts().unwrap().clone(),
+            object.clone(),
+            ConnectorReadChangeWindow::new(41, 42),
+            revision(41),
+            revision(42),
+        );
+        let admission = ConnectorChangeWindowAdmission::Incremental {
+            has_inserts: true,
+            has_deletes: false,
+            partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+        };
+        let relations = frozen_prepared_source_relations(
+            &name,
+            &metadata,
+            request.selection(),
+            metadata.current_schema().clone(),
+            metadata.current_schema_id(),
+            Some(&admission),
+        )
+        .unwrap();
+        let source = Arc::new(IcebergPreparedSourceRead {
+            owner: novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: descriptor.instance_id.clone(),
+                incarnation,
+            },
+            catalog: catalog.clone(),
+            request,
+            access: Arc::new(IcebergAttemptTableAccess::freeze(physical)),
+            relations,
+            admission: Some(admission),
+            to_metadata: Arc::new(observed),
+        });
+        let boundary = Arc::new(
+            IcebergTypedBoundary::new(
+                descriptor,
+                incarnation,
+                catalog,
+                HiveTransactionHandle::new(true, [0x72; 16]),
+                runtime,
+            )
+            .for_request(context),
+        );
+        (executor, warehouse, boundary, source)
+    }
+    fn install_inventory(boundary: &IcebergTypedBoundary, source: &Arc<IcebergPreparedSourceRead>) {
+        *boundary
+            .prepared_source_accesses
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap() = [
+            ConnectorReadSourceProjection::To,
+            ConnectorReadSourceProjection::From,
+            ConnectorReadSourceProjection::Delta,
+        ]
+        .into_iter()
+        .map(|projection| PreparedSourceAccess {
+            source: source.clone(),
+            projection,
+        })
+        .collect();
+    }
+
+    #[test]
+    fn prepared_inventory_checks_all_occurrence_projections_before_refusal() {
+        let (_executor, _warehouse, boundary, source) = inventory_fixture();
+        install_inventory(&boundary, &source);
+        let from = crate::typed_read::IcebergRuntimeRelation::Table(
+            source.relations.from.as_ref().unwrap().clone(),
+        );
+        let found = boundary.prepared_source_access(&from).unwrap().unwrap();
+        assert_eq!(found.projection, ConnectorReadSourceProjection::From);
+        assert!(Arc::ptr_eq(&found.source, &source));
+        let delta = crate::typed_read::IcebergRuntimeRelation::ChangeWindow(
+            source.relations.delta.as_ref().unwrap().clone(),
+        );
+        assert_eq!(
+            boundary
+                .prepared_source_access(&delta)
+                .unwrap()
+                .unwrap()
+                .projection,
+            ConnectorReadSourceProjection::Delta
+        );
+        let filtered = source
+            .relations
+            .to
+            .apply_filter(&Constraint::of_summary(TupleDomain::all()))
+            .unwrap()
+            .into_handle();
+        let limited = filtered.apply_limit(1).unwrap().into_handle();
+        let column =
+            IcebergColumnHandle::base_column_of(&limited.parse_table_schema().unwrap(), 1).unwrap();
+        let assignment = Assignment::try_new("id", column, ConnectorValueType::BigInt).unwrap();
+        let projected = limited
+            .apply_projection(&OrderedAssignments::try_new(vec![assignment]).unwrap())
+            .unwrap()
+            .into_handle();
+        assert_eq!(
+            boundary
+                .prepared_source_access(&crate::typed_read::IcebergRuntimeRelation::Table(
+                    projected
+                ))
+                .unwrap()
+                .unwrap()
+                .projection,
+            ConnectorReadSourceProjection::To
+        );
+    }
+
+    #[test]
+    fn same_name_unknown_domain_and_window_cannot_fall_back_to_original_split_opening() {
+        use novarocks_spi::connector::read_stack::adapter::{
+            ProviderReadSplitManager, ProviderReadSplitOpenRequest,
+        };
+        let (_executor, _warehouse, boundary, source) = inventory_fixture();
+        install_inventory(&boundary, &source);
+        let mut table = source.relations.to.to_proto();
+        table.read_domain.as_mut().unwrap().observation_id[0] ^= 1;
+        let table = crate::typed_read::IcebergRuntimeRelation::Table(
+            IcebergTableHandle::from_proto(&table).unwrap(),
+        );
+        let mut window = source.relations.delta.as_ref().unwrap().to_proto();
+        window.from_snapshot_id_exclusive = window.to_snapshot_id_inclusive;
+        window.from_read_domain = window.to_read_domain.clone();
+        let window = crate::typed_read::IcebergRuntimeRelation::ChangeWindow(
+            IcebergChangeWindowHandle::from_proto(&window).unwrap(),
+        );
+        for relation in [table, window] {
+            let error = boundary.prepared_source_access(&relation).err().unwrap();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "prepared source relation differs from its original prepared inventory"
+            );
+            let mut owner = None;
+            // Synchronous refusal cannot yield a foreign F or install/take Source.
+            let result = Arc::clone(&boundary).begin_get_splits(
+                ProviderReadSplitOpenRequest {
+                    session: ConnectorSession::try_new(
+                        "q",
+                        "u",
+                        "UTC",
+                        "en_US",
+                        std::time::SystemTime::UNIX_EPOCH,
+                    )
+                    .unwrap(),
+                    table: Arc::new(relation),
+                    columns: Vec::new(),
+                    dynamic_filter_columns: BTreeSet::new(),
+                    constraint: Constraint::of_summary(TupleDomain::all()),
+                    preparation: None,
+                },
+                &mut owner,
+            );
+            let error = result.err().expect("no ordinary foreign future may escape");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "prepared source relation differs from its original prepared inventory"
+            );
+            assert!(owner.is_none());
+        }
+    }
+
+    #[test]
+    fn empty_or_different_name_inventory_preserves_ordinary_none() {
+        let (_executor, _warehouse, boundary, source) = inventory_fixture();
+        let same = crate::typed_read::IcebergRuntimeRelation::Table(source.relations.to.clone());
+        assert!(boundary.prepared_source_access(&same).unwrap().is_none());
+        let mut no_inventory = boundary.as_ref().clone();
+        no_inventory.prepared_source_accesses = None;
+        assert!(
+            no_inventory
+                .prepared_source_access(&same)
+                .unwrap()
+                .is_none()
+        );
+        install_inventory(&boundary, &source);
+        let mut table = source.relations.to.to_proto();
+        table.schema_table_name.as_mut().unwrap().table_name = "ordinary_other".into();
+        let other = crate::typed_read::IcebergRuntimeRelation::Table(
+            IcebergTableHandle::from_proto(&table).unwrap(),
+        );
+        assert!(boundary.prepared_source_access(&other).unwrap().is_none());
+    }
     #[test]
     fn prepared_incremental_relations_share_the_original_endpoint_domains() {
         let metadata = metadata();

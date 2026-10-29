@@ -250,6 +250,9 @@ impl<T> ProviderReadOpenedRelation<T> {
 }
 
 pub trait ProviderReadMetadata: ProviderReadRuntime {
+    /// Completed resource-free facts own their retained data independently of
+    /// the preparing request/provider. Projection borrows a current exact
+    /// binding; a receipt does not keep the old request's live capabilities.
     type PreparedSourceRead: Send + Sync + 'static;
 
     fn prepare_source_read<'a>(
@@ -828,8 +831,6 @@ struct BoundRelationPreparation<P: ProviderReadMetadata> {
 
 struct BoundSourcePreparation<P: ProviderReadMetadata> {
     facts: P::PreparedSourceRead,
-    // Retain the original preparation generation through its facts' Drop.
-    _provider: Arc<P>,
 }
 
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
@@ -866,7 +867,6 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
                 prepared.to_metadata,
                 BoundSourcePreparation::<P> {
                     facts: prepared.source,
-                    _provider: Arc::clone(&self.provider),
                 },
             ))
         })
@@ -1871,7 +1871,22 @@ mod tests {
 
     const PUBLIC_SCHEMA_EXTRA_FIELD: u8 = 99;
 
+    struct SourceDropWitness(Arc<AtomicU64>);
+    impl Drop for SourceDropWitness {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ProbeSourceFacts {
+        ordinal: usize,
+        _retention: Option<SourceDropWitness>,
+    }
+
     struct Probe {
+        // Representative provider-private request inventory. It must not be
+        // retained merely because a completed fact receipt has aliases.
+        _source_request_inventory: Option<SourceDropWitness>,
         descriptor: ConnectorInstanceDescriptor,
         catalog_handle: CatalogHandle,
         public_schema_calls: AtomicU64,
@@ -1885,6 +1900,7 @@ mod tests {
     impl Probe {
         fn new() -> Self {
             Self {
+                _source_request_inventory: None,
                 descriptor: ConnectorInstanceDescriptor {
                     provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
                     instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
@@ -1921,7 +1937,7 @@ mod tests {
     }
 
     impl ProviderReadMetadata for Probe {
-        type PreparedSourceRead = usize;
+        type PreparedSourceRead = ProbeSourceFacts;
 
         fn project_prepared_source_read(
             &self,
@@ -1930,7 +1946,7 @@ mod tests {
             source: &Self::PreparedSourceRead,
             _projection: super::super::ConnectorReadSourceProjection,
         ) -> Result<Self::Table, ConnectorError> {
-            assert_eq!(*source, 41);
+            assert_eq!(source.ordinal, 41);
             self.created_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Table)
         }
@@ -2344,6 +2360,21 @@ mod tests {
         adapter: &ReadRuntimeAdapter<Probe>,
         admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
     ) -> super::super::ConnectorPreparedSourceRead {
+        prepared_source_with_facts(
+            adapter,
+            admission,
+            ProbeSourceFacts {
+                ordinal: 41,
+                _retention: None,
+            },
+        )
+    }
+
+    fn prepared_source_with_facts(
+        adapter: &ReadRuntimeAdapter<Probe>,
+        admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+        facts: ProbeSourceFacts,
+    ) -> super::super::ConnectorPreparedSourceRead {
         use crate::connector::read_stack::{
             ConnectorReadChangeWindow, ConnectorReadSourcePreparationRequest,
         };
@@ -2392,10 +2423,7 @@ mod tests {
             request,
             admission,
             prepared_source_metadata(adapter),
-            BoundSourcePreparation::<Probe> {
-                facts: 41,
-                _provider: Arc::clone(&adapter.provider),
-            },
+            BoundSourcePreparation::<Probe> { facts },
         )
     }
 
@@ -2489,18 +2517,43 @@ mod tests {
     }
 
     #[test]
-    fn prepared_source_aliases_retain_the_original_facts_author() {
-        let provider = Arc::new(Probe::new());
-        let author = Arc::downgrade(&provider);
-        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
-        let source = prepared_source(&adapter, None);
+    fn prepared_source_aliases_retain_facts_without_the_original_request_inventory() {
+        use crate::connector::read_stack::ConnectorReadSourceProjection;
+        let inventory_drops = Arc::new(AtomicU64::new(0));
+        let facts_drops = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(Probe {
+            _source_request_inventory: Some(SourceDropWitness(inventory_drops.clone())),
+            ..Probe::new()
+        });
+        let old_request = Arc::downgrade(&provider);
+        let adapter = ReadRuntimeAdapter::new(provider.clone());
+        let source = prepared_source_with_facts(
+            &adapter,
+            None,
+            ProbeSourceFacts {
+                ordinal: 41,
+                _retention: Some(SourceDropWitness(facts_drops.clone())),
+            },
+        );
         let alias = source.clone();
         drop(adapter);
         drop(provider);
+        assert!(old_request.upgrade().is_none());
+        assert_eq!(inventory_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(facts_drops.load(Ordering::SeqCst), 0);
+
+        // A different request of the same exact binding consumes retained
+        // facts after the preparing provider and its inventory actually drop.
+        let request = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        request
+            .project_prepared_source_read(&session(), &alias, ConnectorReadSourceProjection::To)
+            .unwrap();
+        assert_eq!(request.provider.created_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.provider.prepared_calls.load(Ordering::SeqCst), 0);
         drop(source);
-        assert!(author.upgrade().is_some());
+        assert_eq!(facts_drops.load(Ordering::SeqCst), 0);
         drop(alias);
-        assert!(author.upgrade().is_none());
+        assert_eq!(facts_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

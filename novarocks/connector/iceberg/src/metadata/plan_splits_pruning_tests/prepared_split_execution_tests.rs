@@ -744,3 +744,289 @@ fn held_prepared_split_cpu_footer_keeps_original_owner_across_borrowed_waiter_dr
         );
     });
 }
+
+/// This is the real vended REST owner, not a static Table substituted by a
+/// callback. UUID rejection must happen before opening any S3 manifest.
+#[test]
+fn actual_vended_prepared_source_keeps_renewal_and_rejects_fresh_replaced_uuid() {
+    use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts;
+    use crate::catalog_runtime::RestAccessDelegationMode;
+    use crate::iceberg::spec::UnboundPartitionSpec;
+    use crate::loaded_table::IcebergVendedS3RenewalCapability;
+    use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadSourcePreparationRequest, SchemaTableName,
+    };
+
+    let metadata = TableMetadataBuilder::new(
+        Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap(),
+        UnboundPartitionSpec::default(),
+        SortOrder::unsorted_order(),
+        "s3://warehouse/db/t".into(),
+        FormatVersion::V2,
+        HashMap::new(),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .metadata;
+    let original_uuid = metadata.uuid();
+    let mut wire = serde_json::to_value(&metadata).unwrap();
+    let timestamp = wire["last-updated-ms"].clone();
+    wire["last-sequence-number"] = serde_json::json!(1);
+    wire["current-snapshot-id"] = serde_json::json!(22);
+    wire["snapshots"] = serde_json::json!([{
+        "snapshot-id": 22, "sequence-number": 1, "timestamp-ms": timestamp,
+        "manifest-list": "s3://warehouse/db/t/metadata/list-22.avro",
+        "summary": {"operation": "append", "total-records": "0"}, "schema-id": 0,
+    }]);
+    wire["snapshot-log"] = serde_json::json!([{"timestamp-ms": timestamp, "snapshot-id": 22}]);
+    wire["refs"] = serde_json::json!({"main": {"snapshot-id": 22, "type": "branch"}});
+    let expiry = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 3_600_000)
+        .to_string();
+    let response = serde_json::json!({
+        "metadata-location": "s3://warehouse/db/t/metadata/v1.json", "metadata": wire,
+        "storage-credentials": [{"prefix": "s3://warehouse/db/t", "config": {
+            "s3.access-key-id": "prepared-vended-key-canary",
+            "s3.secret-access-key": "prepared-vended-secret-canary",
+            "s3.session-token": "prepared-vended-session-canary",
+            "s3.session-token-expires-at-ms": expiry,
+        }}],
+    });
+    let mut replaced = response.clone();
+    let replaced_uuid = uuid::Uuid::new_v4();
+    assert_ne!(original_uuid, replaced_uuid);
+    replaced["metadata"]["table-uuid"] = serde_json::json!(replaced_uuid);
+    let server = TestServer::start(
+        Script::new()
+            .on("GET", "/v1/config", Reply::config(&[], &[], None))
+            .on_sequence(
+                "GET",
+                "/v1/namespaces/db/tables/t",
+                vec![Reply::json(200, &response), Reply::json(200, &replaced)],
+            ),
+    );
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let configuration = crate::catalog_config::parse_catalog_configuration(
+        "ice",
+        &[
+            ("iceberg.catalog.type".into(), "rest".into()),
+            ("iceberg.catalog.warehouse".into(), "s3://warehouse".into()),
+            ("iceberg.catalog.uri".into(), server.url()),
+        ],
+    )
+    .unwrap();
+    let binding = IcebergReadBinding::new(
+        None,
+        FsAccessResolver::new(),
+        Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+        Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+    );
+    let runtime = Arc::new(
+        IcebergMetadataContext::try_new_with_rest_access_delegation(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, executor.handle().clone()),
+            RestAccessDelegationMode::Vended,
+        )
+        .unwrap(),
+    );
+    let provider = IcebergMetadata::new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+        },
+        ProviderBindingEpoch::from_bytes([7; 16]),
+        runtime,
+    );
+    executor.block_on(async {
+        let active = Arc::new(AtomicBool::new(false));
+        let io = Arc::new(IoFixture {
+            in_cpu: active.clone(),
+            owned_reads: AtomicUsize::new(0),
+        });
+        let cpu: Arc<dyn ProviderMetadataCpuPort> = Arc::new(PhasePort {
+            in_cpu: active,
+            descriptor: provider.descriptor.clone(),
+            incarnation: provider.incarnation,
+            calls: AtomicUsize::new(0),
+        });
+        let context = context().with_io_admission(io.clone());
+        let original = ConnectorOriginalResultScope::from_original(Arc::new(OriginalScope(
+            context.deadline(),
+        )));
+        let observed = prepared_source_fixture_metadata(&provider, "db", &context).await;
+        let facts = observed
+            .source_read_facts()
+            .unwrap()
+            .value::<IcebergObservedSourceReadFacts>(provider.descriptor.instance_id.as_str())
+            .unwrap();
+        assert_eq!(facts.snapshots, SnapshotLoading::All);
+        assert_eq!(facts.access.metadata().uuid(), original_uuid);
+        assert!(matches!(
+            facts.access.renewal(),
+            Some(IcebergVendedS3RenewalCapability::LoadTableDelegation(_))
+        ));
+        let object =
+            ConnectorTableObjectId::try_new(Bytes::from(original_uuid.to_string())).unwrap();
+        let revision = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            provider.descriptor.provider_id.clone(),
+            &object,
+            Some(22),
+        )
+        .unwrap();
+        let request = ConnectorReadSourcePreparationRequest::snapshot(
+            SchemaTableName::try_new("db", "t").unwrap(),
+            observed.table.clone(),
+            observed.source_read_facts().unwrap().clone(),
+            object,
+            22,
+            revision,
+        );
+        let read = prepared_source_fixture_control(&provider, &context);
+        let mut preparation_owner = None;
+        let prepared = read
+            .metadata()
+            .prepare_source_read(
+                &session(),
+                &request,
+                &cpu,
+                &original,
+                &mut preparation_owner,
+            )
+            .await
+            .unwrap();
+        assert!(
+            prepared.admission().is_none(),
+            "a first/full To source must not pretend to be Delta"
+        );
+        let selected = prepared
+            .to_metadata()
+            .source_read_facts()
+            .unwrap()
+            .value::<IcebergObservedSourceReadFacts>(provider.descriptor.instance_id.as_str())
+            .unwrap();
+        assert!(matches!(
+            selected.access.renewal(),
+            Some(IcebergVendedS3RenewalCapability::LoadTableDelegation(_))
+        ));
+        assert_eq!(
+            selected.access.request_cache_identity(),
+            facts.access.request_cache_identity()
+        );
+        for table in [&observed.table, &prepared.to_metadata().table] {
+            let bytes = std::str::from_utf8(table.payload()).unwrap();
+            for canary in [
+                "prepared-vended-key-canary",
+                "prepared-vended-secret-canary",
+                "prepared-vended-session-canary",
+            ] {
+                assert!(
+                    !bytes.contains(canary),
+                    "vended response material is not a table attribute"
+                );
+            }
+        }
+        std::future::poll_fn(|cx| cpu.poll_closed(cx))
+            .await
+            .unwrap();
+        drop(preparation_owner);
+        assert_eq!(
+            server.count("GET", "/v1/namespaces/db/tables/t"),
+            1,
+            "SnapshotTo preparation must use the frozen observation, not late Current reload"
+        );
+        let table = read
+            .metadata()
+            .project_prepared_source_read(&session(), &prepared, ConnectorReadSourceProjection::To)
+            .unwrap();
+        assert!(
+            read.seal_attempt_access(&table)
+                .unwrap()
+                .requires_metadata_split_preparation()
+        );
+        let owned_before_fresh = io.owned_reads.load(Ordering::SeqCst);
+        let mut owner = None;
+        let error = match read
+            .splits()
+            .get_splits(
+                ConnectorReadSplitOpenRequest::new(
+                    session(),
+                    table,
+                    Vec::new(),
+                    std::collections::BTreeSet::new(),
+                    novarocks_spi::connector::read_stack::ConnectorReadConstraint::of_summary(
+                        TupleDomain::all(),
+                    ),
+                )
+                .with_source_preparation(ConnectorReadSplitPreparation::new(cpu.clone(), original)),
+                &mut owner,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("vended fresh replaced UUID was accepted"),
+        };
+        assert_eq!(
+            error.table_object_binding_failure(),
+            Some(ConnectorTableObjectBindingFailure::Replaced)
+        );
+        assert_eq!(
+            io.owned_reads.load(Ordering::SeqCst),
+            owned_before_fresh,
+            "UUID refusal precedes original manifest read/spec-slot backing admission"
+        );
+        assert!(
+            owner.is_some(),
+            "the original source still owns its actual result/exit inventory"
+        );
+        std::future::poll_fn(|cx| cpu.poll_closed(cx))
+            .await
+            .unwrap();
+        drop(owner);
+        let loads = server.requests_to("GET", "/v1/namespaces/db/tables/t");
+        assert_eq!(
+            loads.len(),
+            2,
+            "one initial observation plus one real fresh observation"
+        );
+        for load in &loads {
+            assert_eq!(
+                load.query(),
+                None,
+                "All uses the original complete default load; never refs"
+            );
+            assert_eq!(
+                load.header("x-iceberg-access-delegation"),
+                Some("vended-credentials")
+            );
+        }
+        assert_eq!(
+            server.count("GET", "/v1/config"),
+            1,
+            "one original REST generation/session"
+        );
+        assert_eq!(
+            server.count("GET", "/v1/namespaces/db/tables/t/credentials"),
+            0,
+            "the observed load-table renewal capability cannot turn into another acquisition path"
+        );
+        assert_eq!(
+            server.requests().len(),
+            3,
+            "the real REST owner must not dispatch any guessed additional endpoint"
+        );
+    });
+    // TestServer Drop joins every original loopback actor after the original
+    // opening Source/CPU component has been explicitly closed above.
+}

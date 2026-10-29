@@ -1313,24 +1313,22 @@ async fn prepare_frontend_incremental_write(
         let right_from = rewrite.previous_snapshot_id(right_ref)?;
         let left_to = rewrite.pinned_snapshot_id(left_ref)?;
         let right_to = rewrite.pinned_snapshot_id(right_ref)?;
-        let (left_admission, _) = crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(io,
-            source.connector_control(),
-            source.storage_observation(),
+        let (left_admission, _) = crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(io,
+                        source.storage_observation(),
             &left_ref.table,
             rewrite.previous_revision(left_ref)?,
             left_from,
             left_to,
             &connector_context,
-        ).await?;
-        let (right_admission, _) = crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(io,
-            source.connector_control(),
-            source.storage_observation(),
+        )?;
+        let (right_admission, _) = crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(io,
+                        source.storage_observation(),
             &right_ref.table,
             rewrite.previous_revision(right_ref)?,
             right_from,
             right_to,
             &connector_context,
-        ).await?;
+        )?;
         let left_facts = admitted_change_facts(&left_admission);
         let right_facts = admitted_change_facts(&right_admission);
         let mut full_rebuild_reasons = Vec::new();
@@ -1493,15 +1491,14 @@ async fn prepare_frontend_incremental_write(
             )
             .into());
         }
-        let (admission, _) = crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(io,
-                source.connector_control(),
-                source.storage_observation(),
+        let (admission, _) = crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(io,
+                                source.storage_observation(),
                 &base.table,
                 rewrite.previous_revision(base)?,
                 previous_snapshot_id,
                 current_snapshot_id,
                 &connector_context,
-            ).await?;
+            )?;
         loaded_bases.push((
             base,
             current_snapshot_id,

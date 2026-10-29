@@ -212,9 +212,10 @@ pub(crate) async fn rewrite_history_sources_original(
     Ok(result)
 }
 
-pub(crate) async fn observe_and_admit_change_window_for_table_original(
+/// Project policy and source schema from the one completed Root preparation.
+/// This function cannot start catalog or endpoint discovery.
+pub(crate) fn project_prepared_change_window_for_table_original(
     io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
-    _connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
     from_revision: &ConnectorExactSemanticRevision,
