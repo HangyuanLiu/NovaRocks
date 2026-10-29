@@ -169,6 +169,9 @@ fn session() -> ConnectorSession {
     ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH).unwrap()
 }
 async fn fixture(original: &IcebergMetadata) -> Fixture {
+    source_fixture(original, false).await
+}
+async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixture {
     for request in [
         CatalogPublicationRequest::CreateNamespace {
             namespace: CatalogNamespaceName::new("prepared_execution"),
@@ -285,6 +288,18 @@ async fn fixture(original: &IcebergMetadata) -> Fixture {
         snapshots[0],
         snapshots[1],
     );
+    let request = if snapshot_only {
+        novarocks_spi::connector::read_stack::ConnectorReadSourcePreparationRequest::snapshot(
+            request.name().clone(),
+            request.observed_table().clone(),
+            request.observed_source_facts().clone(),
+            request.object_id().clone(),
+            snapshots[1],
+            request.to_revision().clone(),
+        )
+    } else {
+        request
+    };
     let facts = request.observed_source_facts().value::<
         crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts
     >(provider.descriptor.instance_id.as_str()).unwrap();
@@ -312,10 +327,15 @@ async fn fixture(original: &IcebergMetadata) -> Fixture {
         .prepare_source_read(&session, &request, &cpu, &scope, &mut owner)
         .await
         .unwrap();
-    assert!(matches!(
-        prepared.admission(),
-        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
-    ));
+    if snapshot_only {
+        assert!(prepared.admission().is_none());
+        assert!(prepared.request().from_revision().is_none());
+    } else {
+        assert!(matches!(
+            prepared.admission(),
+            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
+        ));
+    }
     std::future::poll_fn(|cx| cpu.poll_closed(cx))
         .await
         .unwrap();
@@ -522,6 +542,57 @@ fn actual_prepared_to_observes_later_append_but_reads_the_original_to_files() {
             fixture.io.owned_reads.load(Ordering::SeqCst) > baseline,
             "original MIO actually serviced frozen Avro discovery/spec-slot backing"
         );
+        fixture.close_source(source, owner, &fixture.cpu).await;
+    });
+}
+
+#[test]
+fn actual_snapshot_to_without_from_reads_its_frozen_table_after_later_append() {
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = source_fixture(&provider, true).await;
+        assert!(fixture.prepared.request().from_revision().is_none());
+        assert!(matches!(
+            fixture.prepared.request().selection(),
+            novarocks_spi::connector::read_stack::ConnectorReadSourceSelection::Snapshot(id)
+                if id == fixture.to
+        ));
+        fixture.observe(|value| {
+            let next_id = fixture.to.checked_add(1).unwrap();
+            let mut next = snapshot_mut(value, fixture.to).clone();
+            next["snapshot-id"] = serde_json::json!(next_id);
+            next["parent-snapshot-id"] = serde_json::json!(fixture.to);
+            next["sequence-number"] =
+                serde_json::json!(value["last-sequence-number"].as_i64().unwrap() + 1);
+            next["manifest-list"] = serde_json::json!("file:///later-unread-manifest-list.avro");
+            value["last-sequence-number"] = next["sequence-number"].clone();
+            value["snapshots"].as_array_mut().unwrap().push(next);
+            value["current-snapshot-id"] = serde_json::json!(next_id);
+            value["refs"]["main"]["snapshot-id"] = serde_json::json!(next_id);
+        });
+        assert!(
+            fixture
+                .read
+                .seal_attempt_access(&fixture.table(ConnectorReadSourceProjection::To))
+                .unwrap()
+                .requires_metadata_split_preparation()
+        );
+        let baseline = fixture.io.owned_reads.load(Ordering::SeqCst);
+        let mut owner = None;
+        let mut source = fixture
+            .opening(
+                ConnectorReadSourceProjection::To,
+                fixture.cpu.clone(),
+                &mut owner,
+            )
+            .await
+            .unwrap();
+        fixture.assert_actual_all();
+        let paths = fixture.paths(source.as_mut());
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("/a.parquet"));
+        assert!(paths[1].ends_with("/b.parquet"));
+        assert!(fixture.io.owned_reads.load(Ordering::SeqCst) > baseline);
         fixture.close_source(source, owner, &fixture.cpu).await;
     });
 }
@@ -749,6 +820,15 @@ fn held_prepared_split_cpu_footer_keeps_original_owner_across_borrowed_waiter_dr
 /// callback. UUID rejection must happen before opening any S3 manifest.
 #[test]
 fn actual_vended_prepared_source_keeps_renewal_and_rejects_fresh_replaced_uuid() {
+    vended_prepared_source_fresh_refusal(false);
+}
+
+#[test]
+fn actual_vended_prepared_source_rejects_fresh_missing_endpoint_without_manifest_io() {
+    vended_prepared_source_fresh_refusal(true);
+}
+
+fn vended_prepared_source_fresh_refusal(expire_selected_endpoint: bool) {
     use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts;
     use crate::catalog_runtime::RestAccessDelegationMode;
     use crate::iceberg::spec::UnboundPartitionSpec;
@@ -805,9 +885,36 @@ fn actual_vended_prepared_source_keeps_renewal_and_rejects_fresh_replaced_uuid()
         }}],
     });
     let mut replaced = response.clone();
-    let replaced_uuid = uuid::Uuid::new_v4();
-    assert_ne!(original_uuid, replaced_uuid);
-    replaced["metadata"]["table-uuid"] = serde_json::json!(replaced_uuid);
+    if expire_selected_endpoint {
+        replaced["metadata-location"] = serde_json::json!("s3://warehouse/db/t/metadata/v2.json");
+        assert_ne!(replaced["metadata-location"], response["metadata-location"]);
+        let mut next = replaced["metadata"]["snapshots"][0].clone();
+        next["snapshot-id"] = serde_json::json!(23);
+        next["parent-snapshot-id"] = serde_json::json!(22);
+        next["sequence-number"] = serde_json::json!(2);
+        next["manifest-list"] = serde_json::json!("s3://warehouse/db/t/metadata/list-23.avro");
+        replaced["metadata"]["last-sequence-number"] = serde_json::json!(2);
+        replaced["metadata"]["current-snapshot-id"] = serde_json::json!(23);
+        replaced["metadata"]["snapshots"] = serde_json::json!([next]);
+        replaced["metadata"]["snapshot-log"] =
+            serde_json::json!([{"timestamp-ms": timestamp, "snapshot-id": 23}]);
+        replaced["metadata"]["refs"]["main"]["snapshot-id"] = serde_json::json!(23);
+        assert_eq!(
+            replaced["metadata"]["table-uuid"],
+            response["metadata"]["table-uuid"]
+        );
+        assert!(
+            replaced["metadata"]["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|snapshot| snapshot["snapshot-id"].as_i64() != Some(22))
+        );
+    } else {
+        let replaced_uuid = uuid::Uuid::new_v4();
+        assert_ne!(original_uuid, replaced_uuid);
+        replaced["metadata"]["table-uuid"] = serde_json::json!(replaced_uuid);
+    }
     let server = TestServer::start(
         Script::new()
             .on("GET", "/v1/config", Reply::config(&[], &[], None))
@@ -975,16 +1082,25 @@ fn actual_vended_prepared_source_keeps_renewal_and_rejects_fresh_replaced_uuid()
             .await
         {
             Err(error) => error,
-            Ok(_) => panic!("vended fresh replaced UUID was accepted"),
+            Ok(_) => panic!("vended fresh source invalidation was accepted"),
         };
-        assert_eq!(
-            error.table_object_binding_failure(),
-            Some(ConnectorTableObjectBindingFailure::Replaced)
-        );
+        if expire_selected_endpoint {
+            assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+            assert_eq!(error.table_object_binding_failure(), None);
+            assert_eq!(
+                error.message(),
+                "Iceberg prepared endpoint is no longer visible"
+            );
+        } else {
+            assert_eq!(
+                error.table_object_binding_failure(),
+                Some(ConnectorTableObjectBindingFailure::Replaced)
+            );
+        }
         assert_eq!(
             io.owned_reads.load(Ordering::SeqCst),
             owned_before_fresh,
-            "UUID refusal precedes original manifest read/spec-slot backing admission"
+            "fresh source refusal precedes original manifest read/spec-slot backing admission"
         );
         assert!(
             owner.is_some(),

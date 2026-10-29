@@ -105,6 +105,24 @@ pub(crate) struct RoundSplitSourceRecipe {
 }
 
 impl RoundSplitSourceRecipe {
+    #[cfg(test)]
+    pub(crate) fn for_initializer_test(
+        fragment_id: FragmentId,
+        plan_node_id: i32,
+        access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
+    ) -> Self {
+        Self {
+            fragment_id,
+            plan_node_id,
+            access,
+            assignments: Vec::new(),
+            dynamic_filters: Vec::new(),
+            constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint::of_summary(
+                novarocks_spi::connector::read_stack::TupleDomain::all(),
+            ),
+        }
+    }
+
     pub(crate) fn from_artifacts(
         artifacts: &PreparedDistributedQuery,
         fragment_id: FragmentId,

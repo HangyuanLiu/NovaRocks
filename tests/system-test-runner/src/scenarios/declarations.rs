@@ -179,6 +179,22 @@ pub(super) fn for_module(
             .map(str::to_owned),
         );
     }
+    if module == "mv_recovery" && name == "mv/current-dependency-recheck" {
+        paths.extend(
+            [
+                "novarocks/spi/src/connector/**",
+                "novarocks/connector-contract/**",
+                "novarocks/connector/iceberg/**",
+                "novarocks/failure-contract/**",
+                "tests/system-test-runner/src/scenarios/mv_control_plan.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7_documents.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7_documents/wire.rs",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
     if module == "distributed_writer" {
         paths.extend(
             [

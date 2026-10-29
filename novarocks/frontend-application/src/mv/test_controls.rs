@@ -1110,7 +1110,11 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
             let phase = text("phase")?;
             if !matches!(
                 phase,
-                "data-prepared" | "write-committed" | "publication-committed"
+                "source-pinned"
+                    | "source-prepared"
+                    | "data-prepared"
+                    | "write-committed"
+                    | "publication-committed"
             ) {
                 return Err("MV recovery grant has invalid phase".into());
             }

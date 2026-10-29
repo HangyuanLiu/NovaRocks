@@ -222,6 +222,13 @@ fn receive_prepared_source_result(
     result.map_err(provider_error)
 }
 
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone)]
+struct SourceWindowControl {
+    controls: Arc<crate::mv::test_controls::MvTestControls>,
+    target: novarocks_sql::planning::mv::SqlMvTarget,
+}
+
 pub(crate) struct MvRefreshPreparationIo {
     state: Mutex<Option<State>>,
     poisoned: AtomicBool,
@@ -234,6 +241,8 @@ pub(crate) struct MvRefreshPreparationIo {
     source_result: Mutex<Option<SourceReceiving>>,
     current_metadata_cpu: Arc<crate::mv::domain::staged_create::CurrentProjectionMetadataCpu>,
     sources: Arc<CapturedRefreshSources>,
+    #[cfg(novarocks_dev_controls)]
+    source_window_control: Option<SourceWindowControl>,
 }
 
 struct Loan<'a> {
@@ -277,7 +286,29 @@ impl MvRefreshPreparationIo {
             source_result: Mutex::new(None),
             current_metadata_cpu,
             sources: Arc::new(CapturedRefreshSources::default()),
+            #[cfg(novarocks_dev_controls)]
+            source_window_control: None,
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_source_window_control(
+        mut self,
+        controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
+    ) -> Result<Self, novarocks_query_application::session_error::QueryServiceError> {
+        if let Some(controls) = controls {
+            if target.catalog.is_none() {
+                return Err(
+                    novarocks_query_application::session_error::QueryServiceError::new(
+                        novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+                        "MV source-window control requires its resolved target catalog",
+                    ),
+                );
+            }
+            self.source_window_control = Some(SourceWindowControl { controls, target });
+        }
+        Ok(self)
     }
 
     pub(crate) async fn refresh_graph(
@@ -345,6 +376,8 @@ impl MvRefreshPreparationIo {
                 unreachable!()
             };
             let services = Arc::clone(&self.services);
+            #[cfg(novarocks_dev_controls)]
+            let source_window_control = self.source_window_control.clone();
             let original = self.original.clone();
             let admission = Arc::clone(&self.admission);
             let registration = Arc::clone(&self.registration);
@@ -493,6 +526,30 @@ impl MvRefreshPreparationIo {
                         request,
                         context,
                     } => {
+                        #[cfg(novarocks_dev_controls)]
+                        if let Some(control) = &source_window_control {
+                            // The original driver is servicing its named SourceRead
+                            // after the reader worker joined, before Provider prepare.
+                            if let Err(error) = control
+                                .controls
+                                .recovery_async(
+                                    control
+                                        .target
+                                        .catalog
+                                        .as_deref()
+                                        .expect("resolved control target"),
+                                    &control.target.database,
+                                    &control.target.name,
+                                    "source-pinned",
+                                )
+                                .await
+                            {
+                                return Response::SourceRead(Err(ConnectorError::new(
+                                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                                    error,
+                                )));
+                            }
+                        }
                         let cpu = match services.cpu.planning_metadata_cpu_port(
                             &services.scope,
                             services.window.clone(),

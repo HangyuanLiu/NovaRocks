@@ -9,11 +9,19 @@ date: 2026-10-29
 provenance:
   - "discussion: 2026-10-29 typed window preparation, frozen source endpoints and execution observations"
 code-anchors:
-  - "novarocks/frontend-application/src/mv/domain/refresh/rewrite_context.rs (observe_and_admit_change_window_for_table_original)"
+  - "novarocks/spi/src/connector/read_stack/adapter/mod.rs (BoundSourcePreparation, project_prepared_source_read)"
+  - "novarocks/frontend-application/src/query_execution/mv_assembly/refresh_preparation/captured_sources.rs (CapturedRefreshSource)"
+  - "novarocks/frontend-application/src/query_execution/mv_assembly/refresh_preparation/io_gate.rs (MvRefreshPreparationIo)"
+  - "novarocks/frontend-application/src/mv/domain/refresh/rewrite_context.rs (project_prepared_change_window_for_table_original)"
   - "novarocks/frontend-application/src/query_execution/mv_assembly/query_local_bindings.rs (validate_source_revisions_original)"
-  - "novarocks/frontend-application/src/query/mv_action.rs (MvActionSource)"
+  - "novarocks/frontend-application/src/query_execution/provider_read_facts.rs (open_relation)"
+  - "novarocks/frontend-application/src/query_execution/attempt_initialization.rs (ProductionSourceOpening)"
+  - "novarocks/frontend-application/src/query/mv_action.rs (MvCommandOriginal)"
   - "novarocks/frontend-application/src/query/statement_computation.rs (StatementComputation)"
-  - "novarocks/connector/iceberg/src/typed_boundary.rs (change_window_split_source)"
+  - "novarocks/connector/iceberg/src/typed_boundary.rs (project_prepared_source_read, begin_get_splits)"
+  - "novarocks/connector/iceberg/src/catalog_control/statistics/scoped_prepared_source.rs (IcebergPreparedSourceRead)"
+  - "novarocks/connector/iceberg/src/catalog_control/statistics/scoped_prepared_split.rs (Work, drive_prepared_split)"
+  - "novarocks/connector/iceberg/src/typed_read/prepared_source_proof.rs (validate_prepared_endpoint, validate_referenced_specs)"
   - "novarocks/connector/iceberg/src/metadata_context.rs (observe_table_original_for_request_with_snapshots_async)"
   - "novarocks/connector/iceberg/src/read_snapshot.rs (observe_read_files_original)"
 ---
@@ -39,9 +47,9 @@ code-anchors:
 
 `read_snapshot::observe_read_files_original` 已核选中物理视图的 UUID，也核整份 metadata 与冻结 domain 的一致性。这个哈希可证明同一冻结解释内部一致，不能用来要求一次新观察的整表 metadata 完全不变。`IcebergMetadataContext::observe_table_original_for_request_with_snapshots_async` 是实际绕过 request/generation 缓存的观察作者；凭据续期后返回冻结 Table 的 access 重建不是替代品。
 
-原 `MvActionSource` 的 positive MetadataIoAdmission 是 Internal 计算可续接的实际 IO 作者。实现本条时，应沿 `StatementComputation`、私有 launcher/factory 与原 attempt context 传递同一能力，保原 Source 的 progress 与实际 quiescence；不能从 scope/window 或凭据另造授权。
+MV action 的原 `MvCommandOriginal` 所持 positive MetadataIoAdmission 是 Internal 计算可续接的实际 IO 作者。当前接线沿 `StatementComputation`、私有 launcher/factory 与原 attempt context 续同一能力；`ProductionSourceOpening` 保管实际 preparation packet、原始结果与 close。原 Source 的 progress 与实际 quiescence 仍分别取证，不能从 scope/window 或凭据另造授权。
 
-本条记录已接受的长期设计。上述代码锚点包括迁移前接缝；新增单次准备与执行观察尚待实现和验证，不能据 `status: active` 声称产品已满足本条。
+本条记录已接受的长期设计。当前源码已接通 `CapturedRefreshSource` 的完成事实库存、Provider 单次 typed 准备、FE 同步策略/关系投影，以及实际 fresh 观察、端点证明和冻结 split 规划。`scoped_prepared_source`、`scoped_prepared_split` 与 `prepared_source_proof` 是当前 MV 路径的规范作者；原 `change_window_split_source` 留给普通 typed ChangeWindow/TVF，不是 MV 准备的 fallback。源码接线不提供 B1b plan v5 的 F/G/H、完整原生或最终验收的完成资格；这些范围仍按各自实际结果、原始失败和收尾证据独立核对，不能据 `status: active` 声称产品已满足本条。
 
 ## 考虑过的选项
 
@@ -64,7 +72,7 @@ code-anchors:
 
 **漂移与晚期失败。** 准备及执行均以 typed 错误拒绝对象 UUID 替换；后果交 MV application。准备时端点丢失/非祖先按既定能力产生 FullRebuild 原因或 typed 错误；执行期才发现端点不可见/解释漂移，本轮失败，不改读最新端点、不静默转 full 或空结果。后续位置变化不直接拒绝，实际旧依赖访问失败仍失败。授权在原语句准入和准确请求 scope 各自成立，权限撤销造成的 IO 失败保原原因。
 
-**原资源与责任。** 准备仍沿原 CPU、MIO、稳定 raw receiving、retention 与完整依赖域。Internal 计算从原 Source 续同 MIO port，Source 强持并驱动、factory 弱借，不复活已关闭 prepare gate，不新增池/额度/位置。新观察的 child Future、原始结果与析构实际退出前不宣称 quiescent；取消/timeout/Ready 不代替退出。冻结事实与并存峰按原预算付费，句柄或 Arc 不自行授容量。
+**原资源与责任。** 准备仍沿原 CPU、MIO、稳定 raw receiving、retention 与完整依赖域。Internal 计算从原 Source 续同 MIO port，Source 强持并驱动、factory 弱借，不复活已关闭 prepare gate，不新增池/额度/位置。新观察的 child Future、原始结果与析构实际退出前不宣称 quiescent；取消/timeout/Ready 不代替退出。冻结事实与并存峰按原预算付费，句柄或 Arc 不自行授容量。完成的 source receipt 独立拥有不可变事实及其数据，不强持准备时的 per-request Provider、request-bound Table/FileIO 或旧请求库存；同 exact binding 与 incarnation 的新请求仅从这些事实投影。原 Root、planning lease、access/split Source 继续分别保管实际授权、请求作用域、活跃资源和真实 close，resource-free 事实不授予或替代这些能力。
 
 **完整发现与可选复用。** 对需要端点比较并执行 Delta 的窗口，当前保留准备一次、执行一次的两端完整发现。lineage 已闭合的 MetadataOnly/FullRebuild 保原分类，不为取得 Delta 句柄强行枚举不可用的 From。物理复用可选，只限 Provider 内同 attempt/同窗口，且 descriptor 与继承上下文、完整 delete、From 先错顺序、真实容量全部成立；否则执行自行发现。不是固定两次网络请求，不跨 attempt 保存，不跳共同 manifest，不做差集或 lineage 相消。
 
