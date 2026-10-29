@@ -44,7 +44,7 @@ pub mod compare;
 pub mod hash;
 mod prepared;
 pub mod selected;
-pub use prepared::{OwnedBytesPage, PreparedBytes};
+pub use prepared::{OwnedBytesPage, OwnedPreparedBytes, PreparedBytes};
 
 pub(crate) const ROW_BLOCK: usize = 1024;
 pub(crate) const BYTE_BLOCK: usize = 64 * 1024;
