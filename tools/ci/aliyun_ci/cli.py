@@ -196,8 +196,10 @@ def execute(config, args):
             raise ValueError('source archive differs from the exact preparation commit')
         plan = load_plan(config, args)
         retain_plan(args, plan)
+        from .image_tools import stage_nextest
+        nextest = stage_nextest(config, oss, expected, plan.deadline)
         return build_image(config, plan, ecs, oss,
-                 preparation_sha=args.preparation_sha, source_archive=args.source_archive.read_bytes()), 0
+                 preparation_sha=args.preparation_sha, source_archive=expected, nextest=nextest), 0
     if args.command == 'promote-image':
         from .image import promote_image
         return promote_image(config, oss, args.image_id, args.summary_key), 0

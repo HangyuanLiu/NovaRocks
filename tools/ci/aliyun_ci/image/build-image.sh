@@ -25,6 +25,21 @@ preparation_sha=${2:?preparation SHA is required}
 if ! id runner >/dev/null 2>&1; then
   useradd --create-home --home-dir /var/lib/novarocks-ci/runner --shell /bin/bash runner
 fi
+# Seed the native owner's pinned cache from the operator's verified OSS copy.
+# The installer still checks both archive and executable digests from its inputs.
+if [ -n "${3:-}" ]; then
+  nextest_cache=$(python3 - "$source_root" "$3" <<'PY_NEXTEST'
+import hashlib,json,sys
+from pathlib import Path
+item=json.loads((Path(sys.argv[1])/'tools/dev/linux-env.inputs.json').read_text())['nextest']
+if hashlib.file_digest(Path(sys.argv[2]).open('rb'),'sha256').hexdigest()!=item['sha256']:
+    raise SystemExit('Staged nextest archive SHA-256 differs')
+print('nextest-'+item['version']+'-'+item['sha256'])
+PY_NEXTEST
+)
+  install -d -o runner -g runner -m 0755 /var/lib/novarocks-ci/runner/.cache/novarocks/linux-env
+  install -o runner -g runner -m 0644 "$3" "/var/lib/novarocks-ci/runner/.cache/novarocks/linux-env/$nextest_cache"
+fi
 install -d -m 0755 /opt/novarocks-ci /opt/novarocks-ci/tools-source/tools
 install -d -g runner -m 0750 /var/log/novarocks-ci
 install -g runner -m 0640 /dev/null /var/log/novarocks-ci/bootstrap.log

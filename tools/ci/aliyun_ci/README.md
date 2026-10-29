@@ -40,7 +40,9 @@ python3 -m unittest discover -s aliyun_ci/tests -t . -v
 
 ## 镜像与执行边界
 
-基础是部署地域的官方 Ubuntu 26.04 amd64 公共镜像，准确 ImageId 必须由维护者填入 `base_image_id`。镜像提供 G19 工具模式、平台 venv、引导/上传/watcher、Runner 原生依赖与只读检查定义，不提供产品 fixture、Docker、源码 checkout、target、Runner 注册或凭证。Runner 包每日从官方 release 校验后同步 OSS，启动时按准确版本与 SHA-256 下载；镜像不会随 Runner 发布自动失效。账户 HOME 是 `/var/lib/novarocks-ci/runner`，Runner runtime 是 `agent/` 子目录。
+基础是部署地域的官方 Ubuntu 26.04 amd64 公共镜像，准确 ImageId 必须由维护者填入 `base_image_id`。制作时开发机按准备源码中锁定的nextest归档摘要校验并不可变暂存OSS，builder只将准确文件交给G19原缓存；原安装器仍核验归档和可执行文件，不依赖builder直连GitHub。镜像捕获前清除云助手中带限时签名能力的历史脚本并读回零残留。
+
+镜像提供 G19 工具模式、平台 venv、引导/上传/watcher、Runner 原生依赖与只读检查定义，不提供产品 fixture、Docker、源码 checkout、target、Runner 注册或凭证。Runner 包每日从官方 release 校验后同步 OSS，启动时按准确版本与 SHA-256 下载；镜像不会随 Runner 发布自动失效。账户 HOME 是 `/var/lib/novarocks-ci/runner`，Runner runtime 是 `agent/` 子目录。
 
 已登记的候选镜像可以直接启动。start 核对镜像身份和实例的自动释放时间后才发布 JIT；机器上的只读检查失败就结束，清理由 teardown 执行。`promote-image` 记录已有的工具检查通过事实，不再是首次启动门，也不自动修改仓库变量。
 

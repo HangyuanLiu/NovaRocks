@@ -96,7 +96,7 @@ def scrub_command_history(directory='/usr/local/share/aliyun-assist/work/script'
 
 
 def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: bytes,
-                now=None, sleep=time.sleep):
+                now=None, sleep=time.sleep, nextest=None):
     if plan.role != 'builder':
         raise ValueError('image creation requires a builder identity')
     if not re.fullmatch(r'[0-9a-f]{40}', preparation_sha):
@@ -114,14 +114,21 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
                                   user_data={'role': 'builder', 'deadline': plan.deadline})
         wait_running(config, plan, ecs, instance_id, config['base_image_id'], now=now, sleep=sleep)
         # This command contains only a public-source, bounded read capability.
+        tool_commands = []
+        tool_argument = ''
+        if nextest is not None:
+            tool_commands = [f'curl --fail --location --output \"$work/nextest.tar.gz\" {shlex.quote(nextest["url"])}',
+                f'printf \"%s  %s\\n\" {shlex.quote(nextest["sha256"])} \"$work/nextest.tar.gz\" | sha256sum -c -']
+            tool_argument = ' \"$work/nextest.tar.gz\"'
         script = '\n'.join(['set -eu', 'work=$(mktemp -d /var/tmp/novarocks-image.XXXXXX)',
             'trap \'rm -rf "$work"\' EXIT',
             f'curl --fail --location --output "$work/source.tar" {shlex.quote(url)}',
             f'printf "%s  %s\\n" {shlex.quote(digest)} "$work/source.tar" | sha256sum -c -',
             'mkdir "$work/source"', 'tar -xf "$work/source.tar" -C "$work/source"',
-            f'set +e; "$work/source/tools/ci/aliyun_ci/image/build-image.sh" "$work/source" {preparation_sha} > /var/log/novarocks-ci-image-build.log 2>&1',
+            *tool_commands,
+            f'set +e; "$work/source/tools/ci/aliyun_ci/image/build-image.sh" "$work/source" {preparation_sha}{tool_argument} > /var/log/novarocks-ci-image-build.log 2>&1',
             'build_exit=$?; set -e',
-            f'curl --fail --silent --show-error --request PUT --data-binary @/var/log/novarocks-ci-image-build.log {shlex.quote(build_log_url)} >/dev/null',
+            f'curl --fail --silent --show-error --header \'Content-Type:\' --request PUT --data-binary @/var/log/novarocks-ci-image-build.log {shlex.quote(build_log_url)} >/dev/null',
             'exit "$build_exit"'])
         run_command(config, plan, ecs, instance_id, script, now=now, sleep=sleep)
         build_log = oss.get(build_log_key)
@@ -147,6 +154,7 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
                 raise ValueError('created image readback identity mismatch')
             if rows[0]['Status'] == 'Available':
                 release = dict(facts, image_id=image_id, region=config['region'], command_history_hygiene=hygiene,
+                               staged_nextest=None if nextest is None else {k:nextest[k] for k in ('key','sha256')},
                                build_log={'key': build_log_key, 'sha256': hashlib.sha256(build_log).hexdigest()},
                                builder_run={'run_id': plan.run_id, 'run_attempt': plan.run_attempt})
                 oss.put(image_key(config, image_id, 'release.json'),
