@@ -327,23 +327,73 @@ pub(crate) async fn drive_read_snapshot(
     source: &Arc<IcebergMetadataCpuOriginal>,
     cpu: &Arc<dyn ProviderMetadataCpuPort>,
 ) -> Result<(), ConnectorError> {
-    loop {
-        let mut input = Some(ProviderMetadataCpuInput(source.clone()));
-        cpu.submit_metadata_in(&mut input)?;
-        std::future::poll_fn(|cx| cpu.poll_finished(cx)).await?;
-        let mut loan = BodyLoan::take(source);
-        let original = loan.body.as_mut().unwrap();
-        let CpuBody::ReadSnapshot(body) = &mut original.body else {
-            return Err(invalid("foreign snapshot CPU body"));
-        };
-        if body.result.is_some() {
-            return Ok(());
+    drive_read_snapshot_observed(source, cpu, None).await
+}
+pub(super) async fn drive_change_window_snapshot(
+    source: &Arc<IcebergMetadataCpuOriginal>,
+    cpu: &Arc<dyn ProviderMetadataCpuPort>,
+    snapshot_id: i64,
+) -> Result<(), ConnectorError> {
+    drive_read_snapshot_observed(source, cpu, Some(snapshot_id)).await
+}
+async fn drive_read_snapshot_observed(
+    source: &Arc<IcebergMetadataCpuOriginal>,
+    cpu: &Arc<dyn ProviderMetadataCpuPort>,
+    snapshot_id: Option<i64>,
+) -> Result<(), ConnectorError> {
+    let enabled = snapshot_id.is_some() && tracing::enabled!(tracing::Level::INFO);
+    let started = enabled.then(std::time::Instant::now);
+    let mut cpu_wall = std::time::Duration::ZERO;
+    let mut fulfill_wall = std::time::Duration::ZERO;
+    let mut cpu_completions = 0_u64;
+    let mut fulfills = 0_u64;
+    let result = async {
+        loop {
+            let mut input = Some(ProviderMetadataCpuInput(source.clone()));
+            let cpu_started = enabled.then(std::time::Instant::now);
+            cpu.submit_metadata_in(&mut input)?;
+            std::future::poll_fn(|cx| cpu.poll_finished(cx)).await?;
+            if let Some(cpu_started) = cpu_started {
+                cpu_wall = cpu_wall.saturating_add(cpu_started.elapsed());
+                cpu_completions = cpu_completions.saturating_add(1);
+            }
+            let mut loan = BodyLoan::take(source);
+            let original = loan.body.as_mut().unwrap();
+            let CpuBody::ReadSnapshot(body) = &mut original.body else {
+                return Err(invalid("foreign snapshot CPU body"));
+            };
+            if body.result.is_some() {
+                return Ok(());
+            }
+            let fulfill_started = enabled.then(std::time::Instant::now);
+            body.gate.fulfill(&body.io, &body.context).await?;
+            if let Some(fulfill_started) = fulfill_started {
+                fulfill_wall = fulfill_wall.saturating_add(fulfill_started.elapsed());
+                fulfills = fulfills.saturating_add(1);
+            }
+            // Only this successful original I/O delivery permits the next pure
+            // continuation. The previous physical CPU/forwarder has actually joined.
+            original.started = false;
         }
-        body.gate.fulfill(&body.io, &body.context).await?;
-        // Only this successful original I/O delivery permits the next pure
-        // continuation. The previous physical CPU/forwarder has actually joined.
-        original.started = false;
     }
+    .await;
+    if let Some(started) = started {
+        // Completion wall includes admission, queue, run, footer and actual
+        // join/resume. Fulfill wall includes size, reservation, read and Drop.
+        // Failed/abandoned turns do not acquire a successful completion count.
+        tracing::info!(
+            snapshot_id = ?snapshot_id,
+            total_wall_seconds = started.elapsed().as_secs_f64(),
+            completed_cpu_completion_wall_seconds = cpu_wall.as_secs_f64(),
+            completed_fulfill_wall_seconds = fulfill_wall.as_secs_f64(),
+            cpu_completions,
+            completed_fulfills = fulfills,
+            buckets_complete = result.is_ok(),
+            driver_status = if result.is_ok() { "driver_ok" } else { "driver_err" },
+            "Diagnostic original change-window snapshot driver returned"
+        );
+    }
+    result
 }
 /// One actual cause record plus the caller's coexisting ConnectorError message
 /// clones. SharedFailureCause aliases never clone the original SDK error graph.

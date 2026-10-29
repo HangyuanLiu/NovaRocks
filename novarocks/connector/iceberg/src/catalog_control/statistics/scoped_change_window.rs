@@ -212,6 +212,37 @@ impl IcebergMetadataCpuOriginal {
         self: &Arc<Self>,
         cpu: &Arc<dyn ProviderMetadataCpuPort>,
     ) -> Result<(), ConnectorError> {
+        // Diagnostic clocks observe this same borrowed driver; they never
+        // replace its operation deadline, source or actual-close obligations.
+        let started = tracing::enabled!(tracing::Level::INFO).then(std::time::Instant::now);
+        let window = started.and_then(|_| {
+            let original = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let CpuBody::ChangeWindow(body) = &original.as_ref()?.body else {
+                return None;
+            };
+            match &body.request.selection {
+                novarocks_spi::connector::ConnectorScanSelection::ChangeWindow(window) => {
+                    Some((window.from_exclusive(), window.to_inclusive()))
+                }
+                _ => None,
+            }
+        });
+        let result = self.drive_change_window_original(cpu).await;
+        if let Some(started) = started {
+            tracing::info!(
+                from_snapshot_id = ?window.map(|window| window.0),
+                to_snapshot_id = ?window.map(|window| window.1),
+                total_wall_seconds = started.elapsed().as_secs_f64(),
+                driver_status = if result.is_ok() { "driver_ok" } else { "driver_err" },
+                "Diagnostic original change-window driver returned"
+            );
+        }
+        result
+    }
+    async fn drive_change_window_original(
+        self: &Arc<Self>,
+        cpu: &Arc<dyn ProviderMetadataCpuPort>,
+    ) -> Result<(), ConnectorError> {
         super::run_provider_metadata(cpu, self).await?;
         {
             let mut loan = BodyLoan::take(self);
@@ -280,14 +311,19 @@ impl IcebergMetadataCpuOriginal {
             }
         }
         for index in 0..2 {
-            let snapshot = {
+            let (snapshot, snapshot_id) = {
                 let mut loan = BodyLoan::take(self);
                 let CpuBody::ChangeWindow(body) = &mut loan.body.as_mut().unwrap().body else {
                     return Err(invalid("foreign change-window source"));
                 };
-                body.snapshots[index].as_ref().unwrap().clone()
+                let window = body.prepared.as_ref().unwrap().window;
+                (
+                    body.snapshots[index].as_ref().unwrap().clone(),
+                    [window.from_exclusive(), window.to_inclusive()][index],
+                )
             };
-            super::scoped_snapshot::drive_read_snapshot(&snapshot, cpu).await?;
+            super::scoped_snapshot::drive_change_window_snapshot(&snapshot, cpu, snapshot_id)
+                .await?;
             let mut loan = BodyLoan::take(self);
             let CpuBody::ChangeWindow(body) = &mut loan.body.as_mut().unwrap().body else {
                 return Err(invalid("foreign change-window source"));
