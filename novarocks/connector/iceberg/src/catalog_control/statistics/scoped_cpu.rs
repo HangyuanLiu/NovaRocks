@@ -39,6 +39,7 @@ mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
+    ViewListing(Box<crate::catalog_control::views::async_listing::Work>),
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
     ChangeWindow(Box<scoped_change_window::ChangeWindowBody>),
     Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
@@ -120,6 +121,51 @@ impl Drop for BodyLoan<'_> {
     }
 }
 impl IcebergMetadataCpuOriginal {
+    pub(crate) fn view_listing(
+        provider: IcebergMetadata,
+        request: novarocks_spi::connector::ConnectorListViewsRequest,
+    ) -> Arc<Self> {
+        Self::new(
+            provider.descriptor().clone(),
+            provider.incarnation(),
+            CpuBody::ViewListing(Box::new(
+                crate::catalog_control::views::async_listing::Work::new(provider, request),
+            )),
+        )
+    }
+    pub(crate) fn view_listing_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        let original = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let CpuBody::ViewListing(work) = &original.as_ref().expect("same listing source").body
+        else {
+            panic!("same view listing source")
+        };
+        work.context().clone()
+    }
+    pub(crate) fn view_listing_receive(&self, raw: Result<Vec<u8>, ConnectorError>) {
+        let mut loan = BodyLoan::take(self);
+        let original = loan.body.as_mut().unwrap();
+        let CpuBody::ViewListing(work) = &mut original.body else {
+            panic!("same view listing source")
+        };
+        work.receive(raw);
+        original.started = false;
+    }
+    pub(crate) fn view_listing_error(&self) -> Option<ConnectorError> {
+        let original = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let CpuBody::ViewListing(work) = &original.as_ref().expect("same listing source").body
+        else {
+            panic!("same view listing source")
+        };
+        work.error()
+    }
+    pub(crate) fn view_listing_next(&self) -> crate::catalog_control::views::async_listing::Next {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::ViewListing(work) = &mut loan.body.as_mut().unwrap().body else {
+            panic!("same view listing source")
+        };
+        work.next()
+    }
+
     pub(crate) fn compaction_source(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
         incarnation: novarocks_spi::connector::ProviderBindingEpoch,
@@ -309,6 +355,7 @@ impl IcebergMetadataCpuOriginal {
         assert!(!original.started, "one original Statistics CPU execution");
         original.started = true;
         match &mut original.body {
+            CpuBody::ViewListing(work) => work.run(),
             CpuBody::Compaction(work) => work.run(),
             CpuBody::ChangeWindow(body) => body.run(),
             CpuBody::Cleanup(work) => work.run(),
@@ -622,6 +669,19 @@ impl novarocks_spi::connector::StatisticsReadCpuSource for IcebergMetadataCpuOri
     }
 }
 
+impl crate::catalog::listing_admission::ListingOriginalError for IcebergMetadataCpuOriginal {
+    fn selected_error(&self) -> Option<ConnectorError> {
+        // A loaned body has not published a result at this same mutex. Do not
+        // wait for CPU/footer exit and then overwrite an already chosen stop.
+        let original = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let original = original.as_ref()?;
+        match &original.body {
+            CpuBody::ViewListing(work) => work.error(),
+            _ => None,
+        }
+    }
+}
+
 impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuOriginal {
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
         &self.descriptor
@@ -636,6 +696,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                 matches!(
                     &body.as_ref().expect("same metadata source").body,
                     CpuBody::MetadataBinding { .. }
+                        | CpuBody::ViewListing(_)
                         | CpuBody::ChangeWindow(_)
                         | CpuBody::ReadSnapshot(_)
                         | CpuBody::Cleanup(_)
@@ -664,7 +725,10 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
     // Read and change-window bodies are mutually exclusive; the nested
     // snapshot Source owns neither parent packet.
     let parent_body = std::mem::size_of::<scoped_read::ReadBody>()
-        .max(std::mem::size_of::<scoped_change_window::ChangeWindowBody>());
+        .max(std::mem::size_of::<scoped_change_window::ChangeWindowBody>())
+        .max(std::mem::size_of::<
+            crate::catalog_control::views::async_listing::Work,
+        >());
     header
         .checked_mul(2)
         .and_then(|n| n.checked_add(parent_body))
