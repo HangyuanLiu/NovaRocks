@@ -669,9 +669,9 @@ mod tests {
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 10);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 11);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 9);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 10);
     }
     #[test]
     fn arrow_selection_and_time_semantics_cut_off_the_previous_epoch() {
@@ -688,6 +688,23 @@ mod tests {
         };
         assert_ne!(NATIVE_COMPAT_EPOCH, 8);
         assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(8).id());
+    }
+
+    #[test]
+    fn complete_write_runtime_does_not_share_the_upstream_value_epoch() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        assert_ne!(NATIVE_COMPAT_EPOCH, 9);
+        assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(9).id());
     }
 
     #[test]

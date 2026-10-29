@@ -23,8 +23,8 @@
 
 use super::{ConnectorReadBinding, ConnectorReadChangeWindow, OpaquePayload, SchemaTableName};
 use crate::connector::{
-    ConnectorChangeWindowAdmission, ConnectorExactSemanticRevision, ConnectorTableMetadata,
-    ConnectorTableObjectId,
+    ConnectorChangeWindowAdmission, ConnectorExactSemanticRevision, ConnectorProcessLocalPayload,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableObjectId,
 };
 use std::sync::Arc;
 
@@ -40,6 +40,8 @@ pub enum ConnectorReadSourceSelection {
 #[derive(Clone, Debug)]
 pub struct ConnectorReadSourcePreparationRequest {
     name: SchemaTableName,
+    observed_table: ConnectorTableHandle,
+    observed_source_facts: ConnectorProcessLocalPayload,
     object_id: ConnectorTableObjectId,
     selection: ConnectorReadSourceSelection,
     from_revision: Option<ConnectorExactSemanticRevision>,
@@ -49,12 +51,16 @@ pub struct ConnectorReadSourcePreparationRequest {
 impl ConnectorReadSourcePreparationRequest {
     pub fn snapshot(
         name: SchemaTableName,
+        observed_table: ConnectorTableHandle,
+        observed_source_facts: ConnectorProcessLocalPayload,
         object_id: ConnectorTableObjectId,
         snapshot_id: i64,
         revision: ConnectorExactSemanticRevision,
     ) -> Self {
         Self {
             name,
+            observed_table,
+            observed_source_facts,
             object_id,
             selection: ConnectorReadSourceSelection::Snapshot(snapshot_id),
             from_revision: None,
@@ -64,6 +70,8 @@ impl ConnectorReadSourcePreparationRequest {
 
     pub fn change_window(
         name: SchemaTableName,
+        observed_table: ConnectorTableHandle,
+        observed_source_facts: ConnectorProcessLocalPayload,
         object_id: ConnectorTableObjectId,
         window: ConnectorReadChangeWindow,
         from_revision: ConnectorExactSemanticRevision,
@@ -71,6 +79,8 @@ impl ConnectorReadSourcePreparationRequest {
     ) -> Self {
         Self {
             name,
+            observed_table,
+            observed_source_facts,
             object_id,
             selection: ConnectorReadSourceSelection::ChangeWindow(window),
             from_revision: Some(from_revision),
@@ -80,6 +90,20 @@ impl ConnectorReadSourcePreparationRequest {
 
     pub const fn name(&self) -> &SchemaTableName {
         &self.name
+    }
+
+    /// The exact observation which authored this pin. A later Current lookup
+    /// cannot replace its schema fallback, defaults or interpretation facts.
+    /// The original caller retains the full metadata and its storage lifetime.
+    pub const fn observed_table(&self) -> &ConnectorTableHandle {
+        &self.observed_table
+    }
+
+    /// Non-secret original observation facts. The Provider validates their
+    /// exact generation, private type and agreement with observed_table before
+    /// using them; these facts never authorize a metadata or storage request.
+    pub const fn observed_source_facts(&self) -> &ConnectorProcessLocalPayload {
+        &self.observed_source_facts
     }
 
     pub const fn object_id(&self) -> &ConnectorTableObjectId {
@@ -107,7 +131,7 @@ pub enum ConnectorReadSourceProjection {
     Delta,
 }
 
-// Design: ADR-0205 (docs/adr/ADR-0205-single-prepared-change-window-and-frozen-source-endpoints.md)
+// Design: ADR-0207 (docs/adr/ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md)
 #[derive(Clone)]
 pub struct ConnectorPreparedSourceRead {
     binding: ConnectorReadBinding,

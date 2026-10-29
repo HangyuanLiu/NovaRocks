@@ -608,6 +608,13 @@ impl State {
                     owner
                         .result_window_alias()
                         .ok_or_else(|| contract("SHOW Local delivery is absent"))?,
+                    *self
+                        .input
+                        .as_ref()
+                        .expect("same SHOW input")
+                        .request
+                        .session()
+                        .presentation(),
                 )
                 .map_err(contract)?,
             );

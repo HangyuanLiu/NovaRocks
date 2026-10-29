@@ -1,5 +1,5 @@
 ---
-id: ADR-0203
+id: ADR-0205
 title: "Logical write counts, physical routing and strict stream delivery are independent contracts"
 domain: [pipeline-execution, frontend-dml]
 status: active

@@ -353,8 +353,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
   WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results
   合流和准确 source-bound summary，不再为 summary 构建竞争同一 receiver 的第二个 Source。
-  核心契约见 [ADR-0203](docs/adr/ADR-0203-logical-write-counts-and-strict-stream-delivery.md)，
-  冻结放置、Task 绑定与完成装配见 [ADR-0204](docs/adr/ADR-0204-frozen-write-placement-and-task-completion-assembly.md)。
+  核心契约见 [ADR-0205](docs/adr/ADR-0205-logical-write-counts-and-strict-stream-delivery.md)，
+  冻结放置、Task 绑定与完成装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.

@@ -591,7 +591,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
             crate::native::data_runtime::FrontendDataRuntime,
         ),
-        io: &MetadataIoAdmission,
+        io: &Arc<MetadataIoAdmission>,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {
@@ -609,7 +609,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
             crate::native::data_runtime::FrontendDataRuntime,
         ),
-        io: &MetadataIoAdmission,
+        io: &Arc<MetadataIoAdmission>,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {
@@ -657,6 +657,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
                     &mut self.computation,
                     self.admission.owner_slot(),
                     &capacity,
+                    io,
                     &mut self.original,
                     #[cfg(novarocks_dev_controls)]
                     self.observation.clone(),
@@ -966,6 +967,7 @@ mod tests {
             _: &mut Option<crate::query_execution::logical_execution::PreparedLogicalComputation>,
             _: &mut Option<WorkOwner>,
             _: &QueryResultCapacityBinding,
+            _: &Arc<MetadataIoAdmission>,
             _: &mut OriginalComputationStart,
             #[cfg(novarocks_dev_controls)] _: Option<
                 crate::preparation_diagnostics::StatementObservationHandle,

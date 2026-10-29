@@ -1,5 +1,5 @@
 ---
-id: ADR-0204
+id: ADR-0206
 title: "Frozen write placement, actual drivers and exact Task completion compose before publication"
 domain: [pipeline-execution, distributed-query-lifecycle, frontend-dml]
 status: active
@@ -38,7 +38,7 @@ code-anchors:
 
 同一逻辑变化可以进入多个 Provider route。每个 route 的共置要求、实际实例集合和 driver 数量各有自己的事实；逻辑受影响行数既不等于物理写行数，也不等于某个固定 target 子集之和。纯计划只有要求和语义，不能取得 live sender、writer 或 Task-local accumulator。
 
-[ADR-0203](ADR-0203-logical-write-counts-and-strict-stream-delivery.md) 固定了计数、严格消费和公平双输入的算子核契约；其正文保留当时装配尚未完成的阶段事实。本条补充当前装配规则，不替代该核，也不改写历史正文。[ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 的统一逻辑执行、原始 custody、计算就绪与独立 publication 继续适用。本条记录已组装的责任，不能据此推断完整 Native 分布式验收、性能收益或容量上界已经验证。
+[ADR-0205](ADR-0205-logical-write-counts-and-strict-stream-delivery.md) 固定了计数、严格消费和公平双输入的算子核契约；其正文保留当时装配尚未完成的阶段事实。本条补充当前装配规则，不替代该核，也不改写历史正文。[ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 的统一逻辑执行、原始 custody、计算就绪与独立 publication 继续适用。本条记录已组装的责任，不能据此推断完整 Native 分布式验收、性能收益或容量上界已经验证。
 
 | 实体 | 唯一拥有的事实 | 不提供的证明 |
 |---|---|---|

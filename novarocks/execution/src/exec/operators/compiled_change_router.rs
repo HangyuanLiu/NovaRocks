@@ -18,7 +18,7 @@
 //! An effect-validated, strict fanout over the original compiled input layout.
 //! Each branch's DataStreamSink performs its own frozen wire projection. Keeping
 //! the complete root input here preserves compiled partition-root bindings.
-// Design: ADR-0203 (docs/adr/ADR-0203-logical-write-counts-and-strict-stream-delivery.md)
+// Design: ADR-0205 (docs/adr/ADR-0205-logical-write-counts-and-strict-stream-delivery.md)
 use super::{
     compiled_writer_failure::contract,
     data_stream_sink::take_partition_rows_created,

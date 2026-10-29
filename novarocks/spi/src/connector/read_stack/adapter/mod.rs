@@ -798,6 +798,9 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
         owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
     ) -> super::runtime::ConnectorPreparedSourceReadFuture<'a> {
         Box::pin(async move {
+            if request.observed_table().owner() != &self.provider.descriptor().instance_id {
+                return Err(binding_error());
+            }
             let prepared = self
                 .provider
                 .prepare_source_read(session, request, cpu, original, owner)
@@ -2303,16 +2306,32 @@ mod tests {
             .unwrap()
         };
         let name = SchemaTableName::try_new("db", "source").unwrap();
+        let observation = crate::connector::ConnectorProcessLocalPayload::new(
+            crate::connector::ConnectorProviderBindingKey {
+                instance_id: adapter.provider.descriptor.instance_id.clone(),
+                incarnation: crate::connector::ProviderBindingEpoch::from_bytes([1; 16]),
+            },
+            Arc::new(41_i64),
+        );
         let request = if admission.is_some() {
             ConnectorReadSourcePreparationRequest::change_window(
                 name,
+                prepared_source_metadata(adapter).table.clone(),
+                observation,
                 object.clone(),
                 ConnectorReadChangeWindow::new(40, 41),
                 revision(40),
                 revision(41),
             )
         } else {
-            ConnectorReadSourcePreparationRequest::snapshot(name, object.clone(), 41, revision(41))
+            ConnectorReadSourcePreparationRequest::snapshot(
+                name,
+                prepared_source_metadata(adapter).table.clone(),
+                observation,
+                object.clone(),
+                41,
+                revision(41),
+            )
         };
         super::super::ConnectorPreparedSourceRead::new(
             adapter.binding.clone(),

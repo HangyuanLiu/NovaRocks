@@ -24,7 +24,7 @@ use novarocks_query_application::{
     admitted_query_context::{QueryResultCapacityBinding, RequestAdmission},
     api::BackendTopologySnapshot,
     cpu::QueryBlockingExecutorConfig,
-    session_control::{SessionToken, StatementToken},
+    session_control::{ClientSessionKey, SessionToken, StatementToken},
     view::QueryViewService,
 };
 use novarocks_workload_control::{
@@ -139,13 +139,14 @@ impl Fixture {
             cancellation.clone(),
             Default::default(),
             Default::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ))
         .with_result_capacity(QueryResultCapacityBinding::try_new(&scope, origin.clone()).unwrap())
         .unwrap();
         let command = CommandContext::new(
             scope.clone(),
             crate::connector::test_request_context(),
-            StatementToken::new(SessionToken::new(913, 17), 1),
+            StatementToken::new(SessionToken::new(ClientSessionKey::new(17).unwrap()), 1),
             "test-principal",
         )
         .with_result_window(origin.clone())
@@ -194,7 +195,14 @@ impl Fixture {
                 lease: None,
                 names: None,
                 raw: None,
-                producer: Some(LocalResultProducer::try_new(&scope, origin.clone()).unwrap()),
+                producer: Some(
+                    LocalResultProducer::try_new(
+                        &scope,
+                        origin.clone(),
+                        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                    )
+                    .unwrap(),
+                ),
                 result: None,
             })),
             cpu_unreturned: AtomicBool::new(false),
@@ -465,7 +473,7 @@ async fn held_provider_root_deadline_and_kill_keep_query_verdict_and_raw_outcome
             tokio::time::sleep_until(deadline).await;
         } else {
             fixture.root.owner.cancel(CancellationReason::ExplicitKill {
-                requester_connection_id: 23,
+                requester_session: 23,
             });
         }
         {
@@ -618,7 +626,7 @@ async fn original_cpu_receipt_closes_before_cancelled_action_can_release_local()
         );
     }
     fixture.root.owner.cancel(CancellationReason::ExplicitKill {
-        requester_connection_id: 23,
+        requester_session: 23,
     });
     let error = match fixture.business().await {
         Err(e) => e,
@@ -659,7 +667,7 @@ async fn selected_action_ready_success_is_not_revisited_by_residual_cancellation
     };
     assert!(fixture.state.as_ref().unwrap().selected);
     fixture.root.owner.cancel(CancellationReason::ExplicitKill {
-        requester_connection_id: 23,
+        requester_session: 23,
     });
     assert_eq!(
         result.row_count(),
@@ -878,7 +886,7 @@ async fn held_actual_provider_cpu_keeps_the_action_and_local_until_its_footer() 
         );
     }
     fixture.root.owner.cancel(CancellationReason::ExplicitKill {
-        requester_connection_id: 29,
+        requester_session: 29,
     });
     {
         let state = fixture.state.as_mut().unwrap();

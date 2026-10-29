@@ -127,7 +127,6 @@ fn fixture() -> (
                 encoded(binding, ConnectorCodecCategory::ReadTable, 1),
                 encoded(binding, ConnectorCodecCategory::ReadView, 2),
             ),
-
         },
         selection_digest: [8; 32],
         schema: Box::from([RelationField {

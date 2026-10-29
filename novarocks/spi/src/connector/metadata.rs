@@ -1243,9 +1243,21 @@ pub struct ConnectorTableMetadata {
     pub version: Option<Bytes>,
     pub statistics_data_version: Option<StatisticsDataVersion>,
     pub table: ConnectorTableHandle,
+    source_read_facts: Option<super::ConnectorProcessLocalPayload>,
     _source_storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl ConnectorTableMetadata {
+    /// Immutable Provider facts from this exact observation, retained only in
+    /// this process. They may describe frozen metadata and non-secret renewal
+    /// provenance, but must not hold FileIO, credentials, a running Future or
+    /// a resource owner. Facts grant no access; reads obtain their own access.
+    pub fn with_source_read_facts(mut self, facts: super::ConnectorProcessLocalPayload) -> Self {
+        self.source_read_facts = Some(facts);
+        self
+    }
+    pub fn source_read_facts(&self) -> Option<&super::ConnectorProcessLocalPayload> {
+        self.source_read_facts.as_ref()
+    }
     pub fn schema(&self) -> &arrow::datatypes::Schema {
         &self.format_schema
     }
@@ -1303,6 +1315,7 @@ impl ConnectorTableMetadata {
             version: header.version,
             statistics_data_version: header.statistics_data_version,
             table: header.table,
+            source_read_facts: None,
             _source_storage: creation.storage(),
         })
     }
