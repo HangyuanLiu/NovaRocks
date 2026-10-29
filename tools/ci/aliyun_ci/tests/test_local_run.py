@@ -196,6 +196,38 @@ class LocalTests(unittest.TestCase):
                 source=self.source,record_path=self.record,now=lambda:NOW)
         self.assertFalse(self.record.exists())
 
+    def test_rsproxy_requires_guest_reported_image_capability_before_any_allocation(self):
+        self.config = validate_config(dict(self.config.data, cargo_registry='rsproxy'))
+        key = f"{self.config['oss']['prefix']}/images/m-exact/release.json"
+        for capabilities in (None, ['crates-io']):
+            release = {'image_id': 'm-exact', 'region': self.config['region']}
+            if capabilities is not None:
+                release['local_rust_cargo_registries'] = capabilities
+            self.store.objects[key] = json.dumps(release).encode()
+            api = ScriptAPI([])
+            with self.subTest(capabilities=capabilities), self.assertRaisesRegex(ValueError, 'does not support'):
+                start_local(self.config, self.plan, api, ScriptAPI([]), self.store, image_id='m-exact',
+                    source=self.source, record_path=self.record, now=lambda: NOW)
+            self.assertEqual([], api.calls)
+            self.assertFalse(any(action == 'put' for action, *_ in self.store.calls))
+            self.assertFalse(self.record.exists())
+
+    def test_rsproxy_choice_reaches_original_bootstrap_payload_on_supported_image(self):
+        self.config = validate_config(dict(self.config.data, cargo_registry='rsproxy'))
+        self.store.objects[f"{self.config['oss']['prefix']}/images/m-exact/release.json"] = json.dumps(
+            {'image_id': 'm-exact', 'region': self.config['region'],
+             'local_rust_cargo_registries': ['crates-io', 'rsproxy']}).encode()
+        api = ScriptAPI([('DescribeInstances', EMPTY), ('RunInstances', CREATED),
+            ('DescribeInstances', listed(instance(self.config, self.plan))),
+            ('RunCommand', {'InvokeId': 'invoke-original'})])
+        payloads = []
+        with patch('aliyun_ci.local_run.publish_bootstrap', side_effect=lambda *args: payloads.append(args[-1])):
+            value = start_local(self.config, self.plan, api, ScriptAPI([]), self.store, image_id='m-exact',
+                source=self.source, record_path=self.record, now=lambda: NOW, sleep=lambda _: None)
+        self.assertEqual('rsproxy', payloads[0]['cargo_registry'])
+        self.assertEqual('rsproxy', value['config']['cargo_registry'])
+        self.assertEqual(1, sum(action == 'RunInstances' for action, _ in api.calls))
+
     def test_cancel_without_recorded_instance_has_no_cloud_effect(self):
         self.prepare_record(instance_id=None)
         value=cancel_local(self.config,ScriptAPI([]),self.record,now=lambda:NOW)

@@ -107,6 +107,88 @@ class LocalRustTests(unittest.TestCase):
             self.assertEqual(account.pw_uid,(self.attempt/name).stat().st_uid)
             self.assertEqual(0o640,(self.attempt/name).stat().st_mode & 0o777)
 
+    def test_rsproxy_config_is_read_by_real_child_and_retained_in_original_archive(self):
+        from types import SimpleNamespace
+        import hashlib
+        self.payload.update(cargo_registry='rsproxy', build_jobs=8)
+        self.install()
+        self.source.mkdir()
+        lock = self.source / 'Cargo.lock'; lock.write_bytes(b'original locked input\n')
+        tools = self.source / 'tools/ci'; tools.mkdir(parents=True)
+        (tools / 'test-run.py').write_text("""import hashlib,json,os,pathlib,sys,tomllib
+root=pathlib.Path(sys.argv[-1]);root.mkdir()
+assert os.environ['CARGO_BUILD_JOBS']=='8'
+assert os.environ['CARGO_HTTP_MULTIPLEXING']=='false'
+config=pathlib.Path(os.environ['CARGO_HOME'])/'config.toml'
+raw=config.read_bytes();parsed=tomllib.loads(raw.decode())
+assert parsed['source']['crates-io']['replace-with']=='rsproxy-sparse'
+assert parsed['source']['rsproxy-sparse']['registry']=='sparse+https://rsproxy.cn/index/'
+(root/'observed-cargo-config.json').write_text(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'uid':os.getuid()}))
+raise SystemExit(7)
+""")
+        home = self.root / 'home'; (home / '.config/novarocks').mkdir(parents=True)
+        (home / '.config/novarocks/linux-env.sh').write_text(
+            f'export PATH={Path(sys.executable).parent}:/usr/bin:/bin\nexport CARGO_HOME="$HOME/.cargo"\n')
+        account = SimpleNamespace(pw_name=self.account.pw_name, pw_uid=os.getuid(),
+            pw_gid=os.getgid(), pw_dir=str(home))
+        archives = []
+        def upload(attempt, *, kind, url, timeout):
+            archive = handoff.pack(attempt, kind=kind, output=self.root / 'original.tar.gz')
+            archives.append(archive)
+            return {'uploaded': handoff.verify(archive)['manifest_ok']}
+        result = local_rust.run(self.payload, runtime=self.runtime, source_root=self.source,
+            account=account, source_preparer=lambda *_: {'sha': 'a' * 40},
+            tools_checker=lambda *args, **kwargs: {'action': 'check'}, uploader=upload)
+        self.assertEqual(7, result['exit_code'])
+        self.assertTrue(result['batch']['exited'])
+        fact = json.loads((self.attempt / 'cargo-registry.json').read_text())
+        observed = json.loads((self.attempt / 'rust/observed-cargo-config.json').read_text())
+        self.assertEqual(hashlib.sha256((home / '.cargo/config.toml').read_bytes()).hexdigest(), fact['config_sha256'])
+        self.assertEqual(fact['config_sha256'], observed['sha256'])
+        self.assertEqual(account.pw_uid, observed['uid'])
+        self.assertEqual(b'original locked input\n', lock.read_bytes())
+        self.assertEqual(0o640, (self.attempt / 'cargo-registry.json').stat().st_mode & 0o777)
+        self.assertEqual(0o600, (self.runtime / 'cargo-registry.json').stat().st_mode & 0o777)
+        import tarfile
+        with tarfile.open(archives[0], mode='r:gz') as archive:
+            self.assertEqual(fact, json.load(archive.extractfile('attempt/cargo-registry.json')))
+
+    def test_registry_configuration_preserves_default_and_rejects_unknown_user_files(self):
+        from types import SimpleNamespace
+        home = self.root / 'home'; cargo = home / '.cargo'; cargo.mkdir(parents=True)
+        account = SimpleNamespace(pw_dir=str(home), pw_uid=os.getuid(), pw_gid=os.getgid())
+        path = cargo / 'config.toml'; original = b'[build]\njobs = 3\n'; path.write_bytes(original)
+        fact = local_rust.configure_cargo_registry('crates-io', account=account)
+        self.assertFalse(fact['managed']); self.assertEqual(original, path.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'unmanaged'):
+            local_rust.configure_cargo_registry('rsproxy', account=account)
+        self.assertEqual(original, path.read_bytes())
+        path.unlink()
+        target = self.root / 'target'; target.write_bytes(original); path.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, 'unmanaged'):
+            local_rust.configure_cargo_registry('rsproxy', account=account)
+        self.assertTrue(path.is_symlink()); self.assertEqual(original, target.read_bytes())
+        path.unlink(); (cargo / 'config').write_bytes(original)
+        with self.assertRaisesRegex(ValueError, 'legacy'):
+            local_rust.configure_cargo_registry('rsproxy', account=account)
+        self.assertFalse(path.exists())
+
+    def test_managed_registry_configuration_can_be_reobserved_without_rewriting(self):
+        from types import SimpleNamespace
+        home = self.root / 'home'; home.mkdir()
+        account = SimpleNamespace(pw_dir=str(home), pw_uid=os.getuid(), pw_gid=os.getgid())
+        first = local_rust.configure_cargo_registry('rsproxy', account=account)
+        inode = (home / '.cargo/config.toml').stat().st_ino
+        second = local_rust.configure_cargo_registry('rsproxy', account=account)
+        self.assertEqual(first, second)
+        self.assertEqual(inode, (home / '.cargo/config.toml').stat().st_ino)
+
+    def test_unknown_registry_is_refused_before_worker_files_are_installed(self):
+        self.payload['cargo_registry'] = 'auto'
+        with self.assertRaisesRegex(ValueError, 'unsupported local Cargo registry'):
+            self.install()
+        self.assertFalse(self.runtime.exists())
+
     def test_tools_failure_keeps_unknown_test_exit_and_upload_failure_independent(self):
         self.install()
         def bad_tools(*args, **kwargs):

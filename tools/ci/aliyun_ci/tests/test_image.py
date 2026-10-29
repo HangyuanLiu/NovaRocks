@@ -83,6 +83,21 @@ class ImageTests(unittest.TestCase):
         self.assertFalse(api.exists)
         self.assertNotIn(image_key(self.config, 'm-candidate', 'ready.json'), objects.objects)
         self.assertIn(image_key(self.config, 'm-candidate', 'release.json'), objects.objects)
+        self.assertNotIn('local_rust_cargo_registries', result)
+
+    def test_release_keeps_guest_capabilities_instead_of_inventing_operator_support(self):
+        class GuestCratesOnly(BuilderAPI):
+            def call(self, action, **parameters):
+                value = super().call(action, **parameters)
+                if action == 'DescribeInvocationResults' and parameters['InvokeId'] == '2':
+                    row = value['Invocation']['InvocationResults']['InvocationResult'][0]
+                    facts = json.loads(base64.b64decode(row['Output']))
+                    facts['local_rust_cargo_registries'] = ['crates-io']
+                    row['Output'] = base64.b64encode(json.dumps(facts).encode()).decode()
+                return value
+        result = build_image(self.config, self.plan, GuestCratesOnly(self.plan), BuilderObjects(),
+            preparation_sha='a' * 40, source_archive=b'source', now=self.now, sleep=lambda _: None)
+        self.assertEqual(['crates-io'], result['local_rust_cargo_registries'])
 
     def test_builder_is_deleted_on_prepare_stop_or_capture_failure(self):
         for failure in ('RunCommand', 'StopInstance', 'CreateImage'):

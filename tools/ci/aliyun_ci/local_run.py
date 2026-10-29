@@ -142,6 +142,12 @@ def start_local(config, plan, ecs, oos, oss, *, image_id, source, record_path,
     release = json.loads(oss.get(f"{config['oss']['prefix']}/images/{image_id}/release.json"))
     if release.get('image_id') != image_id or release.get('region') != config['region']:
         raise ValueError('image release identity does not match request')
+    cargo_registry = config.data.get('cargo_registry', 'crates-io')
+    supported = release.get('local_rust_cargo_registries', ['crates-io'])
+    if not isinstance(supported, list) or any(not isinstance(item, str) for item in supported):
+        raise ValueError('image Cargo registry capabilities are invalid')
+    if cargo_registry not in supported:
+        raise ValueError(f'image does not support local Cargo registry {cargo_registry}')
     source_key = f"{config['oss']['prefix']}/runs/{plan.run_id}/{plan.run_attempt}/source.bundle"
     manifest_key = source_key.removesuffix('.bundle') + '.json'
     capability_deadline = timestamp(parse_time(plan.deadline) - timedelta(
@@ -172,6 +178,7 @@ def start_local(config, plan, ecs, oos, oss, *, image_id, source, record_path,
                'deadline': capability_deadline,
                'work_deadline': work_deadline,
                'build_jobs': config.data.get('build_jobs'),
+               'cargo_registry': cargo_registry,
                'attempt_root': ATTEMPT, 'upload_urls': upload_urls, 'watcher': config['watcher'],
                'identity': {'run_id': plan.run_id, 'run_attempt': plan.run_attempt,
                             'label': plan.label, 'image_id': image_id, 'instance_id': instance_id}}

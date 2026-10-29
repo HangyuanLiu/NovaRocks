@@ -39,12 +39,16 @@ import time
 import urllib.request
 
 from aliyun_ci.handoff import pack_upload
+from aliyun_ci.config import LOCAL_CARGO_REGISTRIES
 from aliyun_ci.plan import parse_time
 from aliyun_ci.source_bundle import import_bundle
 
 RUNTIME = Path('/run/novarocks-ci')
 SOURCE = Path('/var/lib/novarocks-ci/source')
 TOOLS_SOURCE = Path('/opt/novarocks-ci/tools-source')
+RSPROXY_CARGO_CONFIG = ("# Managed by NovaRocks local Rust worker.\n"
+    "[source.crates-io]\nreplace-with = 'rsproxy-sparse'\n"
+    "[source.rsproxy-sparse]\nregistry = 'sparse+https://rsproxy.cn/index/'\n")
 
 
 def _atomic(path, value, *, mode=0o600, uid=None, gid=None):
@@ -75,6 +79,43 @@ def _validate(payload):
         raise ValueError('local task requires original run identity')
     if not isinstance(payload.get('source'), dict) or not payload['source'].get('url'):
         raise ValueError('local task requires a source manifest and read capability')
+    if payload.get('cargo_registry', 'crates-io') not in LOCAL_CARGO_REGISTRIES:
+        raise ValueError('unsupported local Cargo registry')
+
+
+def configure_cargo_registry(selection, *, account):
+    """Select one explicit mirror without changing source identity or unknown config."""
+    if selection not in LOCAL_CARGO_REGISTRIES:
+        raise ValueError('unsupported local Cargo registry')
+    home = Path(account.pw_dir) / '.cargo'
+    path = home / 'config.toml'
+    fact = {'selection': selection, 'cargo_home': str(home), 'managed': False,
+            'config_path': str(path), 'config_sha256': None}
+    if selection == 'crates-io':
+        return fact
+    if home.is_symlink() or (home.exists() and not home.is_dir()):
+        raise ValueError('Cargo home must be an ordinary directory')
+    legacy = home / 'config'
+    if legacy.exists() or legacy.is_symlink():
+        raise ValueError('refusing to override existing legacy Cargo configuration')
+    expected = RSPROXY_CARGO_CONFIG.encode()
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != expected:
+            raise ValueError('refusing to override unmanaged Cargo configuration')
+    else:
+        if not home.exists():
+            home.mkdir(mode=0o750, parents=True)
+            os.chown(home, account.pw_uid, account.pw_gid)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(descriptor, 'wb') as output:
+            os.fchmod(output.fileno(), 0o644)
+            os.fchown(output.fileno(), account.pw_uid, account.pw_gid)
+            output.write(expected)
+    actual = path.read_bytes()
+    if actual != expected:
+        raise ValueError('local Cargo registry configuration readback differs')
+    return dict(fact, managed=True, config_sha256=hashlib.sha256(actual).hexdigest(),
+                config_text=actual.decode())
 
 
 def install(payload, *, uid, gid, runtime=RUNTIME, source_root=SOURCE,
@@ -237,6 +278,10 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
             raise
         finally:
             _atomic(attempt / 'tools-check-result.json', {'exit_code': status['tools_check_exit']}, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
+        registry = configure_cargo_registry(payload.get('cargo_registry', 'crates-io'), account=account)
+        status['cargo_registry'] = registry
+        _atomic(runtime / 'cargo-registry.json', registry)
+        _atomic(attempt / 'cargo-registry.json', registry, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
         _chown_tree(source_root, account.pw_uid, account.pw_gid)
         status['state'] = 'running'
         publish()
@@ -245,6 +290,8 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
             'PATH': f'{account.pw_dir}/.cargo/bin:/usr/local/bin:/usr/bin:/bin',
             'CARGO_HTTP_MULTIPLEXING': 'false',
             'PYTHONDONTWRITEBYTECODE': '1'}
+        if registry['managed']:
+            environment['CARGO_HOME'] = registry['cargo_home']
         if payload.get('build_jobs') is not None:
             if type(payload['build_jobs']) is not int or payload['build_jobs'] <= 0:
                 raise ValueError('build_jobs must be a positive integer')

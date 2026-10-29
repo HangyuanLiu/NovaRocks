@@ -22,6 +22,8 @@ import json
 from pathlib import Path
 import re
 
+LOCAL_CARGO_REGISTRIES = ('crates-io', 'rsproxy')
+
 
 def fields(value, expected, name):
     if not isinstance(value, dict) or set(value) != set(expected):
@@ -45,6 +47,12 @@ def validate_config(data: dict) -> DeploymentConfig:
     data = dict(data)
     execution_kind = data.pop('execution_kind', 'github-runner')
     build_jobs = data.pop('build_jobs', None)
+    registry_requested = 'cargo_registry' in data
+    cargo_registry = data.pop('cargo_registry', 'crates-io')
+    if cargo_registry not in LOCAL_CARGO_REGISTRIES:
+        raise ValueError('cargo_registry must be crates-io or rsproxy')
+    if registry_requested and execution_kind != 'local-rust':
+        raise ValueError('cargo_registry is a local-rust input')
     if build_jobs is not None:
         positive(build_jobs, 'build_jobs')
         if execution_kind != 'local-rust':
@@ -105,6 +113,8 @@ def validate_config(data: dict) -> DeploymentConfig:
         data['execution_kind'] = execution_kind
     if build_jobs is not None:
         data['build_jobs'] = build_jobs
+    if registry_requested:
+        data['cargo_registry'] = cargo_registry
     return DeploymentConfig(json.loads(json.dumps(data)))
 
 

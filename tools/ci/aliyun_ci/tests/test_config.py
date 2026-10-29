@@ -72,3 +72,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual('local-rust',plan.tags['execution_kind'])
         data['github']={'runner_group_id':1,'workflow':'.github/workflows/aliyun-ci.yml'}
         with self.assertRaisesRegex(ValueError,'omit github'):validate_config(data)
+
+    def test_cargo_registry_is_explicit_local_only_and_unknown_values_fail(self):
+        data = example(); data.pop('github'); data['execution_kind'] = 'local-rust'
+        self.assertNotIn('cargo_registry', validate_config(data).data)
+        for selection in ('crates-io', 'rsproxy'):
+            self.assertEqual(selection, validate_config(dict(data, cargo_registry=selection))['cargo_registry'])
+        for selection in ('auto', '', None, True, []):
+            with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, 'cargo_registry'):
+                validate_config(dict(data, cargo_registry=selection))
+        with self.assertRaisesRegex(ValueError, 'local-rust'):
+            validate_config(dict(example(), cargo_registry='rsproxy'))

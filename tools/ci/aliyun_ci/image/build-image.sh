@@ -76,9 +76,12 @@ systemd-analyze verify /etc/systemd/system/novarocks-ci-bootstrap.service \
 python3 - "$source_root" "$preparation_sha" <<'PY_FACTS'
 import hashlib, json, platform, subprocess, sys
 from pathlib import Path
+sys.path.insert(0, '/opt/novarocks-ci')
+from aliyun_ci.instance.local_rust import LOCAL_CARGO_REGISTRIES
 root=Path(sys.argv[1])
 digest=lambda path:hashlib.sha256((root/path).read_bytes()).hexdigest()
 facts={'schema':1,'preparation_sha':sys.argv[2], 'os':'ubuntu-26.04','arch':'amd64',
+       'local_rust_cargo_registries':list(LOCAL_CARGO_REGISTRIES),
        'tools_profile_digest':digest('tools/dev/profiles/aliyun-ubuntu26-amd64-tools.json'),
        'inputs_digest':digest('tools/dev/linux-env.inputs.json'),
        'platform_lock_digest':digest('tools/ci/aliyun_ci/requirements.lock'),
