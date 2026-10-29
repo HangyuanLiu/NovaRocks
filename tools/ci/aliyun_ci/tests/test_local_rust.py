@@ -74,7 +74,7 @@ class LocalRustTests(unittest.TestCase):
         self.source.mkdir()
         tools = self.source / 'tools/ci'
         tools.mkdir(parents=True)
-        (tools / 'test-run.py').write_text("import json, pathlib, sys\nroot=pathlib.Path(sys.argv[-1]); root.mkdir()\n(root/'execution-index.json').write_text(json.dumps({'native_exit':7}))\nimport os; assert os.environ['CARGO_BUILD_JOBS']=='2'\nprint('actual stdout'); print('actual stderr',file=sys.stderr)\nraise SystemExit(7)\n")
+        (tools / 'test-run.py').write_text("import json, pathlib, sys\nroot=pathlib.Path(sys.argv[-1]); root.mkdir()\n(root/'execution-index.json').write_text(json.dumps({'native_exit':7}))\nimport os; assert os.environ['CARGO_BUILD_JOBS']=='2'\nassert os.environ['CARGO_HTTP_MULTIPLEXING']=='false'\nprint('actual stdout'); print('actual stderr',file=sys.stderr)\nraise SystemExit(7)\n")
         # The real child sources its ordinary HOME environment, isolated per test.
         home = self.root / 'home'
         (home / '.config/novarocks').mkdir(parents=True)

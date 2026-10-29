@@ -243,6 +243,7 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
         environment = {'HOME': account.pw_dir, 'USER': account.pw_name,
             'LOGNAME': account.pw_name,
             'PATH': f'{account.pw_dir}/.cargo/bin:/usr/local/bin:/usr/bin:/bin',
+            'CARGO_HTTP_MULTIPLEXING': 'false',
             'PYTHONDONTWRITEBYTECODE': '1'}
         if payload.get('build_jobs') is not None:
             if type(payload['build_jobs']) is not int or payload['build_jobs'] <= 0:
