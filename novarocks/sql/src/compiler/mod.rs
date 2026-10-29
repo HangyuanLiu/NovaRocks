@@ -3002,8 +3002,8 @@ mod tests {
             let DataType::List(string_item) = &result.fields[1].ty.data_type() else {
                 panic!("expected STRING List");
             };
-            assert_eq!(json_item.metadata().capacity(), 0);
-            assert_eq!(string_item.metadata().capacity(), 0);
+            assert!(json_item.metadata().as_arc().is_none());
+            assert!(string_item.metadata().as_arc().is_none());
             assert_eq!(
                 result.fields[0].ty.child_at(0).unwrap().logical_type(),
                 novarocks_type_contract::ValueLogicalType::Json
@@ -3032,7 +3032,7 @@ mod tests {
                             else {
                                 panic!("aggregate input must be a value");
                             };
-                            assert_eq!(item.metadata().capacity(), 0);
+                            assert!(item.metadata().as_arc().is_none());
                             assert_eq!(
                                 call.binding
                                     .function
@@ -3046,7 +3046,7 @@ mod tests {
                             else {
                                 panic!("expected state List")
                             };
-                            assert_eq!(item.metadata().capacity(), 0);
+                            assert!(item.metadata().as_arc().is_none());
                             assert_eq!(
                                 call.binding
                                     .intermediate_type
@@ -3121,7 +3121,7 @@ mod tests {
             let arrow::datatypes::DataType::List(item) = field.ty.data_type() else {
                 panic!("the original aggregate output must remain a List");
             };
-            assert_eq!(item.metadata().capacity(), 0);
+            assert!(item.metadata().as_arc().is_none());
             let child = field.ty.child_at(0).unwrap();
             assert!(child.nullable(), "the original UNION includes SQL NULL");
             assert_eq!(child.logical_type(), domain);

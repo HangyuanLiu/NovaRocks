@@ -89,6 +89,9 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 9 freezes unique case-insensitive struct-field ordinals, checked TIME
+/// conversion overflow, and NULL-preserving selection semantics. These execution
+/// rules are not encoded by function metadata, descriptors or carrier layouts.
 /// Epoch 8 adds independent logical write results, explicit stage placement,
 /// selected-action assertions and exact-stream cumulative close dispositions.
 /// Epoch 7 removes the retired evaluator implementation from compatibility
@@ -107,11 +110,11 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 8;
+pub const NATIVE_COMPAT_EPOCH: u64 = 9;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 9;
+pub const NATIVE_COMPAT_EPOCH: u64 = 10;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -662,10 +665,27 @@ mod tests {
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 9);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 10);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 8);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 9);
     }
+    #[test]
+    fn arrow_selection_and_time_semantics_cut_off_the_previous_epoch() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        assert_ne!(NATIVE_COMPAT_EPOCH, 8);
+        assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(8).id());
+    }
+
     #[test]
     fn cumulative_exchange_close_does_not_share_the_pre_change_stream_epoch() {
         let at = |epoch| {

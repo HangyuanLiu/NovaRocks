@@ -1682,7 +1682,10 @@ mod tests {
             novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1,
         ] {
             let source = arrow::datatypes::Field::new("nested", DataType::Int32, false)
-                .with_metadata([("provider.attribute".into(), "v".repeat(length))].into());
+                .with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "provider.attribute".into(),
+                    "v".repeat(length),
+                )]));
             let same = ValueType::new(DataType::Struct(vec![source.clone()].into()), false);
             assert_eq!(same, near);
             assert_eq!(source.metadata()["provider.attribute"].len(), length);

@@ -453,6 +453,8 @@ pub(crate) enum ExecutionReason {
     LogicalChangeCount = 613,
     LogicalSummaryContract = 614,
     FanoutRequiredBranchWithdrawn = 615,
+    UnpivotExtension = 616,
+    UnpivotExtensionAllocation = 617,
 }
 impl ExecutionReason {
     pub(crate) const fn code(self) -> NonZeroU16 {

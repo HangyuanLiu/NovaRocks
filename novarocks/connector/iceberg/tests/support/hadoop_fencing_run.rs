@@ -58,6 +58,9 @@ impl RunOwner {
     /// independent monitor that settles their complete process groups.
     pub fn local() -> Result<Self> {
         let work_end = Instant::now() + Duration::from_secs(90);
+        // Establish the run lease before a caller installs a short payload
+        // clock and before either concurrent child can initialize it lazily.
+        novarocks_test_support::ensure_run_retention(work_end)?;
         let mut environment = BTreeMap::new();
         environment.insert(
             CHILD_WORK_END_ENV.to_owned(),

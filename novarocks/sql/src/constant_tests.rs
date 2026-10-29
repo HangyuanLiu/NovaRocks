@@ -77,7 +77,7 @@ fn admit(value: LiteralValue, ty: &FunctionValueType) -> ConstantValue {
     assert_eq!(value.pool().field_ref().name(), "literal");
     assert_eq!(value.pool().field_ref().data_type(), ty.data_type());
     assert_eq!(value.pool().field_ref().is_nullable(), ty.nullable());
-    assert_eq!(value.pool().field_ref().metadata().capacity(), 0);
+    assert!(value.pool().field_ref().metadata().as_arc().is_none());
     value
 }
 fn refused(value: LiteralValue, ty: &FunctionValueType) {
@@ -598,7 +598,7 @@ fn pure_nominal_constant_author_keeps_semantics_out_of_field_metadata() {
         )
         .unwrap();
         assert_eq!(value.value_type(), &declared);
-        assert_eq!(value.pool().field_ref().metadata().capacity(), 0);
+        assert!(value.pool().field_ref().metadata().as_arc().is_none());
         assert!(value.pool().source_metadata_namespace().is_none());
     }
 }

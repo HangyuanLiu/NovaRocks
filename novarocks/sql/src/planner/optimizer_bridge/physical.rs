@@ -1104,10 +1104,12 @@ mod tests {
 
         source.value_type = FunctionValueType::new(
             DataType::Struct(
-                vec![
-                    Field::new("nested", DataType::Utf8, false)
-                        .with_metadata([("provider.field-id".into(), "17".into())].into()),
-                ]
+                vec![Field::new("nested", DataType::Utf8, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.field-id".into(),
+                        "17".into(),
+                    )]),
+                )]
                 .into(),
             ),
             false,
@@ -1116,10 +1118,12 @@ mod tests {
         source_attributes_changed.value_type =
             novarocks_type_contract::FunctionValueType::try_with_logical_type(
                 DataType::Struct(
-                    vec![
-                        Field::new("nested", DataType::Utf8, false)
-                            .with_metadata([("provider.field-id".into(), "18".into())].into()),
-                    ]
+                    vec![Field::new("nested", DataType::Utf8, false).with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider.field-id".into(),
+                            "18".into(),
+                        )]),
+                    )]
                     .into(),
                 ),
                 source_attributes_changed.value_type.nullable(),
