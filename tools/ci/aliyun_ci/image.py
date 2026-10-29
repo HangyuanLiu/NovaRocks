@@ -148,8 +148,12 @@ def build_image(config, plan, ecs, oss, *, preparation_sha, source_archive: byte
         print('AliyunCIImage: ' + json.dumps({'image_id': image_id, 'region': config['region'],
               'run_id': plan.run_id, 'run_attempt': plan.run_attempt}), file=sys.stderr, flush=True)
         while now() < parse_time(plan.deadline):
-            result = ecs.call('DescribeImages', RegionId=config['region'], ImageId=image_id)
+            result = ecs.call('DescribeImages', RegionId=config['region'], ImageId=image_id,
+                              ImageOwnerAlias='self', Status='ALL')
             rows = result.get('Images', {}).get('Image', [])
+            if not rows:
+                sleep(5)
+                continue
             if len(rows) != 1 or rows[0].get('ImageId') != image_id:
                 raise ValueError('created image readback identity mismatch')
             if rows[0]['Status'] == 'Available':

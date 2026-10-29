@@ -38,7 +38,8 @@ from pathlib import Path, PurePosixPath
 import tarfile
 import tempfile
 import time
-import urllib.request
+import http.client
+from urllib.parse import urlsplit
 
 from .ports import MANIFEST_SCHEMA
 
@@ -187,14 +188,26 @@ def verify(source: bytes | str | Path) -> dict:
 def upload(archive: str | Path, url: str, *, timeout: float = 60) -> dict:
     path = Path(archive)
     digest = _digest_file(path)
-    # Empty Content-Type preserves the presigner's empty canonical header and
-    # prevents urllib from inserting application/x-www-form-urlencoded.
-    with path.open('rb') as source:
-        request = urllib.request.Request(url, data=source, method='PUT',
-            headers={'Content-Length': str(path.stat().st_size), 'Content-Type': ''})
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+    # OSS signs canonical content headers. http.client streams the exact bytes
+    # without urllib's implicit Content-Type, including an empty header line.
+    endpoint = urlsplit(url)
+    if endpoint.scheme not in ('https', 'http') or not endpoint.hostname:
+        raise ValueError('archive upload requires an HTTP capability')
+    transport = http.client.HTTPSConnection if endpoint.scheme == 'https' else http.client.HTTPConnection
+    connection = transport(endpoint.hostname, endpoint.port, timeout=timeout)
+    target = endpoint.path or '/'
+    if endpoint.query:
+        target += '?' + endpoint.query
+    try:
+        with path.open('rb') as source:
+            connection.request('PUT', target, body=source,
+                headers={'Content-Length': str(path.stat().st_size)})
+            response = connection.getresponse()
             if response.status not in (200, 201, 204):
                 raise OSError(f'archive upload returned HTTP {response.status}')
+            response.read()
+    finally:
+        connection.close()
     return {'uploaded': True, 'kind': verify(path)['kind'], 'size': path.stat().st_size, 'sha256': digest}
 
 

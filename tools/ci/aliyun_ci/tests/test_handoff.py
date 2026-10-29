@@ -114,7 +114,7 @@ class HandoffTests(unittest.TestCase):
                 output=self.root / 'uploaded.tar.gz', url=f'http://127.0.0.1:{server.server_port}/exact-key')
             self.assertTrue(result['uploaded'])
             self.assertEqual('/exact-key', received[0][0])
-            self.assertEqual('', received[0][1])
+            self.assertIsNone(received[0][1])
             self.assertEqual(Path(result['archive']).read_bytes(), received[0][2])
             self.assertTrue(handoff.verify(received[0][2])['manifest_ok'])
         finally:

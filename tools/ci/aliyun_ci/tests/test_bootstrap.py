@@ -208,3 +208,11 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(any(destination.iterdir()))
         bootstrap.download_runner({'url': 'unused', 'sha256': hashlib.sha256(content).hexdigest()}, destination, opener=opener)
         self.assertEqual(b'hello', (destination / 'run.sh').read_bytes())
+
+    def test_explicit_builder_pointer_needs_no_secret_or_cloud_client(self):
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        pointer=types.SimpleNamespace(read=lambda path:json.dumps({'role':'builder','deadline':'2026-10-29T00:00:00Z'}))
+        with patch.object(bootstrap.os,'geteuid',return_value=0),patch.object(bootstrap,'Metadata',return_value=pointer),patch('aliyun_ci.sdk.RPC',side_effect=AssertionError('builder must not consume worker secrets')),redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(0,bootstrap.main([]))
+        self.assertEqual({'execution_kind':'builder','installed':False},json.loads(output.getvalue()))

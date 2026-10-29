@@ -118,3 +118,18 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(0,result['remaining_capabilities'])
             self.assertFalse((root/'source.sh').exists())
             self.assertEqual('echo status',(root/'observe.sh').read_text())
+
+    def test_pending_image_is_observed_with_all_statuses_without_recreation(self):
+        expected=self
+        class PendingImage(BuilderAPI):
+            states=[None,'Creating','Available']
+            def call(self,action,**params):
+                if action=='DescribeImages':
+                    self.calls.append((action,params));expected.assertEqual('ALL',params['Status'])
+                    state=self.states.pop(0)
+                    return {'Images':{'Image':[] if state is None else [{'ImageId':'m-candidate','Status':state}]}}
+                return super().call(action,**params)
+        api=PendingImage(self.plan);result=build_image(self.config,self.plan,api,BuilderObjects(),preparation_sha='a'*40,source_archive=b'source',now=self.now,sleep=lambda _:None)
+        self.assertEqual('m-candidate',result['image_id'])
+        self.assertEqual(1,sum(action=='CreateImage' for action,params in api.calls))
+        self.assertFalse(api.exists)

@@ -18,7 +18,7 @@
 [Unit]
 Description=NovaRocks one-run encrypted CI bootstrap
 Wants=network-online.target
-After=network-online.target cloud-final.service
+After=network-online.target
 
 [Service]
 Type=oneshot

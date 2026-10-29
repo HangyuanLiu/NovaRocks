@@ -195,6 +195,9 @@ def main(argv=None):
         launch_runner()
         return 0
     pointer = json.loads(Metadata(args.metadata_url).read('/latest/user-data'))
+    if pointer.get('role') == 'builder':
+        print(json.dumps({'execution_kind': 'builder', 'installed': False}, sort_keys=True))
+        return 0
     from aliyun_ci.sdk import RPC
     payload = await_envelope(RPC('oos', pointer['region']), pointer)
     account = pwd.getpwnam('runner')
