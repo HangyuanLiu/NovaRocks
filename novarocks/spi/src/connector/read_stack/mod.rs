@@ -96,8 +96,8 @@ pub use runtime::{
     ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
     ConnectorReadSourceSelection, ConnectorReadSplit, ConnectorReadSplitFacts,
     ConnectorReadSplitManager, ConnectorReadSplitOpenFuture, ConnectorReadSplitOpenRequest,
-    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadTableExecuteProcedure,
-    ConnectorReadTableHandle, ConnectorReadTransactionHandle,
+    ConnectorReadSplitPreparation, ConnectorReadSplitSource, ConnectorReadSystemTablePlan,
+    ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};

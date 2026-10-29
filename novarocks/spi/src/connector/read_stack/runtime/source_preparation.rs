@@ -210,3 +210,26 @@ pub type ConnectorPreparedSourceReadFuture<'a> = futures::future::BoxFuture<
     'a,
     Result<ConnectorPreparedSourceRead, crate::connector::ConnectorError>,
 >;
+
+/// Existing execution-time authors borrowed by one real split opening. This
+/// packet grants no new capacity or I/O authority and never crosses the wire.
+/// A Provider requires it for reads carrying prepared-source provenance.
+#[derive(Clone)]
+pub struct ConnectorReadSplitPreparation {
+    cpu: Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+    original: crate::connector::ConnectorOriginalResultScope,
+}
+impl ConnectorReadSplitPreparation {
+    pub fn new(
+        cpu: Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        original: crate::connector::ConnectorOriginalResultScope,
+    ) -> Self {
+        Self { cpu, original }
+    }
+    pub fn cpu(&self) -> &Arc<dyn crate::connector::ProviderMetadataCpuPort> {
+        &self.cpu
+    }
+    pub fn original(&self) -> &crate::connector::ConnectorOriginalResultScope {
+        &self.original
+    }
+}

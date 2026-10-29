@@ -459,7 +459,51 @@ pub trait ProviderReadSplitSource<P: ProviderReadRuntime>: Send {
     fn close(&mut self) -> Result<(), ConnectorError>;
 }
 
+/// Original owned split inputs. Sharing an opaque table keeps its actual
+/// concrete value without imposing Clone or re-creating Provider facts.
+pub struct ProviderReadSplitOpenRequest<P: ProviderReadRuntime> {
+    pub session: ConnectorSession,
+    pub table: Arc<P::Table>,
+    pub columns: Vec<Assignment<P::Column>>,
+    pub dynamic_filter_columns: BTreeSet<P::Column>,
+    pub constraint: Constraint<P::Column>,
+    pub preparation: Option<super::runtime::ConnectorReadSplitPreparation>,
+}
+
+/// Driver returned after the original split-open source has been installed.
+pub type ProviderReadSplitOpenFuture<P> =
+    BoxFuture<'static, Result<Box<dyn ProviderReadSplitSource<P>>, ConnectorError>>;
+
 pub trait ProviderReadSplitManager: ProviderReadRuntime {
+    /// Prepared-source providers install their closed original Source here,
+    /// synchronously into the caller-owned slot before returning its driver.
+    /// Ordinary reads retain their existing borrowed planning implementation.
+    fn begin_get_splits(
+        self: Arc<Self>,
+        request: ProviderReadSplitOpenRequest<Self>,
+        original_owner: &mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> Result<ProviderReadSplitOpenFuture<Self>, ConnectorError>
+    where
+        Self: Sized,
+    {
+        if original_owner.is_some() {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "split opening owner is occupied",
+            ));
+        }
+        Ok(Box::pin(async move {
+            self.get_splits(
+                &request.session,
+                &request.table,
+                &request.columns,
+                &request.dynamic_filter_columns,
+                &request.constraint,
+            )
+            .await
+        }))
+    }
+
     fn get_splits<'a>(
         &'a self,
         session: &'a ConnectorSession,
@@ -1272,25 +1316,35 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
     fn get_splits(
         &self,
         request: super::runtime::ConnectorReadSplitOpenRequest,
+        original_owner: &mut Option<crate::connector::ConnectorProcessLocalPayload>,
     ) -> super::runtime::ConnectorReadSplitOpenFuture {
         let adapter = self.clone();
-        Box::pin(async move {
-            let (session, table, columns, dynamic_filter_columns, constraint) =
+        // Typed input and the Provider Source are received before an async
+        // borrower can poll or unwind. A pending driver never owns this slot.
+        let opening = (|| {
+            if original_owner.is_some() {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "split opening owner is occupied",
+                ));
+            }
+            let (session, table, columns, dynamic_filter_columns, constraint, preparation) =
                 request.into_parts();
-            let columns = adapter.typed_assignments(&columns)?;
-            let dynamic_filter_columns = adapter.typed_columns(&dynamic_filter_columns)?;
-            let constraint = adapter.typed_constraint(&constraint)?;
-            let table = adapter.table(&table)?;
-            let source = adapter
-                .provider
-                .get_splits(
-                    &session,
-                    table,
-                    &columns,
-                    &dynamic_filter_columns,
-                    &constraint,
-                )
-                .await?;
+            adapter.table(&table)?;
+            let table =
+                super::runtime::shared_table_value::<P::Table>(&table).ok_or_else(type_error)?;
+            let request = ProviderReadSplitOpenRequest::<P> {
+                session,
+                table,
+                columns: adapter.typed_assignments(&columns)?,
+                dynamic_filter_columns: adapter.typed_columns(&dynamic_filter_columns)?,
+                constraint: adapter.typed_constraint(&constraint)?,
+                preparation,
+            };
+            Arc::clone(&adapter.provider).begin_get_splits(request, original_owner)
+        })();
+        Box::pin(async move {
+            let source = opening?.await?;
             Ok(Box::new(AdapterSplitSource { source, adapter })
                 as Box<dyn ConnectorReadSplitSource>)
         })
@@ -2633,13 +2687,17 @@ mod tests {
         let original = Arc::downgrade(&provider);
         let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
         let table = adapter.wrap_table(Table);
-        let mut opening = adapter.get_splits(ConnectorReadSplitOpenRequest::new(
-            test_session(),
-            table,
-            Vec::new(),
-            BTreeSet::new(),
-            Constraint::of_summary(TupleDomain::all()),
-        ));
+        let mut original_owner = None;
+        let mut opening = adapter.get_splits(
+            ConnectorReadSplitOpenRequest::new(
+                test_session(),
+                table,
+                Vec::new(),
+                BTreeSet::new(),
+                Constraint::of_summary(TupleDomain::all()),
+            ),
+            &mut original_owner,
+        );
         assert!(opening.as_mut().now_or_never().is_none());
         assert_eq!(provider.split_calls.load(Ordering::SeqCst), 1);
         drop(adapter);
@@ -2650,6 +2708,47 @@ mod tests {
         let error = opening.await.err().unwrap();
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
         assert!(original.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn occupied_split_owner_refuses_before_provider_and_preserves_original() {
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(provider.clone());
+        let retained = Arc::new(41_i64);
+        let weak = Arc::downgrade(&retained);
+        let mut owner = Some(crate::connector::ConnectorProcessLocalPayload::new(
+            crate::connector::ConnectorProviderBindingKey {
+                instance_id: provider.descriptor.instance_id.clone(),
+                incarnation: crate::connector::ProviderBindingEpoch::from_bytes([1; 16]),
+            },
+            retained,
+        ));
+        let error = adapter
+            .get_splits(
+                super::super::ConnectorReadSplitOpenRequest::new(
+                    test_session(),
+                    adapter.wrap_table(Table),
+                    Vec::new(),
+                    BTreeSet::new(),
+                    Constraint::of_summary(TupleDomain::all()),
+                ),
+                &mut owner,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.kind(),
+            crate::connector::ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(provider.split_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            **owner.as_ref().unwrap().value::<i64>("catalog").unwrap(),
+            41
+        );
+        assert!(weak.upgrade().is_some());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
     }
 
     fn probe_public_schema(

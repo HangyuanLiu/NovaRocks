@@ -1694,6 +1694,23 @@ pub trait ConnectorMetadata: Send + Sync {
         })
     }
 
+    /// Capture the original base source with the complete snapshot inventory
+    /// required to distinguish an absent historical endpoint from an unloaded
+    /// one. Ordinary metadata preparation keeps its own selection contract.
+    /// The same create_prepared_table author materializes this observation.
+    fn prepare_source_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> ConnectorTablePreparationFuture<'_> {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector does not support complete source table observation",
+            ))
+        })
+    }
+
     /// Create the same public schema and opaque handle from already observed
     /// facts. This stage performs no external I/O and retains no observer.
     fn create_prepared_table(
@@ -1751,20 +1768,6 @@ pub trait ConnectorMetadata: Send + Sync {
         Err(ConnectorError::new(
             super::ConnectorErrorKind::Unsupported,
             "connector metadata does not admit exact-revision read selectors",
-        ))
-    }
-
-    /// Admit both provider-issued endpoints on one frozen table generation
-    /// before converting them to a typed change window.
-    fn change_window_from_exact_revisions(
-        &self,
-        _table: &ConnectorTableHandle,
-        _from: &super::ConnectorExactSemanticRevision,
-        _to: &super::ConnectorExactSemanticRevision,
-    ) -> Result<super::ConnectorChangeWindow, ConnectorError> {
-        Err(ConnectorError::new(
-            super::ConnectorErrorKind::Unsupported,
-            "connector metadata does not admit exact-revision change windows",
         ))
     }
 

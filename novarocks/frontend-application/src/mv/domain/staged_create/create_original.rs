@@ -1622,25 +1622,18 @@ mod original_stage_tests {
         let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
         let object_id =
             ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
-        let observation = crate::mv::domain::storage_observation::schema_validation_from_spi(
-            MvSchemaValidationObservation::try_new(
+        let observation = crate::mv::domain::storage_observation::source_schema_from_spi(
+            novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
                     namespace: Arc::from("db"),
                     table: Arc::from("orders"),
                 },
                 object_id,
-                ConnectorCommittedVersion::try_new(
-                    Bytes::from_static(b"orders-metadata"),
-                    Some(11),
-                )
-                .unwrap(),
                 Bytes::from_static(b"schema-1"),
-                Bytes::from_static(b"spec-0"),
                 true,
                 true,
-                vec![(
-                    0,
+                vec![
                     MvObservedSourceField::try_new(
                         Bytes::from_static(b"id-1"),
                         "id".into(),
@@ -1648,8 +1641,7 @@ mod original_stage_tests {
                         true,
                     )
                     .unwrap(),
-                )],
-                Vec::new(),
+                ],
                 context,
             )
             .unwrap(),

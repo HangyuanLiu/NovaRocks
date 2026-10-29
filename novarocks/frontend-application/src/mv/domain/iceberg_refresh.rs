@@ -76,7 +76,9 @@ use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::schema_validation::{
     validate_branch_id_field, validate_join_schema_contract, validate_schema_contract,
 };
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::{
+    MvSchemaValidationObservation, MvSourceSchemaObservation,
+};
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_mv_application::persistence::codec::{ApplyKeyKind, RelationOccurrence};
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
@@ -520,7 +522,7 @@ pub(crate) fn finish_mv_create_preparation(
         novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation,
     >,
     binding_document: novarocks_mv_application::persistence::codec::keyed::BindingDocument,
-    base_field_observations: BTreeMap<String, MvSchemaValidationObservation>,
+    base_field_observations: BTreeMap<String, MvSourceSchemaObservation>,
 ) -> Result<Arc<IcebergMvCreatePlan>, novarocks_sql::compiler::SqlCompileError> {
     let MvCreateShape {
         target,
@@ -784,7 +786,7 @@ pub(crate) fn build_create_documents_for_prepared_target(
 }
 
 fn base_table_descriptor_from_observation(
-    observation: &MvSchemaValidationObservation,
+    observation: &MvSourceSchemaObservation,
 ) -> BaseTableDescriptor {
     BaseTableDescriptor {
         format_version: if observation.is_format_v3() { 3 } else { 2 },
@@ -866,7 +868,7 @@ fn validate_union_projection_schema_contract_for_base(
     projection: &StoredKeyedMvProjection,
     branch_count: usize,
     occurrence: &RelationOccurrence,
-    base_observation: &MvSchemaValidationObservation,
+    base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), String> {
     let interpretation = projection.facts.interpretation();
@@ -1259,10 +1261,10 @@ fn union_branch_count(query: &ast::Query) -> u32 {
 fn observed_base<'a>(
     base_field_observations: &'a std::collections::BTreeMap<
         String,
-        crate::mv::domain::storage_observation::MvSchemaValidationObservation,
+        crate::mv::domain::storage_observation::MvSourceSchemaObservation,
     >,
     base_ref: &TableIdentity,
-) -> Result<&'a crate::mv::domain::storage_observation::MvSchemaValidationObservation, String> {
+) -> Result<&'a crate::mv::domain::storage_observation::MvSourceSchemaObservation, String> {
     base_field_observations.get(&base_ref.fqn()).ok_or_else(|| {
         format!(
             "MV base {} was not observed before contract build",

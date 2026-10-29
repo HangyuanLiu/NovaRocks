@@ -1070,9 +1070,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
-                metadata_io: Arc::downgrade(
-                    &(io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>),
-                ),
+                metadata_io: OriginalAttemptMetadataSource::Read(Arc::downgrade(io)),
                 runtime: self.runtime.clone(),
                 options,
                 aborts: Arc::clone(&aborts),
@@ -1216,9 +1214,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
-                metadata_io: Arc::downgrade(
-                    &(io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>),
-                ),
+                metadata_io: OriginalAttemptMetadataSource::Computation(Arc::downgrade(io)),
                 runtime: self.runtime.clone(),
                 options,
                 aborts: Arc::clone(&aborts),
@@ -1294,8 +1290,17 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
     }
 }
 
+/// Both arms borrow an already-owned original action Source. The Internal
+/// arm can project its existing positive Root for metadata CPU; the ordinary
+/// Read arm retains its original lazy preparation and progress author.
+#[derive(Clone)]
+enum OriginalAttemptMetadataSource {
+    Read(Weak<crate::query::read_action::io_source::ReadMetadataIoSource>),
+    Computation(Weak<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>),
+}
+
 struct ProductionManifestAttemptProjection {
-    metadata_io: Weak<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
+    metadata_io: OriginalAttemptMetadataSource,
     control_binding: NativeControlBinding,
     source_cohort: NativeSourceCohortAdmission,
     native_actions: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
@@ -1542,7 +1547,7 @@ impl ProjectedManifestAttempt {
 }
 
 struct ProductionDormantAttemptFactory {
-    metadata_io: Weak<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
+    metadata_io: OriginalAttemptMetadataSource,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
     aborts: Arc<LogicalAbortRouter>,
@@ -1915,10 +1920,19 @@ impl ProductionManifestAttemptProjection {
         .map_err(projection_message)?;
         // The original action strongly owns and drives this source until all
         // active/retired initializers actually exit. A scope cannot replace it.
-        let metadata_io = self.metadata_io.upgrade().ok_or_else(|| {
+        let unavailable = || {
             projection_message("original metadata I/O source exited before Native initialization")
-        })?;
-        let connector_context = connector_context.with_io_admission(metadata_io);
+        };
+        let (connector_context, metadata_preparation) = match &self.metadata_io {
+            OriginalAttemptMetadataSource::Read(original) => (
+                connector_context.with_io_admission(original.upgrade().ok_or_else(unavailable)?),
+                None,
+            ),
+            OriginalAttemptMetadataSource::Computation(original) => (
+                connector_context.with_io_admission(original.upgrade().ok_or_else(unavailable)?),
+                Some(original.clone()),
+            ),
+        };
         let connector_context = self
             .pending_credential_source
             .as_ref()
@@ -1943,6 +1957,7 @@ impl ProductionManifestAttemptProjection {
             connector_context,
             cancellation,
             self.runtime.data_runtime.clone(),
+            metadata_preparation,
             &mut self.pending_credential_source,
             &mut self.pending_initializer,
         )

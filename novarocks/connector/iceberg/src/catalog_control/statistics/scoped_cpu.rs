@@ -32,8 +32,10 @@ type PublicationResult = Result<async_publication::PreparedStatisticsPublication
 type EvidenceResult = crate::iceberg::Result<(ExternalMutationEvidence, StatisticsReceipt)>;
 #[path = "scoped_capture.rs"]
 pub(crate) mod scoped_capture;
-#[path = "scoped_change_window.rs"]
-pub(crate) mod scoped_change_window;
+#[path = "scoped_prepared_source.rs"]
+pub(crate) mod scoped_prepared_source;
+#[path = "scoped_prepared_split.rs"]
+pub(crate) mod scoped_prepared_split;
 #[path = "scoped_read.rs"]
 mod scoped_read;
 #[path = "scoped_snapshot.rs"]
@@ -41,7 +43,8 @@ pub(crate) mod scoped_snapshot;
 enum CpuBody {
     ViewListing(Box<crate::catalog_control::views::async_listing::Work>),
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
-    ChangeWindow(Box<scoped_change_window::ChangeWindowBody>),
+    PreparedSource(Box<scoped_prepared_source::Work>),
+    PreparedSplit(Box<scoped_prepared_split::Work>),
     Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
     Read(Box<scoped_read::ReadBody>),
@@ -357,7 +360,8 @@ impl IcebergMetadataCpuOriginal {
         match &mut original.body {
             CpuBody::ViewListing(work) => work.run(),
             CpuBody::Compaction(work) => work.run(),
-            CpuBody::ChangeWindow(body) => body.run(),
+            CpuBody::PreparedSource(body) => body.run(),
+            CpuBody::PreparedSplit(body) => body.run(),
             CpuBody::Cleanup(work) => work.run(),
             CpuBody::Read(body) => body.run(),
             CpuBody::ReadSnapshot(body) => body.run(),
@@ -697,7 +701,8 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                     &body.as_ref().expect("same metadata source").body,
                     CpuBody::MetadataBinding { .. }
                         | CpuBody::ViewListing(_)
-                        | CpuBody::ChangeWindow(_)
+                        | CpuBody::PreparedSource(_)
+                        | CpuBody::PreparedSplit(_)
                         | CpuBody::ReadSnapshot(_)
                         | CpuBody::Cleanup(_)
                         | CpuBody::Compaction(_)
@@ -722,10 +727,11 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
         .max(IcebergMetadata::statistics_read_preparation_bytes()?);
     let error = scoped_read::error_backing_bytes()?;
     // One actual parent Source keeps its owned body through every phase.
-    // Read and change-window bodies are mutually exclusive; the nested
+    // Read and prepared-source bodies are mutually exclusive; the nested
     // snapshot Source owns neither parent packet.
     let parent_body = std::mem::size_of::<scoped_read::ReadBody>()
-        .max(std::mem::size_of::<scoped_change_window::ChangeWindowBody>())
+        .max(std::mem::size_of::<scoped_prepared_source::Work>())
+        .max(std::mem::size_of::<scoped_prepared_split::Work>())
         .max(std::mem::size_of::<
             crate::catalog_control::views::async_listing::Work,
         >());

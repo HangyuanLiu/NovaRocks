@@ -83,6 +83,7 @@ async fn prepare_refresh_inner(
             current_database,
             statement,
             request.target.clone(),
+            repartition_fields.is_some(),
             connector_context,
         ).await?;
     let retained_repartition_target = if repartition_fields.is_some() {
@@ -178,11 +179,14 @@ async fn prepare_refresh_inner(
             )
             .await?;
             PreparedMvRefreshWork::DataProducing {
-                write: PreparedMvRefreshWrite::first_refresh(if full_overwrite {
-                    write.into_full_overwrite()
-                } else {
-                    write
-                }),
+                write: PreparedMvRefreshWrite::first_refresh(
+                    if full_overwrite {
+                        write.into_full_overwrite()
+                    } else {
+                        write
+                    },
+                    io.captured_sources(),
+                ),
                 admitted,
             }
         }
@@ -201,13 +205,13 @@ async fn prepare_refresh_inner(
         {
             PreparedIncrementalRefreshWork::ChangeStream(incremental, admitted) => {
                 PreparedMvRefreshWork::DataProducing {
-                    write: PreparedMvRefreshWrite::incremental(incremental),
+                    write: PreparedMvRefreshWrite::incremental(incremental, io.captured_sources()),
                     admitted,
                 }
             }
             PreparedIncrementalRefreshWork::FullRebuild(rebuild, admitted) => {
                 PreparedMvRefreshWork::DataProducing {
-                    write: PreparedMvRefreshWrite::first_refresh(rebuild),
+                    write: PreparedMvRefreshWrite::first_refresh(rebuild, io.captured_sources()),
                     admitted,
                 }
             }
@@ -306,7 +310,9 @@ async fn build_aggregate_layout_for_refresh_select_sql(
                 connector_context,
             ),
             bindings: Arc::new(QueryTableBindingStore::try_new()?),
-            overlays: Vec::new(),
+            overlays: super::super::query_local_bindings::freeze_captured_source_overlays(
+                &io.captured_sources(),
+            )?,
         },
         io,
     )
@@ -431,7 +437,9 @@ async fn prepare_managed_repartition_transition(
                 connector_context,
             ),
             bindings: Arc::new(QueryTableBindingStore::try_new()?),
-            overlays: Vec::new(),
+            overlays: super::super::query_local_bindings::freeze_captured_source_overlays(
+                &io.captured_sources(),
+            )?,
         },
         io,
     )

@@ -182,6 +182,21 @@ impl IcebergSystemRelation {
 type RequestPinnedPhysicalTables = Arc<Mutex<HashMap<SchemaTableName, IcebergPhysicalTable>>>;
 type FrozenCowSource = Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>;
 type FrozenCowSources = Arc<Mutex<BTreeMap<[u8; 32], FrozenCowSource>>>;
+use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::{
+    IcebergObservedSourceReadFacts, IcebergPreparedSourceRead, PreparedRelations,
+};
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
+    ConnectorReadSourceSelection,
+};
+/// FE-only provenance. The wire relation keeps its original snapshot/domain;
+/// this receipt selects the original frozen access author for fresh proofs.
+#[derive(Clone)]
+pub(crate) struct PreparedSourceAccess {
+    pub(crate) source: Arc<IcebergPreparedSourceRead>,
+    pub(crate) projection: ConnectorReadSourceProjection,
+}
+type PreparedSourceAccesses = Arc<Mutex<Vec<PreparedSourceAccess>>>;
 
 /// The coordinator-side Iceberg adapter for one catalog instance generation.
 ///
@@ -209,6 +224,7 @@ pub struct IcebergTypedBoundary {
     /// Exact COW observations adopted by this request's actual generation.
     /// Keyed by original source identity, never a SQL name or projection set.
     frozen_cow_sources: Option<FrozenCowSources>,
+    prepared_source_accesses: Option<PreparedSourceAccesses>,
 }
 
 impl IcebergTypedBoundary {
@@ -249,6 +265,7 @@ impl IcebergTypedBoundary {
             request_pinned_physical_tables: None,
             split_source_options: IcebergSplitSourceOptions::default(),
             frozen_cow_sources: None,
+            prepared_source_accesses: None,
         }
     }
 
@@ -266,6 +283,7 @@ impl IcebergTypedBoundary {
             request_pinned_physical_tables: Some(Arc::new(Mutex::new(HashMap::new()))),
             split_source_options: self.split_source_options,
             frozen_cow_sources: Some(Arc::new(Mutex::new(BTreeMap::new()))),
+            prepared_source_accesses: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
 
@@ -286,7 +304,64 @@ impl IcebergTypedBoundary {
             request_pinned_physical_tables: Some(tables),
             split_source_options: self.split_source_options,
             frozen_cow_sources: Some(Arc::new(Mutex::new(BTreeMap::new()))),
+            prepared_source_accesses: Some(Arc::new(Mutex::new(Vec::new()))),
         }
+    }
+
+    pub(crate) fn prepared_source_request_context(
+        &self,
+    ) -> Result<ConnectorRequestContext, ConnectorError> {
+        self.check_request_active()?;
+        self.request_context
+            .clone()
+            .ok_or_else(|| invalid("prepared source requires its actual request"))
+    }
+
+    pub(crate) fn prepared_source_runtime(&self) -> Arc<IcebergMetadataContext> {
+        Arc::clone(&self.runtime)
+    }
+
+    fn prepared_source_access(
+        &self,
+        relation: &crate::typed_read::IcebergRuntimeRelation,
+    ) -> Result<Option<PreparedSourceAccess>, ConnectorError> {
+        let Some(sources) = &self.prepared_source_accesses else {
+            return Ok(None);
+        };
+        let sources = sources
+            .lock()
+            .map_err(|_| corrupt("prepared source inventory poisoned"))?;
+        for receipt in sources.iter() {
+            let matches = match (receipt.projection, relation) {
+                (
+                    ConnectorReadSourceProjection::To,
+                    crate::typed_read::IcebergRuntimeRelation::Table(table),
+                ) => same_source_table(table, &receipt.source.relations.to),
+                (
+                    ConnectorReadSourceProjection::From,
+                    crate::typed_read::IcebergRuntimeRelation::Table(table),
+                ) => receipt
+                    .source
+                    .relations
+                    .from
+                    .as_ref()
+                    .is_some_and(|expected| same_source_table(table, expected)),
+                (
+                    ConnectorReadSourceProjection::Delta,
+                    crate::typed_read::IcebergRuntimeRelation::ChangeWindow(window),
+                ) => receipt
+                    .source
+                    .relations
+                    .delta
+                    .as_ref()
+                    .is_some_and(|expected| window == expected),
+                _ => false,
+            };
+            if matches {
+                return Ok(Some(receipt.clone()));
+            }
+        }
+        Ok(None)
     }
 
     fn adopted_cow_source(
@@ -320,7 +395,7 @@ impl IcebergTypedBoundary {
         Ok(Some(source))
     }
 
-    fn pinned_table_for_attempt(
+    pub(crate) fn pinned_table_for_attempt(
         &self,
         name: &SchemaTableName,
     ) -> Result<IcebergPhysicalTable, ConnectorError> {
@@ -610,53 +685,13 @@ impl IcebergTypedBoundary {
         domain: Arc<crate::delete_semantics::ReadDomain>,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         self.check_request_active()?;
+        let projection = ChangeWindowEndpointProjection::new(table.metadata(), &domain)?;
         let table = table.clone();
         let control = self.request_context.clone();
-        let schema = domain
-            .endpoint()
-            .schema()
-            .map_err(|e| corrupt(e.to_string()))?;
-        let integer_domains = crate::scalar_integer_domain::of_schema(
-            &schema,
-            &crate::scalar_integer_domain::metadata_declarations(table.metadata())?,
-        )?;
-        let partition_specs = domain
-            .endpoint()
-            .partition_spec_jsons()
-            .iter()
-            .map(|(id, json)| {
-                serde_json::from_str::<PartitionSpec>(json)
-                    .map(|spec| (*id, spec))
-                    .map_err(|error| {
-                        corrupt(format!("decode pinned endpoint partition spec: {error}"))
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, ConnectorError>>()?;
-        let result =
-            (async move { plan_pinned_snapshot(table, domain, control.as_ref()).await }).await;
+        let result = plan_pinned_snapshot(table, domain, control.as_ref()).await;
         self.check_request_active()?;
         let read_snapshot = result.map_err(unavailable)?;
-        read_snapshot
-            .files
-            .into_iter()
-            .map(|read_file| {
-                let partition_spec = read_file
-                    .partition_spec_id
-                    .map(|id| {
-                        partition_specs.get(&id).ok_or_else(|| {
-                            corrupt("iceberg change-window file names an absent partition spec")
-                        })
-                    })
-                    .transpose()?;
-                validate_scalar_integer_manifest_facts(
-                    &integer_domains,
-                    read_file.manifest.as_ref(),
-                    partition_spec,
-                    read_file.partition_values.as_ref(),
-                )?;
-                planned_data_file(read_file, &schema, partition_spec, &BTreeSet::new())
-            })
-            .collect()
+        projection.plan(read_snapshot.files, self.request_context.as_ref())
     }
 
     /// Whether this relation's rows carry Iceberg v3 row lineage.
@@ -742,6 +777,75 @@ impl IcebergTypedBoundary {
             self.split_source_options,
         )?;
         Ok(IcebergChangeWindowSplitSource::new(plan))
+    }
+}
+
+/// Frozen interpretation prepared before the original complete endpoint walk.
+/// Both legacy ordinary planning and prepared execution use this same author.
+struct ChangeWindowEndpointProjection {
+    schema: Schema,
+    integers: crate::scalar_integer_domain::ScalarIntegerDomains,
+    specs: BTreeMap<i32, PartitionSpec>,
+}
+impl ChangeWindowEndpointProjection {
+    fn new(
+        metadata: &TableMetadata,
+        domain: &crate::delete_semantics::ReadDomain,
+    ) -> Result<Self, ConnectorError> {
+        let schema = domain
+            .endpoint()
+            .schema()
+            .map_err(|e| corrupt(e.to_string()))?;
+        let integers = crate::scalar_integer_domain::of_schema(
+            &schema,
+            &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        )?;
+        let specs = domain
+            .endpoint()
+            .partition_spec_jsons()
+            .iter()
+            .map(|(id, json)| {
+                serde_json::from_str::<PartitionSpec>(json)
+                    .map(|spec| (*id, spec))
+                    .map_err(|error| {
+                        corrupt(format!("decode pinned endpoint partition spec: {error}"))
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, ConnectorError>>()?;
+        Ok(Self {
+            schema,
+            integers,
+            specs,
+        })
+    }
+    fn plan(
+        self,
+        files: Vec<IcebergReadFile>,
+        control: Option<&ConnectorRequestContext>,
+    ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+        files
+            .into_iter()
+            .map(|read_file| {
+                if let Some(control) = control {
+                    control.check_active()?;
+                }
+                let spec = read_file
+                    .partition_spec_id
+                    .map(|id| {
+                        self.specs.get(&id).ok_or_else(|| {
+                            corrupt("iceberg change-window file names an absent partition spec")
+                        })
+                    })
+                    .transpose()?;
+                validate_scalar_integer_manifest_facts(
+                    &self.integers,
+                    read_file.manifest.as_ref(),
+                    spec,
+                    read_file.partition_values.as_ref(),
+                )?;
+                planned_data_file(read_file, &self.schema, spec, &BTreeSet::new())
+            })
+            .collect()
     }
 }
 
@@ -943,11 +1047,16 @@ impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
             }
             _ => None,
         };
-        let access = match frozen_cow_source {
-            Some(source) => IcebergAttemptAccessRecipe::Cow(source),
-            None => IcebergAttemptAccessRecipe::Original(IcebergAttemptTableAccess::freeze(
-                self.boundary.pinned_table_for_attempt(&name)?,
-            )),
+        let prepared = self.boundary.prepared_source_access(relation)?;
+        let access = match (prepared, frozen_cow_source) {
+            (Some(receipt), None) => IcebergAttemptAccessRecipe::PreparedSource(receipt),
+            (Some(_), Some(_)) => {
+                return Err(invalid("read relation has two source provenance authors"));
+            }
+            (None, Some(source)) => IcebergAttemptAccessRecipe::Cow(source),
+            (None, None) => IcebergAttemptAccessRecipe::Original(
+                IcebergAttemptTableAccess::freeze(self.boundary.pinned_table_for_attempt(&name)?),
+            ),
         };
         Ok(mint.seal(Arc::new(IcebergAttemptAccessReacquirer {
             template: Arc::clone(&self.template),
@@ -961,6 +1070,7 @@ impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
 // Ordinary attempts keep the original owned recipe and allocation behavior.
 enum IcebergAttemptAccessRecipe {
     Original(IcebergAttemptTableAccess),
+    PreparedSource(PreparedSourceAccess),
     Cow(Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>),
 }
 
@@ -969,6 +1079,7 @@ impl IcebergAttemptAccessRecipe {
         match self {
             Self::Original(access) => access,
             Self::Cow(source) => source.access.as_ref(),
+            Self::PreparedSource(receipt) => receipt.source.access.as_ref(),
         }
     }
 }
@@ -1035,6 +1146,10 @@ impl AttemptReacquiredTableCache {
 }
 
 impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
+    fn requires_metadata_split_preparation(&self) -> bool {
+        matches!(self.access, IcebergAttemptAccessRecipe::PreparedSource(_))
+    }
+
     fn for_attempt<'a>(
         &'a self,
         request: &'a novarocks_spi::connector::ConnectorAttemptContext,
@@ -1094,6 +1209,15 @@ impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
                     .expect("request Iceberg COW source lock")
                     .insert(digest, source.clone());
             }
+            if let IcebergAttemptAccessRecipe::PreparedSource(receipt) = &self.access {
+                boundary
+                    .prepared_source_accesses
+                    .as_ref()
+                    .ok_or_else(|| corrupt("prepared source retry lost its request inventory"))?
+                    .lock()
+                    .map_err(|_| corrupt("prepared source inventory poisoned"))?
+                    .push(receipt.clone());
+            }
             let control = iceberg_request_control(Arc::clone(&self.template), boundary);
             Ok(ConnectorReadAttemptRuntime::new(control.splits()))
         })
@@ -1149,9 +1273,161 @@ pub struct IcebergPreparedRelation {
 }
 
 impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for IcebergTypedBoundary {
-    type PreparedSourceRead =
-        novarocks_spi::connector::read_stack::adapter::UnsupportedPreparedSourceRead;
+    type PreparedSourceRead = Arc<IcebergPreparedSourceRead>;
     type PreparedRelation = IcebergPreparedRelation;
+    fn prepare_source_read<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        request: &'a ConnectorReadSourcePreparationRequest,
+        cpu: &'a Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+        original: &'a novarocks_spi::connector::ConnectorOriginalResultScope,
+        owner: &'a mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead<
+                Self::PreparedSourceRead,
+            >,
+            ConnectorError,
+        >,
+    > {
+        Box::pin(async move {
+            let context = self
+                .request_context
+                .as_ref()
+                .ok_or_else(|| invalid("source preparation requires its original request"))?;
+            self.check_request_active()?;
+            if owner.is_some() {
+                return Err(invalid("source preparation owner slot is occupied"));
+            }
+            let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::prepared_source(
+                self.descriptor.clone(), self.incarnation, self.catalog_handle.clone(),
+                Arc::clone(&self.runtime), request.clone(), context.clone(), original.clone(),
+            );
+            *owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                novarocks_spi::connector::ConnectorProviderBindingKey {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    incarnation: self.incarnation,
+                },
+                Arc::clone(&source),
+            ));
+            source.drive_prepared_source(cpu).await?;
+            source.take_prepared_source()
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        _session: &ConnectorSession,
+        request: &ConnectorReadSourcePreparationRequest,
+        source: &Self::PreparedSourceRead,
+        projection: ConnectorReadSourceProjection,
+    ) -> Result<Self::Table, ConnectorError> {
+        let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
+        };
+        if source.owner != owner
+            || source.catalog != self.catalog_handle
+            || request.name() != source.request.name()
+            || request.object_id() != source.request.object_id()
+            || request.selection() != source.request.selection()
+            || request.from_revision() != source.request.from_revision()
+            || request.to_revision() != source.request.to_revision()
+            || request.observed_table() != source.request.observed_table()
+        {
+            return Err(invalid(
+                "prepared source belongs to another exact read binding or pin",
+            ));
+        }
+        request.observed_source_facts().validate_owner(&owner)?;
+        let supplied = request
+            .observed_source_facts()
+            .value::<IcebergObservedSourceReadFacts>(self.descriptor.instance_id.as_str())?;
+        if supplied.access.request_cache_identity() != source.access.request_cache_identity()
+            || supplied.snapshots
+                != source
+                    .request
+                    .observed_source_facts()
+                    .value::<IcebergObservedSourceReadFacts>(self.descriptor.instance_id.as_str())?
+                    .snapshots
+        {
+            return Err(invalid(
+                "prepared source access frame differs from its original observation",
+            ));
+        }
+        let context = self
+            .request_context
+            .as_ref()
+            .ok_or_else(|| invalid("source projection requires a request binding"))?;
+        self.check_request_active()?;
+        let relation = match projection {
+            ConnectorReadSourceProjection::To => {
+                crate::typed_read::IcebergRuntimeRelation::Table(source.relations.to.clone())
+            }
+            ConnectorReadSourceProjection::From => {
+                crate::typed_read::IcebergRuntimeRelation::Table(
+                    source
+                        .relations
+                        .from
+                        .clone()
+                        .ok_or_else(|| invalid("prepared decision has no From relation"))?,
+                )
+            }
+            ConnectorReadSourceProjection::Delta => {
+                crate::typed_read::IcebergRuntimeRelation::ChangeWindow(
+                    source
+                        .relations
+                        .delta
+                        .clone()
+                        .ok_or_else(|| invalid("prepared decision has no Delta relation"))?,
+                )
+            }
+        };
+        let physical = source.access.reacquired_request_scoped(
+            self.runtime
+                .resources()
+                .planning_binding()
+                .for_request(context.clone()),
+            self.runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        )?;
+        let tables = self
+            .request_pinned_physical_tables
+            .as_ref()
+            .ok_or_else(|| invalid("source projection has no request inventory"))?;
+        let mut tables = tables
+            .lock()
+            .map_err(|_| corrupt("request physical inventory poisoned"))?;
+        if let Some(previous) = tables.get(request.name()) {
+            if crate::delete_semantics::canonical_metadata_json(previous.table.metadata())
+                .map_err(|error| corrupt(error.to_string()))?
+                != crate::delete_semantics::canonical_metadata_json(physical.table.metadata())
+                    .map_err(|error| corrupt(error.to_string()))?
+            {
+                return Err(invalid(
+                    "request already contains a different frozen table frame",
+                ));
+            }
+        } else {
+            tables.insert(request.name().clone(), physical);
+        }
+        drop(tables);
+        self.prepared_source_accesses
+            .as_ref()
+            .ok_or_else(|| invalid("source projection has no provenance inventory"))?
+            .lock()
+            .map_err(|_| corrupt("prepared source inventory poisoned"))?
+            .push(PreparedSourceAccess {
+                source: Arc::clone(source),
+                projection,
+            });
+        Ok(relation)
+    }
+
     fn prepare_relation<'a>(
         &'a self,
         _session: &'a ConnectorSession,
@@ -2046,9 +2322,115 @@ fn validate_rewrite_position_delete_artifact(
     Ok(snapshot_id)
 }
 
+/// Preserve the original no-read case before starting a fresh observation.
+/// Only an exact successful None predicate proves emptiness; neither a policy
+/// label nor an unavailable observation is a substitute for that proof.
+fn known_empty_prepared_table_source(
+    request: &novarocks_spi::connector::read_stack::adapter::ProviderReadSplitOpenRequest<
+        IcebergTypedBoundary,
+    >,
+    options: IcebergSplitSourceOptions,
+) -> Result<Option<Box<dyn ProviderReadSplitSource<IcebergTypedBoundary>>>, ConnectorError> {
+    let crate::typed_read::IcebergRuntimeRelation::Table(handle) = request.table.as_ref() else {
+        return Ok(None);
+    };
+    if handle.pinned_data_files().is_some() {
+        return Ok(None);
+    }
+    let predicate = handle
+        .effective_predicate()
+        .and_then(|predicate| predicate.intersect(request.constraint.summary()));
+    if predicate
+        .as_ref()
+        .is_ok_and(|predicate| !predicate.is_none())
+    {
+        return Ok(None);
+    }
+    // Keep the old Table order: assignments/projection, schema, then the
+    // selected predicate refusal or known-empty source. An erroneous predicate
+    // cannot hide an earlier projection/type refusal.
+    let enumeration = if request.columns.is_empty() {
+        handle.clone()
+    } else {
+        handle
+            .apply_projection(&OrderedAssignments::try_new(request.columns.clone())?)?
+            .into_handle()
+    };
+    handle.parse_table_schema()?;
+    let predicate = predicate?;
+    if !predicate.is_none() {
+        return Ok(None);
+    }
+    let wait = if request.dynamic_filter_columns.is_empty() {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_secs(1)
+    };
+    Ok(Some(Box::new(
+        IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
+            &enumeration,
+            Vec::new(),
+            options,
+        )?)
+        .with_initial_dynamic_filter_wait(wait),
+    )))
+}
+
 impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
     for IcebergTypedBoundary
 {
+    fn begin_get_splits(
+        self: Arc<Self>,
+        request: novarocks_spi::connector::read_stack::adapter::ProviderReadSplitOpenRequest<Self>,
+        original_owner: &mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
+    ) -> Result<
+        futures::future::BoxFuture<
+            'static,
+            Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>,
+        >,
+        ConnectorError,
+    > {
+        if original_owner.is_some() {
+            return Err(invalid("split opening owner is occupied"));
+        }
+        let receipt = self.prepared_source_access(request.table.as_ref())?;
+        let Some(receipt) = receipt else {
+            return Ok(Box::pin(async move {
+                self.get_splits(
+                    &request.session,
+                    &request.table,
+                    &request.columns,
+                    &request.dynamic_filter_columns,
+                    &request.constraint,
+                )
+                .await
+            }));
+        };
+        let preparation = request
+            .preparation
+            .clone()
+            .ok_or_else(|| invalid("prepared source has no original split preparation packet"))?;
+        self.check_request_active()?;
+        if let Some(empty) = known_empty_prepared_table_source(&request, self.split_source_options)?
+        {
+            return Ok(Box::pin(async move { Ok(empty) }));
+        }
+        let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::prepared_split_source(
+            Arc::clone(&self), request, receipt,
+        )?;
+        *original_owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            Arc::clone(&source),
+        ));
+        Ok(Box::pin(async move {
+            source.drive_prepared_split(preparation.cpu()).await?;
+            source.take_prepared_split()
+        }))
+    }
+
     fn get_splits<'a>(
         &'a self,
         _session: &'a ConnectorSession,
@@ -2061,6 +2443,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
         Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>,
     > {
         Box::pin(async move {
+            if self.prepared_source_access(table)?.is_some() {
+                return Err(invalid(
+                    "prepared source must open through its original closed split source",
+                ));
+            }
             let result: Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> = match table
             {
                 crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => Ok(Box::new(
@@ -2119,6 +2506,103 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
 }
 
 impl IcebergTypedBoundary {
+    pub(crate) fn plan_prepared_source_endpoint(
+        &self,
+        request: &novarocks_spi::connector::read_stack::adapter::ProviderReadSplitOpenRequest<Self>,
+        domain: &Arc<crate::delete_semantics::ReadDomain>,
+        snapshot: crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot,
+    ) -> Result<crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint, ConnectorError>{
+        let crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot {
+            files,
+            retention_guard,
+            ..
+        } = snapshot;
+        let files = match request.table.as_ref() {
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(_) => {
+                let frozen = self.pinned_table_for_attempt(request.table.schema_table_name())?;
+                ChangeWindowEndpointProjection::new(frozen.table.metadata(), domain)?
+                    .plan(files, self.request_context.as_ref())?
+            }
+            crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
+                if handle.read_domain() != Some(domain) {
+                    return Err(invalid(
+                        "prepared Table endpoint differs from its frozen domain",
+                    ));
+                }
+                self.planned_files_from_observation(
+                    handle,
+                    domain.endpoint().snapshot_id(),
+                    files,
+                    &request.constraint,
+                    &request.dynamic_filter_columns,
+                )?
+            }
+            _ => return Err(invalid("prepared source has an unsupported relation kind")),
+        };
+        Ok(crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint {
+            files, retention: retention_guard,
+        })
+    }
+
+    pub(crate) fn finish_prepared_source_splits(
+        &self,
+        request: novarocks_spi::connector::read_stack::adapter::ProviderReadSplitOpenRequest<Self>,
+        from: Option<crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint>,
+        selected: crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint,
+    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
+        use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint;
+        self.check_request_active()?;
+        let PreparedSplitEndpoint { files, retention } = selected;
+        match request.table.as_ref() {
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {
+                let PreparedSplitEndpoint {
+                    files: from_files,
+                    retention: from_retention,
+                } = from.ok_or_else(|| invalid("prepared Delta has no original From endpoint"))?;
+                let plan = plan_change_window_splits(
+                    handle,
+                    IcebergChangeWindowEndpoints {
+                        from_visible: &from_files,
+                        to_visible: &files,
+                    },
+                    &change_window_partition_types(handle.to_read_domain())?,
+                    self.split_source_options,
+                )?;
+                Ok(Box::new(
+                    IcebergRuntimeSplitSource::new(IcebergChangeWindowSplitSource::new(plan))
+                        .with_source_retention([Some(from_retention), Some(retention)]),
+                ))
+            }
+            crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
+                if from.is_some() {
+                    return Err(invalid("prepared Table received two endpoint projections"));
+                }
+                let enumeration_handle = if request.columns.is_empty() {
+                    handle.clone()
+                } else {
+                    handle
+                        .apply_projection(&OrderedAssignments::try_new(request.columns)?)?
+                        .into_handle()
+                };
+                let wait = if request.dynamic_filter_columns.is_empty() {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs(1)
+                };
+                Ok(Box::new(
+                    IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
+                        &enumeration_handle,
+                        files,
+                        self.split_source_options,
+                    )?)
+                    .with_initial_dynamic_filter_wait(wait)
+                    .with_source_retention([None, Some(retention)]),
+                ))
+            }
+            _ => Err(invalid("prepared source has an unsupported relation kind")),
+        }
+    }
+
     async fn planned_files_runtime(
         &self,
         handle: &IcebergTableHandle,
@@ -2149,18 +2633,14 @@ impl IcebergTypedBoundary {
             self.check_request_active()?;
             return Ok(vec![planned]);
         }
-        let pinned = handle.pinned_data_files();
-        let predicates = if pinned.is_some() {
-            Vec::new()
-        } else {
-            let static_predicate = handle
+        if handle.pinned_data_files().is_none()
+            && handle
                 .effective_predicate()?
-                .intersect(constraint.summary())?;
-            if static_predicate.is_none() {
-                return Ok(Vec::new());
-            }
-            physical_predicates(&static_predicate, &schema)
-        };
+                .intersect(constraint.summary())?
+                .is_none()
+        {
+            return Ok(Vec::new());
+        }
         let physical = self
             .load_pinned_relation_async(handle.schema_table_name())
             .await?;
@@ -2175,9 +2655,40 @@ impl IcebergTypedBoundary {
             (async move { plan_pinned_snapshot(table, domain, control.as_ref()).await }).await;
         self.check_request_active()?;
         let read_snapshot = result.map_err(unavailable)?;
-        let mut planned = Vec::with_capacity(read_snapshot.files.len());
+        self.planned_files_from_observation(
+            handle,
+            snapshot_id,
+            read_snapshot.files,
+            constraint,
+            dynamic_filter_columns,
+        )
+    }
+
+    fn planned_files_from_observation(
+        &self,
+        handle: &IcebergTableHandle,
+        snapshot_id: i64,
+        read_files: Vec<IcebergReadFile>,
+        constraint: &Constraint<IcebergColumnHandle>,
+        dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
+    ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+        let schema = handle.parse_table_schema()?;
+        let pinned = handle.pinned_data_files();
+        let predicates = if pinned.is_some() {
+            Vec::new()
+        } else {
+            let predicate = handle
+                .effective_predicate()?
+                .intersect(constraint.summary())?;
+            if predicate.is_none() {
+                return Ok(Vec::new());
+            }
+            physical_predicates(&predicate, &schema)
+        };
+        let mut planned = Vec::with_capacity(read_files.len());
         let mut pinned_seen = 0_usize;
-        for read_file in read_snapshot.files {
+        for read_file in read_files {
+            self.check_request_active()?;
             if let Some(pinned) = pinned {
                 if !pinned.contains(&read_file.path) {
                     continue;
@@ -2237,6 +2748,7 @@ struct IcebergRuntimeSplitSource<S> {
     inner: S,
     closed: bool,
     initial_dynamic_filter_wait: std::time::Duration,
+    _source_retention: [Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>; 2],
 }
 
 impl<S> IcebergRuntimeSplitSource<S> {
@@ -2245,7 +2757,16 @@ impl<S> IcebergRuntimeSplitSource<S> {
             inner,
             closed: false,
             initial_dynamic_filter_wait: std::time::Duration::ZERO,
+            _source_retention: [None, None],
         }
+    }
+
+    fn with_source_retention(
+        mut self,
+        retention: [Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>; 2],
+    ) -> Self {
+        self._source_retention = retention;
+        self
     }
 
     fn with_initial_dynamic_filter_wait(mut self, wait: std::time::Duration) -> Self {
@@ -2908,6 +3429,15 @@ fn pinned_change_window_handle(
     metadata: &TableMetadata,
     window: ConnectorReadChangeWindow,
 ) -> Result<Option<IcebergChangeWindowHandle>, ConnectorError> {
+    pinned_change_window_handle_with_fallback(name, metadata, window, metadata.current_schema_id())
+}
+
+fn pinned_change_window_handle_with_fallback(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    window: ConnectorReadChangeWindow,
+    fallback_schema_id: i32,
+) -> Result<Option<IcebergChangeWindowHandle>, ConnectorError> {
     match metadata.format_version() {
         FormatVersion::V2 | FormatVersion::V3 => {}
         FormatVersion::V1 => return Ok(None),
@@ -2928,8 +3458,8 @@ fn pinned_change_window_handle(
         )));
     }
 
-    let from_schema = pinned_schema(metadata, Some(from))?;
-    let to_schema = crate::change_planning::resolved_window_schema(metadata, to)?;
+    let from_schema = crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(metadata, from, fallback_schema_id)?;
+    let to_schema = crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(metadata, to, fallback_schema_id)?;
     if !struct_types_share_field_identities(from_schema.as_struct(), to_schema.as_struct()) {
         // A rename preserves every field ID, so one frozen schema still
         // describes both endpoints. Anything else does not, and the single
@@ -2993,6 +3523,66 @@ fn pinned_change_window_handle(
         )?,
     )
     .map(Some)
+}
+
+fn same_source_table(actual: &IcebergTableHandle, expected: &IcebergTableHandle) -> bool {
+    actual.schema_table_name() == expected.schema_table_name()
+        && actual.snapshot_id() == expected.snapshot_id()
+        && actual.read_domain() == expected.read_domain()
+}
+
+pub(crate) fn frozen_prepared_source_relations(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    selection: ConnectorReadSourceSelection,
+    to_schema: SchemaRef,
+    fallback_schema_id: i32,
+    admission: Option<&novarocks_spi::connector::ConnectorChangeWindowAdmission>,
+) -> Result<PreparedRelations, ConnectorError> {
+    let to = match selection {
+        ConnectorReadSourceSelection::Snapshot(to) => to,
+        ConnectorReadSourceSelection::ChangeWindow(window) => window.to_snapshot_id(),
+    };
+    if matches!(
+        admission,
+        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
+    ) {
+        let ConnectorReadSourceSelection::ChangeWindow(window) = selection else {
+            return Err(invalid(
+                "snapshot source cannot have an incremental decision",
+            ));
+        };
+        let delta =
+            pinned_change_window_handle_with_fallback(name, metadata, window, fallback_schema_id)?
+                .ok_or_else(|| unsupported("incremental decision has no typed Delta relation"))?;
+        let to = pinned_table_handle_with_schema_and_domain(
+            name,
+            metadata,
+            Some(to),
+            to_schema.clone(),
+            None,
+            || Ok(Some(Arc::clone(delta.to_read_domain()))),
+        )?;
+        let from = pinned_table_handle_with_schema_and_domain(
+            name,
+            metadata,
+            Some(window.from_snapshot_id()),
+            to_schema,
+            None,
+            || Ok(Some(Arc::clone(delta.from_read_domain()))),
+        )?;
+        Ok(PreparedRelations {
+            to,
+            from: Some(from),
+            delta: Some(delta),
+        })
+    } else {
+        Ok(PreparedRelations {
+            to: pinned_table_handle_with_schema(name, metadata, Some(to), to_schema, None)?,
+            from: None,
+            delta: None,
+        })
+    }
 }
 
 /// Whether `descendant` reaches `ancestor` by following parent pointers.
@@ -5324,6 +5914,198 @@ mod system_work_unit_tests {
                 .unwrap()
                 .into_splits()
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod prepared_source_relation_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
+        ConnectorChangeWindowPartitionImpact,
+    };
+
+    fn metadata() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let mut builder = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://prepared-source".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap();
+        for (id, parent, seq) in [(41, None, 1), (42, Some(41), 2)] {
+            builder = builder
+                .add_snapshot(
+                    crate::iceberg::spec::Snapshot::builder()
+                        .with_snapshot_id(id)
+                        .with_parent_snapshot_id(parent)
+                        .with_sequence_number(seq)
+                        .with_timestamp_ms(1_700_000_000_000 + seq)
+                        .with_manifest_list(format!("memory://prepared-source/{id}.avro"))
+                        .with_summary(crate::iceberg::spec::Summary {
+                            operation: crate::iceberg::spec::Operation::Append,
+                            additional_properties: HashMap::new(),
+                        })
+                        .build(),
+                )
+                .unwrap();
+        }
+        builder.build().unwrap().metadata
+    }
+
+    #[test]
+    fn prepared_incremental_relations_share_the_original_endpoint_domains() {
+        let metadata = metadata();
+        let relations = frozen_prepared_source_relations(
+            &SchemaTableName::try_new("db", "t").unwrap(),
+            &metadata,
+            ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(41, 42)),
+            metadata.current_schema().clone(),
+            metadata.current_schema_id(),
+            Some(&ConnectorChangeWindowAdmission::Incremental {
+                has_inserts: true,
+                has_deletes: false,
+                partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+            }),
+        )
+        .unwrap();
+        let delta = relations.delta.unwrap();
+        let from = relations.from.unwrap();
+        assert_eq!(from.snapshot_id(), Some(41));
+        assert_eq!(relations.to.snapshot_id(), Some(42));
+        assert_eq!(from.read_domain(), Some(delta.from_read_domain()));
+        assert_eq!(relations.to.read_domain(), Some(delta.to_read_domain()));
+        let decoded = IcebergChangeWindowHandle::from_proto(&delta.to_proto()).unwrap();
+        assert_eq!(decoded, delta);
+        assert!(same_source_table(
+            &relations.to.apply_limit(1).unwrap().into_handle(),
+            &relations.to
+        ));
+    }
+
+    #[test]
+    fn prepared_closed_decisions_do_not_manufacture_from_or_delta_relations() {
+        let metadata = metadata();
+        for admission in [
+            None,
+            Some(ConnectorChangeWindowAdmission::MetadataOnly),
+            Some(ConnectorChangeWindowAdmission::FullRebuild(
+                ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                    from_snapshot_id: 999,
+                },
+            )),
+        ] {
+            let selection = if admission.is_none() {
+                ConnectorReadSourceSelection::Snapshot(42)
+            } else {
+                ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(999, 42))
+            };
+            let relations = frozen_prepared_source_relations(
+                &SchemaTableName::try_new("db", "t").unwrap(),
+                &metadata,
+                selection,
+                metadata.current_schema().clone(),
+                metadata.current_schema_id(),
+                admission.as_ref(),
+            )
+            .unwrap();
+            assert_eq!(relations.to.snapshot_id(), Some(42));
+            assert!(relations.from.is_none());
+            assert!(relations.delta.is_none());
+        }
+    }
+
+    #[test]
+    fn prepared_snapshot_missing_schema_id_uses_only_the_original_pin_fallback() {
+        let metadata = metadata();
+        let schema = crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(
+            &metadata, 42, metadata.current_schema_id(),
+        ).unwrap();
+        assert_eq!(schema.as_ref(), metadata.current_schema().as_ref());
+        assert!(crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(&metadata, 42, i32::MAX).is_err());
+        assert!(crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(&metadata, 999, metadata.current_schema_id()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod known_empty_prepared_source_tests {
+    use super::*;
+    use novarocks_spi::connector::read_stack::adapter::ProviderReadSplitOpenRequest;
+
+    fn request(
+        summary: TupleDomain<IcebergColumnHandle>,
+    ) -> ProviderReadSplitOpenRequest<IcebergTypedBoundary> {
+        ProviderReadSplitOpenRequest {
+            session: ConnectorSession::try_new(
+                "q",
+                "u",
+                "UTC",
+                "en_US",
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .unwrap(),
+            table: Arc::new(crate::typed_read::IcebergRuntimeRelation::Table(
+                super::final_static_facts_tests::table_handle(),
+            )),
+            columns: Vec::new(),
+            dynamic_filter_columns: BTreeSet::new(),
+            constraint: Constraint::of_summary(summary),
+            preparation: None,
+        }
+    }
+    #[test]
+    fn exact_none_uses_empty_source_but_nonempty_still_requires_the_original_open() {
+        let request = request(TupleDomain::none());
+        let mut source =
+            known_empty_prepared_table_source(&request, IcebergSplitSourceOptions::default())
+                .unwrap()
+                .expect("exact None has no read");
+        let batch = source
+            .next_batch(1, &DynamicFilterSnapshot::all_complete())
+            .unwrap();
+        assert!(batch.no_more_splits());
+        assert!(batch.into_splits().is_empty());
+        source.close().unwrap();
+        assert!(
+            known_empty_prepared_table_source(
+                &self::request(TupleDomain::all()),
+                IcebergSplitSourceOptions::default()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    #[test]
+    fn known_empty_does_not_hide_the_original_projection_refusal() {
+        let mut request = request(TupleDomain::none());
+        let crate::typed_read::IcebergRuntimeRelation::Table(handle) = request.table.as_ref()
+        else {
+            unreachable!();
+        };
+        let column =
+            IcebergColumnHandle::base_column_of(&handle.parse_table_schema().unwrap(), 1).unwrap();
+        let assignment = Assignment::try_new("same", column, ConnectorValueType::BigInt).unwrap();
+        request.columns = vec![assignment.clone(), assignment];
+        let Err(error) =
+            known_empty_prepared_table_source(&request, IcebergSplitSourceOptions::default())
+        else {
+            panic!("known-empty read skipped original projection validation");
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "connector assignment variables must be unique"
         );
     }
 }

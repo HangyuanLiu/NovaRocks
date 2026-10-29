@@ -158,10 +158,23 @@ async fn prepare_create_inner(
             input.ports.storage_observation(), &persistence, &captured.bindings, input.context.clone())?;
     let mut base_observations = BTreeMap::new();
     for base in &shape.resolved_dependencies.base_refs {
-        base_observations.insert(
-            base.fqn(),
-            io.schema(&input.ports, base, &input.context).await?,
-        );
+        base_observations.insert(base.fqn(), {
+            let binding = captured
+                .bindings
+                .strict_base_binding(&base.catalog, &base.namespace, &base.table)
+                .ok_or("CREATE base schema has no original catalog binding")?;
+            let metadata = binding
+                .source_metadata
+                .as_ref()
+                .ok_or("CREATE base schema has no original metadata")?;
+            let lease = binding.admission.exact_planning_lease()?;
+            crate::mv::domain::storage_observation::observe_source_schema(
+                input.ports.storage_observation(),
+                &lease,
+                metadata,
+                input.context.clone(),
+            )?
+        });
     }
     finish_mv_create_preparation(
         shape,

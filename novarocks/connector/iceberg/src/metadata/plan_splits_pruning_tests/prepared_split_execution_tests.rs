@@ -1,0 +1,746 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Real catalog callback + Avro discovery + typed split-open component tests.
+//! The explicit inline CPU/MIO fixtures are not a physical QB/WC exit oracle.
+
+use super::prepared_source_phase_support::{IoFixture, OriginalScope, PhasePort, written};
+use super::*;
+use crate::catalog::catalog_request::CatalogPublicationRequest;
+use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
+use crate::catalog::{CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, SnapshotLoading};
+use crate::loaded_table::{IcebergLoadedTable, IcebergPhysicalTable};
+use crate::typed_boundary::IcebergTypedBoundary;
+use crate::typed_read::HiveTransactionHandle;
+use novarocks_spi::connector::read_stack::{
+    ConnectorPreparedSourceRead, ConnectorReadDynamicFilterSnapshot, ConnectorReadRequestControl,
+    ConnectorReadSourceProjection, ConnectorReadSplitOpenRequest, ConnectorReadSplitPreparation,
+    ConnectorReadSplitSource, ConnectorSession, TupleDomain,
+};
+use novarocks_spi::connector::{
+    CatalogHandle, CatalogVersion, ConnectorOriginalResultScope, ConnectorProcessLocalPayload,
+    ConnectorTableObjectBindingFailure, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
+    ProviderMetadataCpuSource,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+/// A controllable external catalog response, on the ACTUAL load callback.
+/// Other catalog behavior keeps the original formally admitted fixture owner.
+struct ObservationCatalog {
+    inner: Arc<dyn NovaRocksCatalog>,
+    replacement: Mutex<Option<crate::iceberg::spec::TableMetadataRef>>,
+    reads: Mutex<Vec<SnapshotLoading>>,
+    runtime: crate::iceberg::Runtime,
+}
+impl std::fmt::Debug for ObservationCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedSplitObservationCatalog")
+    }
+}
+#[async_trait::async_trait]
+impl NovaRocksCatalog for ObservationCatalog {
+    fn implementation_name(&self) -> &'static str {
+        "prepared-split-observation"
+    }
+    fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
+        self.inner.listing_admission()
+    }
+    async fn list_namespaces(
+        &self,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.inner.list_namespaces(bound).await
+    }
+    async fn namespace_exists(&self, name: CatalogNamespaceName) -> Result<bool, ConnectorError> {
+        self.inner.namespace_exists(name).await
+    }
+    async fn list_tables(
+        &self,
+        name: CatalogNamespaceName,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.inner.list_tables(name, bound).await
+    }
+    async fn table_exists(&self, name: CatalogTableName) -> Result<bool, ConnectorError> {
+        self.inner.table_exists(name).await
+    }
+    async fn load_table(
+        &self,
+        name: CatalogTableName,
+    ) -> Result<IcebergLoadedTable, ConnectorError> {
+        self.inner.load_table(name).await
+    }
+    async fn load_table_for_read_with_snapshots(
+        &self,
+        name: CatalogTableName,
+        binding: IcebergReadBinding,
+        snapshots: SnapshotLoading,
+    ) -> Result<IcebergLoadedTable, ConnectorError> {
+        self.reads.lock().unwrap().push(snapshots);
+        let loaded = self
+            .inner
+            .load_table_for_read_with_snapshots(name, binding, snapshots)
+            .await?;
+        let selected = self.replacement.lock().unwrap().clone();
+        let Some(selected) = selected else {
+            return Ok(loaded);
+        };
+        let (materialization, delegation) = loaded.into_parts();
+        // The formal provider() fixture is static Hadoop. Do not invent a
+        // credential fallback for a REST-deferred response.
+        let original = materialization.into_static_table()?;
+        let mut builder = crate::iceberg::table::Table::builder()
+            .identifier(original.identifier().clone())
+            .runtime(self.runtime.clone())
+            .readonly(original.readonly())
+            .file_io(original.file_io().clone())
+            .metadata(selected);
+        if let Some(location) = original.metadata_location() {
+            builder = builder.metadata_location(location.to_string());
+        }
+        Ok(IcebergLoadedTable::new(
+            builder.build().unwrap(),
+            delegation,
+        ))
+    }
+    async fn view_exists(&self, name: CatalogTableName) -> Result<bool, ConnectorError> {
+        self.inner.view_exists(name).await
+    }
+    async fn list_views(
+        &self,
+        name: CatalogNamespaceName,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.inner.list_views(name, bound).await
+    }
+    async fn load_view(
+        &self,
+        name: CatalogTableName,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        self.inner.load_view(name).await
+    }
+    async fn anchor_written_metadata(
+        &self,
+        name: CatalogTableName,
+        location: Arc<str>,
+    ) -> CatalogOutcome<CatalogTableName> {
+        self.inner.anchor_written_metadata(name, location).await
+    }
+    fn admit_operation(
+        &self,
+        operation: &crate::catalog::admission::CatalogOperation,
+        target: &crate::catalog::admission::CatalogAdmissionTarget,
+    ) -> Result<(), CatalogUnsupported> {
+        self.inner.admit_operation(operation, target)
+    }
+}
+
+struct Fixture {
+    provider: IcebergMetadata,
+    catalog: Arc<ObservationCatalog>,
+    io: Arc<IoFixture>,
+    cpu: Arc<dyn ProviderMetadataCpuPort>,
+    original: ConnectorOriginalResultScope,
+    read: ConnectorReadRequestControl,
+    prepared: ConnectorPreparedSourceRead,
+    session: ConnectorSession,
+    physical: IcebergPhysicalTable,
+    setup_io: crate::iceberg::io::FileIO,
+    from: i64,
+    to: i64,
+}
+fn session() -> ConnectorSession {
+    ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH).unwrap()
+}
+async fn fixture(original: &IcebergMetadata) -> Fixture {
+    for request in [
+        CatalogPublicationRequest::CreateNamespace {
+            namespace: CatalogNamespaceName::new("prepared_execution"),
+            properties: HashMap::new(),
+            no_op_if_exists: false,
+        },
+        CatalogPublicationRequest::CreateTable {
+            namespace: CatalogNamespaceName::new("prepared_execution"),
+            creation: crate::iceberg::TableCreation::builder()
+                .name("t".into())
+                .schema(
+                    Schema::builder()
+                        .with_fields(vec![Arc::new(NestedField::required(
+                            1,
+                            "id",
+                            Type::Primitive(PrimitiveType::Long),
+                        ))])
+                        .build()
+                        .unwrap(),
+                )
+                .format_version(FormatVersion::V2)
+                .build(),
+            no_op_if_exists: false,
+        },
+    ] {
+        let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+            original.runtime(),
+            original.incarnation,
+            request,
+        )
+        .await;
+        assert!(
+            matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+            "{outcome:?}"
+        );
+    }
+    let mut snapshots = Vec::new();
+    for label in ["a", "b"] {
+        original
+            .runtime()
+            .control_state()
+            .invalidate_table_cache("prepared_execution", "t");
+        let loaded = original
+            .runtime()
+            .load_table_for_request_async("prepared_execution", "t", &context())
+            .await
+            .unwrap();
+        let file = written(&loaded.table, label);
+        snapshots.push(
+            crate::commit::run::append_snapshot_for_test(
+                original.clone(),
+                loaded.table,
+                vec![file],
+                "main".into(),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    // The original fixture's generation FileIO is retained only for test
+    // corruption after preparation. Do not ask the read-only IoFixture to
+    // open a writer stream or weaken its existing stream-refusal assertion.
+    let (materialization, _) = original
+        .runtime
+        .novarocks_catalog()
+        .load_table(CatalogTableName::new("prepared_execution", "t"))
+        .await
+        .unwrap()
+        .into_parts();
+    let setup_io = materialization
+        .into_static_table()
+        .unwrap()
+        .file_io()
+        .clone();
+    let catalog = Arc::new(ObservationCatalog {
+        inner: original.runtime.novarocks_catalog().clone(),
+        replacement: Mutex::new(None),
+        reads: Mutex::new(Vec::new()),
+        runtime: original
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .iceberg_runtime()
+            .clone(),
+    });
+    let runtime = Arc::new(IcebergMetadataContext::with_catalog_for_test(
+        original.runtime.control_state().clone(),
+        original.runtime.resources().clone(),
+        catalog.clone(),
+    ));
+    let provider = IcebergMetadata::new(original.descriptor.clone(), original.incarnation, runtime);
+    let active = Arc::new(AtomicBool::new(false));
+    let io = Arc::new(IoFixture {
+        in_cpu: active.clone(),
+        owned_reads: AtomicUsize::new(0),
+    });
+    let phase = Arc::new(PhasePort {
+        in_cpu: active,
+        descriptor: provider.descriptor.clone(),
+        incarnation: provider.incarnation,
+        calls: AtomicUsize::new(0),
+    });
+    let cpu: Arc<dyn ProviderMetadataCpuPort> = phase;
+    let context = context().with_io_admission(io.clone());
+    let scope =
+        ConnectorOriginalResultScope::from_original(Arc::new(OriginalScope(context.deadline())));
+    let observed =
+        prepared_source_fixture_metadata(&provider, "prepared_execution", &context).await;
+    let request = prepared_source_fixture_window(
+        &provider,
+        &observed,
+        "prepared_execution",
+        snapshots[0],
+        snapshots[1],
+    );
+    let facts = request.observed_source_facts().value::<
+        crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts
+    >(provider.descriptor.instance_id.as_str()).unwrap();
+    let physical = facts
+        .access
+        .reacquired_request_scoped(
+            provider
+                .runtime
+                .resources()
+                .planning_binding()
+                .for_request(context.clone()),
+            provider
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        )
+        .unwrap();
+    let read = prepared_source_fixture_control(&provider, &context);
+    let metadata = read.metadata();
+    let session = session();
+    let mut owner = None;
+    let prepared = metadata
+        .prepare_source_read(&session, &request, &cpu, &scope, &mut owner)
+        .await
+        .unwrap();
+    assert!(matches!(
+        prepared.admission(),
+        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
+    ));
+    std::future::poll_fn(|cx| cpu.poll_closed(cx))
+        .await
+        .unwrap();
+    drop(owner);
+    catalog.reads.lock().unwrap().clear();
+    Fixture {
+        provider,
+        catalog,
+        io,
+        cpu,
+        original: scope,
+        read,
+        prepared,
+        session,
+        physical,
+        setup_io,
+        from: snapshots[0],
+        to: snapshots[1],
+    }
+}
+impl Fixture {
+    fn observe(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut value = serde_json::to_value(self.physical.table.metadata()).unwrap();
+        edit(&mut value);
+        *self.catalog.replacement.lock().unwrap() =
+            Some(Arc::new(serde_json::from_value(value).unwrap()));
+    }
+    fn table(
+        &self,
+        projection: ConnectorReadSourceProjection,
+    ) -> novarocks_spi::connector::read_stack::ConnectorReadTableHandle {
+        self.read
+            .metadata()
+            .project_prepared_source_read(&self.session, &self.prepared, projection)
+            .unwrap()
+    }
+    fn opening(
+        &self,
+        projection: ConnectorReadSourceProjection,
+        cpu: Arc<dyn ProviderMetadataCpuPort>,
+        owner: &mut Option<ConnectorProcessLocalPayload>,
+    ) -> novarocks_spi::connector::read_stack::ConnectorReadSplitOpenFuture {
+        let table = self.table(projection);
+        self.read.splits().get_splits(
+            ConnectorReadSplitOpenRequest::new(
+                self.session.clone(),
+                table,
+                Vec::new(),
+                std::collections::BTreeSet::new(),
+                novarocks_spi::connector::read_stack::ConnectorReadConstraint::of_summary(
+                    TupleDomain::all(),
+                ),
+            )
+            .with_source_preparation(ConnectorReadSplitPreparation::new(
+                cpu,
+                self.original.clone(),
+            )),
+            owner,
+        )
+    }
+    fn assert_actual_all(&self) {
+        assert_eq!(
+            *self.catalog.reads.lock().unwrap(),
+            vec![SnapshotLoading::All],
+            "one actual catalog callback; not static access reconstruction or a cache hit"
+        );
+    }
+    fn adapter(
+        &self,
+    ) -> novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter<IcebergTypedBoundary>
+    {
+        Arc::new(IcebergTypedBoundary::new(
+            self.provider.descriptor.clone(),
+            self.provider.incarnation,
+            CatalogHandle::new(
+                self.provider.descriptor.instance_id.clone(),
+                CatalogVersion::from_bytes([0x65; 32]),
+            ),
+            HiveTransactionHandle::new(true, [0x71; 16]),
+            self.provider.runtime.clone(),
+        ))
+        .read_runtime_adapter()
+    }
+    fn paths(&self, source: &mut dyn ConnectorReadSplitSource) -> Vec<String> {
+        let adapter = self.adapter();
+        let mut paths = Vec::new();
+        loop {
+            let batch = source
+                .next_batch(64, &ConnectorReadDynamicFilterSnapshot::all_complete())
+                .unwrap();
+            let finished = batch.no_more_splits();
+            for split in batch.into_splits() {
+                let crate::typed_read::IcebergReadSplit::Data(data) =
+                    adapter.split(&split).unwrap()
+                else {
+                    panic!("To Table must retain its data split kind");
+                };
+                assert_eq!(data.read_domain().endpoint().snapshot_id(), self.to);
+                paths.push(data.path().to_string());
+            }
+            if finished {
+                break;
+            }
+        }
+        paths.sort_unstable();
+        paths
+    }
+    async fn close_source(
+        &self,
+        mut source: Box<dyn ConnectorReadSplitSource>,
+        mut owner: Option<ConnectorProcessLocalPayload>,
+        cpu: &Arc<dyn ProviderMetadataCpuPort>,
+    ) {
+        source.close().unwrap();
+        drop(source);
+        std::future::poll_fn(|cx| cpu.poll_closed(cx))
+            .await
+            .unwrap();
+        drop(owner.take());
+    }
+    async fn corrupt_from_list(&self) {
+        let path = self
+            .physical
+            .table
+            .metadata()
+            .snapshot_by_id(self.from)
+            .unwrap()
+            .manifest_list();
+        let mut output = self
+            .setup_io
+            .new_output(path)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        output
+            .write(Bytes::from_static(
+                b"invalid original From manifest list avro",
+            ))
+            .await
+            .unwrap();
+        output.close().await.unwrap();
+    }
+}
+fn snapshot_mut(value: &mut serde_json::Value, id: i64) -> &mut serde_json::Value {
+    value["snapshots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(id))
+        .unwrap()
+}
+
+#[test]
+fn actual_prepared_to_observes_later_append_but_reads_the_original_to_files() {
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = fixture(&provider).await;
+        fixture.observe(|value| {
+            let next_id = fixture.to.checked_add(1).unwrap();
+            let mut schema = value["schemas"][0].clone();
+            let schema_id = schema["schema-id"].as_i64().unwrap() + 1;
+            schema["schema-id"] = serde_json::json!(schema_id);
+            schema["fields"][0]["name"] = serde_json::json!("future_name");
+            value["schemas"].as_array_mut().unwrap().push(schema);
+            value["current-schema-id"] = serde_json::json!(schema_id);
+            let mut next = snapshot_mut(value, fixture.to).clone();
+            next["snapshot-id"] = serde_json::json!(next_id);
+            next["parent-snapshot-id"] = serde_json::json!(fixture.to);
+            next["sequence-number"] =
+                serde_json::json!(value["last-sequence-number"].as_i64().unwrap() + 1);
+            next["schema-id"] = serde_json::json!(schema_id);
+            next["manifest-list"] = serde_json::json!("file:///future-unread-manifest-list.avro");
+            value["last-sequence-number"] = next["sequence-number"].clone();
+            value["snapshots"].as_array_mut().unwrap().push(next);
+            value["current-snapshot-id"] = serde_json::json!(next_id);
+            value["refs"]["main"]["snapshot-id"] = serde_json::json!(next_id);
+            let mut spec = value["partition-specs"][0].clone();
+            spec["spec-id"] = serde_json::json!(1);
+            value["partition-specs"].as_array_mut().unwrap().push(spec);
+            value["default-spec-id"] = serde_json::json!(1);
+            value["location"] = serde_json::json!(format!(
+                "{}/future",
+                fixture.physical.table.metadata().location()
+            ));
+            value["properties"]["unrelated.future"] = serde_json::json!("changed");
+        });
+        let baseline = fixture.io.owned_reads.load(Ordering::SeqCst);
+        let mut owner = None;
+        let mut source = fixture
+            .opening(
+                ConnectorReadSourceProjection::To,
+                fixture.cpu.clone(),
+                &mut owner,
+            )
+            .await
+            .unwrap();
+        fixture.assert_actual_all();
+        let paths = fixture.paths(source.as_mut());
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("/a.parquet"));
+        assert!(paths[1].ends_with("/b.parquet"));
+        assert!(
+            fixture.io.owned_reads.load(Ordering::SeqCst) > baseline,
+            "original MIO actually serviced frozen Avro discovery/spec-slot backing"
+        );
+        fixture.close_source(source, owner, &fixture.cpu).await;
+    });
+}
+
+#[test]
+fn actual_prepared_split_rejects_replaced_uuid_from_the_fresh_catalog_callback() {
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = fixture(&provider).await;
+        fixture.observe(|value| value["table-uuid"] = serde_json::json!(uuid::Uuid::new_v4()));
+        let mut owner = None;
+        let error = match fixture
+            .opening(
+                ConnectorReadSourceProjection::Delta,
+                fixture.cpu.clone(),
+                &mut owner,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("fresh replaced object was accepted"),
+        };
+        assert_eq!(
+            error.table_object_binding_failure(),
+            Some(ConnectorTableObjectBindingFailure::Replaced)
+        );
+        fixture.assert_actual_all();
+        assert!(owner.is_some());
+        std::future::poll_fn(|cx| fixture.cpu.poll_closed(cx))
+            .await
+            .unwrap();
+        drop(owner);
+    });
+}
+
+#[test]
+fn actual_from_avro_failure_wins_over_to_fresh_descriptor_drift() {
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = fixture(&provider).await;
+        fixture.observe(|value| {
+            snapshot_mut(value, fixture.to)["manifest-list"] =
+                serde_json::json!("file:///wrong-To-descriptor.avro")
+        });
+        // First establish that this exact public path rejects the To-only
+        // proof fault while From is still complete. Both endpoints' raw FileIO
+        // errors share a safe public detail, so that text alone is not origin.
+        let mut proof_owner = None;
+        let proof_error = match fixture
+            .opening(
+                ConnectorReadSourceProjection::Delta,
+                fixture.cpu.clone(),
+                &mut proof_owner,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("fresh To descriptor drift was accepted"),
+        };
+        assert_eq!(proof_error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(
+            proof_error.message(),
+            "Iceberg prepared endpoint descriptor changed"
+        );
+        fixture.assert_actual_all();
+        std::future::poll_fn(|cx| fixture.cpu.poll_closed(cx))
+            .await
+            .unwrap();
+        drop(proof_owner);
+        fixture.catalog.reads.lock().unwrap().clear();
+        // With the same To proof fault still present, the original From Avro
+        // failure must now win; the second open also observes exactly All once.
+        fixture.corrupt_from_list().await;
+        let mut owner = None;
+        let error = match fixture
+            .opening(
+                ConnectorReadSourceProjection::Delta,
+                fixture.cpu.clone(),
+                &mut owner,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("two invalid endpoints were accepted"),
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(
+            error.message(),
+            "original snapshot metadata I/O failed",
+            "To descriptor failure must not hide the real From Avro failure"
+        );
+        fixture.assert_actual_all();
+        std::future::poll_fn(|cx| fixture.cpu.poll_closed(cx))
+            .await
+            .unwrap();
+        drop(owner);
+    });
+}
+#[test]
+fn actual_to_only_ignores_historical_from_proof_and_manifest_list() {
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = fixture(&provider).await;
+        fixture.corrupt_from_list().await;
+        fixture.observe(|value| {
+            snapshot_mut(value, fixture.from)["manifest-list"] =
+                serde_json::json!("file:///changed-historical-From.avro")
+        });
+        let mut owner = None;
+        let mut source = fixture
+            .opening(
+                ConnectorReadSourceProjection::To,
+                fixture.cpu.clone(),
+                &mut owner,
+            )
+            .await
+            .unwrap();
+        fixture.assert_actual_all();
+        assert_eq!(fixture.paths(source.as_mut()).len(), 2);
+        fixture.close_source(source, owner, &fixture.cpu).await;
+    });
+}
+
+struct HeldPhasePort {
+    inner: PhasePort,
+    released: AtomicBool,
+    original: Mutex<Option<Arc<dyn ProviderMetadataCpuSource>>>,
+    wake: futures::task::AtomicWaker,
+}
+impl ProviderMetadataCpuPort for HeldPhasePort {
+    fn submit_metadata_in(
+        &self,
+        input: &mut Option<ProviderMetadataCpuInput>,
+    ) -> Result<(), ConnectorError> {
+        if self.inner.calls.load(Ordering::SeqCst) == 0 {
+            *self.original.lock().unwrap() = Some(input.as_ref().unwrap().0.clone());
+        }
+        self.inner.submit_metadata_in(input)
+    }
+    fn poll_finished(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+        self.wake.register(cx.waker());
+        if !self.released.load(Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        drop(self.original.lock().unwrap().take());
+        Poll::Ready(Ok(()))
+    }
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+        self.poll_finished(cx)
+    }
+    fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        None
+    }
+}
+#[test]
+fn held_prepared_split_cpu_footer_keeps_original_owner_across_borrowed_waiter_drop() {
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = fixture(&provider).await;
+        let held = Arc::new(HeldPhasePort {
+            inner: PhasePort {
+                in_cpu: fixture.io.in_cpu.clone(),
+                descriptor: fixture.provider.descriptor.clone(),
+                incarnation: fixture.provider.incarnation,
+                calls: AtomicUsize::new(0),
+            },
+            released: AtomicBool::new(false),
+            original: Mutex::new(None),
+            wake: futures::task::AtomicWaker::new(),
+        });
+        let cpu: Arc<dyn ProviderMetadataCpuPort> = held.clone();
+        let mut owner = None;
+        let mut opening =
+            fixture.opening(ConnectorReadSourceProjection::To, cpu.clone(), &mut owner);
+        let original = owner
+            .as_ref()
+            .expect("Source is installed synchronously before driver polling")
+            .value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(
+                fixture.provider.descriptor.instance_id.as_str(),
+            )
+            .unwrap();
+        let weak = Arc::downgrade(original);
+        {
+            let borrowed = std::future::poll_fn(|cx| {
+                assert!(opening.as_mut().poll(cx).is_pending());
+                if held.inner.calls.load(Ordering::SeqCst) > 0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), borrowed)
+                .await
+                .unwrap();
+        }
+        assert!(weak.upgrade().is_some());
+        assert!(owner.is_some());
+        std::future::poll_fn(|cx| {
+            assert!(cpu.poll_closed(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            weak.upgrade().is_some(),
+            "a pending component footer cannot retire its actual Source"
+        );
+        held.released.store(true, Ordering::SeqCst);
+        held.wake.wake();
+        let mut source = tokio::time::timeout(Duration::from_secs(5), opening.as_mut())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(opening);
+        fixture.assert_actual_all();
+        assert_eq!(fixture.paths(source.as_mut()).len(), 2);
+        fixture.close_source(source, owner, &cpu).await;
+        assert!(
+            weak.upgrade().is_none(),
+            "no runtime Source alias is hidden in final split facts"
+        );
+    });
+}

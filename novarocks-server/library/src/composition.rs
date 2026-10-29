@@ -54,12 +54,12 @@ use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExec
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
-    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
-    MvObservedRefreshMarker, MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
-    WriteCommitEvidenceLimits,
+    ConnectorTableMetadata, MvCreatedTargetObservation, MvMaintenanceMetadataObservation,
+    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
+    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
+    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
+    MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_runtime::{
@@ -148,15 +148,15 @@ fn mv_partition_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
-    fn observe_create_source(
+    fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+    ) -> Result<MvSourceSchemaObservation, ConnectorError> {
         let observed =
             self.inspector
-                .observe_create_source(exact_lease, metadata, context.clone())?;
+                .observe_source_schema(exact_lease, metadata, context.clone())?;
         if metadata.version.as_ref() != Some(&observed.schema_version) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -175,10 +175,12 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        MvCreateSourceObservation::try_new(
+        MvSourceSchemaObservation::try_new(
             metadata.identity.clone(),
             observed.object_id,
             observed.schema_version,
+            observed.format_v3,
+            observed.stored_row_lineage_enabled,
             fields,
             &context,
         )

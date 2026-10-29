@@ -173,9 +173,16 @@ pub struct IcebergTablePlanningFactsInput<'a> {
     pub context: &'a ConnectorRequestContext,
 }
 
-pub fn table_planning_facts(
-    input: IcebergTablePlanningFactsInput<'_>,
-) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+struct TablePlanningColumns {
+    column_facts: Vec<ConnectorTableColumnPlanningFact>,
+    unique_constraints: Vec<ConnectorTableUniqueConstraint>,
+    foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+    metadata: Option<crate::iceberg::spec::TableMetadata>,
+}
+
+fn table_planning_columns(
+    input: &IcebergTablePlanningFactsInput<'_>,
+) -> Result<TablePlanningColumns, ConnectorError> {
     let column_facts = input
         .schema
         .fields()
@@ -249,6 +256,23 @@ pub fn table_planning_facts(
             )
         })
         .unwrap_or_default();
+    Ok(TablePlanningColumns {
+        column_facts,
+        unique_constraints,
+        foreign_key_constraints,
+        metadata,
+    })
+}
+
+pub fn table_planning_facts(
+    input: IcebergTablePlanningFactsInput<'_>,
+) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+    let TablePlanningColumns {
+        column_facts,
+        unique_constraints,
+        foreign_key_constraints,
+        metadata,
+    } = table_planning_columns(&input)?;
     let partition_source_column_ordinals = match (metadata.as_ref(), input.iceberg_schema) {
         (Some(metadata), Some(iceberg_schema)) => {
             iceberg_partition_source_ordinals(metadata, iceberg_schema, input.schema)?
@@ -263,6 +287,21 @@ pub fn table_planning_facts(
         unique_constraints,
         foreign_key_constraints,
         partition_source_column_ordinals,
+        input.context,
+    )
+}
+
+/// Snapshot source columns retain complete schema/default/constraint facts,
+/// without claiming the table's Current default partition membership.
+pub(crate) fn snapshot_source_planning_facts(
+    input: IcebergTablePlanningFactsInput<'_>,
+) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+    let facts = table_planning_columns(&input)?;
+    ConnectorTablePlanningFacts::try_new_snapshot_source(
+        input.schema,
+        facts.column_facts,
+        facts.unique_constraints,
+        facts.foreign_key_constraints,
         input.context,
     )
 }
@@ -693,6 +732,59 @@ mod tests {
             Some(&ConnectorColumnDefault::String(Arc::from("fallback")))
         );
         assert_eq!(facts.column_facts()[1].write_default(), None);
+    }
+
+    #[test]
+    fn snapshot_sources_preserve_defaults_and_original_default_errors() {
+        use crate::iceberg::spec::{Literal, PrimitiveType, Type};
+        let namespace = Arc::from("db");
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let request = context();
+        let nominal = BTreeMap::new();
+        for (kind, literal, arrow, expected) in [
+            (
+                Type::Primitive(PrimitiveType::String),
+                Literal::string("fallback"),
+                DataType::Utf8,
+                true,
+            ),
+            (
+                Type::Variant(crate::iceberg::spec::VariantType),
+                Literal::string("not-a-variant"),
+                DataType::LargeBinary,
+                false,
+            ),
+        ] {
+            let iceberg_schema = write_default_schema(kind, literal);
+            let arrow_schema = Arc::new(Schema::new(vec![
+                Field::new("with_default", arrow, true),
+                Field::new("plain", DataType::Int64, true),
+            ]));
+            let result = snapshot_source_planning_facts(IcebergTablePlanningFactsInput {
+                schema: &arrow_schema,
+                iceberg_schema: Some(&iceberg_schema),
+                metadata_columns: &[],
+                hidden_columns: &[],
+                nominal_declarations: &nominal,
+                serialized_metadata: None,
+                namespace: &namespace,
+                instance_id: &instance_id,
+                context: &request,
+            });
+            if expected {
+                let facts = result.unwrap();
+                assert_eq!(facts.column_facts().len(), 2);
+                assert_eq!(
+                    facts.column_facts()[0].write_default(),
+                    Some(&ConnectorColumnDefault::String(Arc::from("fallback")))
+                );
+                assert_eq!(facts.partition_source_column_ordinals(), None);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+                assert!(error.message().contains("with_default"));
+            }
+        }
     }
 
     #[test]

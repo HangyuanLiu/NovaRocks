@@ -4781,6 +4781,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
             .get_table_execute_plan(&session, &name, procedure)
             .unwrap()
             .unwrap();
+        let mut original_split_owner = None;
         let mut source = lake
             .executor
             .block_on(split_manager.get_splits(
@@ -4793,6 +4794,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
                         novarocks_spi::connector::read_stack::TupleDomain::all(),
                     ),
                 ),
+                &mut original_split_owner,
             ))
             .unwrap();
         let batch = source
