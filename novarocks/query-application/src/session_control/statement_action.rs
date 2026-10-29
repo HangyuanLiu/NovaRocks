@@ -25,6 +25,7 @@ pub enum StatementActionValue {
     Rows(crate::api::ExecutionHandle),
     Local(crate::api::OwnedLocalResult),
     Ok,
+    SessionChanges(crate::session_effects::SessionEffects),
 }
 use crate::api::StatementExternalEffectDisposition;
 use crate::session_error::QueryServiceError;
@@ -173,6 +174,11 @@ impl StatementActionReady {
             Ok(StatementActionValue::Local(result)) => QuerySessionOutput::GovernedQuery(
                 GovernedImmediateStatementResult::from_verified_owned_local(result, ready.owner),
             ),
+            Ok(StatementActionValue::SessionChanges(effects)) => {
+                QuerySessionOutput::GovernedCompletion(
+                    GovernedCompletionStatementResult::with_session_effects(ready.owner, effects),
+                )
+            }
             Ok(StatementActionValue::Ok) => QuerySessionOutput::GovernedCompletion(
                 GovernedCompletionStatementResult::new(ready.owner),
             ),

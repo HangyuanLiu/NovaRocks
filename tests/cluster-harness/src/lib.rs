@@ -487,6 +487,7 @@ pub struct CrossProcessRuntime {
     pub fe_http_port: u16,
     pub fe_grpc_port: u16,
     pub fe_mysql_port: u16,
+    pub fe_trino_port: u16,
 }
 
 /// Sanitized response captured from the FE management listener during a
@@ -3142,6 +3143,10 @@ pub fn render_cross_process_config(
                 "mysql_port".to_string(),
                 Value::Integer(i64::from(runtime.fe_mysql_port)),
             );
+            standalone_server.insert(
+                "trino_port".to_string(),
+                Value::Integer(i64::from(runtime.fe_trino_port)),
+            );
             // An operator declaration is refused where there is nowhere to
             // record it, so a frontend that a test may issue one to needs a
             // sink. The path is relative, which the server resolves against
@@ -3158,6 +3163,7 @@ pub fn render_cross_process_config(
                 .and_then(Value::as_table_mut)
             {
                 standalone_server.remove("mysql_port");
+                standalone_server.remove("trino_port");
             }
         }
     }
@@ -4036,6 +4042,7 @@ impl CrossProcessServerHandle {
             fe_http_port: reserved.fe_http_port.port(),
             fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
+            fe_trino_port: reserved.fe_trino_port.port(),
         };
         let native_proxy_config = proxy_config.clone();
         let mut native_fault_proxies = BackendNativeFaultProxies::start(
@@ -4210,6 +4217,7 @@ impl CrossProcessServerHandle {
             let _ = reserved.fe_http_port.release();
             let _ = reserved.fe_grpc_port.release();
             let _ = reserved.fe_mysql_port.release();
+            let _ = reserved.fe_trino_port.release();
             let (fe_process, fe_launch_identity) = spawn_novarocks_process(ProcessLaunch {
                 binary: &fe_binary,
                 role: "fe",
@@ -6597,9 +6605,9 @@ fn merge_safe_config_overlay(
     if overlay
         .get("standalone_server")
         .and_then(Value::as_table)
-        .is_some_and(|table| table.contains_key("mysql_port"))
+        .is_some_and(|table| table.contains_key("mysql_port") || table.contains_key("trino_port"))
     {
-        bail!("cross-process config overlay cannot modify standalone_server.mysql_port");
+        bail!("cross-process config overlay cannot modify frontend listener ports");
     }
     merge_toml_table(root, overlay);
     Ok(())
@@ -6791,6 +6799,7 @@ struct ReservedRuntimePorts {
     fe_http_port: ReservedTcpPort,
     fe_grpc_port: ReservedTcpPort,
     fe_mysql_port: ReservedTcpPort,
+    fe_trino_port: ReservedTcpPort,
 }
 
 impl ReservedRuntimePorts {
@@ -6809,6 +6818,7 @@ impl ReservedRuntimePorts {
             fe_http_port: ReservedTcpPort::new()?,
             fe_grpc_port: ReservedTcpPort::new()?,
             fe_mysql_port: ReservedTcpPort::new()?,
+            fe_trino_port: ReservedTcpPort::new()?,
         })
     }
 }
@@ -8143,6 +8153,7 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         }
     }
 
@@ -8163,6 +8174,7 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         }
     }
 
@@ -9357,6 +9369,7 @@ static_file_path = "catalogs.toml"
             Some(500)
         );
         assert!(merge_safe_config_overlay(root, "[standalone_server]\nmysql_port = 1\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[standalone_server]\ntrino_port = 1\n").is_err());
     }
 
     #[test]

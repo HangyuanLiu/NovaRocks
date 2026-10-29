@@ -28,6 +28,7 @@ struct ReadSqlInput {
     query: Query,
     current_catalog: Option<String>,
     current_database: String,
+    family: novarocks_result_contract::ClientPresentationFamily,
 }
 struct ReadDistributedMetadata {
     query: Query,
@@ -147,6 +148,7 @@ impl FrontendQueryCompiler {
                 query,
                 current_catalog: context.session().current_catalog().map(str::to_owned),
                 current_database: context.session().current_database().to_owned(),
+                family: *context.session().presentation(),
             },
             query_options,
             planning,
@@ -184,6 +186,7 @@ impl FrontendQueryCompiler {
             query,
             current_catalog,
             current_database,
+            family,
         } = sql;
         let request: Result<
             (
@@ -270,7 +273,13 @@ impl FrontendQueryCompiler {
                     purpose: ReadEncodingPurpose::Read(purpose),
                     version,
                     options: query_options,
-                    offset: chrono::Local::now().offset().local_minus_utc(),
+                    family,
+                    offset: match family {
+                        novarocks_result_contract::ClientPresentationFamily::MysqlText => {
+                            chrono::Local::now().offset().local_minus_utc()
+                        }
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(_) => 0,
+                    },
                     carrier: *self.query.static_plan_carrier(),
                     policy: self.constant_policy(),
                     control: encoding_control,

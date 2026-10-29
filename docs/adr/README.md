@@ -135,6 +135,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0204](ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) — Iceberg 为何仅允许有界的原样上游依赖移植，实验性 Provider 为何保留注册并明确暂停能力（active；部分替代 ADR-0138/0139/0170/0174，授权读取、唯一 manifest、禁止计量 fork 与同源基线责任保留）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
 - [ADR-0196](ADR-0196-hadoop-test-catalog-complete-version-installation.md) — Hadoop 测试 catalog 为何共用完整不替换安装、只读版本发现与完整清单建删表，普通回收为何保护发现根（active；部分替代 ADR-0077/0118/0179 的 Hadoop 发现、存在性、DROP 与旧 UPDATE 协议，其余 owner 和生命周期保留）
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
@@ -156,9 +157,9 @@ code-anchors:
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
 - ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
-- ADR-0139 — Server 为何以唯一封闭 manifest 定义 active provider 并拒绝退役配置（active）
+- ADR-0139 — Server 为何以唯一封闭 manifest 定义 active provider 并拒绝退役配置（active；manifest 成员与可用能力的等同由 ADR-0204 部分替代，唯一装配和退役配置拒绝保留）
 - ADR-0137 — 多 provider 的私有 Connector wire 为何归 provider 自有、Native 只承载 opaque envelope（active）
-- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
+- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active；暂停期间保留 vendor 的裁决由 ADR-0204 部分替代，恢复时的授权读取边界保留）
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
@@ -222,6 +223,7 @@ code-anchors:
 
 资源沿用原 executor、Transport 和结果预算；普通 Full 是可取消背压。完整依赖事实约束来源与责任，不构成另一套工作类别或依赖域配额。计算位置、仍活数据和残留责任分别退出，超时不证明实际退出。公平推进以资源可用、依赖能够返回为条件；共享 worker 全部永久阻塞时，健康请求与结算也可能不可用，不据此承诺故障隔离或新增 worker 最低数。
 
+- [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对，ADR-0172 继续有效）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据，单一接受事务、细化及其余规则保留）
@@ -236,6 +238,7 @@ code-anchors:
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md) — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active；兼容材料由 ADR-0185 部分替代，exact-island 与 ingress 规则保留）
+- [ADR-0201](ADR-0201-role-local-node-credential-sources.md) — 节点身份为何使用独立 NodeLocal 来源、各角色本地取得并复用原 authority 续期，而不冒充 Static 或 Vended（active；部分替代 ADR-0151 的 NodeLocal principal 含义）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149；取得路径的含义由 ADR-0175 部分替代：两条路径都携带 FE 冻结的公开路由上下文、执行节点不建会话、vended 读取准入要求 BE 首次取得；消费侧续期与材料不跨进程仍有效）
 - [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
 
@@ -293,6 +296,7 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
+- [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对，ADR-0172 继续有效）
 - ADR-0090 — MV/View定义为何持久化用户有效SQL原文与解析上下文，而不是AST Display（active）
 - ADR-0101 — native SQL language authority 为何分离 parser、SQL semantic value 与 Frontend application request（active）
 
@@ -311,6 +315,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 StarRocks 已废弃且没有 active read capability。
 
 
+- [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对，ADR-0172 继续有效）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0121 — FE serving lifecycle 为何用单向 admission drain、而不是 connection shutdown 或远程 management mutation（active）
@@ -473,7 +478,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0162 — 查询中间计算状态为何保持内存内，并完整退出外溢能力（active；收敛 ADR-0148 的回收动作范围，不改变容量与谱系规则）
 - ADR-0156 — Connector FE 操作控制为何不授予容量，以及 BE 为何只接受准入后的真实资源（active；不改变 ADR-0148 的 BE 容量权威）
 - ADR-0163 — 进程为何由构建期选定的 jemalloc 分配，并从本进程的 cgroup 路径得知内存上限与用量（active；物理 allocator/cgroup 合同保留，外层归属由 ADR-0167 部分替换）
-- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，其余规则保留）
+- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，Paimon 暂停期间的 allowlist 由 ADR-0204 部分替代，其余规则保留）
 
 #### 历史
 
@@ -484,6 +489,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：crate 结构表达依赖事实，编译器拒绝未声明的 crate 使用；哪些边可以新增、optional/feature/target 与传递能力是否符合 owner 边界，由 review 判断。CI 保留供应链与通用 lint，不增加依赖边界、源码形状或产品前提检查。迁移期临时检查随迁移完成一并删除。
 
+- [ADR-0200](ADR-0200-advisory-discovery-is-independent-of-admission.md) — 公告发现为何独立于准入、保留真实失败与动态输入追溯，并报告传递 unsound（active）
+- [ADR-0204](ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) — Iceberg 为何仅允许有界的原样上游依赖移植，实验性 Provider 为何保留注册并明确暂停能力（active；部分替代 ADR-0138/0139/0170/0174，授权读取、唯一 manifest、禁止计量 fork 与同源基线责任保留）
 - [ADR-0190](ADR-0190-dependency-direction-by-structure-and-review.md) — 依赖方向为何由 crate 结构与 review 维持、CI 为何保留通用检查，第三方资源预留为何按准入估计理解（active；部分替代 ADR-0140/0150/0168/0179 的具名检查与验收门规则；全局 Clippy warning-only 现状由 ADR-0194 替代，依赖治理与资源估计仍有效）
 - [ADR-0194](ADR-0194-strict-clippy-ci-baseline.md) — Clippy 为何只在 CI 阶段严格阻止警告、哪些放宽项与局部例外构成最小基线（active；仅替代 ADR-0190 的全局 Clippy warning-only 现状）
 
@@ -492,7 +499,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - [ADR-0184](ADR-0184-native-test-execution-and-process-monitor-ownership.md) — 原生逐测试进程为何与独立 payload monitor、懒建调用租约和封闭材料汇总分工（active；部分替代 ADR-0069 的进程内 reader / Drop 所有权，机械叶子与领域边界保留）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active；进程内 reader / Drop 所有权由 ADR-0184 部分替代，机械叶子与领域边界保留）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active；其中 SQL runner 独立 workspace/profile 前提由 ADR-0142 替换）
-- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
+- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active；暂停期间保留 vendor 的裁决由 ADR-0204 部分替代，恢复时的授权读取边界保留）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 - ADR-0144 — 应用领域为何沿稳定 owner 接缝物理化，依赖为何指向政策而移动接缝留在模块内（active）
@@ -502,8 +509,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
 - ADR-0150 — 概率结构为何精确锁定 registry DataSketches 正式版、并以版本无关的升级门管辖后续变化（active；版本/checksum 字面值规则由 ADR-0168 替换；永久图/lockfile 守卫与第 5 道结构性 benchmark 验收门由 ADR-0190 部分替代；精确正式版锁定、最小 feature 由 review 维持，格式所有权与第 1–4 道门保留；第 5 道门按当前阶段政策不作为验收门，恢复性能工作时重评）
 - ADR-0168 — CI 依赖守卫为何从 Cargo 权威派生版本与 checksum、同时保护来源身份和封闭依赖面（active；部分替代 ADR-0150；身份与测试权威守卫规则由 ADR-0190 部分替代，版本仅由根 manifest 与 Cargo.lock 表达的规则保留）
-- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，其余规则保留）
-- [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md) — vendored Iceberg 的基线为何可重建、协议补丁为何由消费 owner 负责退出（active；部分替代 ADR-0170；REST crate 补丁清单、裁决 4 的临时结果收窄与 SDK 认证妥协由 ADR-0175 部分替代，core U2/P8/View API 保留项由 ADR-0176 部分替代，U8 与 Variant 读取暂缓由 ADR-0178 部分替代，P2 退出和 U4 交接由 ADR-0179 部分替代，基线可重建与其余 core 补丁的消费方退出仍有效）
+- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，Paimon 暂停期间的 allowlist 由 ADR-0204 部分替代，其余规则保留）
+- [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md) — vendored Iceberg 的基线为何可重建、协议补丁为何由消费 owner 负责退出（active；部分替代 ADR-0170；REST crate 补丁清单、裁决 4 的临时结果收窄与 SDK 认证妥协由 ADR-0175 部分替代，core U2/P8/View API 保留项由 ADR-0176 部分替代，U8 与 Variant 读取暂缓由 ADR-0178 部分替代，P2 退出和 U4 交接由 ADR-0179 部分替代，仅协议分歧限制由 ADR-0204 部分替代以允许有界上游依赖移植，基线可重建与其余 core 补丁的消费方退出仍有效）
 - [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
 - [ADR-0176](ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md) — Iceberg REST 请求词汇为何归连接器、`add-schema` 为何不带 `last-column-id`（支持下限为 Iceberg Java 1.9 语义），view 替换为何总是新增带操作身份的版本并以 `-1` 选择、语义校验为何在派发之前（active；部分替代 ADR-0174 的 core U2/P8/View API 保留项与 ADR-0175 的 core REST 补丁妥协）
 
@@ -553,7 +560,8 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 - ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
 - [ADR-0191](ADR-0191-machine-shared-fixture-and-bounded-scratch.md) — 每个daemon为何只有一组共享fixture服务，维护显式、scratch有界、原owner确认实际writer退出（active；替代ADR-0165运行层，保留ADR-0155供给与ADR-0173 check-only消费）
 - [ADR-0199](ADR-0199-readonly-observation-and-mutation-settlement.md) — 只读观察失败为何与变更结算分开，由原owner显式处置准确观察而保留原失败及未知退出（active；补充ADR-0191，原writer退出与scratch屏障保留）
-- [ADR-0173](ADR-0173-prepared-dataset-consumption-is-check-only.md) — 已有数据消费者为何仅check准确READY绑定，而实际producer核验与数据写入保留给显式供给（active；部分替代ADR-0165条9）
+- [ADR-0202](ADR-0202-benchmark-ready-after-complete-data.md) — 标准数据为何只在完整后普通发布 READY，删除条件覆盖与原地重建而保留准确只读消费（active；部分替代 ADR-0173 的条件发布与 rebuild）
+- [ADR-0173](ADR-0173-prepared-dataset-consumption-is-check-only.md) — 已有数据消费者为何仅check准确READY绑定，而实际producer核验与数据写入保留给显式供给（active；部分替代ADR-0165条9；条件发布与原地 rebuild 由 ADR-0202 替代）
 
 #### 历史
 

@@ -195,7 +195,12 @@ impl Fixture {
             .unwrap();
         let scope = root.owner.scope();
         let origin = local.retain_alias();
-        let producer = LocalResultProducer::try_new(&scope, origin.clone()).unwrap();
+        let producer = LocalResultProducer::try_new(
+            &scope,
+            origin.clone(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        )
+        .unwrap();
         let io = MetadataIoAdmission::for_original_source(
             &root.owner,
             binding.blocking_dependency_facts().to_vec(),
@@ -253,6 +258,7 @@ impl Fixture {
             }
         };
         let mut state = State {
+            family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
             readiness,
             entrance,
             binding,

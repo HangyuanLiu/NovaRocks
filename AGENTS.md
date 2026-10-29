@@ -46,9 +46,10 @@ Its production runtime is the native NovaRocks FE/BE role model:
     boundary and is not an application role or separate production topology.
 
 - **Sealed external Connector providers**
-  - The active Server provider manifest contains exactly Iceberg and Paimon.
-  - Paimon is read-only for append-only and `deduplicate` primary-key snapshot
-    reads. Iceberg retains its existing read/write capabilities.
+  - Server sealed manifest 保留 Iceberg 与 Paimon 注册；Iceberg 保持既有读写能力。
+  - Paimon 读取已暂停：catalog 配置与投影保留，目录和读取操作明确返回 Unsupported，
+    不进入 pure catalogue。恢复须待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，
+    并重新满足 ADR-0138 的授权读取边界；见 ADR-0204。
   - StarRocks is retired: its source remains for reference, but it has no active
     read capability and `[connector.starrocks]` is rejected at configuration
     parsing.
@@ -321,7 +322,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 compatibility domain/生产 epoch 为 7；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 compatibility domain 为 8、生产 epoch 为 9；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -448,8 +449,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
 
 - `novarocks/connector/paimon/**`
-  Read-only Paimon Filesystem Catalog, private wire codec, snapshot planning,
-  and append-only / `deduplicate` primary-key table reads.
+  Paimon Provider 已暂停；保留配置、合约与私有 wire codec，catalog materialize 成功，
+  目录与读取入口返回带恢复条件的 Unsupported，BE bind 明确拒绝。恢复须待 paimon-rust
+  及其依赖支持 Arrow 60 与 zstd 0.14，再按 ADR-0138 恢复授权读取；见 ADR-0204。
 
 - `novarocks/fs/**`
   Connector-neutral authorized object-store access. Its process-local
@@ -467,9 +469,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    entrypoint.
 2. The frontend owns session admission, catalog resolution, planning, and
    supervised statement orchestration and common logical execution assembly.
-3. Persistent tables belong to external providers. Iceberg owns its catalog and
-   mutation truth; Paimon owns its external snapshots and exposes only its
-   supported read capability.
+3. 持久表属于外部 Provider。Iceberg 拥有 catalog 与 mutation 真相；Paimon 保留注册
+   与 catalog 投影，读取已暂停。恢复须待上游闭包支持 Arrow 60 与 zstd 0.14，
+   并重新满足授权读取边界，见 ADR-0204。
 4. Frontend 将完成的物理计划冻结成 compiled packages，连同准确的 Connector facts
    经 native gRPC 提交到一个或多个 `role=be` 进程。
 5. BE hosts bind installed Connector execution instances and run Arrow batches
@@ -623,16 +625,27 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
 
 - `[standalone_server]`
-  `mysql_port`, `user`, MV scheduler settings, and Iceberg maintenance settings.
+  `mysql_port`、`trino_port`（默认 `8080`）、`trino_client_timeout_ms`（默认 `300000`）、
+  `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，与 MySQL
+  复用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
+  Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
-  Process-local object-store credentials for Iceberg and Paimon connector
-  execution; this does not define a native internal table store.
+  Iceberg Connector 执行使用的进程本地对象存储凭据，不定义 native 内部表存储。
+  Paimon 已暂停，不组合其 SDK 存储资源；恢复前须满足 Arrow 60、zstd 0.14
+  与 ADR-0138 的授权读取边界。
 
 - `[debug]`
   `exec_node_output`, `exec_batch_plan_json`
 
 ### 7.3 Local Test Environment (Iceberg REST + MinIO + Spark)
+
+新 Ubuntu 26.04 amd64 开发节点使用 [版本化准备入口](tools/dev/README.md)：
+`sudo tools/dev/linux-env.sh prepare --user <account> --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest`。
+prepare 才安装/联网供给；check/env 只观察/输出环境。显式账户和准确平台必须贯通 fixture schema 2，
+相同输入不无故重启服务；旧 BOM 明确重新 provision，现有机器版本变化沿原维护入口，不清卷。
+专用 profile 使用本机可用 CPU，通用构建默认不变。该节点不因此成为正式 CI 来源。
+
 
 The canonical local test fixture lives at `docker/iceberg-rest/` and is also
 the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
@@ -727,9 +740,11 @@ done
 grep -q '^NOVAROCKS_READY ' "$LOG" || { echo "timed out waiting for NOVAROCKS_READY" >&2; kill -9 "$SRV_PID"; exit 1; }
 ```
 
-The marker line is emitted on stdout immediately after a successful bind:
-`NOVAROCKS_READY mysql_port=23223 pid=<pid>`. Any orchestration that
-backgrounds the server **must** gate its first connection on this line.
+FE 绑定 Trino 与 MySQL 客户端监听后，在 stdout 输出：
+`NOVAROCKS_READY mysql_port=23223 pid=<pid> trino_port=<actual-port>`。
+字段 `trino_port` 追加在末尾，原 `NOVAROCKS_READY mysql_port=` 前缀保留。
+后台启动的编排必须等到这一行再连接，端口取本次实际 marker；不能只探测一个可能已被其他进程占用的端口。
+`NOVA_ENV_TRINO_PORT` 是本地 fixture 导出的 Trino 端口。
 
 Run SQL tests with the generated runner config:
 
@@ -1074,8 +1089,9 @@ suspected case against a clean server before attributing it to the change.
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
   or a no-runtime-filter retry inside an attempt. See ADR-0161.
-- **Connector behavior**: inspect `novarocks/connector/**` and
-  `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
+- **Connector behavior**：读取 `novarocks/connector/**` 与 `novarocks/fs/**`。
+  sealed manifest 注册 Iceberg 与 Paimon，Paimon 能力已暂停；
+  恢复须待上游支持 Arrow 60 与 zstd 0.14，并满足 ADR-0138，见 ADR-0204。
   StarRocks is retired and must not be restored through a local-binding config
   or runtime fallback.
 - **Connector scan execution**: inspect

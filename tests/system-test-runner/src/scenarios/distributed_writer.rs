@@ -101,7 +101,11 @@ const SEED_ROWS: i64 = SEED_ROWS_PER_FILE * SEED_FILES;
 const SEED_SUM: i64 = SEED_ROWS * (SEED_ROWS + 1) / 2;
 const WIDE_STATISTICS_CHANNELS: usize = 1_024;
 const WIDE_SEED_FILES: i64 = 12;
-const WIDE_ROWS_PER_FILE: i64 = 4;
+// Compact Theta v3 stores 16 + 8*n bytes for exact n > 1. Sixteen
+// distinct inputs produce 144 bytes, crossing the IPC 64-byte payload bucket.
+// This keeps the 1024-channel case a real sparse-packing fixture when an
+// all-valid IPC bitmap is omitted, without changing the packet limit.
+const WIDE_ROWS_PER_FILE: i64 = 16;
 const WIDE_ROWS: i64 = WIDE_ROWS_PER_FILE * WIDE_SEED_FILES;
 const STATISTICS_PACKET_BYTES: usize = 320 * 1024;
 

@@ -70,7 +70,6 @@ use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
 use novarocks_workload_control::WorkloadConfig;
 
-use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
 use crate::static_plan::ServerStaticPlan;
@@ -729,6 +728,16 @@ pub fn compose_frontend_role_config(
         port_override,
     )
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
+    let trino_settings = config
+        .standalone_server
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    let trino_listener = novarocks_trino_adapter::TrinoListenerSettings {
+        port: trino_settings.trino_port,
+        user: trino_settings.user,
+        client_timeout: Duration::from_millis(trino_settings.trino_client_timeout_ms),
+    };
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
     #[cfg(novarocks_dev_controls)]
@@ -776,6 +785,7 @@ pub fn compose_frontend_role_config(
                 config.server.frontend_cleanup_timeout_ms,
             ),
             mysql_listener,
+            trino_listener,
             native_trust: std::sync::Arc::clone(native_trust.trust()),
             native_transport: frontend_native_transport(native_trust.transport()),
             native_ingress: runtime_config.native_ingress.to_adapter_config(),
@@ -1112,14 +1122,14 @@ fn compose_iceberg_access_template_from_resources(
     resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
-        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+        dyn novarocks_connector_iceberg::access_binding::IcebergCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
             .credential_registry(ClusterRole::Be)
             .map_err(|error| anyhow::anyhow!("resolve BE catalog credentials: {error}"))?,
     );
-    Ok(IcebergReadBinding::with_static_credential_resolver(
+    Ok(IcebergReadBinding::with_credential_resolver(
         resources, resolver,
     ))
 }
@@ -1132,51 +1142,16 @@ pub(crate) fn compose_iceberg_metadata_access_template(
     resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
-        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+        dyn novarocks_connector_iceberg::access_binding::IcebergCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
             .credential_registry(ClusterRole::Fe)
             .map_err(|error| anyhow::anyhow!("resolve FE metadata credentials: {error}"))?,
     );
-    Ok(IcebergReadBinding::with_static_metadata_credential_resolver(resources, resolver))
-}
-
-/// The coordinator's Paimon file access: metadata reads on the process
-/// runtime, outside the scan I/O services.
-pub(crate) fn compose_paimon_control_access_factory(
-    config: &NovaRocksConfig,
-    resources: FsAccessResources,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    Ok(std::sync::Arc::new(
-        compose_paimon_access_factory_with_resources(config, ClusterRole::Fe, resources)?,
+    Ok(IcebergReadBinding::with_metadata_credential_resolver(
+        resources, resolver,
     ))
-}
-
-/// A backend's Paimon file access: the same scan I/O services as every other
-/// provider's execution reads, so its HEADs and GETs share their windows.
-pub(crate) fn compose_paimon_execution_access_factory(
-    config: &NovaRocksConfig,
-    resources: FsAccessResources,
-    scan_io: &ScanIoServices,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = resources.with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
-    Ok(std::sync::Arc::new(
-        compose_paimon_access_factory_with_resources(config, ClusterRole::Be, resources)?
-            .with_range_service(scan_io.range_service()),
-    ))
-}
-
-pub(crate) fn compose_paimon_access_factory_with_resources(
-    config: &NovaRocksConfig,
-    role: ClusterRole,
-    resources: FsAccessResources,
-) -> anyhow::Result<ServerPaimonRoleFileIoFactory> {
-    let credentials = config
-        .connector
-        .credential_registry(role)
-        .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
-    Ok(ServerPaimonRoleFileIoFactory::new(resources, credentials))
 }
 
 pub fn compose_connector_file_planning_resources(

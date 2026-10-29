@@ -612,8 +612,12 @@ mod tests {
                 .unwrap();
             // The source is called only after its complete producer admission.
             let graph = build_string_query_result("value", vec![value]).unwrap();
-            GovernedImmediateStatementResult::try_new(graph, statement)
-                .unwrap_or_else(|(error, _)| panic!("{error}"))
+            GovernedImmediateStatementResult::try_new(
+                graph,
+                statement,
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            )
+            .unwrap_or_else(|(error, _)| panic!("{error}"))
         }
     }
     struct Shim {
@@ -873,7 +877,11 @@ mod tests {
                     self.fixture.control.cancel_session_statement(
                         self.fixture.session.token(),
                         QueryCancellationReason::ExplicitKill {
-                            requester_connection_id: 901,
+                            requester_session:
+                                novarocks_query_application::session_control::ClientSessionKey::new(
+                                    901,
+                                )
+                                .expect("nonzero fixture requester"),
                         },
                     );
                 }
@@ -907,7 +915,9 @@ mod tests {
                 self.fixture.control.cancel_session_statement(
                     self.fixture.session.token(),
                     QueryCancellationReason::ExplicitKill {
-                        requester_connection_id: 901,
+                        requester_session:
+                            novarocks_query_application::session_control::ClientSessionKey::new(901)
+                                .expect("nonzero fixture requester"),
                     },
                 );
                 return crate::terminal::write_governed_terminal_error(error, protocol, results)
@@ -958,7 +968,9 @@ mod tests {
                 self.fixture.control.cancel_session_statement(
                     self.fixture.session.token(),
                     QueryCancellationReason::ExplicitKill {
-                        requester_connection_id: 901,
+                        requester_session:
+                            novarocks_query_application::session_control::ClientSessionKey::new(901)
+                                .expect("nonzero fixture requester"),
                     },
                 );
             }
@@ -1266,7 +1278,9 @@ mod tests {
             control.cancel_session_statement(
                 session,
                 QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 901,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(901)
+                            .expect("nonzero fixture requester"),
                 },
             );
             while capacity.snapshot().held_positions != [0, 0, 0, 1] {
@@ -1311,7 +1325,9 @@ mod tests {
             control.cancel_session_statement(
                 session,
                 QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 901,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(901)
+                            .expect("nonzero fixture requester"),
                 },
             );
             let mut suffix = Vec::new();

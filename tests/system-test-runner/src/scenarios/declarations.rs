@@ -29,6 +29,21 @@ pub(super) fn for_module(
     compatibility: bool,
 ) -> ScenarioDeclaration {
     let domains: &[&str] = match module {
+        "trino_protocol" => &[
+            "novarocks/trino-adapter/**",
+            "novarocks/result-render/**",
+            "novarocks/result-contract/**",
+            "novarocks/sql/src/compiler/root_render_type.rs",
+            "novarocks/query-application/src/session*.rs",
+            "novarocks/query-application/src/session_control/**",
+            "novarocks/query-application/src/sql/session/**",
+            "novarocks/query-application/src/query_control.rs",
+            "novarocks/query-application/src/protocol_delivery.rs",
+            "novarocks/query-application/src/client_query_id.rs",
+            "novarocks/frontend-application/**",
+            "novarocks-server/**",
+            "tests/system-test-runner/src/actors/trino_protocol.rs",
+        ],
         "backend_membership" => &[
             "novarocks/frontend-application/**",
             "novarocks/coordination-contract/**",

@@ -208,9 +208,11 @@ pub(crate) unsafe fn make_view_unchecked(
 ) -> Result<ArrayRef, ValueError> {
     let array: ArrayRef = match layout {
         ByteLayout::Utf8View => {
+            let buffers: Arc<[Buffer]> = buffers.into();
             Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, nulls) })
         }
         ByteLayout::BinaryView => {
+            let buffers: Arc<[Buffer]> = buffers.into();
             Arc::new(unsafe { BinaryViewArray::new_unchecked(views, buffers, nulls) })
         }
         _ => return Err(ValueError::Invariant(ValueViolation::Layout)),

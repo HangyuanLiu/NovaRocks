@@ -459,7 +459,9 @@ mod tests {
         assert!(!cancellation_overrides_error(
             &error,
             Some(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 7
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester")
             })
         ));
         assert_eq!(error.execution_failure(), Some(&input));

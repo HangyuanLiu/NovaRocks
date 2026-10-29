@@ -173,6 +173,7 @@ impl BackgroundManagementPass {
                     ..Default::default()
                 },
                 Default::default(),
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
             ))
             .with_result_capacity(capacity.clone())
             .map_err(|e| QueryServiceError::new(QueryServiceErrorKind::Internal, e.to_string()))?;
@@ -527,6 +528,7 @@ impl ScheduledCall {
                     ..Default::default()
                 },
                 Default::default(),
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
             ))
             .with_result_capacity(capacity)
             .map_err(|e| QueryServiceError::new(QueryServiceErrorKind::Internal, e.to_string()))?;

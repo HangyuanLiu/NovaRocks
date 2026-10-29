@@ -38,7 +38,9 @@ use novarocks_native_adapter::{
 };
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
-use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+use novarocks_spi::connector::{
+    CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
+};
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_types::{ClusterRole, NativeEndpoint};
 use novarocks_worker::LeaseBounds;
@@ -927,6 +929,13 @@ enum ConnectorCredentialEntryWire {
         access_key_secret: String,
         session_token: Option<String>,
     },
+    AliyunEcsRamRole {
+        purpose: CatalogCredentialPurposeWire,
+        name: String,
+        generation: String,
+        role_name: String,
+        scope_prefixes: Vec<String>,
+    },
     IcebergRestOauth2 {
         purpose: CatalogCredentialPurposeWire,
         name: String,
@@ -962,6 +971,24 @@ impl ConnectorCredentialEntryWire {
                     session_token.map(SecretValue::new),
                 )?),
             ),
+            Self::AliyunEcsRamRole {
+                purpose,
+                name,
+                generation,
+                role_name,
+                scope_prefixes,
+            } => {
+                let reference = NodeLocalCredentialReference::try_new(&name, &generation)
+                    .map_err(|error| error.to_string())?;
+                let config =
+                    novarocks_fs::AliyunEcsRamRoleConfig::try_new(&role_name, scope_prefixes)
+                        .map_err(|error| error.to_string())?;
+                return CatalogCredentialRegistryEntry::try_new_node_local(
+                    purpose.into(),
+                    reference,
+                    config,
+                );
+            }
             Self::IcebergRestOauth2 {
                 purpose,
                 name,
@@ -1038,6 +1065,10 @@ impl ConnectorConfig {
 pub struct StandaloneServerConfig {
     #[serde(default = "default_standalone_server_mysql_port")]
     pub mysql_port: u16,
+    #[serde(default = "default_trino_port")]
+    pub trino_port: u16,
+    #[serde(default = "default_trino_client_timeout_ms")]
+    pub trino_client_timeout_ms: u64,
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
     #[serde(default)]
@@ -1070,6 +1101,13 @@ pub struct StandaloneServerConfig {
     pub iceberg_maintenance_action_cooldown_ms: i64,
     #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
     pub iceberg_maintenance_max_consecutive_failures: u32,
+}
+
+fn default_trino_port() -> u16 {
+    8080
+}
+fn default_trino_client_timeout_ms() -> u64 {
+    300_000
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -1140,6 +1178,8 @@ impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
             mysql_port: default_standalone_server_mysql_port(),
+            trino_port: default_trino_port(),
+            trino_client_timeout_ms: default_trino_client_timeout_ms(),
             user: default_standalone_server_user(),
             mv_refresh_scheduler_enabled: false,
             mv_refresh_scheduler_interval_ms: default_standalone_mv_refresh_scheduler_interval_ms(),
@@ -3166,7 +3206,9 @@ mod tests {
     use novarocks_native_adapter::{
         FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
     };
-    use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+    use novarocks_spi::connector::{
+        CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
+    };
     use novarocks_types::ClusterRole;
 
     #[test]
@@ -3336,6 +3378,85 @@ password = "${ENV:RETIRED_STARROCKS_SECRET_MUST_NOT_BE_RESOLVED}"
             !error.contains("RETIRED_STARROCKS_SECRET_MUST_NOT_BE_RESOLVED"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn connector_credentials_parse_node_local_role_sources_without_acquiring_material() {
+        for (role, purpose, cluster_role) in [
+            ("fe", "object-store-metadata", ClusterRole::Fe),
+            ("be", "object-store-data", ClusterRole::Be),
+        ] {
+            let frontend_endpoint = if role == "be" {
+                "frontend_endpoint = \"127.0.0.1:9070\""
+            } else {
+                ""
+            };
+            let config: NovaRocksConfig = toml::from_str(&format!(
+                r#"
+[cluster]
+role = "{role}"
+{frontend_endpoint}
+[[connector.credentials]]
+purpose = "{purpose}"
+name = "oss-source"
+generation = "blue"
+kind = "aliyun-ecs-ram-role"
+role_name = "novarocks-ecs"
+scope_prefixes = ["s3://novarocks-ci/development/"]
+"#
+            ))
+            .unwrap();
+            let registry = config.connector.credential_registry(cluster_role).unwrap();
+            let purpose = if role == "fe" {
+                CatalogCredentialPurpose::ObjectStoreMetadata
+            } else {
+                CatalogCredentialPurpose::ObjectStoreData
+            };
+            let reference = NodeLocalCredentialReference::try_new("oss-source", "blue").unwrap();
+            let source = registry.resolve_node_local(purpose, &reference).unwrap();
+            assert_eq!(source.role_name(), "novarocks-ecs");
+            assert_eq!(
+                source.scope_prefixes()[0].as_str(),
+                "s3://novarocks-ci/development/"
+            );
+            assert!(
+                registry
+                    .resolve(
+                        purpose,
+                        &StaticCredentialReference::try_new("oss-source", "blue").unwrap()
+                    )
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn node_local_startup_config_requires_an_explicit_closed_source_definition() {
+        let valid = r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "oss-source"
+generation = "blue"
+kind = "aliyun-ecs-ram-role"
+role_name = "novarocks-ecs"
+scope_prefixes = ["s3://novarocks-ci/development/"]
+"#;
+        for invalid in [
+            valid.replace("role_name = \"novarocks-ecs\"", ""),
+            valid.replace("[\"s3://novarocks-ci/development/\"]", "[]"),
+            valid.replace(
+                "s3://novarocks-ci/development/",
+                "s3://novarocks-ci/development",
+            ),
+            valid.replace("object-store-data", "catalog-control"),
+            valid.replace("object-store-data", "data-credential-vending"),
+            format!("{valid}\naccess_key_id = \"must-not-be-a-static-snapshot\"\n"),
+        ] {
+            assert!(toml::from_str::<NovaRocksConfig>(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -4207,6 +4328,8 @@ grpc_port = 19080
             cfg.standalone_server,
             Some(StandaloneServerConfig {
                 mysql_port: 9030,
+                trino_port: 8080,
+                trino_client_timeout_ms: 300_000,
                 user: "root".to_string(),
                 mv_refresh_scheduler_enabled: false,
                 mv_refresh_scheduler_interval_ms: 30_000,

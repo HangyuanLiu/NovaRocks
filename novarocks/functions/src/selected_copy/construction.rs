@@ -16,7 +16,7 @@
 // under the License.
 
 //! Construction facts and the original nested Values constructor.
-//! Arrow 58.4 uses primitive/bytes interleave or MutableArrayData. The nested
+//! Arrow 60.1.0 uses primitive/bytes interleave or MutableArrayData. The nested
 //! constructor below borrows the existing multi-source operation's sole invoice.
 use super::{
     CopyConstructionError, CopyError, CopyMode, CopyObservation, CopyOperationFacts,
@@ -270,14 +270,14 @@ pub fn preflight_null_structure_construction<H>(
     Ok(facts)
 }
 
-fn null_node<E: From<CopyError>>(
+pub(super) fn null_node<E: From<CopyError>>(
     ty: &DataType,
     rows: usize,
     invoice: &mut take_host::CopyInvoiceTotals,
     raw_arrow: bool,
     work: &mut impl FnMut(bool) -> Result<(), E>,
 ) -> Result<usize, E> {
-    // Arrow 58.4 data.rs637: new_empty is exactly new_null(type, 0).
+    // Arrow 60.1.0 ArrayData::new_empty is exactly new_null(type, 0).
     // One zeroed Buffer constructor rounds its actual requested extent once;
     // no append/growth or guessed average value width enters this model.
     work(false)?;
@@ -331,7 +331,7 @@ fn null_node<E: From<CopyError>>(
             DataType::FixedSizeList(_, _) => (0, 1, true),
             DataType::Struct(fields) => (0, fields.len(), true),
             DataType::Union(fields, mode) => {
-                if fields.is_empty() {
+                if fields.is_empty() && !(raw_arrow && rows == 0) {
                     return Err(
                         CopyError::Invalid("empty Union lacks Arrow constructor child").into(),
                     );
@@ -1187,12 +1187,22 @@ pub fn copy_nested_values_construction<H>(
     work.flush().map_err(CopyError::Control)?;
     for &(source, row) in choices {
         work.flush().map_err(CopyError::Control)?;
-        output.extend(
-            source,
-            row,
-            row.checked_add(1)
-                .ok_or_else(|| CopyError::arithmetic(Some(row as u128 + 1)))?,
-        );
+        output
+            .try_extend(
+                source,
+                row,
+                row.checked_add(1)
+                    .ok_or_else(|| CopyError::arithmetic(Some(row as u128 + 1)))?,
+            )
+            .map_err(|source| {
+                CopyError::Control(
+                    crate::control_values::AssemblyFailure::arrow("nested Values copy", source)
+                        .into_kernel(),
+                )
+            })?;
+        // Only successful extension reaches the following checkpoint. The
+        // existing assembly source channel owns the unchanged SDK ArrowError.
+
         work.flush().map_err(CopyError::Control)?;
     }
     let output = arrow_array::make_array(output.freeze());
@@ -1219,8 +1229,12 @@ mod values_copy_tests {
     }
     fn sources() -> Vec<ArrayRef> {
         let field = Arc::new(
-            arrow_schema::Field::new("source-item", DataType::Int64, true)
-                .with_metadata([("nested.unknown".into(), "keep-cross-pool".into())].into()),
+            arrow_schema::Field::new("source-item", DataType::Int64, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "nested.unknown".into(),
+                    "keep-cross-pool".into(),
+                )]),
+            ),
         );
         [
             ListArray::from_iter_primitive::<Int64Type, _, _>([Some(vec![Some(10), None]), None]),
@@ -1352,6 +1366,41 @@ mod values_copy_tests {
                 matches!(values_copy_kind_observed(sources[0].data_type(), || Err(cause.clone())),
                 Err(CopyError::Control(actual)) if actual == cause)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_union_601_tests {
+    use super::*;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    use std::alloc::Layout;
+    #[test]
+    fn raw_empty_union_constructor_keeps_zero_length_sdk_success_without_typed_admission() {
+        for mode in [
+            arrow_schema::UnionMode::Sparse,
+            arrow_schema::UnionMode::Dense,
+        ] {
+            let ty = DataType::Union(arrow_schema::UnionFields::empty(), mode);
+            let mut exact = |_: Layout| Ok::<_, std::convert::Infallible>(());
+            let mut opaque = |_| Ok::<_, std::convert::Infallible>(());
+            let mut creation =
+                ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+            preflight_null_arrow_structure_observed(&ty, 0, &mut creation, &mut |_| Ok(()))
+                .unwrap();
+            let actual = arrow_array::new_empty_array(&ty);
+            assert_eq!(actual.len(), 0);
+            assert_eq!(actual.data_type(), &ty);
+            assert!(matches!(
+                null_node(
+                    &ty,
+                    0,
+                    &mut take_host::CopyInvoiceTotals::default(),
+                    false,
+                    &mut |_| Ok::<_, CopyError>(())
+                ),
+                Err(CopyError::Invalid(_))
+            ));
         }
     }
 }
