@@ -34,6 +34,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual('sts.aliyuncs.com',trust['Condition']['StringEquals']['oidc:aud'])
         self.assertEqual({'Fn::Sub':'repo:${Repository}:environment:aliyun-ci'},trust['Condition']['StringEquals']['oidc:sub'])
         self.assertEqual([],template['Resources']['OutboundSecurityGroup']['Properties']['SecurityGroupIngress'])
+        self.assertEqual('sts:AssumeRole',template['Resources']['InstanceRole']['Properties']['AssumeRolePolicyDocument']['Statement'][0]['Action'])
         worker=template['Resources']['InstanceRole']['Properties']['Policies'][0]['PolicyDocument']
         self.assertIn('kms:DeleteSecret',worker['Statement'][1]['Action'])
         self.assertTrue(first['parameters']['SecretPrefix'].startswith('g16-'))

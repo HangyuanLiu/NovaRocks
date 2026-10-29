@@ -125,9 +125,7 @@
           "Statement": [
             {
               "Effect": "Allow",
-              "Action": [
-                "sts:AssumeRole"
-              ],
+              "Action": "sts:AssumeRole",
               "Principal": {
                 "Service": [
                   "ecs.aliyuncs.com"
