@@ -98,3 +98,21 @@ class SigningExpiryTests(unittest.TestCase):
             self.assertEqual('https://example.invalid/fixed', store.presign('GET', 'key', '2029-01-01T00:00:00Z'))
         self.assertEqual([('test-id', 'test-secret', 'test-token')], observed)
         self.assertIs(newer, next(readings))
+
+
+class ObjectFailureTests(unittest.TestCase):
+    def test_official_operation_wrapper_preserves_no_such_key_and_denied(self):
+        from aliyun_ci.ports import APIError
+        class OperationError(Exception):
+            def __init__(self,error):self.error=error
+            def unwrap(self):return self.error
+        class ServiceError(Exception):
+            def __init__(self,code):self.code=code
+        for code in ('NoSuchKey','AccessDenied'):
+            def get_object(*args):raise OperationError(ServiceError(code))
+            store=ObjectStore.__new__(ObjectStore);store.bucket='bucket'
+            store.sdk=SimpleNamespace(exceptions=SimpleNamespace(OperationError=OperationError),GetObjectRequest=lambda **kw:kw)
+            store.client=SimpleNamespace(get_object=get_object)
+            with self.subTest(code=code),self.assertRaises(APIError) as raised:
+                store.get('object')
+            self.assertEqual(code,raised.exception.code)

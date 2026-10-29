@@ -127,6 +127,14 @@ def signing_credential_expiration(current, *, profile_file=None, environ=None):
     return min(bounds)
 
 
+def oss_error_code(error, sdk):
+    """Read the service verdict through the official operation wrapper."""
+    exceptions = getattr(sdk, 'exceptions', None)
+    if exceptions is not None and isinstance(error, exceptions.OperationError):
+        error = error.unwrap()
+    return getattr(error, 'code', None) or type(error).__name__
+
+
 class ObjectStore:
     def __init__(self, config, *, credential=None):
         self.sdk = import_module('alibabacloud_oss_v2')
@@ -146,7 +154,7 @@ class ObjectStore:
             self.client.put_object(self.sdk.PutObjectRequest(bucket=self.bucket, key=key, body=data,
                                                             forbid_overwrite=write_once))
         except Exception as error:
-            code = getattr(error, 'code', type(error).__name__)
+            code = oss_error_code(error, self.sdk)
             if write_once and code in ('FileAlreadyExists', 'ObjectAlreadyExists'):
                 if self.get(key) == data:
                     return
@@ -161,7 +169,7 @@ class ObjectStore:
             finally:
                 result.body.close()
         except Exception as error:
-            raise APIError(getattr(error, 'code', type(error).__name__), 'OSS GET failed') from error
+            raise APIError(oss_error_code(error, self.sdk), 'OSS GET failed') from error
 
     def list(self, prefix):
         keys, token = [], None
