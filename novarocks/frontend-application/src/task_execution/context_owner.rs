@@ -64,6 +64,30 @@ const RELEASE_RETRY_MAX: Duration = Duration::from_secs(1);
 /// and are not imported into the frontend.
 pub(crate) const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
 
+/// The original finite horizon that may outlive a rejected Create.
+///
+/// Neither source grants Worker ownership or a new observation interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateRefusalObservationHorizon {
+    AppliedLease(MonotonicInstant),
+    IssuedEstablish(MonotonicInstant),
+}
+
+impl CreateRefusalObservationHorizon {
+    pub(crate) const fn expiry(self) -> MonotonicInstant {
+        match self {
+            Self::AppliedLease(expiry) | Self::IssuedEstablish(expiry) => expiry,
+        }
+    }
+
+    pub(crate) const fn matches_parent_acknowledgement(self, acknowledged: bool) -> bool {
+        matches!(
+            (self, acknowledged),
+            (Self::AppliedLease(_), true) | (Self::IssuedEstablish(_), false)
+        )
+    }
+}
+
 /// The shared facts an establish installs atomically.
 ///
 /// All four are codec-owned content: the frontend can size and pass them
@@ -555,16 +579,27 @@ impl QueryContextOwner {
             .then(|| expiry.saturating_duration_since(now))
     }
 
-    /// Existing effective Worker lease at a correlated Create refusal. This
-    /// grants no work and introduces no new timeout; the caller snapshots it
-    /// once so a later renewal cannot extend replacement observation.
-    pub(crate) fn create_refusal_observation_expiry(&self) -> Option<MonotonicInstant> {
-        (self.establish_acknowledged
-            && !self.terminal_cleanup_started
-            && !self.released
-            && self.quiesce_receipt.is_none())
-        .then(|| self.renew_schedule.map(RenewSchedule::conservative_expiry))
-        .flatten()
+    /// Original Establish ticket or effective Worker lease at a Create refusal.
+    /// A pipelined Create does not imply that the Establish ACK arrived. Keep
+    /// those sources distinct, and snapshot once before any later ACK/renewal.
+    pub(crate) fn create_refusal_observation_horizon(
+        &self,
+    ) -> Option<CreateRefusalObservationHorizon> {
+        if self.terminal_cleanup_started || self.released || self.quiesce_receipt.is_some() {
+            return None;
+        }
+        if self.establish_acknowledged {
+            return self.renew_schedule.map(|schedule| {
+                CreateRefusalObservationHorizon::AppliedLease(schedule.conservative_expiry())
+            });
+        }
+        if !self.establish_send_started {
+            return None;
+        }
+        self.establish
+            .as_ref()?
+            .observation_expiry
+            .map(CreateRefusalObservationHorizon::IssuedEstablish)
     }
 
     /// The next renewal, if one is due.

@@ -2189,6 +2189,15 @@ fn first_create_waits_for_the_exact_establish_send_start() {
             .all(|intent| intent.kind() != OperationKind::CreateTask),
         "a queued Establish is not a send-start fact"
     );
+    assert_eq!(
+        harness
+            .execution
+            .owner(admission.context())
+            .unwrap()
+            .create_refusal_observation_horizon(),
+        None,
+        "a queued parent grants no replacement observation source"
+    );
     assert!(
         harness
             .execution
@@ -2196,10 +2205,32 @@ fn first_create_waits_for_the_exact_establish_send_start() {
             .is_err(),
         "a different Establish cannot open the first Create wave"
     );
+    assert_eq!(
+        harness
+            .execution
+            .owner(admission.context())
+            .unwrap()
+            .create_refusal_observation_horizon(),
+        None,
+        "a foreign send cannot mint the original observation source"
+    );
     harness
         .execution
         .establish_send_started(admission.context(), establish.envelope().operation_id())
         .expect("the exact Establish has started its RPC");
+    assert_eq!(
+        harness
+            .execution
+            .owner(admission.context())
+            .unwrap()
+            .create_refusal_observation_horizon(),
+        Some(
+            super::context_owner::CreateRefusalObservationHorizon::IssuedEstablish(
+                MonotonicInstant::from_origin(Duration::from_secs(10)),
+            )
+        ),
+        "only the exact original send carries its existing ticket horizon"
+    );
     assert!(
         harness
             .pump_once()
@@ -7765,7 +7796,20 @@ fn round_waiting_on_creates(
 
 fn round_waiting_on_creates_with_establish_trace(
     harness: Harness,
+    trace: Option<&mut Vec<(OperationIntent, OperationAcknowledgement)>>,
+) -> (
+    TaskRoundForTest,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Vec<OperationIntent>,
+) {
+    round_waiting_on_creates_with_establish_delivery(harness, trace, true)
+}
+
+fn round_waiting_on_creates_with_establish_delivery(
+    harness: Harness,
     mut trace: Option<&mut Vec<(OperationIntent, OperationAcknowledgement)>>,
+    acknowledge_establish: bool,
 ) -> (
     TaskRoundForTest,
     crate::task_execution::status_intake::StatusIntakeHandle,
@@ -7812,7 +7856,23 @@ fn round_waiting_on_creates_with_establish_trace(
                     acks.publish(ack);
                 }
                 OperationKind::UpdateQueryContext => {
-                    let ack = establish_ack(&intent);
+                    let ack = if acknowledge_establish {
+                        establish_ack(&intent)
+                    } else {
+                        let OperationIntent::EstablishQueryContext(request) = &intent else {
+                            unreachable!("startup context operation is its original Establish")
+                        };
+                        // RecordingSink starts this exact released RPC; the
+                        // original intake reports the send before its outcome.
+                        acks.publish_establish_send_started(
+                            intent.operation_id(),
+                            request.context(),
+                        );
+                        OperationAcknowledgement::transport_unknown(
+                            intent.operation_id(),
+                            OperationKind::UpdateQueryContext,
+                        )
+                    };
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.push((intent.clone(), ack.clone()));
                     }
@@ -12021,6 +12081,95 @@ pub(crate) fn pre_ready_original_create_refusal() -> (
         kind: OperationKind::CreateTask, operation_id, ..
     } if *operation_id == creates[0].operation_id()));
     (round, clock, error, trace)
+}
+
+/// Same released parent operation and explicit Unknown transport result as
+/// production pipelining; no Applied Worker receipt is invented.
+pub(crate) fn pre_ready_original_unknown_establish_create_refusal() -> (
+    TaskRoundForTest,
+    Arc<ManualClock>,
+    TaskExecutionError,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let harness = Harness::new(&[0], &[0], 64);
+    let clock = Arc::clone(&harness.clock);
+    let mut trace = Vec::new();
+    let (mut round, _, acks, creates) =
+        round_waiting_on_creates_with_establish_delivery(harness, Some(&mut trace), false);
+    let context = *round.execution().graph().contexts().next().unwrap();
+    assert_eq!(
+        round
+            .execution()
+            .pre_ready_observation_remaining(context.backend_process_id()),
+        Some(Duration::from_secs(10)),
+        "Unknown keeps the original admission horizon, without claiming a Worker lease"
+    );
+    let create = &creates[0];
+    clock.advance(Duration::from_secs(3));
+    acks.publish(OperationAcknowledgement::worker_receipt(
+        create.operation_id(),
+        OperationKind::CreateTask,
+        OperationOutcome::IdentityMismatch,
+        AckPayload::None,
+    ));
+    let error = round.receive_without_dispatch().unwrap_err();
+    assert!(matches!(&error, TaskExecutionError::OperationFailed {
+        context: observed, operation_id, kind: OperationKind::CreateTask, ..
+    } if *observed == context && *operation_id == create.operation_id()));
+    (round, clock, error, trace)
+}
+
+#[test]
+fn rejected_create_observation_keeps_submitted_unknown_establish_horizon() {
+    let (mut round, clock, error, trace) = pre_ready_original_unknown_establish_create_refusal();
+    let TaskExecutionError::OperationFailed {
+        context,
+        operation_id,
+        ..
+    } = error
+    else {
+        unreachable!("the original Create was refused by its Worker")
+    };
+    let establish = trace
+        .iter()
+        .find_map(|(intent, _)| match intent {
+            OperationIntent::EstablishQueryContext(request) if request.context() == context => {
+                Some(intent.clone())
+            }
+            _ => None,
+        })
+        .expect("the same original Establish was actually sent");
+    assert_eq!(
+        round
+            .execution()
+            .rejected_create_observation_remaining(context, operation_id),
+        Some(Duration::from_secs(7)),
+        "the actual submitted parent qualifies before its Applied acknowledgement"
+    );
+    // Unknown has settled the first transport generation. Release the same
+    // original replay before its definitive ACK, as the real dispatcher does.
+    round
+        .turn()
+        .expect("the original Establish replay is released");
+    // A later original Applied acknowledgement cannot replace the frozen cut.
+    round
+        .execution_mut()
+        .acknowledge(&establish_ack(&establish))
+        .unwrap();
+    assert_eq!(
+        round
+            .execution()
+            .rejected_create_observation_remaining(context, operation_id),
+        Some(Duration::from_secs(7)),
+    );
+    clock.advance(Duration::from_secs(8));
+    assert_eq!(
+        round
+            .execution()
+            .rejected_create_observation_remaining(context, operation_id),
+        Some(Duration::ZERO),
+        "late receipt never creates a fresh observation interval"
+    );
 }
 
 #[test]

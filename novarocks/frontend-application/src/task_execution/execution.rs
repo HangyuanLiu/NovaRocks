@@ -1466,16 +1466,16 @@ impl QueryTaskExecution {
                     .owners
                     .get(&context)
                     .is_some_and(QueryContextOwner::establish_acknowledged);
-                let observation_expiry = self
+                let observation_horizon = self
                     .owners
                     .get(&context)
-                    .and_then(QueryContextOwner::create_refusal_observation_expiry);
+                    .and_then(QueryContextOwner::create_refusal_observation_horizon);
                 let previous_status = task.status().map(TaskStatus::version);
                 let settlement = task.on_create_ack(
                     ack,
                     self.clock.now(),
                     context_established,
-                    observation_expiry,
+                    observation_horizon,
                 )?;
                 let accepted_status_changed =
                     previous_status != task.status().map(TaskStatus::version);

@@ -51,6 +51,7 @@ use novarocks_execution::task_execution::{
     TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateTask,
 };
 
+use super::context_owner::CreateRefusalObservationHorizon;
 use super::creation::{
     CreateTaskIntent, CreationLengths, TaskCreationSeed, create_queued_bytes, plan_carrier_bytes,
 };
@@ -1123,7 +1124,7 @@ impl RemoteTask {
         ack: &OperationAcknowledgement,
         now: MonotonicInstant,
         context_established: bool,
-        observation_expiry: Option<MonotonicInstant>,
+        observation_horizon: Option<CreateRefusalObservationHorizon>,
     ) -> Result<CreateSettlement, TaskExecutionError> {
         if ack.kind() != OperationKind::CreateTask
             || self.create_in_flight != Some(ack.operation_id())
@@ -1230,7 +1231,6 @@ impl RemoteTask {
                     ));
                 };
                 if !self.create_ownership_proven
-                    && context_established
                     && outcome == OperationOutcome::IdentityMismatch
                     && matches!(
                         ack.worker_header(),
@@ -1241,14 +1241,15 @@ impl RemoteTask {
                             }
                         )
                     )
-                    && let Some(expiry) = observation_expiry
-                    && !now.has_reached(expiry)
+                    && let Some(horizon) = observation_horizon
+                    && horizon.matches_parent_acknowledgement(context_established)
+                    && !now.has_reached(horizon.expiry())
                 {
-                    // on_create_ack has matched the original in-flight Task
-                    // operation. Capture the original lease before closing;
-                    // neither replay nor a late renewal can replace it.
+                    // on_create_ack has matched the original in-flight Task.
+                    // Preserve the issued Establish ticket or Applied lease;
+                    // a later ACK/renewal never replaces this original cut.
                     self.rejected_create_observation
-                        .get_or_insert((ack.operation_id(), expiry));
+                        .get_or_insert((ack.operation_id(), horizon.expiry()));
                 }
                 self.enter_terminal();
                 Ok(CreateSettlement::FailedClosed(outcome))
@@ -1579,7 +1580,11 @@ mod destination_close_tests {
                 OperationOutcome::IdentityMismatch,
                 AckPayload::None,
             );
-            let old = expiry.map(MonotonicInstant::from_origin);
+            // Preserve the old false-parent plus valid Applied-lease negative.
+            // Unknown submitted parents require their distinct owner source.
+            let old = expiry
+                .map(MonotonicInstant::from_origin)
+                .map(CreateRefusalObservationHorizon::AppliedLease);
             task.on_create_ack(&ack, MonotonicInstant::ORIGIN, established, old)
                 .unwrap();
             let before =
@@ -1596,7 +1601,9 @@ mod destination_close_tests {
                     &ack,
                     MonotonicInstant::ORIGIN,
                     true,
-                    Some(MonotonicInstant::from_origin(Duration::from_secs(90)))
+                    Some(CreateRefusalObservationHorizon::AppliedLease(
+                        MonotonicInstant::from_origin(Duration::from_secs(90))
+                    ))
                 )
                 .is_err()
             );

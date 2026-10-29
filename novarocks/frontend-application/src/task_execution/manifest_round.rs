@@ -2152,8 +2152,10 @@ mod tests {
 
     async fn original_rejected_create_drive(
         recovery: bool,
+        establish_unknown: bool,
     ) -> (
         TaskRound,
+        Arc<super::super::clock::ManualClock>,
         TaskExecutionError,
         novarocks_query_application::test_support::LogicalExecutionTestHarness,
         NativeAttemptDrive,
@@ -2167,21 +2169,32 @@ mod tests {
             EstablishTransportSubmission,
         };
         #[derive(Debug)]
-        struct AppliedTransport;
-        impl EstablishTransportSink for AppliedTransport {
+        struct OriginalTransport {
+            establish_unknown: bool,
+        }
+        impl EstablishTransportSink for OriginalTransport {
             fn try_reserve(&self, _: EstablishIssueIdentity) -> EstablishTransportAdmission {
-                EstablishTransportAdmission::Admitted(Box::new(Self))
+                EstablishTransportAdmission::Admitted(Box::new(Self {
+                    establish_unknown: self.establish_unknown,
+                }))
             }
         }
-        impl EstablishTransportReservation for AppliedTransport {
+        impl EstablishTransportReservation for OriginalTransport {
             fn submit(self: Box<Self>, submission: EstablishTransportSubmission) {
-                submission
-                    .worker_settled(novarocks_execution_contract::OperationOutcome::Accepted)
-                    .unwrap();
+                if self.establish_unknown {
+                    let _late = submission.transport_unknown().unwrap();
+                } else {
+                    submission
+                        .worker_settled(novarocks_execution_contract::OperationOutcome::Accepted)
+                        .unwrap();
+                }
             }
         }
-        let (round, _clock, error, trace) =
-            super::super::tests::pre_ready_original_create_refusal();
+        let (round, clock, error, trace) = if establish_unknown {
+            super::super::tests::pre_ready_original_unknown_establish_create_refusal()
+        } else {
+            super::super::tests::pre_ready_original_create_refusal()
+        };
         let context = *round.execution().graph().contexts().next().unwrap();
         let (logical, drive, cancellation, requester, abort) =
             terminal_regression_drive_with_recovery(context, recovery).await;
@@ -2211,31 +2224,61 @@ mod tests {
                         .unwrap();
                 }
                 super::super::intent::OperationIntent::EstablishQueryContext(request) => {
-                    let issue = drive
-                        .authorize_establish(
-                            request,
-                            native_compatibility_id.expect("original admission precedes Establish"),
-                        )
+                    let context = request.context();
+                    let operation_id = request.envelope().operation_id();
+                    let parent = logical
+                        .establish_snapshot(context)
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .expect("the original admission owns this context");
+                    // Unknown replay re-signs QA's retained original request;
+                    // it cannot authorize a fresh payload or operation.
+                    let issue = if parent.identity().is_some() {
+                        drive.reauthorize_establish(context).await.unwrap()
+                    } else {
+                        drive
+                            .authorize_establish(
+                                request,
+                                native_compatibility_id
+                                    .expect("original admission precedes Establish"),
+                            )
+                            .await
+                            .unwrap()
+                    };
+                    assert_eq!(issue.identity().context(), context);
+                    assert_eq!(issue.identity().operation_id(), operation_id);
                     assert_eq!(
-                        issue.try_submit(&AppliedTransport).unwrap(),
+                        issue
+                            .try_submit(&OriginalTransport { establish_unknown })
+                            .unwrap(),
                         EstablishIssueSubmit::Accepted
                     );
                 }
                 _ => panic!("startup trace contains only original context operations"),
             }
         }
-        (round, error, logical, drive, cancellation, requester, abort)
+        (
+            round,
+            clock,
+            error,
+            logical,
+            drive,
+            cancellation,
+            requester,
+            abort,
+        )
     }
 
     #[tokio::test]
     async fn rejected_create_waits_for_positive_replacement_under_current_qa_policy() {
         // Distinguish policy-closed and cancellation-closed from a positive
         // process observation; the original public Invariant never changes.
-        for case in 0..3 {
-            let (round, error, logical, drive, cancellation, requester, _abort) =
-                original_rejected_create_drive(case != 1).await;
+        for (establish_unknown, case) in [false, true]
+            .into_iter()
+            .flat_map(|establish_unknown| (0..3).map(move |case| (establish_unknown, case)))
+        {
+            let (round, _clock, error, logical, drive, cancellation, requester, _abort) =
+                original_rejected_create_drive(case != 1, establish_unknown).await;
             let context = *round.execution().graph().contexts().next().unwrap();
             let original = error.preparation_input();
             let source = Arc::new(PendingProcessObservation::new(
@@ -2282,6 +2325,65 @@ mod tests {
                     0
                 );
             }
+            drop(assembled);
+            drop(drive);
+            finish_pending_actor(logical, context).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_create_unknown_establish_expires_without_a_replacement_witness() {
+        for (state, late_positive) in [
+            BackendProcessObservation::Current,
+            BackendProcessObservation::Unobservable,
+        ]
+        .into_iter()
+        .flat_map(|state| [false, true].into_iter().map(move |late| (state, late)))
+        {
+            let (round, clock, error, logical, drive, _cancellation, _requester, _abort) =
+                original_rejected_create_drive(true, true).await;
+            let context = *round.execution().graph().contexts().next().unwrap();
+            let original = error.preparation_input();
+            let TaskExecutionError::OperationFailed { operation_id, .. } = &error else {
+                panic!("original Create rejection")
+            };
+            assert_eq!(
+                round
+                    .execution()
+                    .rejected_create_observation_remaining(context, *operation_id),
+                Some(std::time::Duration::from_secs(7)),
+            );
+            let source = Arc::new(PendingProcessObservation::new(
+                context.backend_process_id(),
+                state,
+            ));
+            let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
+            assert!(assembled.pending_pre_ready_must_wait());
+            clock.advance(std::time::Duration::from_secs(6));
+            assert!(assembled.pending_pre_ready_must_wait());
+            clock.advance(std::time::Duration::from_secs(1));
+            let calls = source.calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(!assembled.pending_pre_ready_must_wait());
+            // A positive fact after expiry cannot revive the original cut.
+            // The other branch retains only Current or Unobservable evidence.
+            if late_positive {
+                clock.advance(std::time::Duration::from_secs(1));
+                source.replace();
+            }
+            assert!(!assembled.pending_pre_ready_must_wait());
+            assert_eq!(
+                source.calls.load(std::sync::atomic::Ordering::SeqCst),
+                calls
+            );
+            let NativeAttemptTerminal::Failed(failure) =
+                &assembled.pending_terminal.as_ref().unwrap().terminal
+            else {
+                panic!("original Create rejection")
+            };
+            assert_eq!(failure.input(), &original);
+            assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+            assert!(failure.pre_ready_replacement().is_none());
+            assert!(!assembled.pending_pre_ready_must_wait());
             drop(assembled);
             drop(drive);
             finish_pending_actor(logical, context).await;
