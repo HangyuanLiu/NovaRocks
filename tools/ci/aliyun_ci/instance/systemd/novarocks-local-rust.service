@@ -24,6 +24,7 @@ After=novarocks-ci-bootstrap.service network-online.target
 Type=simple
 User=root
 WorkingDirectory=/opt/novarocks-ci
+LimitNOFILE=65536
 ExecStartPre=/usr/sbin/iptables -I OUTPUT -d 100.100.100.200/32 -m owner --uid-owner runner -j REJECT
 ExecStart=/opt/novarocks-ci/venv/bin/python -m aliyun_ci.instance.local_rust
 OOMPolicy=continue

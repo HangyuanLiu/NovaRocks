@@ -30,6 +30,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import resource
 import shutil
 import signal
 import subprocess
@@ -261,6 +262,8 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
     runtime, source_root, attempt = Path(runtime), Path(source_root), Path(payload['attempt_root'])
     status = {'schema': 1, 'identity': payload['identity'], 'state': 'preparing',
               'exit_code': None, 'tools_check_exit': None, 'handoff': None}
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    status['service_rlimit_nofile'] = {'soft': soft, 'hard': hard}
     def publish():
         _atomic(runtime / 'local-status.json', status)
         _atomic(attempt / 'status.json', status, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)

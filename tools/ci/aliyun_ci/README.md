@@ -4,6 +4,8 @@
 
 local可选 `"cargo_registry":"rsproxy"`，通过Cargo标准source replacement将crates.io的下载定向到 `sparse+https://rsproxy.cn/index/`；省略或选择 `"crates-io"` 保持原配置行为。原Cargo.lock、包来源身份、版本与checksum及完整Rust选择保持不变，不增加下载回退或重试。local Cargo固定使用HTTP/1.1；编译并发仍由原 `build_jobs` 决定。GitHub与G19共享profile不受影响。
 
+local服务显式提供 `LimitNOFILE=65536`，满足原生FE/BE的文件描述符前置条件；根服务实际限额保留在 `service_rlimit_nofile` 状态事实中。普通batch继承情况须按原PID读回，不能用systemd默认值代替实测。
+
 选择rsproxy时，镜像必须在guest实际准备事实中报告 `local_rust_cargo_registries` 支持该值；旧镜像缺少此字段时只认crates-io，控制方会在分配前拒绝rsproxy。实例root仅在runner的Cargo_HOME中写本入口管理的 `config.toml`，未知已有配置、软链和优先级更高的旧 `config` 均拒绝且不覆盖。实际写入内容与readback SHA-256进入本次 `cargo-registry.json`，随原attempt归档取回。[Cargo source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)；[rsproxy官方配置](https://rsproxy.cn/)。
 
 ```sh
