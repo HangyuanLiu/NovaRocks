@@ -70,6 +70,13 @@ impl BulkProbeBatch {
 }
 pub(crate) struct BulkPresenceBatch {
     present: Vec<u8>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen K presence contract retains participation separately from match or miss."
+        )
+    )]
     participates: Vec<u8>,
     _storage: ValueTypeStorageLifetime,
 }
@@ -77,6 +84,13 @@ impl BulkPresenceBatch {
     pub(crate) fn present(&self) -> &[u8] {
         &self.present
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen K presence contract retains participation separately from match or miss."
+        )
+    )]
     pub(crate) fn participates(&self) -> &[u8] {
         &self.participates
     }
@@ -184,6 +198,10 @@ impl IndexView {
     pub(crate) fn spec(&self) -> &KeySpec {
         &self.spec
     }
+    #[expect(
+        dead_code,
+        reason = "Frozen K view purpose accessor remains available to handoff consumers."
+    )]
     pub(crate) fn purpose(&self) -> IndexPurpose {
         self.purpose
     }
@@ -397,6 +415,13 @@ impl IndexView {
     }
     /// Only requested partition/ID metadata is grouped. Borrowed typed pages
     /// are moved by the original read author, with no copied key payload.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen K typed read/export API; current join consumes lookup and assignments."
+        )
+    )]
     pub(crate) fn read_keys(
         &self,
         keys: &[BulkKey],
@@ -483,6 +508,13 @@ impl IndexView {
             }
         }
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen K typed read/export API; current join consumes lookup and assignments."
+        )
+    )]
     pub(crate) fn export_keys(
         &self,
         keys: &[BulkKey],
@@ -498,6 +530,13 @@ impl IndexView {
     }
 }
 #[derive(Clone, Copy)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Partition grouping metadata belongs to the frozen K typed read/export path."
+    )
+)]
 struct Request {
     key: BulkKey,
     ordinal: usize,

@@ -114,6 +114,7 @@ impl PartitionBuildCursor {
 
     /// Counts only references actually committed by this cursor, not complete
     /// route coverage or the number of distinct classes in the partition.
+    #[cfg(test)]
     pub(super) fn consumed(&self) -> ExecutionResult<usize> {
         self.check()?;
         self.state

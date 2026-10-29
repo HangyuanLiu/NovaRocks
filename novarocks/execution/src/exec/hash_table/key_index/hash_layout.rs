@@ -236,9 +236,20 @@ mod tests {
 /// this is deliberately not a complete Layout or allocation upper bound.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HashTableCost {
+    #[expect(
+        dead_code,
+        reason = "Retains the original locked-table modeled bucket-count fact; it is not capacity authority."
+    )]
     pub(super) buckets: usize,
     pub(super) entry_slot_bytes: u128,
     pub(super) control_byte_minimum: u128,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the explicit unknown hashbrown trailer/alignment caveat."
+        )
+    )]
     pub(super) unmodeled_trailer_and_alignment: bool,
 }
 impl HashLayout {

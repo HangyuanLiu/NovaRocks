@@ -664,9 +664,7 @@ impl CanonicalTupleBatch<'_> {
     ) -> ExecutionResult<Option<Option<&str>>> {
         self.storage.view(self.arrays).string_component(column, row)
     }
-    pub(crate) fn row_has_null(&self, row: usize) -> ExecutionResult<bool> {
-        self.storage.view(self.arrays).row_has_null(row)
-    }
+    #[cfg(test)]
     pub(crate) fn encode_row(
         &self,
         row: usize,
@@ -712,6 +710,7 @@ impl<'a> CanonicalTupleView<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn row_has_null(&self, row: usize) -> ExecutionResult<bool> {
         self.row_has_null_observed(row, &|| Ok(()))
     }
@@ -759,6 +758,7 @@ impl<'a> CanonicalTupleView<'a> {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_row(
         &self,
         row: usize,

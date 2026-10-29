@@ -1355,7 +1355,12 @@ mod failure_latch_tests {
         let fragment = FragmentId::new(1);
         let mut builder = FragmentBuilder::new(fragment);
         let source = builder.reserve_node_id().unwrap();
-        let keys = values(&mut builder, source, &[key_type.clone()], literal_rows);
+        let keys = values(
+            &mut builder,
+            source,
+            std::slice::from_ref(&key_type),
+            literal_rows,
+        );
         let (node, _) = add_aggregate(
             &mut builder,
             source,

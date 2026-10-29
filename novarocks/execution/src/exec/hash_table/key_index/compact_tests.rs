@@ -1536,11 +1536,8 @@ fn nominal_raw_bytes_follow_the_real_bulk_hash_graph_without_reframing() {
             // A retained route cursor can wait for frontier space. Continue
             // claiming eager merge work before advancing each retained task
             // once; do not try to finish one route before claiming its merge.
-            loop {
-                match graph.claim(&ports).unwrap() {
-                    BulkClaim::Task(task) => pending.push(task),
-                    BulkClaim::Pending | BulkClaim::Finished => break,
-                }
+            while let BulkClaim::Task(task) = graph.claim(&ports).unwrap() {
+                pending.push(task);
             }
             if pending.is_empty() {
                 break;

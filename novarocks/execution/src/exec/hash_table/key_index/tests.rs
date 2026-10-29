@@ -232,8 +232,8 @@ fn required_null_and_undefined_occurrences_are_rejected_before_hashing() {
     let array: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
     let ty = FunctionValueType::new(DataType::Int32, false);
     let result = KeyInput::new(
-        &[array.clone()],
-        &[ty.clone()],
+        std::slice::from_ref(&array),
+        std::slice::from_ref(&ty),
         &readable(2),
         &[1],
         &mut ValueConversionContext::default(),

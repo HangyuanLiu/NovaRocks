@@ -19,9 +19,11 @@
 //! owns worker/frontier limits, merge priority, coverage and Ready publication.
 //! There is no task registry, queue, driver, observable or payload copy here.
 
+#[cfg(test)]
+use super::capture::BulkOccurrence;
 use super::{
     bulk::{CapturedRuns, CompleteInput},
-    capture::{BulkDomain, BulkOccurrence, CapturedPage, CapturedPageId},
+    capture::{BulkDomain, CapturedPage, CapturedPageId},
     checkpoint_at,
     hash_layout::HashLayout,
     invariant, reserve_push, shared,
@@ -261,6 +263,7 @@ pub(super) struct ReferencePage {
     _storage: ValueTypeStorageLifetime,
 }
 impl ReferencePage {
+    #[cfg(test)]
     pub(super) fn page_id(&self) -> CapturedPageId {
         self.page
     }
@@ -273,6 +276,7 @@ impl ReferencePage {
     pub(super) fn len(&self) -> usize {
         self.occurrences.len()
     }
+    #[cfg(test)]
     pub(super) fn reference(&self, index: usize) -> ExecutionResult<BulkOccurrence> {
         let occurrence = *self
             .occurrences
@@ -294,6 +298,7 @@ impl RoutePartial {
     pub(super) fn partition(&self) -> usize {
         self.partition
     }
+    #[cfg(test)]
     pub(super) fn references(&self) -> &ReferencePage {
         &self.references
     }
@@ -304,14 +309,30 @@ pub(super) enum RouteAdvance {
     Completed,
 }
 pub(super) struct RoutedRange {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the completed route source/range fact beside exact eligible counts."
+        )
+    )]
     page: CapturedPageId,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the completed route source/range fact beside exact eligible counts."
+        )
+    )]
     range: Range<usize>,
     eligible: usize,
 }
 impl RoutedRange {
+    #[cfg(test)]
     pub(super) fn page(&self) -> CapturedPageId {
         self.page
     }
+    #[cfg(test)]
     pub(super) fn range(&self) -> Range<usize> {
         self.range.clone()
     }
@@ -329,9 +350,11 @@ pub(super) struct RouteCursor {
     completed: bool,
 }
 impl RouteCursor {
+    #[cfg(test)]
     pub(super) fn position(&self) -> usize {
         self.position
     }
+    #[cfg(test)]
     pub(super) fn active_partials(&self) -> usize {
         self.workspace.slots.iter().filter(|s| s.is_some()).count()
     }

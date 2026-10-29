@@ -51,6 +51,13 @@ pub(super) struct OwnedByteColumn {
     spec: KeySpec,
     column: usize,
     page: OwnedBytesPage,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the real byte-column creator and raw nominal storage holder; preserve drop order."
+        )
+    )]
     storage: ValueTypeStorageLifetime,
 }
 /// Nominal byte values may use raw private view storage, but that storage is
@@ -249,12 +256,14 @@ impl OwnedByteColumn {
     pub(super) fn page(&self) -> &OwnedBytesPage {
         &self.page
     }
+    #[cfg(test)]
     pub(super) fn array(&self) -> &dyn Array {
         self.array.as_ref()
     }
     pub(super) fn binding(&self) -> &FunctionValueType {
         &self.binding
     }
+    #[cfg(test)]
     pub(super) fn storage(&self) -> &ValueTypeStorageLifetime {
         &self.storage
     }

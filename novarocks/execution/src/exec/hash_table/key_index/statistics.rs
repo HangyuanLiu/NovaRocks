@@ -50,6 +50,7 @@ impl IntegerDomain {
         }
     }
     /// A widened span is an optimization fact, never an input-size quota.
+    #[cfg(test)]
     pub(super) fn span(self) -> Option<u128> {
         self.min_max
             .map(|(min, max)| ((max as i128) - (min as i128) + 1) as u128)

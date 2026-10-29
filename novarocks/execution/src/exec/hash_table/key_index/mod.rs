@@ -48,25 +48,90 @@ mod table;
 mod tests;
 
 pub(crate) use bulk::CompleteInput;
-pub(crate) use bulk_read::{BulkKey, BulkMatch, BulkPresenceBatch, BulkProbeBatch, IndexView};
-pub(crate) use bulk_tasks::{
-    AssignmentChunk, Assignments, BulkAssignments, BulkReady, BulkTaskGraph, Claim as BulkClaim,
-    Completion as BulkCompletion, Task as BulkTask,
-};
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_read::BulkPresenceBatch;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_read::BulkProbeBatch;
+pub(crate) use bulk_read::{BulkKey, BulkMatch, IndexView};
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_tasks::AssignmentChunk;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_tasks::Assignments;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_tasks::BulkReady;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_tasks::Completion as BulkCompletion;
+pub(crate) use bulk_tasks::{BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask};
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use capture::CapturedPageId;
 pub(crate) use capture::{
-    BulkDomain, BulkInput, CaptureBuilder, CaptureWork, CapturedPageId, EvaluatedPage,
-    SealedCapture,
+    BulkDomain, BulkInput, CaptureBuilder, CaptureWork, EvaluatedPage, SealedCapture,
 };
 pub(crate) use direct_int::DirectWork as BulkWork;
 pub(crate) use export::ExportedKeys;
 #[cfg(test)]
 pub(crate) use local_hash::BYTE_HASH_INITS;
 pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
-pub(crate) use prepared::{
-    IndexPurpose, KeyId, KeyInput, KeySpec, KeyStrategy, NullPolicy, PreparedKeyBatch,
-};
-pub(crate) use read::{KeyReadColumn, KeyReadPage, KeyReadRow, KeyReadValues, OwnedKeyReadBatch};
-pub(crate) use table::{InternBatch, KeyIndex, KeyMatch, NewKey, PresenceBatch, ProbeBatch};
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "Names the signed logical key strategy used by the retained K property contract."
+    )
+)]
+pub(crate) use prepared::KeyStrategy;
+pub(crate) use prepared::{IndexPurpose, KeyId, KeyInput, KeySpec, NullPolicy, PreparedKeyBatch};
+#[expect(
+    unused_imports,
+    reason = "Frozen K typed read/export API; current join consumes lookup and assignments."
+)]
+pub(crate) use read::KeyReadPage;
+pub(crate) use read::{KeyReadColumn, KeyReadRow, KeyReadValues, OwnedKeyReadBatch};
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
+)]
+pub(crate) use table::InternBatch;
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
+    )
+)]
+pub(crate) use table::NewKey;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
+)]
+pub(crate) use table::PresenceBatch;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
+)]
+pub(crate) use table::ProbeBatch;
+pub(crate) use table::{KeyIndex, KeyMatch};
 
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},

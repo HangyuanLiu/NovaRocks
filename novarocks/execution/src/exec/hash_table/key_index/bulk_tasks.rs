@@ -176,6 +176,10 @@ impl Shared {
 /// Direct, Hash and Empty share this author and exact private leases. Caller
 /// scheduling and wakeups remain outside this local data-dependency graph.
 pub(crate) struct BulkTaskGraph(Arc<Shared>);
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One linear task moves with its claim; boxing would add a separately funded allocation per claim."
+)]
 pub(crate) enum Claim {
     Task(Task),
     Pending,
@@ -284,6 +288,7 @@ impl BulkTaskGraph {
         result
     }
 
+    #[cfg(test)]
     pub(super) fn phase(&self) -> ExecutionResult<Phase> {
         self.0.domain.check_failure()?;
         Ok(self.0.state()?.phase)
@@ -615,13 +620,11 @@ impl BulkTaskGraph {
             Phase::Assign => Phase::Ready,
             Phase::Ready | Phase::Published => return Ok(()),
         };
-        if next == Phase::Assign || next == Phase::Ready {
-            if state.view.is_none() {
-                state.view = Some(shared(
-                    work.owner,
-                    IndexView::direct(Arc::clone(self.0.direct()?), work.owner, work.control)?,
-                )?);
-            }
+        if (next == Phase::Assign || next == Phase::Ready) && state.view.is_none() {
+            state.view = Some(shared(
+                work.owner,
+                IndexView::direct(Arc::clone(self.0.direct()?), work.owner, work.control)?,
+            )?);
         }
         state.phase = next;
         state.next_shard = 0;
@@ -655,6 +658,10 @@ impl BulkTaskGraph {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The claimed seed transfers existing cursor ownership inline without a new allocation."
+)]
 enum Seed {
     Hash(hash::HashSeed),
     Init(usize),
@@ -680,6 +687,10 @@ impl Drop for Lease {
         }
     }
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The task keeps its original cursor and resource holders inline across bounded advances."
+)]
 enum Body {
     Hash(Option<hash::HashBody>),
     Init(direct_int::InitCursor),
@@ -690,6 +701,10 @@ enum Body {
     Null(usize),
     Assign(AssignCursor),
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Completion moves its existing owned payload once without allocating another carrier."
+)]
 enum Output {
     Hash(hash::HashOutput),
     Unit,
@@ -710,6 +725,7 @@ pub(crate) struct Completion {
     value: Option<(Output, Lease)>,
 }
 impl Task {
+    #[cfg(test)]
     pub(super) fn phase(&self) -> Phase {
         self.lease.as_ref().expect("unconsumed task").phase
     }
@@ -920,12 +936,30 @@ impl BulkReady {
     pub(crate) fn into_parts(self) -> (Arc<IndexView>, BulkAssignments) {
         (self.view, BulkAssignments(self.assignments))
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Ready metadata accessor; the current join consumes into_parts."
+        )
+    )]
     pub(crate) fn spec(&self) -> &super::KeySpec {
         self.view.spec()
     }
+    #[expect(
+        dead_code,
+        reason = "Frozen Ready purpose/presence query API; current join queries the retained IndexView."
+    )]
     pub(crate) fn purpose(&self) -> IndexPurpose {
         self.view.purpose()
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Ready query/typed-output/assignment handoff; current join consumes into_parts."
+        )
+    )]
     pub(crate) fn probe(
         &self,
         input: &PreparedKeyBatch<'_>,
@@ -935,6 +969,10 @@ impl BulkReady {
     ) -> ExecutionResult<super::bulk_read::BulkProbeBatch> {
         self.view.probe(input, saved, owner, control)
     }
+    #[expect(
+        dead_code,
+        reason = "Frozen Ready purpose/presence query API; current join queries the retained IndexView."
+    )]
     pub(crate) fn contains(
         &self,
         input: &PreparedKeyBatch<'_>,
@@ -945,9 +983,23 @@ impl BulkReady {
         self.view.contains(input, saved, owner, control)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Ready query/typed-output/assignment handoff; current join consumes into_parts."
+        )
+    )]
     pub(super) fn view(&self) -> &IndexView {
         &self.view
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Ready query/typed-output/assignment handoff; current join consumes into_parts."
+        )
+    )]
     pub(crate) fn read_keys(
         &self,
         keys: &[BulkKey],
@@ -956,6 +1008,13 @@ impl BulkReady {
     ) -> ExecutionResult<super::OwnedKeyReadBatch<'_>> {
         self.view.read_keys(keys, owner, control)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Ready query/typed-output/assignment handoff; current join consumes into_parts."
+        )
+    )]
     pub(crate) fn export_keys(
         &self,
         keys: &[BulkKey],
@@ -980,6 +1039,13 @@ impl BulkReady {
             .ok_or_else(|| invariant(ValueViolation::Layout))?
             .lookup_value_after_fill(value)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Ready query/typed-output/assignment handoff; current join consumes into_parts."
+        )
+    )]
     pub(crate) fn assignments(&self) -> Assignments<'_> {
         Assignments(self.assignments.as_deref())
     }

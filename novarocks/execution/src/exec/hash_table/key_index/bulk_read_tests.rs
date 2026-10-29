@@ -808,7 +808,13 @@ fn readonly_refusal_foreign_hash_invalid_ranges_and_output_failure_do_not_poison
             .is_err()
     );
     assert_invariant(
-        &error(view.probe_range(&prepared, Some(&hashes), 3..2, owner.as_ref(), &Control)),
+        &error(view.probe_range(
+            &prepared,
+            Some(&hashes),
+            std::ops::Range { start: 3, end: 2 },
+            owner.as_ref(),
+            &Control,
+        )),
         ValueViolation::Bounds,
     );
     let Backend::Hash { policy, .. } = &view.backend else {

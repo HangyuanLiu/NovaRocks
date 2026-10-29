@@ -70,6 +70,13 @@ pub(crate) enum KeyStrategy {
 struct SpecData {
     types: Vec<FunctionValueType>,
     nulls: Vec<NullPolicy>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the signed logical key strategy independently of actual Arrow carrier."
+        )
+    )]
     strategy: KeyStrategy,
     _storage: ValueTypeStorageLifetime,
 }
@@ -121,6 +128,13 @@ impl KeySpec {
     pub(crate) fn nulls(&self) -> &[NullPolicy] {
         &self.0.nulls
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Exposes the frozen signed logical strategy fact used by K property tests."
+        )
+    )]
     pub(crate) fn strategy(&self) -> KeyStrategy {
         self.0.strategy
     }
@@ -163,6 +177,10 @@ struct InputData {
     ordinals: Vec<usize>,
     tuples: CanonicalTupleStorage,
     preparation: Option<CapturedPreparation>,
+    #[expect(
+        dead_code,
+        reason = "Retains the actual input directory/selection creator; preserve field order."
+    )]
     storage: ValueTypeStorageLifetime,
 }
 /// One immutable, evaluated page. Saved hashes bind to this actual owner, not
@@ -170,6 +188,13 @@ struct InputData {
 #[derive(Clone)]
 pub(crate) struct KeyInput(Arc<InputData>);
 impl KeyInput {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     pub(crate) fn new(
         arrays: &[ArrayRef],
         bindings: &[FunctionValueType],
@@ -354,9 +379,6 @@ impl KeyInput {
     }
     pub(super) fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
-    }
-    pub(crate) fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
-        self.0.storage.clone()
     }
 }
 /// Coordinate sorting is ordinary fast-path linear for ordered pages. The
@@ -556,6 +578,13 @@ fn prepare_projection(
 }
 
 enum Preparation<'a> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     Temporary {
         projected: Option<(CanonicalTupleStorage, Vec<FunctionValueType>)>,
         bytes: Vec<Option<PreparedBytes<'a>>>,
@@ -589,6 +618,13 @@ pub(crate) struct PreparedKeyBatch<'a> {
     pub(super) allocator: AggregateAllocator,
 }
 impl<'a> PreparedKeyBatch<'a> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     pub(crate) fn new(
         spec: &KeySpec,
         input: &'a KeyInput,

@@ -110,13 +110,18 @@ pub(super) struct SizingSketch {
 /// its real retained authority. The byte vector drops before its capacity charge.
 pub(super) struct SizingPayload {
     bytes: Vec<u8>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Owns original serialized HLL capacity until bytes drop; field order is required."
+        )
+    )]
     charge: OpaqueRetainedCharge,
     domain: SizingDomain,
 }
 impl SizingPayload {
-    pub(super) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
+    #[cfg(test)]
     pub(super) fn retained_upper_bytes(&self) -> usize {
         self.charge.bytes()
     }
@@ -235,9 +240,7 @@ impl SizingSketch {
         self.handle = None;
         self.charge.release_retained();
     }
-    pub(super) fn domain(&self) -> &SizingDomain {
-        &self.domain
-    }
+    #[cfg(test)]
     pub(super) fn retained_upper_bytes(&self) -> usize {
         self.charge.bytes()
     }

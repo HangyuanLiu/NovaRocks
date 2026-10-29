@@ -574,10 +574,6 @@ impl AggregateTopNBoundaryBinding {
     pub(crate) const fn state(&self) -> &AggregateTopNBoundaryState {
         &self.state
     }
-
-    pub(crate) fn state_mut(&mut self) -> &mut AggregateTopNBoundaryState {
-        &mut self.state
-    }
 }
 
 fn validate_topn_boundary_contract(

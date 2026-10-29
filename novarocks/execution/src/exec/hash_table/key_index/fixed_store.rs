@@ -37,6 +37,13 @@ pub(super) struct OwnedFixedColumn {
     binding: FunctionValueType,
     spec: KeySpec,
     column: usize,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the real fixed-column creator; preserve field order and actual alias lifetime."
+        )
+    )]
     storage: ValueTypeStorageLifetime,
 }
 impl OwnedFixedColumn {
@@ -144,12 +151,14 @@ impl OwnedFixedColumn {
     pub(super) fn array_ref(&self) -> &ArrayRef {
         &self.array
     }
+    #[cfg(test)]
     pub(super) fn array(&self) -> &dyn Array {
         self.array.as_ref()
     }
     pub(super) fn binding(&self) -> &FunctionValueType {
         &self.binding
     }
+    #[cfg(test)]
     pub(super) fn storage(&self) -> &ValueTypeStorageLifetime {
         &self.storage
     }

@@ -119,6 +119,13 @@ pub(super) struct DirectCosts {
     pub(super) storage_headers_bytes: u128,
     pub(super) count_prefix_peak_bytes: u128,
     pub(super) representative_payload_estimate: u128,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost/provenance fact; it grants no allocation authority."
+        )
+    )]
     pub(super) representative_pages_upper: usize,
     pub(super) representative_node_metadata_upper: u128,
     pub(super) null_constructor_peak_upper: u128,
@@ -167,6 +174,7 @@ impl DirectGeometry {
             kind,
         })
     }
+    #[cfg(test)]
     pub(super) fn slots(self) -> usize {
         self.slots
     }
@@ -273,7 +281,7 @@ impl DirectGeometry {
     }
 }
 fn ceiling(value: usize, unit: usize) -> Option<usize> {
-    (value / unit).checked_add(usize::from(value % unit != 0))
+    (value / unit).checked_add(usize::from(!value.is_multiple_of(unit)))
 }
 fn arc_bytes<T>() -> Option<usize> {
     novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
@@ -336,10 +344,18 @@ struct Shard {
 pub(super) struct RepresentativePages {
     pub(super) base: usize,
     pub(super) len: usize,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains actual Direct key representative arrays for the frozen typed read/export API."
+        )
+    )]
     pages: Vec<ArrayRef>,
     _storage: ValueTypeStorageLifetime,
 }
 impl RepresentativePages {
+    #[cfg(test)]
     pub(super) fn arrays(&self) -> &[ArrayRef] {
         &self.pages
     }
@@ -410,6 +426,7 @@ impl Storage {
     pub(super) fn geometry(&self) -> DirectGeometry {
         self.geometry
     }
+    #[cfg(test)]
     pub(super) fn binding(&self) -> &FunctionValueType {
         &self.binding
     }
@@ -548,6 +565,13 @@ impl Storage {
             .get()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Direct typed read/export locates the separately constructed NULL class."
+        )
+    )]
     pub(super) fn null_array(&self) -> ExecutionResult<Option<&ArrayRef>> {
         self.null_representative
             .get()
@@ -641,6 +665,13 @@ impl Storage {
 // This private coordinate keeps REPRESENTATIVE_ROWS inside its constructing
 // author. A NULL page is the original typed one-row array, never a fake value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Private location tag for the frozen Direct typed read/export API."
+    )
+)]
 enum DirectPageId {
     Values { shard: usize, page: usize },
     Null,
@@ -658,6 +689,13 @@ impl Storage {
             .copied()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
+        )
+    )]
     fn locate_id(
         &self,
         id: KeyId,
@@ -703,6 +741,13 @@ impl Storage {
             local % REPRESENTATIVE_ROWS,
         ))
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
+        )
+    )]
     fn read_array(&self, page: DirectPageId) -> ExecutionResult<&ArrayRef> {
         match page {
             DirectPageId::Values { shard, page } => self
@@ -717,6 +762,13 @@ impl Storage {
     }
     /// Borrow exact immutable representative arrays in requested ID order.
     /// Every location is O(log W); no slot scan, per-key Arrow array or codec.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
+        )
+    )]
     pub(super) fn read_keys(
         &self,
         ids: &[KeyId],
@@ -759,6 +811,13 @@ impl Storage {
     }
     /// The existing output author enforces exact signed target/NULL semantics
     /// and owns actual selected copy plus result/Buffer creator custody.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
+        )
+    )]
     pub(super) fn export_keys(
         &self,
         ids: &[KeyId],
@@ -1354,16 +1413,37 @@ fn publish_values<T: ArrowPrimitiveType>(
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+    )
+)]
 pub(super) struct AssignmentPage {
     pub(super) start: usize,
     matches: Vec<KeyMatch>,
     _storage: ValueTypeStorageLifetime,
 }
 impl AssignmentPage {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     pub(super) fn matches(&self) -> &[KeyMatch] {
         &self.matches
     }
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+    )
+)]
 pub(super) struct AssignCursor {
     store: Arc<Storage>,
     input: KeyInput,
@@ -1374,6 +1454,13 @@ pub(super) struct AssignCursor {
     storage: ValueTypeStorageLifetime,
 }
 impl AssignCursor {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     pub(super) fn new(
         store: Arc<Storage>,
         input: &KeyInput,
@@ -1405,6 +1492,13 @@ impl AssignCursor {
         }
         result
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     pub(super) fn advance(&mut self, quota: usize, work: &DirectWork<'_>) -> ExecutionResult<bool> {
         let result: ExecutionResult<_> = (|| {
             self.store.check_failure()?;
@@ -1437,6 +1531,13 @@ impl AssignCursor {
         }
         result
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the tested independent K preparation/task interface in production; current consumers use the shared captured graph path."
+        )
+    )]
     pub(super) fn finish(self) -> ExecutionResult<AssignmentPage> {
         let origin = Arc::clone(&self.store);
         let result: ExecutionResult<_> = (|| {

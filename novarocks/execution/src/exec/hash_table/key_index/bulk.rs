@@ -18,12 +18,11 @@
 //! Merge sealed producer facts without visiting their input pages. Complete
 //! capture coverage is distinct from completion of the later index task graph.
 
+#[cfg(test)]
+use super::capture::BulkOccurrence;
 use super::{
     IndexPurpose,
-    capture::{
-        BulkDomain, BulkInput, BulkOccurrence, CaptureWork, CapturedPage, CapturedPageId,
-        SealedPages,
-    },
+    capture::{BulkDomain, BulkInput, CaptureWork, CapturedPage, CapturedPageId, SealedPages},
     checkpoint_at, invariant, shared,
     sizing::{SizingDomain, SizingSketch},
     statistics::BuildRangeStats,
@@ -50,12 +49,26 @@ pub(super) struct NdvHint {
     input_rows: usize,
     indexable_rows: usize,
     estimate: u64,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost/provenance fact; it grants no allocation authority."
+        )
+    )]
     method: NdvMethod,
 }
 impl NdvHint {
     pub(super) fn estimate(&self) -> u64 {
         self.estimate
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the complete-input NDV provenance accessor; tests distinguish exact-empty facts from HLL estimates."
+        )
+    )]
     pub(super) fn method(&self) -> NdvMethod {
         self.method
     }
@@ -108,6 +121,7 @@ impl CapturedRuns {
         }
         Ok(page)
     }
+    #[cfg(test)]
     pub(super) fn row(&self, reference: BulkOccurrence) -> ExecutionResult<usize> {
         self.page(reference.page)?.input().row(reference.occurrence)
     }

@@ -134,7 +134,7 @@ fn join_k_duplicate_pages_preserve_original_build_rows_and_finite_pair_cursor() 
             ]))],
             vec![Arc::new(Int32Array::from(vec![Some(1), Some(4), Some(2)]))],
         ],
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -145,7 +145,7 @@ fn join_k_duplicate_pages_preserve_original_build_rows_and_finite_pair_cursor() 
         Some(3),
         Some(2),
     ]))];
-    let (actual, lengths) = pairs(&map, &probe, &[binding.clone()], &work, 2);
+    let (actual, lengths) = pairs(&map, &probe, std::slice::from_ref(&binding), &work, 2);
     assert_eq!(actual, vec![(0, 4), (0, 2), (0, 0), (3, 6), (3, 1)]);
     assert_eq!(lengths, vec![2, 2, 1]);
     let (mask, stats) = map
@@ -171,15 +171,15 @@ fn join_k_dense_integer_uses_original_direct_and_presence_never_builds_row_topol
         (0..2048).map(|i| Some(i % 32 - 16)).collect::<Vec<_>>(),
     ))];
     let rows = build(
-        &[input.clone()],
-        &[binding.clone()],
+        std::slice::from_ref(&input),
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
     );
     let set = build(
         &[input],
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::PresenceOnly,
         &work,
@@ -196,7 +196,7 @@ fn join_k_dense_integer_uses_original_direct_and_presence_never_builds_row_topol
     let (mask, stats) = set
         .search_membership_arrays(
             &probe,
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             4,
             &mut ValueConversionContext::default(),
             &work,
@@ -237,7 +237,7 @@ fn join_k_sparse_full_i64_domain_has_no_private_range_cap_and_preserves_null_saf
             Some(i64::MAX),
             Some(i64::MIN),
         ]))]],
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[true],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -262,7 +262,7 @@ fn join_k_string_offsets_views_and_large_offsets_share_signed_domain_without_re_
     let work = ports(owner.as_ref(), &tracker, &control);
     let binding = FunctionValueType::new(DataType::Utf8, true);
     let mut capture = JoinKeyBuild::new(
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[true],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -349,7 +349,7 @@ fn join_k_empty_input_probe_and_all_unmatchable_keep_original_shape_contract() {
     let binding = FunctionValueType::new(DataType::Int32, true);
     let empty = build(
         &[],
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -357,20 +357,20 @@ fn join_k_empty_input_probe_and_all_unmatchable_keep_original_shape_contract() {
     assert!(empty.is_empty());
     let arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![Some(1), None]))];
     assert!(
-        pairs(&empty, &arrays, &[binding.clone()], &work, 2)
+        pairs(&empty, &arrays, std::slice::from_ref(&binding), &work, 2)
             .0
             .is_empty()
     );
     let nulls = build(
         &[vec![Arc::new(Int32Array::from(vec![None, None]))]],
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
     );
     assert!(!nulls.is_empty());
     assert!(
-        pairs(&nulls, &arrays, &[binding.clone()], &work, 1)
+        pairs(&nulls, &arrays, std::slice::from_ref(&binding), &work, 1)
             .0
             .is_empty()
     );
@@ -378,7 +378,7 @@ fn join_k_empty_input_probe_and_all_unmatchable_keep_original_shape_contract() {
     let (mask, stats) = nulls
         .search_membership_arrays(
             &empty_probe,
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             0,
             &mut ValueConversionContext::default(),
             &work,
@@ -407,7 +407,7 @@ fn join_k_mutating_shape_failure_latches_and_readonly_stop_preserves_index() {
     let binding = FunctionValueType::new(DataType::Int32, true);
     let arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![Some(7)]))];
     let mut capture = JoinKeyBuild::new(
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -416,7 +416,7 @@ fn join_k_mutating_shape_failure_latches_and_readonly_stop_preserves_index() {
     let first = capture
         .push(
             &arrays,
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             2,
             &mut ValueConversionContext::default(),
             &work,
@@ -425,7 +425,7 @@ fn join_k_mutating_shape_failure_latches_and_readonly_stop_preserves_index() {
     let again = capture
         .push(
             &arrays,
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             1,
             &mut ValueConversionContext::default(),
             &work,
@@ -434,8 +434,8 @@ fn join_k_mutating_shape_failure_latches_and_readonly_stop_preserves_index() {
     assert_eq!(first.failure_fact(), again.failure_fact());
     assert!(capture.finish(&work).is_err());
     let map = build(
-        &[arrays.clone()],
-        &[binding.clone()],
+        std::slice::from_ref(&arrays),
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -444,7 +444,7 @@ fn join_k_mutating_shape_failure_latches_and_readonly_stop_preserves_index() {
     let error = map
         .lookup_group_ids_arrays(
             &arrays,
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             1,
             &mut ValueConversionContext::default(),
             &work,
@@ -469,7 +469,7 @@ fn join_k_true_tracker_refusal_refunds_all_owned_backing_on_exit() {
     {
         let work = ports(owner.as_ref(), &tracker, &control);
         let mut capture = JoinKeyBuild::new(
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             &[false],
             JoinHashMapBuildPurpose::RowMatches,
             &work,
@@ -515,7 +515,7 @@ fn join_k_dictionary_bottom_null_summary_and_probe_nulls_use_original_prepared_f
         .unwrap(),
     );
     let mut capture = JoinKeyBuild::new(
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -525,7 +525,7 @@ fn join_k_dictionary_bottom_null_summary_and_probe_nulls_use_original_prepared_f
     capture
         .push_observed(
             &[array],
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             4,
             &mut ValueConversionContext::default(),
             &work,
@@ -599,7 +599,7 @@ fn join_k_nested_keys_keep_child_nulls_and_root_null_class_distinct() {
     let binding = FunctionValueType::new(input.data_type().clone(), true);
     let map = build(
         &[vec![input]],
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[true],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -617,7 +617,7 @@ fn join_k_required_null_keeps_original_typed_rejection_and_latched_cause() {
     let work = ports(owner.as_ref(), &tracker, &control);
     let binding = FunctionValueType::new(DataType::Int32, false);
     let mut capture = JoinKeyBuild::new(
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &work,
@@ -626,7 +626,7 @@ fn join_k_required_null_keeps_original_typed_rejection_and_latched_cause() {
     let error = capture
         .push(
             &[Arc::new(Int32Array::from(vec![None]))],
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             1,
             &mut ValueConversionContext::default(),
             &work,
@@ -707,7 +707,7 @@ fn join_k_captured_source_tag_exits_before_published_destination_index() {
     let source_work = ports(&source, &tracker, &control);
     let binding = FunctionValueType::new(DataType::Utf8, true);
     let mut capture = JoinKeyBuild::new(
-        &[binding.clone()],
+        std::slice::from_ref(&binding),
         &[false],
         JoinHashMapBuildPurpose::RowMatches,
         &destination_work,
@@ -719,7 +719,7 @@ fn join_k_captured_source_tag_exits_before_published_destination_index() {
                 Some("a long source value requiring owned destination bytes"),
                 None,
             ]))],
-            &[binding.clone()],
+            std::slice::from_ref(&binding),
             2,
             &mut ValueConversionContext::default(),
             &source_work,

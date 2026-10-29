@@ -55,7 +55,7 @@ fn bytes_input(
     for p in 0..pages {
         let values: Vec<Option<String>> = (0..page_rows)
             .map(|i| {
-                if all_null || (p * page_rows + i) % 13 == 0 {
+                if all_null || (p * page_rows + i).is_multiple_of(13) {
                     None
                 } else {
                     Some(format!("key-{:02}-é中", (p * page_rows + i) % 67))
@@ -104,6 +104,10 @@ fn bytes_input(
     (complete, expected)
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Exercises the original inline linear task/completion transition without a new carrier allocation."
+)]
 enum Step {
     Retained(Task),
     Complete(Completion),
@@ -125,17 +129,12 @@ fn drive(
         if pending.is_empty() && stop == Some(graph.phase().unwrap()) {
             return (None, workers, None);
         }
-        loop {
-            match graph.claim(ports).unwrap() {
-                Claim::Task(task) => {
-                    if stop == Some(task.phase()) {
-                        assert!(pending.is_empty());
-                        return (None, workers, Some(task));
-                    }
-                    pending.push(task);
-                }
-                Claim::Pending | Claim::Finished => break,
+        while let Claim::Task(task) = graph.claim(ports).unwrap() {
+            if stop == Some(task.phase()) {
+                assert!(pending.is_empty());
+                return (None, workers, Some(task));
             }
+            pending.push(task);
         }
         if pending.is_empty() {
             let ready = graph

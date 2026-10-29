@@ -46,21 +46,77 @@ pub(super) enum StrategyReason {
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CostComparison {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost comparison and explicit unmodeled terms; not a physical bound."
+        )
+    )]
     pub(super) direct: DirectCosts,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost comparison and explicit unmodeled terms; not a physical bound."
+        )
+    )]
     pub(super) hash: IntegerHashCosts,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost comparison and explicit unmodeled terms; not a physical bound."
+        )
+    )]
     pub(super) direct_modeled_bytes: u128,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost comparison and explicit unmodeled terms; not a physical bound."
+        )
+    )]
     pub(super) hash_modeled_bytes: u128,
     /// Deliberately use the least fragmented modeled hash endpoint. This is a
     /// cheap reference, not a claim that all hash keys occupy one actual page.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost comparison and explicit unmodeled terms; not a physical bound."
+        )
+    )]
     pub(super) hash_batches_modeled: usize,
     /// Original custody, library padding and capacity slack remain unmodeled
     /// on both sides. The comparison is no physical bound or performance claim.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the original selector cost comparison and explicit unmodeled terms; not a physical bound."
+        )
+    )]
     pub(super) has_unmodeled_terms: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct StrategyDecision {
     pub(super) kind: StrategyKind,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains why the original selector chose a layout and its actual modeled/unknown cost facts."
+        )
+    )]
     pub(super) reason: StrategyReason,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains why the original selector chose a layout and its actual modeled/unknown cost facts."
+        )
+    )]
     pub(super) comparison: Option<CostComparison>,
 }
 

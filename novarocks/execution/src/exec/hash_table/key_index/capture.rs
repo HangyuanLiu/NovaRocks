@@ -231,6 +231,7 @@ impl CapturedPageId {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(super) struct BulkOccurrence {
     pub(super) page: CapturedPageId,
     pub(super) occurrence: usize,
@@ -254,6 +255,7 @@ impl CapturedPage {
     pub(super) fn len(&self) -> usize {
         self.occurrences
     }
+    #[cfg(test)]
     pub(super) fn occurrence(&self, occurrence: usize) -> ExecutionResult<BulkOccurrence> {
         if occurrence >= self.occurrences {
             return Err(invariant(ValueViolation::Bounds));
@@ -300,6 +302,7 @@ impl CaptureBuilder {
             failed: None,
         })
     }
+    #[cfg(test)]
     pub(super) fn run_id(&self) -> CaptureRunId {
         self.run
     }
@@ -474,6 +477,13 @@ pub(super) struct SealedPages {
     pages: Vec<CapturedPage>,
     domain: BulkDomain,
     run: CaptureRunId,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the sealed producer occurrence subtotal alongside its actual page directory."
+        )
+    )]
     occurrences: usize,
     _storage: ValueTypeStorageLifetime,
 }
@@ -484,6 +494,7 @@ impl SealedPages {
     pub(super) fn len(&self) -> usize {
         self.pages.len()
     }
+    #[cfg(test)]
     pub(super) fn occurrences(&self) -> usize {
         self.occurrences
     }
@@ -499,9 +510,11 @@ pub(crate) struct SealedCapture {
     sizing: SizingPayload,
 }
 impl SealedCapture {
+    #[cfg(test)]
     pub(super) fn pages(&self) -> &SealedPages {
         &self.directory
     }
+    #[cfg(test)]
     pub(super) fn counts(&self) -> &BuildRangeStats {
         &self.counts
     }
@@ -591,6 +604,7 @@ impl BulkInput {
     pub(super) fn sealed_runs(&self) -> usize {
         self.sealed_runs
     }
+    #[cfg(test)]
     pub(super) fn capture(&self, run_ordinal: usize) -> ExecutionResult<&SealedCapture> {
         self.captures
             .get(run_ordinal)

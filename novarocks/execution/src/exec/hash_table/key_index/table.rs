@@ -117,6 +117,13 @@ struct CompactedPrefix {
 }
 // A soft work/storage preference. Every remaining class continues in another
 // chunk; neither this value nor a page target bounds legal input or key size.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Chunk target belongs to the frozen incremental compaction API; bulk uses ClassSourcePlan."
+    )
+)]
 const COMPACTION_CLASS_ROWS: usize = 4096;
 
 struct ClassSourceIdentity {
@@ -323,6 +330,7 @@ impl KeyIndex {
     }
     /// Private mutable construction for one closed bulk input. The task graph
     /// retains this value until it publishes an immutable Ready index.
+    #[cfg(test)]
     pub(super) fn new_for_bulk_hash(
         spec: KeySpec,
         purpose: IndexPurpose,
@@ -476,10 +484,10 @@ impl KeyIndex {
             reserve_state(&mut self.classes, initial, &checkpoint)?;
             checkpoint()
         })();
-        if let Err(cause) = &result {
-            if self.failed.is_none() {
-                self.failed = Some(cause.clone());
-            }
+        if let Err(cause) = &result
+            && self.failed.is_none()
+        {
+            self.failed = Some(cause.clone());
         }
         result
     }
@@ -672,6 +680,13 @@ impl KeyIndex {
     }
     /// Rebuild immutable representative pages without rehashing or resigning
     /// classes. Escaped Arrow aliases continue to own their previous creators.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen incremental compaction preserves KeyIds and escaped old Buffer aliases."
+        )
+    )]
     pub(crate) fn compact(
         &mut self,
         owner: &dyn InputConstructionOwner,
@@ -679,10 +694,10 @@ impl KeyIndex {
     ) -> ExecutionResult<()> {
         self.check()?;
         let result = self.compact_pages(owner, control);
-        if let Err(cause) = &result {
-            if self.failed.is_none() {
-                self.failed = Some(cause.clone());
-            }
+        if let Err(cause) = &result
+            && self.failed.is_none()
+        {
+            self.failed = Some(cause.clone());
         }
         result
     }
@@ -791,6 +806,13 @@ impl KeyIndex {
         });
         Ok(RetiredClassBatches { batches: retired })
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen incremental compaction preserves KeyIds and escaped old Buffer aliases."
+        )
+    )]
     fn compact_pages(
         &mut self,
         owner: &dyn InputConstructionOwner,
@@ -863,6 +885,13 @@ impl KeyIndex {
     }
     /// Presence construction returns only cardinality change. No public KeyId,
     /// per-input build assignment or duplicate physical row list is produced.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen whole-batch K membership API; current production consumers use selected occurrence ports."
+        )
+    )]
     pub(crate) fn include_presence(
         &mut self,
         input: &PreparedKeyBatch<'_>,
@@ -959,6 +988,13 @@ impl KeyIndex {
             _storage: owner.storage_lifetime(),
         })
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen whole-batch K membership API; current production consumers use selected occurrence ports."
+        )
+    )]
     pub(crate) fn contains_batch(
         &self,
         input: &PreparedKeyBatch<'_>,
@@ -1306,15 +1342,15 @@ fn probe_chains(
     let mut active = vector(owner, chunk.rows.len())?;
     for (probe, value) in output.iter().enumerate() {
         checkpoint_at(probe, checkpoint)?;
-        if *value == Match::Miss {
-            if let Some(entry) = directory.find(chunk.table_hashes[probe], |entry| {
+        if *value == Match::Miss
+            && let Some(entry) = directory.find(chunk.table_hashes[probe], |entry| {
                 entry.full == chunk.hashes[probe]
-            }) {
-                active.push(Candidate {
-                    probe,
-                    node: resolve(entry.head)?,
-                });
-            }
+            })
+        {
+            active.push(Candidate {
+                probe,
+                node: resolve(entry.head)?,
+            });
         }
     }
     let mut truth = vector(owner, active.len())?;
@@ -1517,7 +1553,21 @@ fn reserve_state<T>(
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct IntegerHashCosts {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains original purpose/eligible/cost caveat facts; NDV estimates never replace exact eligible counts."
+        )
+    )]
     pub(super) purpose: super::IndexPurpose,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains original purpose/eligible/cost caveat facts; NDV estimates never replace exact eligible counts."
+        )
+    )]
     pub(super) exact_eligible: usize,
     pub(super) reserve_classes_estimate: usize,
     pub(super) index_inline_bytes: u128,
@@ -1533,6 +1583,13 @@ pub(super) struct IntegerHashCosts {
     pub(super) representative_validity_may_exist: bool,
     /// Vec spare capacity, private hashbrown group/alignment, creator/custody
     /// chains and source retention are not represented as known zero bytes.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains original purpose/eligible/cost caveat facts; NDV estimates never replace exact eligible counts."
+        )
+    )]
     pub(super) has_unmodeled_custody_and_capacity: bool,
 }
 impl IntegerHashCosts {

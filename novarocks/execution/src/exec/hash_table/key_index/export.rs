@@ -41,6 +41,13 @@ use std::sync::Arc;
 
 pub(crate) struct ExportedKeys {
     arrays: Vec<ArrayRef>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains exact signed output bindings and their metadata lifetimes beside exported arrays."
+        )
+    )]
     bindings: Vec<FunctionValueType>,
     _storage: ValueTypeStorageLifetime,
 }
@@ -48,6 +55,13 @@ impl ExportedKeys {
     pub(crate) fn arrays(&self) -> &[ArrayRef] {
         &self.arrays
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Frozen typed export exposes the exact signed output declaration."
+        )
+    )]
     pub(crate) fn bindings(&self) -> &[FunctionValueType] {
         &self.bindings
     }

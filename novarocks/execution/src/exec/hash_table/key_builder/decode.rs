@@ -289,10 +289,10 @@ fn decode(
                 resource.checkpoint()?;
                 let mut bits = 0;
                 for (i, row) in block.iter().enumerate() {
-                    if let Some(row) = row {
-                        if decode_fixed_value(row, 1, 1, |b| Ok(b[0] != 0))? {
-                            bits |= 1 << i;
-                        }
+                    if let Some(row) = row
+                        && decode_fixed_value(row, 1, 1, |b| Ok(b[0] != 0))?
+                    {
+                        bits |= 1 << i;
                     }
                 }
                 values.push(bits);

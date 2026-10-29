@@ -47,6 +47,13 @@ use std::sync::Arc;
 const PAGE_TARGET: usize = 64 * 1024;
 struct CanonicalPage {
     array: ArrayRef,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the checked OwnedBytesPage custody and defined-row holder; preserve field order."
+        )
+    )]
     page: OwnedBytesPage,
 }
 #[derive(Clone, Copy)]
@@ -64,6 +71,7 @@ pub(super) struct OwnedCanonicalColumn {
 }
 /// An explicitly encoded read. Array materialization belongs to the original
 /// canonical constructor under the caller's signed output and real creator.
+#[cfg(test)]
 pub(super) struct CanonicalKeyRead<'a> {
     pub(super) binding: &'a FunctionValueType,
     pub(super) payload: Option<&'a [u8]>,
@@ -313,6 +321,7 @@ impl OwnedCanonicalColumn {
             checkpoint,
         )
     }
+    #[cfg(test)]
     pub(super) fn read(&self, row: usize) -> ExecutionResult<CanonicalKeyRead<'_>> {
         let location = self
             .locations
