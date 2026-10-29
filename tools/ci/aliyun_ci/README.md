@@ -1,4 +1,29 @@
-# 阿里云手动 Rust CI
+# 本机按需远端 Rust 验证
+
+开发者或Agent可以从开发机直接申请一次性ECS、执行完整原生Rust batch、下载校验后的材料并释放机器。local配置显式使用 `"execution_kind":"local-rust"` 并省略 `github`；不需要推送提交或配置GitHub。规格、磁盘与期限由部署配置明确提供。
+
+```sh
+cd tools/ci
+# 使用安装了 requirements.lock 的 operator venv；标准阿里云凭证链读取本机登录。
+python3 -m aliyun_ci --config /absolute/local-config.json local-run \
+  --source /absolute/NovaRocks --sha FULL_LOCAL_COMMIT --image-id IMAGE_ID \
+  --record /absolute/new/run.json
+python3 -m aliyun_ci --config /absolute/local-config.json local-status --record /absolute/new/run.json
+python3 -m aliyun_ci --config /absolute/local-config.json local-cancel --record /absolute/new/run.json
+python3 -m aliyun_ci --config /absolute/local-config.json local-collect \
+  --record /absolute/new/run.json --destination /absolute/new/collected
+python3 -m aliyun_ci --config /absolute/local-config.json teardown --plan /absolute/new/run.json
+```
+
+工作树必须clean，所选提交必须是准确HEAD；源码以自包含Git bundle交付，不带本机Git配置或登录信息。`local-run --prepare-only`只生成本机源码与计划，供离线预览。默认执行原 `test-run.py batch` 的完整常规nextest和独立doctest，不接受过滤或任意shell。
+
+run记录在云副作用之前保存；断连后 `local-status` 仅观察原命令，不能重新运行 `local-run` 当作续跑。Ctrl-C与 `local-cancel` 向原batch发送SIGTERM并观察实际退出；强制终止或未知清理如实记录。完成后原生日志/index/JUnit随逐成员校验归档取回，测试、材料、机器释放和遗留资源分别报告。自动释放不依赖本机控制方存活；未上传材料可能在释放时丢失。
+
+local `deploy render/plan/apply/check` 仅管理独立安全组和实例执行角色，复用明确VPC/vSwitch/Bucket；不创建GitHub OIDC或控制角色。镜像仍由显式image命令制作。OAuth预签名使用官方CLI缓存中与实际签名身份匹配的STS到期事实；未知或短于run期限时在创建前拒绝，需重新登录/续期。其它临时凭证仍须提供真实 `ALIYUN_CI_STS_NOT_AFTER`，不可填写预计时长。
+
+本地与云端材料由运行者保管，不自动过期；机器释放不删除OSS原证据和镜像/快照。该入口只证明所执行的Rust范围，SQL/System与正式准入仍须相应原生环境和验收。
+
+## GitHub 手动 Rust CI（后续接入）
 
 首版入口仅接受完整 SHA，执行原生 `test-run.py batch`；不增加过滤、重试或跳过表。它不授予正式准入、完整 E1 e2e 或 E2 服务资格。维护 owner 为 CI 维护者。
 

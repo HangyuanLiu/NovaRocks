@@ -111,6 +111,12 @@ def install(payload: dict, *, uid: int, gid: int, runtime=RUNTIME,
             runner_home=RUNNER_HOME, attempt_root=ATTEMPT, tools_source=TOOLS_SOURCE,
             run=subprocess.run, downloader=download_runner):
     """Prepare files once; only trusted image code is run before privilege drop."""
+    kind = payload.get('execution_kind', 'github-runner')
+    if kind == 'local-rust':
+        from .local_rust import install as install_local
+        return install_local(payload, uid=uid, gid=gid)
+    if kind != 'github-runner':
+        raise ValueError('unsupported bootstrap execution kind')
     if not isinstance(payload.get('jit'), str) or not payload['jit']:
         raise ValueError('bootstrap requires an encoded JIT configuration')
     if payload['attempt_root'] != str(attempt_root):

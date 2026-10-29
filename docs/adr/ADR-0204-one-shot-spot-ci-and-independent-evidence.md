@@ -9,7 +9,9 @@ date: 2026-10-28
 provenance:
   - "discussion: 2026-10-28 manual spot execution, direct candidate image start and evidence handoff"
 code-anchors:
-  - "tools/ci/aliyun_ci/start.py (start_run, create_once)"
+  - "tools/ci/aliyun_ci/lifecycle.py (create_once, delete_exact)"
+  - "tools/ci/aliyun_ci/local_run.py (start_local, finish_local)"
+  - "tools/ci/aliyun_ci/source_bundle.py (create, import_bundle)"
   - "tools/ci/aliyun_ci/teardown.py (teardown_run, delete_exact)"
   - "tools/ci/aliyun_ci/handoff.py (pack, verify)"
   - ".github/workflows/aliyun-ci.yml"
@@ -25,7 +27,7 @@ code-anchors:
 
 | owner | 事实与责任 |
 |---|---|
-| GitHub run/attempt | 一次手动请求身份；start、test、teardown 三个 job 的依赖与终态 |
+| 本机run/attempt或GitHub run/attempt | 一次请求身份；调用方保管原run记录与真实终态，GitHub三job是独立接入方式 |
 | start | 创建一台抢占实例；创建时写全部归属标签，以原 ClientToken 处理未知结果；核对实际镜像、标签和自动释放时间后交付 JIT |
 | 原生 batch | 完整常规选择、联合准备、断言、取消、子进程收束、execution-index 与真实退出 |
 | 实例 bootstrap/watcher | 只读工具及 Runner ABI 检查；root-only JIT 交给降权后的 Runner；抢占预告取消原 batch 并上传部分材料 |
@@ -46,10 +48,11 @@ code-anchors:
 
 ## 裁决
 
-- **原身份规则。** GitHub 使用 run/attempt，本机演练使用具名 local 身份。未知创建结果保持原 ClientToken，不换 token 再建，不做按量回退或透明重试。
+- **原身份规则。** GitHub 使用 run/attempt，本机开发验证使用具名local身份和显式local-rust执行种类。未知创建结果保持原 ClientToken，不换 token 再建，不做按量回退或透明重试。
 - **先核实后接单规则。** 可接单前读回准确 ImageId、完整归属和自动释放时间；引导秘密只交给核实后的实例。测试账户不能通过 IMDS 获取实例角色能力。
-- **原生执行规则。** Rust step 直接 exec 原 batch。平台不加测试过滤或跳过表，不根据断言文字决定重试；取消与原始退出保持原事实。
+- **原生执行规则。** 本机云助手与GitHub只启动同一原生batch；本机源码以准确已提交SHA/tree和逐文件摘要的自包含Git bundle交付，允许未推送提交，dirty在副作用前拒绝。Rust step直接exec原batch。平台不加测试过滤或跳过表，不根据断言文字决定重试；取消与原始退出保持原事实。
 - **独立关闭规则。** teardown 按准确身份删除并确认 absence；自动释放承担控制面失联兜底；janitor 只清理拥有准确归属、原 deadline 与相应云事实的资源。
+- **原任务观察规则。** 本机记录在副作用前持有原run，派发未知不能重新启动测试。status/collect/cancel使用原实例和原命令；断连不授予第二次派发权。local基础设施不依赖GitHub，测试账户不能取得维护者凭据。
 - **四类事实规则。** 测试结果、归档校验、算力终态和遗留资源分别记录。有效归档中的 execution-index 原样投影；缺少结果时保持未知，不能由实例已释放或归档存在补成成功。
 - **有限交接规则。** 执行机只取得本运行对象的限时写入能力；预签名期限不能超过已知临时凭证有效期。结束与中断归档均带逐成员摘要，机外读取验证，不把上传调用成功等同于交接完整。
 

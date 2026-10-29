@@ -50,3 +50,20 @@ class CliTests(unittest.TestCase):
             path.write_text(json.dumps(data))
             with self.assertRaisesRegex(ValueError, 'deployment'):
                 cli.load_plan(config, args)
+
+    def test_local_prepare_is_offline_and_dirty_rejected_before_sdk(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);repo=root/'repo';repo.mkdir()
+            def git(*args):return subprocess.run(['git','-C',str(repo),*args],check=True,capture_output=True)
+            git('init');git('config','user.email','ci@example.invalid');git('config','user.name','CI')
+            (repo/'file').write_text('original');git('add','file');git('commit','-m','Initial')
+            data=example();data.pop('github');data['execution_kind']='local-rust'
+            config=root/'config.json';config.write_text(json.dumps(data))
+            command=['--config',str(config),'local-run','--source',str(repo),'--image-id','m-candidate','--record',str(root/'attempt/run.json'),'--prepare-only']
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(0,cli.main(command))
+            self.assertEqual('local-rust',json.loads(output.getvalue())['plan']['execution_kind'])
+            (repo/'file').write_text('dirty')
+            with self.assertRaisesRegex(SystemExit,'2'):
+                cli.main(command)

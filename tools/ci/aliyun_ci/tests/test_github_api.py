@@ -136,14 +136,18 @@ class SDKProjectionTests(unittest.TestCase):
         for temporary in (True,False):
             with self.subTest(temporary=temporary):
                 store=ObjectStore.__new__(ObjectStore)
-                store.sdk=SimpleNamespace(PutObjectRequest=Request,GetObjectRequest=Request)
-                store.credential=SimpleNamespace(get_credential=lambda:SimpleNamespace(security_token='temporary-token' if temporary else None))
+                store.sdk=SimpleNamespace(PutObjectRequest=Request,GetObjectRequest=Request,
+                    credentials=SimpleNamespace(Credentials=lambda *args:args,CredentialsProviderFunc=lambda fn:fn),
+                    config=SimpleNamespace(load_default=SimpleNamespace),
+                    Client=lambda settings:SimpleNamespace(presign=lambda request,**kwargs:called.append(kwargs) or SimpleNamespace(signed_headers=None,url='https://example.test/signed')))
+                store.credential=SimpleNamespace(get_credential=lambda:SimpleNamespace(access_key_id='test-id',access_key_secret='test-secret',security_token='temporary-token' if temporary else None))
                 called=[]
                 store.client=SimpleNamespace(presign=lambda request,**kwargs:called.append(kwargs) or SimpleNamespace(signed_headers=None,url='https://example.test/signed'))
                 store.bucket='example-bucket'
+                store.region='cn-beijing'
                 with patch.dict(os.environ,{},clear=True):
                     if temporary:
-                        with self.assertRaisesRegex(ValueError,'ALIYUN_CI_STS_NOT_AFTER'):
+                        with self.assertRaisesRegex(ValueError,'known STS expiration'):
                             store.presign('PUT','run/final','2026-10-28T03:00:00Z')
                         self.assertEqual([],called)
                         os.environ['ALIYUN_CI_STS_NOT_AFTER']='2026-10-28T01:00:00Z'

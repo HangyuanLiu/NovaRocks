@@ -114,3 +114,13 @@ class TeardownTests(unittest.TestCase):
             ScriptAPI([('ListSecretParameters',{'Parameters':[]})]), DeniedStore(), EmptyGitHub(), now=lambda:NOW)
         self.assertIsNone(result['handoff']['final']['present'])
         self.assertFalse(result['handoff']['interrupted']['present'])
+
+    def test_local_cleanup_never_calls_github(self):
+        data=example();data.pop('github');data['execution_kind']='local-rust'
+        config=validate_config(data);plan=derive(config,'local-test',1,NOW)
+        class DeniedGitHub:
+            def call(self,*args,**kwargs):raise AssertionError('GitHub is not a local prerequisite')
+        result=teardown_run(config,plan,ScriptAPI([('DescribeInstances',EMPTY)]),
+            ScriptAPI([('ListSecretParameters',{'Parameters':[]})]),Store(),DeniedGitHub(),now=lambda:NOW)
+        self.assertEqual('released',result['compute_terminal'])
+        self.assertEqual([],result['leftovers'])

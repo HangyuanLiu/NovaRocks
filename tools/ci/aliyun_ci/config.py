@@ -42,6 +42,14 @@ class DeploymentConfig:
 
 
 def validate_config(data: dict) -> DeploymentConfig:
+    data = dict(data)
+    execution_kind = data.pop('execution_kind', 'github-runner')
+    if execution_kind not in ('local-rust', 'github-runner'):
+        raise ValueError('unsupported execution_kind')
+    if execution_kind == 'local-rust':
+        if 'github' in data:
+            raise ValueError('local-rust configuration must omit github')
+        data['github'] = None
     fields(data, ('deployment_id', 'repository', 'account_id', 'region', 'candidates',
                   'security_group_id', 'instance_ram_role', 'system_disk_gib', 'internet_max_bandwidth_out_mbps',
                   'oss', 'deadline', 'watcher', 'janitor', 'github', 'base_image_id'), 'deployment')
@@ -81,10 +89,15 @@ def validate_config(data: dict) -> DeploymentConfig:
         raise ValueError('cloud auto release requires at least 30 minutes')
     if data['watcher']['poll_seconds'] + data['watcher']['cancel_budget_seconds'] >= 300:
         raise ValueError('spot notice must retain time for upload within five minutes')
-    fields(data['github'], ('runner_group_id', 'workflow'), 'github')
-    positive(data['github']['runner_group_id'], 'github.runner_group_id')
-    if data['github']['workflow'] != '.github/workflows/aliyun-ci.yml':
-        raise ValueError('unsupported worker workflow')
+    if execution_kind == 'github-runner':
+        fields(data['github'], ('runner_group_id', 'workflow'), 'github')
+        positive(data['github']['runner_group_id'], 'github.runner_group_id')
+        if data['github']['workflow'] != '.github/workflows/aliyun-ci.yml':
+            raise ValueError('unsupported worker workflow')
+    else:
+        data.pop('github')
+    if execution_kind != 'github-runner':
+        data['execution_kind'] = execution_kind
     return DeploymentConfig(json.loads(json.dumps(data)))
 
 

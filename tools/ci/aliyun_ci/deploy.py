@@ -24,6 +24,11 @@ from .ports import APIError
 
 def render(config, parameters=None):
     template = json.loads((Path(__file__).parent / 'infra/foundation.ros.json').read_text())
+    if config.data.get('execution_kind') == 'local-rust':
+        for name in ('GitHubOidc', 'ControlRole'):
+            template['Resources'].pop(name)
+        template['Parameters'].pop('GitHubOidcFingerprint')
+        template['Outputs'].pop('ControlRoleArn')
     values = {'DeploymentId': config['deployment_id'], 'Repository': config['repository'],
               'BucketName': config['oss']['bucket'], 'ObjectPrefix': config['oss']['prefix'],
               'SecretPrefix': 'g16-' + config['deployment_id'].encode().hex() + '-',
@@ -74,7 +79,7 @@ def apply_deployment(config, ros, *, change_set_id, reviewed_digest):
     return ros.call('ExecuteChangeSet', RegionId=config['region'], ChangeSetId=change_set_id)
 
 
-def check_deployment(config, ros, *, stack_id, variables):
+def check_deployment(config, ros, *, stack_id, variables=None):
     response = ros.call('GetStack', RegionId=config['region'], StackId=stack_id)
     if response.get('Status') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
         raise ValueError('ROS stack is not in a successful terminal state')
@@ -83,6 +88,10 @@ def check_deployment(config, ros, *, stack_id, variables):
                 'SecurityGroupId': config['security_group_id'], 'InstanceRoleName': config['instance_ram_role']}
     if any(str(outputs.get(key)) != str(value) for key, value in expected.items()):
         raise ValueError('stack outputs do not match deployment configuration')
+    if config.data.get('execution_kind') == 'local-rust':
+        return {'matched': True, 'outputs': outputs}
+    if variables is None:
+        raise ValueError('GitHub deployment requires repository variables')
     if variables.get('ALIYUN_CI_ROLE_ARN') != outputs.get('ControlRoleArn'):
         raise ValueError('repository role variable does not match stack output')
     encoded = variables.get('ALIYUN_CI_CONFIG_JSON')

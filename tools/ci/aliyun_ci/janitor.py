@@ -64,7 +64,7 @@ def sweep(config, ecs, oos, oss, github, *, now=None, sleep=None):
             continue
         runs[(plan.run_id, plan.run_attempt)] = plan
     # Runner labels carry the original resource facts even after cloud-side release.
-    for row in runners(config, github):
+    for row in (runners(config, github) if config.data.get('execution_kind', 'github-runner') == 'github-runner' else []):
         from .github_api import runner_tags
         tags = runner_tags(row)
         if any(tags.get(key) != value for key, value in query.items()):
@@ -92,7 +92,8 @@ def sweep(config, ecs, oos, oss, github, *, now=None, sleep=None):
     for plan in runs.values():
         try:
             delete_bootstrap(config, plan, oos)
-            delete_run_runners(config, plan, github)
+            if plan.execution_kind == 'github-runner':
+                delete_run_runners(config, plan, github)
             try:
                 oss.get(plan.oss_keys['summary'])
                 missing_summary = False

@@ -18,6 +18,9 @@
 """Lazy official SDK adapters. All callers use the same standard credential chain."""
 from __future__ import annotations
 from importlib import import_module
+from datetime import datetime, timezone
+import hmac
+from pathlib import Path
 import json
 import os
 from .ports import APIError
@@ -83,6 +86,47 @@ def check_account(config, sts):
     return identity
 
 
+def signing_credential_expiration(current, *, profile_file=None, environ=None):
+    """Read expiry facts for the exact signing identity, never infer a duration.
+
+    The pinned Credentials Client and CLI provider discard the provider's public
+    expiration. OAuth persists its actual exchanged STS expiry in the official
+    CLI cache. Consume that fact only when all cached credential fields match
+    the fetched signing snapshot; another process may have refreshed the cache.
+    """
+    environ = os.environ if environ is None else environ
+    bounds = []
+    explicit = environ.get('ALIYUN_CI_STS_NOT_AFTER')
+    if explicit:
+        bounds.append(parse_time(explicit))
+    provider = getattr(current, 'provider_name', '') or ''
+    if provider.split('/')[-2:] == ['cli_profile', 'oauth']:
+        path = Path(profile_file) if profile_file is not None else Path.home() / '.aliyun/config.json'
+        try:
+            cache = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise ValueError('cannot read the OAuth STS expiration fact') from None
+        selected = environ.get('ALIBABA_CLOUD_PROFILE') or cache.get('current')
+        rows = [row for row in cache.get('profiles', []) if row.get('name') == selected]
+        if len(rows) != 1 or rows[0].get('mode') != 'OAuth':
+            raise ValueError('OAuth signing profile does not match the active CLI profile')
+        profile = rows[0]
+        pairs = (('access_key_id', 'access_key_id'), ('access_key_secret', 'access_key_secret'),
+                 ('sts_token', 'security_token'))
+        if any(not isinstance(profile.get(key), str)
+               or not isinstance(getattr(current, field, None), str)
+               or not hmac.compare_digest(profile[key], getattr(current, field))
+               for key, field in pairs):
+            raise ValueError('OAuth STS cache changed; signing identity must be resolved again')
+        expiration = profile.get('sts_expiration')
+        if type(expiration) is not int or expiration <= 0:
+            raise ValueError('OAuth STS expiration is unknown')
+        bounds.append(datetime.fromtimestamp(expiration, timezone.utc))
+    if not bounds:
+        raise ValueError('temporary signing credentials require a known STS expiration')
+    return min(bounds)
+
+
 class ObjectStore:
     def __init__(self, config, *, credential=None):
         self.sdk = import_module('alibabacloud_oss_v2')
@@ -93,7 +137,7 @@ class ObjectStore:
             return self.sdk.credentials.Credentials(value.access_key_id, value.access_key_secret,
                                                     value.security_token)
         settings = self.sdk.config.load_default()
-        settings.region = config['region']
+        self.region = settings.region = config['region']
         settings.credentials_provider = self.sdk.credentials.CredentialsProviderFunc(get_credentials)
         self.client, self.bucket = self.sdk.Client(settings), config['oss']['bucket']
 
@@ -135,15 +179,19 @@ class ObjectStore:
         expiration = parse_time(expires_at)
         current = self.credential.get_credential()
         if current.security_token:
-            bound = os.environ.get('ALIYUN_CI_STS_NOT_AFTER')
-            if not bound:
-                raise ValueError('temporary signing credentials require ALIYUN_CI_STS_NOT_AFTER')
-            if expiration > parse_time(bound):
+            if expiration > signing_credential_expiration(current):
                 raise ValueError('object capability outlives the known STS credential expiry')
         request_type = {'PUT': self.sdk.PutObjectRequest, 'GET': self.sdk.GetObjectRequest}.get(method)
         if request_type is None:
             raise ValueError('only GET and PUT object capabilities are supported')
-        result = self.client.presign(request_type(bucket=self.bucket, key=key), expiration=expiration)
+        # Freeze the checked identity for this signature. A refreshing provider
+        # could otherwise replace it between expiry validation and signing.
+        snapshot = self.sdk.credentials.Credentials(current.access_key_id, current.access_key_secret,
+                                                     current.security_token)
+        settings = self.sdk.config.load_default()
+        settings.region = self.region
+        settings.credentials_provider = self.sdk.credentials.CredentialsProviderFunc(lambda: snapshot)
+        result = self.sdk.Client(settings).presign(request_type(bucket=self.bucket, key=key), expiration=expiration)
         if result.signed_headers:
             raise ValueError('bootstrap upload capability unexpectedly requires signed headers')
         return result.url

@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from .plan import derive, parse_time
-from .start import create_once, find_run, wait_running, describe_instances, owned
+from .lifecycle import create_once, find_run, wait_running, describe_instances, owned
 from .teardown import delete_exact
 
 

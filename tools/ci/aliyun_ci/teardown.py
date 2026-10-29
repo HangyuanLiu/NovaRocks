@@ -29,28 +29,7 @@ from .github_api import delete_runner, runners, runner_tags
 from .summary import run_summary
 
 
-def delete_exact(config, ecs, instance_id, expected_tags, *, deadline=None, now=None, sleep=time.sleep):
-    now = now or (lambda: datetime.now(timezone.utc))
-    # Cleanup gets its own observation budget even when the work deadline expired.
-    cleanup_end = now() + timedelta(minutes=config['deadline']['teardown_reserve_minutes'])
-    values = describe_instances(config, ecs, instance_id=instance_id)
-    if not values:
-        return {'instance_id': instance_id, 'terminal': 'released'}
-    if len(values) != 1 or values[0].get('InstanceId') != instance_id:
-        raise ValueError('exact instance lookup returned an unexpected identity')
-    owned(config, values[0], expected_tags)
-    try:
-        ecs.call('DeleteInstance', RegionId=config['region'], InstanceId=instance_id, Force=True)
-    except (APIError, TimeoutError, ConnectionError) as error:
-        if isinstance(error, APIError) and error.code not in ('InvalidInstanceId.NotFound', 'TransportUnknown', 'RequestTimeout'):
-            raise
-    while now() < cleanup_end:
-        values = describe_instances(config, ecs, instance_id=instance_id)
-        if not values:
-            return {'instance_id': instance_id, 'terminal': 'released'}
-        owned(config, values[0], expected_tags)
-        sleep(5)
-    raise APIError('ReleaseUnconfirmed', f'instance still present or unknown: {instance_id}')
+from .lifecycle import delete_exact
 
 
 def secret_parameters(config, oos):
@@ -146,9 +125,10 @@ def teardown_run(config, plan, ecs, oos, oss, github, *, instance_id=None,
         terminal = 'released'
     except Exception as error:
         leftovers.append({'kind': 'compute', 'id': instance_id, 'error': str(error)})
-    for kind, operation in (
-            ('runner', lambda: delete_run_runners(config, plan, github)),
-            ('bootstrap', lambda: delete_bootstrap(config, plan, oos))):
+    operations = [('bootstrap', lambda: delete_bootstrap(config, plan, oos))]
+    if plan.execution_kind == 'github-runner':
+        operations.insert(0, ('runner', lambda: delete_run_runners(config, plan, github)))
+    for kind, operation in operations:
         try:
             operation()
         except Exception as error:

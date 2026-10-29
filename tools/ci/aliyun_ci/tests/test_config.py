@@ -58,3 +58,15 @@ class ConfigTests(unittest.TestCase):
         config = validate_config(data)
         data['oss']['prefix'] = 'changed'
         self.assertEqual('novarocks-ci', config['oss']['prefix'])
+
+    def test_local_requires_no_github_and_has_explicit_kind(self):
+        data=example();data.pop('github');data['execution_kind']='local-rust'
+        config=validate_config(data)
+        self.assertNotIn('github',config.data)
+        from aliyun_ci.plan import derive
+        from datetime import datetime,timezone
+        plan=derive(config,'local-one',1,datetime.now(timezone.utc))
+        self.assertEqual('local-rust',plan.execution_kind)
+        self.assertEqual('local-rust',plan.tags['execution_kind'])
+        data['github']={'runner_group_id':1,'workflow':'.github/workflows/aliyun-ci.yml'}
+        with self.assertRaisesRegex(ValueError,'omit github'):validate_config(data)

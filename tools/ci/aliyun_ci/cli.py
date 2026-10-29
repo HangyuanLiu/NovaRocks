@@ -85,6 +85,18 @@ def parser():
     teardown.add_argument('--tools-check', choices=('true', 'false'))
     sub.add_parser('janitor')
     sub.add_parser('runner-sync')
+    local = sub.add_parser('local-run'); add_run_options(local)
+    local.add_argument('--source', type=Path, default=Path.cwd())
+    local.add_argument('--sha')
+    local.add_argument('--image-id', required=True)
+    local.add_argument('--record', type=Path, required=True)
+    local.add_argument('--prepare-only', action='store_true')
+    for name in ('local-status', 'local-cancel', 'local-collect'):
+        item=sub.add_parser(name)
+        item.add_argument('--record', type=Path, required=True)
+        if name == 'local-collect':
+            item.add_argument('--destination', type=Path, required=True)
+
     image = sub.add_parser('image'); add_run_options(image)
     image.set_defaults(role='builder')
     image.add_argument('--preparation-sha', required=True)
@@ -110,8 +122,37 @@ def execute(config, args):
     if args.command == 'deploy' and args.operation == 'render':
         from .deploy import render
         return render(config, json.loads(args.parameters.read_text()) if args.parameters else None), 0
+    if args.command.startswith('local-'):
+        if config.data.get('execution_kind') != 'local-rust':
+            raise ValueError('local commands require execution_kind local-rust')
+        if args.command == 'local-run':
+            from .source_bundle import create
+            source_dir = args.record.parent / (args.record.stem + '-source')
+            manifest = create(args.source, source_dir, sha=args.sha)
+            plan=load_plan(config,args)
+            if args.prepare_only:
+                return {'plan':plan.to_dict(),'source':manifest,'source_directory':str(source_dir)},0
     from .sdk import adapters
     services = adapters(config)
+    if args.command.startswith('local-'):
+        from .local_run import start_local, wait_local, status_local, collect_local, cancel_local, finish_local, result_exit_code
+        ecs,oos,oss=(services[key] for key in ('ecs','oos','oss'))
+        if args.command == 'local-status':
+            return status_local(config,ecs,args.record),0
+        if args.command == 'local-cancel':
+            return cancel_local(config,ecs,args.record),0
+        if args.command == 'local-collect':
+            return collect_local(config,oss,args.record,args.destination),0
+        try:
+            start_local(config,plan,ecs,oos,oss,image_id=args.image_id,source=source_dir,record_path=args.record)
+            wait_local(config,ecs,args.record)
+        except KeyboardInterrupt:
+            cancel_local(config,ecs,args.record)
+            wait_local(config,ecs,args.record)
+        finally:
+            if args.record.exists():
+                result=finish_local(config,ecs,oos,oss,args.record)
+        return result,result_exit_code(result)
     if args.command == 'deploy':
         from . import deploy
         ros = services['ros']
@@ -128,8 +169,8 @@ def execute(config, args):
                 raise ValueError('--change-set-id and --reviewed-digest are required')
             value = deploy.apply_deployment(config, ros, change_set_id=args.change_set_id, reviewed_digest=args.reviewed_digest)
         else:
-            if not args.stack_id or not args.variables: raise ValueError('--stack-id and --variables are required')
-            value = deploy.check_deployment(config, ros, stack_id=args.stack_id, variables=json.loads(args.variables.read_text()))
+            if not args.stack_id: raise ValueError('--stack-id is required')
+            value = deploy.check_deployment(config, ros, stack_id=args.stack_id, variables=json.loads(args.variables.read_text()) if args.variables else None)
         return value, 0
     oss, ecs, oos = (services[key] for key in ('oss', 'ecs', 'oos'))
     if args.command == 'image':
@@ -145,8 +186,10 @@ def execute(config, args):
     if args.command == 'promote-image':
         from .image import promote_image
         return promote_image(config, oss, args.image_id, args.summary_key), 0
-    from .github_api import GitHub
-    github = GitHub(os.environ.get(args.github_token_env))
+    github = None
+    if config.data.get('execution_kind', 'github-runner') == 'github-runner':
+        from .github_api import GitHub
+        github = GitHub(os.environ.get(args.github_token_env))
     if args.command == 'runner-sync':
         from .runner_sync import sync_runner
         return sync_runner(config, github, oss), 0

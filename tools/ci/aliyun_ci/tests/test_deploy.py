@@ -55,3 +55,14 @@ class DeployTests(unittest.TestCase):
         config=validate_config(example());api=ScriptAPI([])
         with self.assertRaisesRegex(ValueError,'parameters'):plan_deployment(config,api,stack_name='ci',parameters={})
         self.assertEqual([],api.calls)
+
+    def test_local_foundation_requires_only_network_and_no_github(self):
+        data=example();data.pop('github');data['execution_kind']='local-rust'
+        config=validate_config(data);value=render(config,{'VpcId':'vpc-existing'})
+        self.assertEqual({'OutboundSecurityGroup','OptionalVSwitch','InstanceRole'},set(value['template']['Resources']))
+        self.assertNotIn('GitHubOidcFingerprint',value['template']['Parameters'])
+        from aliyun_ci.deploy import check_deployment
+        outputs={key: config[source] for key,source in [('SecurityGroupId','security_group_id'),('InstanceRoleName','instance_ram_role')]}
+        outputs.update(BucketName=config['oss']['bucket'],ObjectPrefix=config['oss']['prefix'])
+        api=ScriptAPI([('GetStack',{'Status':'CREATE_COMPLETE','Outputs':[{'OutputKey':k,'OutputValue':v} for k,v in outputs.items()]})])
+        self.assertTrue(check_deployment(config,api,stack_id='stack')['matched'])

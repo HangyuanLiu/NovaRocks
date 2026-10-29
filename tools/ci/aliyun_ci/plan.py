@@ -61,13 +61,17 @@ class RunPlan:
     oss_keys: dict
     secret_name: str
     role: str
+    execution_kind: str = 'github-runner'
 
     def to_dict(self):
         return asdict(self)
 
 
 def derive(config: DeploymentConfig, run_id: str, run_attempt: int, now: datetime,
-           *, nonce: str | None = None, role: str = 'worker') -> RunPlan:
+           *, nonce: str | None = None, role: str = 'worker', execution_kind: str | None = None) -> RunPlan:
+    execution_kind = execution_kind or ('builder' if role == 'builder' else config.data.get('execution_kind', 'github-runner'))
+    if execution_kind not in ('builder', 'local-rust', 'github-runner'):
+        raise ValueError('unsupported execution kind')
     tags = identity_tags(config, run_id, run_attempt, role)
     token = f"g16-{config['deployment_id']}-{run_id}-{run_attempt}"
     # ECS permits 64 ASCII bytes, including the candidate suffix.
@@ -81,10 +85,12 @@ def derive(config: DeploymentConfig, run_id: str, run_attempt: int, now: datetim
         deadline_value += timedelta(minutes=1)
     deadline = timestamp(deadline_value)
     tags['deadline'] = deadline
+    if execution_kind != 'github-runner':
+        tags['execution_kind'] = execution_kind
     label = f'g16-{run_id}-{run_attempt}-{nonce or secrets.token_hex(6)}'
     root = f"{config['oss']['prefix']}/runs/{run_id}/{run_attempt}"
     return RunPlan(str(run_id), run_attempt, token, tags, label, deadline, deadline,
                    duration['work_minutes'] + duration['upload_reserve_minutes'],
                    {kind: f'{root}/{kind}.tar.gz' for kind in ('final', 'interrupted')} |
                    {'summary': f'{root}/summary.json'},
-                   f"g16-{config['deployment_id'].encode().hex()}-{run_id}-{run_attempt}", role)
+                   f"g16-{config['deployment_id'].encode().hex()}-{run_id}-{run_attempt}", role, execution_kind)
