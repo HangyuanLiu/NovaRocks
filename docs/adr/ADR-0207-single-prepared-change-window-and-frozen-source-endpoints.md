@@ -68,6 +68,10 @@ MV action 的原 `MvCommandOriginal` 所持 positive MetadataIoAdmission 是 Int
 
 **读取冻结 To。** pin 后源可以继续追加。本轮读取和发布水位都是 To，之后的提交由下一轮消费。移除以 current==To、table/metadata location 相等作为窗口准入条件的检查；按 To schema 解释，不按后来的 current schema 重解释。
 
+**定义准入与读取解释分开。** D/L 的对象、字段身份、类型和可空性校验消费同一次初始 All pin 的 schema，由原 7B7 作者逐 occurrence 裁决。pin 前发生的定义漂移不能被旧 To schema 遮蔽；实际读取继续消费准备后的 To schema。两者都从原 Root 的捕获帧投影，不为定义校验再读 Current，也不在 pin 后跟随 schema 推进。
+
+**闭合的零贡献投影。** 混合 UNION 中一项依赖为 MetadataOnly，仍可从该 exact 窗口事实投影空 Delta。它返回零 split，不开放可执行 From，也不以相同数字端点代替 Provider 的空贡献证明。原 binding、请求与 Root scope 检查仍成立；无 fresh 观察、CPU 工作或新的 Source。该依赖真正读取 To 时继续执行原观察及数据读取。FullRebuild 和 snapshot-only 不因此获得 Delta。
+
 **真实执行观察。** 实际启动读取时，FE 原 access/split owner 使用同 Root 已付费 IO 能力实际观察 catalog，先核 UUID。可执行 Delta 核两端仍可证明可见及合法祖先关系（含合法同端点）；first/full 与 FullRebuild 的实际 To 读取只核 To，历史 From 只保留为 FullRebuild 原因。MetadataOnly/SkipEmpty 没有实际 split 时不强加执行观察，也不冒称完成该观察。各实际读取分支验证冻结 To schema 和所依赖的 snapshot manifest-list、sequence、父链、spec/partition storage type、field/nominal domain 及所选端点实际依赖的 name mapping/default 读取政策等相关事实。新增无关 snapshot、默认 spec 或 property 不是拒绝理由。用准备时冻结的物理视图和请求期 FileIO 进行完整发现与 split 规划；一次整窗 catalog 读取/解码及 control/UUID 后，Delta 按 From 专属证明、From 完整发现、To 专属证明/关系核对、To 完整发现推进。To 专属的新验证不能遮蔽 From manifest 硬错，整窗 catalog/解码/control/identity 失败仍保持原位置。共享 observer 的全 metadata hash 仍保冻结 domain 对冻结视图的内部一致性。普通 Snapshot、Statistics、Rewrite/COW、TableExecute 的合同与目标 OCC 不被放宽。
 
 **漂移与晚期失败。** 准备及执行均以 typed 错误拒绝对象 UUID 替换；后果交 MV application。准备时端点丢失/非祖先按既定能力产生 FullRebuild 原因或 typed 错误；执行期才发现端点不可见/解释漂移，本轮失败，不改读最新端点、不静默转 full 或空结果。后续位置变化不直接拒绝，实际旧依赖访问失败仍失败。授权在原语句准入和准确请求 scope 各自成立，权限撤销造成的 IO 失败保原原因。

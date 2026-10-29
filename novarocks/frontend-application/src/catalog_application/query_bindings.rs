@@ -333,12 +333,17 @@ fn prepared_source_selector(
 ) -> Result<QueryPreparedSourceSelector, String> {
     use ConnectorReadSourceProjection as P;
     use ConnectorReadSourceSelection as S;
-    if projection != P::To
-        && !matches!(
+    let incremental = matches!(
+        admission,
+        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
+    );
+    let empty_delta = projection == P::Delta
+        && matches!(selection, S::ChangeWindow(_))
+        && matches!(
             admission,
-            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
-        )
-    {
+            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
+        );
+    if projection != P::To && !incremental && !empty_delta {
         return Err("prepared source does not authorize a From or Delta projection".into());
     }
     match (selection, projection) {
@@ -997,10 +1002,19 @@ mod tests {
                 from_snapshot_id: 7,
             },
         );
-        for refusal in [A::MetadataOnly, full] {
-            assert!(prepared_source_selector(window, P::From, Some(&refusal)).is_err());
-            assert!(prepared_source_selector(window, P::Delta, Some(&refusal)).is_err());
-        }
+        assert!(prepared_source_selector(window, P::From, Some(&A::MetadataOnly)).is_err());
+        assert_eq!(
+            prepared_source_selector(window, P::Delta, Some(&A::MetadataOnly)).unwrap(),
+            QueryPreparedSourceSelector::Delta {
+                from_exclusive: 7,
+                to_inclusive: 19
+            }
+        );
+        assert!(prepared_source_selector(window, P::From, Some(&full)).is_err());
+        assert!(prepared_source_selector(window, P::Delta, Some(&full)).is_err());
+        assert!(
+            prepared_source_selector(S::Snapshot(19), P::Delta, Some(&A::MetadataOnly)).is_err()
+        );
     }
 
     #[test]

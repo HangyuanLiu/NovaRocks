@@ -156,6 +156,7 @@ struct Fixture {
     catalog: Arc<ObservationCatalog>,
     io: Arc<IoFixture>,
     cpu: Arc<dyn ProviderMetadataCpuPort>,
+    cpu_calls: Arc<PhasePort>,
     original: ConnectorOriginalResultScope,
     read: ConnectorReadRequestControl,
     prepared: ConnectorPreparedSourceRead,
@@ -172,6 +173,19 @@ async fn fixture(original: &IcebergMetadata) -> Fixture {
     source_fixture(original, false).await
 }
 async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixture {
+    source_fixture_selection(original, snapshot_only, None).await
+}
+#[derive(Clone, Copy)]
+enum EmptyWindow {
+    SameSnapshot,
+    DistinctSnapshots,
+}
+async fn source_fixture_selection(
+    original: &IcebergMetadata,
+    snapshot_only: bool,
+    metadata_only: Option<EmptyWindow>,
+) -> Fixture {
+    assert!(!(snapshot_only && metadata_only.is_some()));
     for request in [
         CatalogPublicationRequest::CreateNamespace {
             namespace: CatalogNamespaceName::new("prepared_execution"),
@@ -219,12 +233,19 @@ async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixt
             .load_table_for_request_async("prepared_execution", "t", &context())
             .await
             .unwrap();
-        let file = written(&loaded.table, label);
+        let files = if label == "b" && matches!(metadata_only, Some(EmptyWindow::DistinctSnapshots))
+        {
+            // The original staging helper requests a real SnapshotProducing
+            // append. No new files leaves equal endpoint content, not equal IDs.
+            Vec::new()
+        } else {
+            vec![written(&loaded.table, label)]
+        };
         snapshots.push(
             crate::commit::run::append_snapshot_for_test(
                 original.clone(),
                 loaded.table,
-                vec![file],
+                files,
                 "main".into(),
                 std::collections::BTreeMap::new(),
             )
@@ -275,7 +296,7 @@ async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixt
         incarnation: provider.incarnation,
         calls: AtomicUsize::new(0),
     });
-    let cpu: Arc<dyn ProviderMetadataCpuPort> = phase;
+    let cpu: Arc<dyn ProviderMetadataCpuPort> = phase.clone();
     let context = context().with_io_admission(io.clone());
     let scope =
         ConnectorOriginalResultScope::from_original(Arc::new(OriginalScope(context.deadline())));
@@ -288,7 +309,20 @@ async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixt
         snapshots[0],
         snapshots[1],
     );
-    let request = if snapshot_only {
+    let request = if matches!(metadata_only, Some(EmptyWindow::SameSnapshot)) {
+        novarocks_spi::connector::read_stack::ConnectorReadSourcePreparationRequest::change_window(
+            request.name().clone(),
+            request.observed_table().clone(),
+            request.observed_source_facts().clone(),
+            request.object_id().clone(),
+            novarocks_spi::connector::read_stack::ConnectorReadChangeWindow::new(
+                snapshots[1],
+                snapshots[1],
+            ),
+            request.to_revision().clone(),
+            request.to_revision().clone(),
+        )
+    } else if snapshot_only {
         novarocks_spi::connector::read_stack::ConnectorReadSourcePreparationRequest::snapshot(
             request.name().clone(),
             request.observed_table().clone(),
@@ -330,6 +364,11 @@ async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixt
     if snapshot_only {
         assert!(prepared.admission().is_none());
         assert!(prepared.request().from_revision().is_none());
+    } else if metadata_only.is_some() {
+        assert!(matches!(
+            prepared.admission(),
+            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
+        ));
     } else {
         assert!(matches!(
             prepared.admission(),
@@ -346,13 +385,18 @@ async fn source_fixture(original: &IcebergMetadata, snapshot_only: bool) -> Fixt
         catalog,
         io,
         cpu,
+        cpu_calls: phase,
         original: scope,
         read,
         prepared,
         session,
         physical,
         setup_io,
-        from: snapshots[0],
+        from: if matches!(metadata_only, Some(EmptyWindow::SameSnapshot)) {
+            snapshots[1]
+        } else {
+            snapshots[0]
+        },
         to: snapshots[1],
     }
 }
@@ -487,6 +531,167 @@ fn snapshot_mut(value: &mut serde_json::Value, id: i64) -> &mut serde_json::Valu
         .iter_mut()
         .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(id))
         .unwrap()
+}
+
+#[test]
+fn actual_metadata_only_delta_is_empty_without_observation_but_to_still_reads() {
+    for selection in [EmptyWindow::SameSnapshot, EmptyWindow::DistinctSnapshots] {
+        let (executor, _warehouse, provider) = provider();
+        executor.block_on(async {
+            let fixture = source_fixture_selection(&provider, false, Some(selection)).await;
+            assert_eq!(
+                fixture.from == fixture.to,
+                matches!(selection, EmptyWindow::SameSnapshot)
+            );
+            assert!(
+                fixture
+                    .read
+                    .metadata()
+                    .project_prepared_source_read(
+                        &fixture.session,
+                        &fixture.prepared,
+                        ConnectorReadSourceProjection::From,
+                    )
+                    .is_err()
+            );
+            let before_io = fixture.io.owned_reads.load(Ordering::SeqCst);
+            let before_cpu = fixture.cpu_calls.calls.load(Ordering::SeqCst);
+            let mut owner = None;
+            let mut delta = fixture
+                .opening(
+                    ConnectorReadSourceProjection::Delta,
+                    fixture.cpu.clone(),
+                    &mut owner,
+                )
+                .await
+                .unwrap();
+            assert!(
+                owner.is_none(),
+                "closed empty Delta must not create an observation owner"
+            );
+            let batch = delta
+                .next_batch(64, &ConnectorReadDynamicFilterSnapshot::all_complete())
+                .unwrap();
+            assert!(batch.no_more_splits());
+            assert!(batch.into_splits().is_empty());
+            assert!(delta.is_finished());
+            delta.close().unwrap();
+            drop(delta);
+            assert_eq!(fixture.io.owned_reads.load(Ordering::SeqCst), before_io);
+            assert_eq!(fixture.cpu_calls.calls.load(Ordering::SeqCst), before_cpu);
+            assert!(
+                fixture.catalog.reads.lock().unwrap().is_empty(),
+                "empty Delta must not issue fresh catalog observation"
+            );
+            let mut to_owner = None;
+            let mut to = fixture
+                .opening(
+                    ConnectorReadSourceProjection::To,
+                    fixture.cpu.clone(),
+                    &mut to_owner,
+                )
+                .await
+                .unwrap();
+            assert!(
+                to_owner.is_some(),
+                "MetadataOnly must not globally suppress a real To read"
+            );
+            fixture.assert_actual_all();
+            assert_eq!(
+                fixture.paths(to.as_mut()).len(),
+                if matches!(selection, EmptyWindow::SameSnapshot) {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert!(fixture.io.owned_reads.load(Ordering::SeqCst) > before_io);
+            assert!(fixture.cpu_calls.calls.load(Ordering::SeqCst) > before_cpu);
+            fixture.close_source(to, to_owner, &fixture.cpu).await;
+        });
+    }
+}
+
+#[derive(Debug)]
+struct InactiveOpeningControl;
+impl std::fmt::Display for InactiveOpeningControl {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        panic!("the original opening control cause must not be formatted")
+    }
+}
+impl std::error::Error for InactiveOpeningControl {}
+impl novarocks_failure_contract::FailureProjection for InactiveOpeningControl {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &ConnectorErrorKind::Interrupted,
+        )
+    }
+}
+struct InactiveOpeningScope {
+    deadline: Instant,
+    calls: AtomicUsize,
+}
+impl novarocks_spi::connector::ConnectorOriginalResultScopeCheck for InactiveOpeningScope {
+    fn original_deadline(&self) -> Instant {
+        self.deadline
+    }
+    fn check_active(&self) -> Result<(), novarocks_spi::connector::OriginalResultCheckError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(novarocks_spi::connector::OriginalResultCheckError::new(
+            novarocks_spi::connector::OriginalResultCheckClass::Control,
+            InactiveOpeningControl,
+        ))
+    }
+}
+
+#[test]
+fn actual_metadata_only_delta_preserves_inactive_original_scope_before_empty_success() {
+    use novarocks_failure_contract::FailureProjection;
+    for selection in [EmptyWindow::SameSnapshot, EmptyWindow::DistinctSnapshots] {
+        let (executor, _warehouse, provider) = provider();
+        executor.block_on(async {
+            let mut fixture = source_fixture_selection(&provider, false, Some(selection)).await;
+            let original = Arc::new(InactiveOpeningScope {
+                deadline: fixture.original.original_deadline(),
+                calls: AtomicUsize::new(0),
+            });
+            fixture.original = ConnectorOriginalResultScope::from_original(original.clone());
+            // Successful projection still checks the actual Provider context.
+            // Only the independent original Root scope refuses this opening.
+            let _ = fixture.table(ConnectorReadSourceProjection::Delta);
+            let before_io = fixture.io.owned_reads.load(Ordering::SeqCst);
+            let before_cpu = fixture.cpu_calls.calls.load(Ordering::SeqCst);
+            let mut owner = None;
+            let result = fixture
+                .opening(
+                    ConnectorReadSourceProjection::Delta,
+                    fixture.cpu.clone(),
+                    &mut owner,
+                )
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("a closed empty Delta cannot bypass its original Root refusal"),
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::Interrupted);
+            assert_eq!(
+                error.failure_fact(),
+                ConnectorErrorKind::Interrupted.failure_fact()
+            );
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            let mut original_cause_retained = false;
+            while let Some(current) = cause {
+                original_cause_retained |= current.is::<InactiveOpeningControl>();
+                cause = current.source();
+            }
+            assert!(original_cause_retained);
+            assert_eq!(original.calls.load(Ordering::SeqCst), 1);
+            assert!(owner.is_none());
+            assert_eq!(fixture.io.owned_reads.load(Ordering::SeqCst), before_io);
+            assert_eq!(fixture.cpu_calls.calls.load(Ordering::SeqCst), before_cpu);
+            assert!(fixture.catalog.reads.lock().unwrap().is_empty());
+        });
+    }
 }
 
 #[test]

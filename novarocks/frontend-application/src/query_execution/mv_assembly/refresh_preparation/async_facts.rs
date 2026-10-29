@@ -214,6 +214,28 @@ impl MvRefreshPreparationIo {
         )?;
         Ok(observed)
     }
+    /// Definition admission uses the Current schema from this Root's initial
+    /// observation. Reading uses `schema`, which projects the prepared To.
+    pub(crate) fn definition_schema(
+        &self,
+        source: &IcebergMvCorePorts,
+        table: &TableIdentity,
+        context: &ConnectorRequestContext,
+    ) -> Result<MvSourceSchemaObservation, PreparationError> {
+        context.original_operation_control().check_active()?;
+        let captured = self.captured_sources().require(table)?;
+        let observed = crate::mv::domain::storage_observation::observe_source_schema(
+            source.storage_observation(),
+            &captured.lease,
+            &captured.observed,
+            context.clone(),
+        )?;
+        crate::mv::domain::refresh::observation::validate_observed_schema_locator(
+            observed.table(),
+            &captured.observed.identity,
+        )?;
+        Ok(observed)
+    }
     pub(crate) async fn target_schema(
         &self,
         source: &IcebergMvCorePorts,
@@ -357,14 +379,14 @@ impl MvRefreshPreparationIo {
                             .into());
                         }
                     }
-                    let (object, _) = novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision(&revision)?;
-                    if object != relation.object_id
-                        || revision.object_identity().value().as_ref()
-                            != observed.object_id().as_bytes().as_ref()
+                    if revision.object_identity().value().as_ref()
+                        != observed.object_id().as_bytes().as_ref()
                     {
-                        return Err(
-                            "MV source observation differs from its definition object".into()
-                        );
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "MV initial source observation and exact revision disagree",
+                        )
+                        .into());
                     }
                     let captured = CapturedRefreshSource::new(
                         table.clone(),
@@ -377,10 +399,11 @@ impl MvRefreshPreparationIo {
                     inventory.install(captured)?
                 }
             };
-            let (object, _) = novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision(&captured.revision)?;
-            if object != relation.object_id {
-                return Err("MV source occurrence names another captured object".into());
-            }
+            let definition_schema = self.definition_schema(source, &table, context)?;
+            crate::mv::domain::refresh::schema_contract::validate_relation_occurrence_schema(
+                relation,
+                &definition_schema,
+            )?;
             let Some(to) = captured.snapshot else {
                 continue;
             };
@@ -492,7 +515,7 @@ impl MvRefreshPreparationIo {
         let mut renames = Vec::new();
         for (occurrence, table) in occurrences.iter().zip(refs) {
             observation::validate_occurrence_locator(occurrence, table)?;
-            let observed = self.schema(source, table, context).await?;
+            let observed = self.definition_schema(source, table, context)?;
             renames.extend(schema_contract::validate_relation_occurrence_schema(
                 occurrence, &observed,
             )?);

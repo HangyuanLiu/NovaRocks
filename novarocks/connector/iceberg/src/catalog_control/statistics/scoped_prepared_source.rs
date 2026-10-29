@@ -925,7 +925,14 @@ mod tests {
             let prepared = body.result.as_ref().unwrap().as_ref().unwrap();
             assert_eq!(prepared.relations.to.snapshot_id(), Some(42));
             assert!(prepared.relations.from.is_none());
-            assert!(prepared.relations.delta.is_none());
+            match from {
+                Some(42) => {
+                    let delta = prepared.relations.delta.as_ref().unwrap();
+                    assert_eq!(delta.from_snapshot_id_exclusive(), 42);
+                    assert_eq!(delta.to_snapshot_id_inclusive(), 42);
+                }
+                _ => assert!(prepared.relations.delta.is_none()),
+            }
             assert_eq!(prepared.to_metadata.schema().field(0).name(), "id");
             assert_eq!(prepared.admission, match from {
                 None => None,

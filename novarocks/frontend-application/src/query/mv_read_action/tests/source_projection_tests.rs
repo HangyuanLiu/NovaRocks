@@ -39,6 +39,15 @@ use std::{
 type CompileResult<T> =
     Result<T, novarocks_connector_contract::PureProviderCompileError<ConnectorError>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialSourceSchema {
+    Original,
+    MissingBoundField,
+    ChangedBoundType,
+    UnrelatedField,
+    ReplacedObject,
+}
+
 pub(super) struct SourceFixture {
     descriptor: ConnectorInstanceDescriptor,
     epoch: ProviderBindingEpoch,
@@ -54,6 +63,7 @@ pub(super) struct SourceFixture {
     captured_context: Mutex<Option<ConnectorRequestContext>>,
     snapshot: i64,
     background_composition: bool,
+    initial_schema: InitialSourceSchema,
 }
 /// Use only the existing row-level projection capability. The pure keyed
 /// fixture supplies durable identities; SQL owns internal target labels/types.
@@ -174,6 +184,7 @@ impl SourceFixture {
             captured_context: Mutex::new(None),
             snapshot: 18,
             background_composition,
+            initial_schema: InitialSourceSchema::Original,
         })
     }
     fn object(&self) -> ConnectorTableObjectId {
@@ -181,6 +192,14 @@ impl SourceFixture {
             &self.projection.facts.definition().relation_occurrences[0].object_id,
         )
         .unwrap()
+    }
+    fn initial_object(&self) -> ConnectorTableObjectId {
+        if self.initial_schema == InitialSourceSchema::ReplacedObject {
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"replacement-source-object"))
+                .unwrap()
+        } else {
+            self.object()
+        }
     }
     fn source_identity(&self) -> ConnectorTableIdentity {
         ConnectorTableIdentity {
@@ -203,6 +222,40 @@ impl SourceFixture {
                 .unwrap()
             })
             .collect()
+    }
+    fn observed_source_fields(&self, initial: bool) -> Vec<MvObservedSourceField> {
+        let mut fields = self.source_fields();
+        if initial {
+            match self.initial_schema {
+                InitialSourceSchema::MissingBoundField => {
+                    fields.retain(|field| field.name() != "amount");
+                }
+                InitialSourceSchema::ChangedBoundType => {
+                    let amount = fields
+                        .iter_mut()
+                        .find(|field| field.name() == "amount")
+                        .unwrap();
+                    *amount = MvObservedSourceField::try_new(
+                        amount.provider_field_id().clone(),
+                        amount.name().to_owned(),
+                        "bigint".to_owned(),
+                        amount.nullable(),
+                    )
+                    .unwrap();
+                }
+                InitialSourceSchema::UnrelatedField => fields.push(
+                    MvObservedSourceField::try_new(
+                        Bytes::from_static(b"unrelated-current-field"),
+                        "unrelated_current".to_owned(),
+                        "bigint".to_owned(),
+                        true,
+                    )
+                    .unwrap(),
+                ),
+                InitialSourceSchema::Original | InitialSourceSchema::ReplacedObject => {}
+            }
+        }
+        fields
     }
     fn target_fields(&self) -> Vec<(u32, MvObservedSourceField)> {
         let mut seen = BTreeSet::new();
@@ -233,12 +286,20 @@ impl SourceFixture {
         source: bool,
         creation: &mut ConnectorReadSchemaCreation<'_>,
     ) -> CompileResult<ConnectorTableMetadata> {
+        self.metadata_for_projection(source, true, creation)
+    }
+    fn metadata_for_projection(
+        &self,
+        source: bool,
+        initial: bool,
+        creation: &mut ConnectorReadSchemaCreation<'_>,
+    ) -> CompileResult<ConnectorTableMetadata> {
         let identity = if source {
             self.source_identity()
         } else {
             self.projection.facts.source_revision().target.clone()
         };
-        let fields: Vec<Field> = if source {
+        let mut fields: Vec<Field> = if source {
             vec![
                 Field::new("amount", DataType::Float64, true),
                 Field::new("order_id", DataType::Int64, false),
@@ -265,6 +326,24 @@ impl SourceFixture {
                 })
                 .collect()
         };
+        if source && initial {
+            match self.initial_schema {
+                InitialSourceSchema::MissingBoundField => {
+                    fields.retain(|field| field.name() != "amount");
+                }
+                InitialSourceSchema::ChangedBoundType => {
+                    let amount = fields
+                        .iter_mut()
+                        .find(|field| field.name() == "amount")
+                        .unwrap();
+                    *amount = Field::new("amount", DataType::Int64, true);
+                }
+                InitialSourceSchema::UnrelatedField => {
+                    fields.push(Field::new("unrelated_current", DataType::Int64, true));
+                }
+                InitialSourceSchema::Original | InitialSourceSchema::ReplacedObject => {}
+            }
+        }
         let types = fields
             .iter()
             .map(|v| {
@@ -287,7 +366,7 @@ impl SourceFixture {
                         u32::try_from(i).unwrap(),
                         ConnectorTableColumnVisibility::Sql,
                         ConnectorTableColumnSemanticKind::None,
-                        if source && i == 2 {
+                        if source && schema.field(i).name() == "_row_id" {
                             ConnectorTableColumnRole::RowLineageSystem
                         } else {
                             ConnectorTableColumnRole::Ordinary
@@ -313,8 +392,10 @@ impl SourceFixture {
                 statistics_data_version: None,
                 table: novarocks_spi::connector::ConnectorTableHandle::try_new(
                     self.descriptor.instance_id.clone(),
-                    Bytes::from_static(if source {
+                    Bytes::from_static(if source && initial {
                         b"original-source-18"
+                    } else if source {
+                        b"prepared-source-to-18"
                     } else {
                         b"original-target-11"
                     }),
@@ -513,7 +594,7 @@ impl ConnectorMetadata for SourceFixture {
         selector: ConnectorReadSelector,
     ) -> Result<ConnectorExactSemanticRevision, ConnectorError> {
         let source = match table.payload().as_ref() {
-            b"original-source-18" => true,
+            b"original-source-18" | b"prepared-source-to-18" => true,
             b"original-target-11" => false,
             _ => panic!("unknown original table revision request"),
         };
@@ -537,7 +618,11 @@ impl ConnectorMetadata for SourceFixture {
             snapshot == 11
         });
         let object = if source {
-            self.object()
+            if table.payload().as_ref() == b"original-source-18" {
+                self.initial_object()
+            } else {
+                self.object()
+            }
         } else {
             self.projection
                 .facts
@@ -557,12 +642,16 @@ impl ConnectorMetadata for SourceFixture {
         revision: &ConnectorExactSemanticRevision,
     ) -> Result<ConnectorReadSelector, ConnectorError> {
         let source = match table.payload().as_ref() {
-            b"original-source-18" => true,
+            b"original-source-18" | b"prepared-source-to-18" => true,
             b"original-target-11" => false,
             _ => panic!("unknown original table revision selector request"),
         };
         let object = if source {
-            self.object()
+            if table.payload().as_ref() == b"original-source-18" {
+                self.initial_object()
+            } else {
+                self.object()
+            }
         } else {
             self.projection
                 .facts
@@ -651,7 +740,7 @@ impl ProviderReadMetadata for SourceFixture {
             let context = crate::connector::test_request_context();
             let metadata =
                 crate::connector::schema_creation::with_schema_creation(&context, |creation| {
-                    self.metadata(true, creation)
+                    self.metadata_for_projection(true, false, creation)
                 })
                 .map_err(crate::connector::schema_creation::connector_schema_error)?;
             Ok(ProviderPreparedSourceRead::change_window(
@@ -823,15 +912,23 @@ impl MvStorageObservationPort for SourceFixture {
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::MvSourceSchemaObservation, ConnectorError> {
-        assert_eq!(metadata.table.payload().as_ref(), b"original-source-18");
+        let initial = match metadata.table.payload().as_ref() {
+            b"original-source-18" => true,
+            b"prepared-source-to-18" => false,
+            _ => panic!("source schema must project the original pin or its prepared To"),
+        };
         self.schema_projections.fetch_add(1, Ordering::SeqCst);
         novarocks_spi::connector::MvSourceSchemaObservation::try_new(
             metadata.identity.clone(),
-            self.object(),
+            if initial {
+                self.initial_object()
+            } else {
+                self.object()
+            },
             Bytes::from_static(&[1]),
             true,
             true,
-            self.source_fields(),
+            self.observed_source_fields(initial),
             &context,
         )
     }
@@ -844,7 +941,7 @@ impl MvStorageObservationPort for SourceFixture {
         assert_eq!(metadata.identity, self.source_identity());
         novarocks_spi::connector::MvRefreshBaseObservation::try_new(
             metadata.identity.clone(),
-            self.object(),
+            self.initial_object(),
             Some(self.snapshot),
             &context,
         )
@@ -1009,8 +1106,73 @@ async fn original_explain_self_join_binds_one_window_before_existing_join_key_re
 async fn background_composed_generation_prepares_actual_source_read_once() {
     explain_counted(false, true).await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn original_explain_rejects_initial_definition_drift_before_preparing_frozen_to() {
+    for (drift, expected) in [
+        (
+            InitialSourceSchema::MissingBoundField,
+            "MV source field is missing for relation occurrence 7",
+        ),
+        (
+            InitialSourceSchema::ChangedBoundType,
+            "MV source field type or nullability changed for relation occurrence 7",
+        ),
+        (
+            InitialSourceSchema::ReplacedObject,
+            "MV source object changed for relation occurrence 7",
+        ),
+    ] {
+        let mut source = SourceFixture::new(false, false);
+        Arc::get_mut(&mut source).unwrap().initial_schema = drift;
+        let mut fixture = Fixture::with_source_explain(
+            Some(novarocks_sql::compiler::ExplainLevel::Costs),
+            Some(source.clone()),
+        )
+        .await;
+        seed(&mut fixture, &source).await;
+        let result = fixture.business().await;
+        let error = result
+            .as_ref()
+            .err()
+            .expect("initial D drift must reject EXPLAIN");
+        assert!(error.message().contains(expected), "{drift:?}: {error:?}");
+        let state = fixture.state.as_ref().unwrap();
+        assert!(
+            state.local_health().is_none(),
+            "definition refusal is not Native health"
+        );
+        assert!(matches!(
+            state.explain.as_ref().unwrap().result,
+            Some(Err(_))
+        ));
+        assert_eq!(source.initial_observations.load(Ordering::SeqCst), 1);
+        assert_eq!(source.preparations.load(Ordering::SeqCst), 0);
+        assert!(source.requests.lock().unwrap().is_empty());
+        drop(result);
+        fixture.close(false).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn original_explain_uses_initial_schema_for_admission_and_frozen_to_for_reads() {
+    explain_counted_with_initial_schema(false, false, InitialSourceSchema::UnrelatedField).await;
+}
+
 async fn explain_counted(self_join: bool, background_composition: bool) {
-    let source = SourceFixture::new(self_join, background_composition);
+    explain_counted_with_initial_schema(
+        self_join,
+        background_composition,
+        InitialSourceSchema::Original,
+    )
+    .await;
+}
+async fn explain_counted_with_initial_schema(
+    self_join: bool,
+    background_composition: bool,
+    initial_schema: InitialSourceSchema,
+) {
+    let mut source = SourceFixture::new(self_join, background_composition);
+    Arc::get_mut(&mut source).unwrap().initial_schema = initial_schema;
     let mut fixture = Fixture::with_source_explain(
         Some(novarocks_sql::compiler::ExplainLevel::Costs),
         Some(source.clone()),
@@ -1075,6 +1237,35 @@ async fn explain_counted(self_join: bool, background_composition: bool) {
         .clone();
     let context = source.captured_context.lock().unwrap().take().unwrap();
     let table = novarocks_types::naming::TableIdentity::new("ice", "sales", "orders");
+    if initial_schema == InitialSourceSchema::UnrelatedField {
+        let io = explain.reader.original_io_for_test();
+        let captured = io.captured_sources().require(&table).unwrap();
+        assert!(
+            captured
+                .observed
+                .schema()
+                .field_with_name("unrelated_current")
+                .is_ok()
+        );
+        assert!(
+            captured
+                .metadata()
+                .unwrap()
+                .schema()
+                .field_with_name("unrelated_current")
+                .is_err()
+        );
+        // The same fake Provider projects the retained source facts; this call
+        // cannot load metadata or start SourceRead work (both callbacks panic).
+        let ports = source.ports(state.readiness.clone(), state.entrance.clone());
+        let actual_read_schema = io.schema(&ports, &table, &context).await.unwrap();
+        assert!(
+            actual_read_schema
+                .fields()
+                .iter()
+                .all(|field| field.name != "unrelated_current")
+        );
+    }
     let projections_before = source.schema_projections.load(Ordering::SeqCst);
     let mut occurrences = BTreeSet::new();
     for occurrence in &source.projection.facts.definition().relation_occurrences {

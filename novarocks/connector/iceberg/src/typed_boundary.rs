@@ -2427,6 +2427,39 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
             .clone()
             .ok_or_else(|| invalid("prepared source has no original split preparation packet"))?;
         self.check_request_active()?;
+        crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::validate_prepared_split_request(
+            self.as_ref(), &request, &receipt,
+        )?;
+        if receipt.projection == ConnectorReadSourceProjection::Delta
+            && matches!(
+                receipt.source.admission,
+                Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
+            )
+        {
+            let crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) =
+                request.table.as_ref()
+            else {
+                return Err(invalid("MetadataOnly Delta lost its exact typed window"));
+            };
+            let outcome = crate::typed_read::IcebergChangeWindowPlan::try_plan(
+                handle.clone(),
+                crate::typed_read::IcebergEndpointVisibility::Proven,
+                Vec::new(),
+            )?;
+            let crate::typed_read::IcebergChangeWindowPlanOutcome::Incremental(plan) = outcome
+            else {
+                return Err(invalid(
+                    "proven MetadataOnly Delta did not form an empty plan",
+                ));
+            };
+            // Exact original receipt is the proof of zero contribution. No
+            // fresh loader, CPU job, Source owner or retention guard is created.
+            return Ok(Box::pin(async move {
+                Ok(Box::new(IcebergRuntimeSplitSource::new(
+                    IcebergChangeWindowSplitSource::new(plan),
+                )) as Box<dyn ProviderReadSplitSource<Self>>)
+            }));
+        }
         if let Some(empty) = known_empty_prepared_table_source(&request, self.split_source_options)?
         {
             return Ok(Box::pin(async move { Ok(empty) }));
@@ -3495,6 +3528,23 @@ fn pinned_change_window_handle_with_fallback(
             "Iceberg change-window endpoints have different declared scalar integer domains",
         ));
     }
+    change_window_handle_with_frozen_schema(name, metadata, window, to_schema).map(Some)
+}
+
+/// Static endpoint identities from the original frozen metadata, not evidence
+/// of a physical read. MetadataOnly has no executable From projection and its
+/// empty Delta never starts endpoint discovery.
+fn change_window_handle_with_frozen_schema(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    window: ConnectorReadChangeWindow,
+    to_schema: SchemaRef,
+) -> Result<IcebergChangeWindowHandle, ConnectorError> {
+    let from = window.from_snapshot_id();
+    let to = window.to_snapshot_id();
+    let document =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
+    let to_domains = crate::scalar_integer_domain::of_schema(&to_schema, &document.integers)?;
     let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?
         .into_iter()
         .map(|column| {
@@ -3538,7 +3588,6 @@ fn pinned_change_window_handle_with_fallback(
             &document.nominals,
         )?,
     )
-    .map(Some)
 }
 
 fn same_source_table(actual: &IcebergTableHandle, expected: &IcebergTableHandle) -> bool {
@@ -3590,6 +3639,43 @@ pub(crate) fn frozen_prepared_source_relations(
         Ok(PreparedRelations {
             to,
             from: Some(from),
+            delta: Some(delta),
+        })
+    } else if matches!(
+        admission,
+        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
+    ) {
+        let ConnectorReadSourceSelection::ChangeWindow(window) = selection else {
+            return Err(invalid(
+                "snapshot source cannot have a MetadataOnly window decision",
+            ));
+        };
+        // A real MetadataOnly preparation proved this exact original lineage.
+        // Reject contradictory private facts rather than inventing a From pin.
+        if !matches!(
+            metadata.format_version(),
+            FormatVersion::V2 | FormatVersion::V3
+        ) || metadata.snapshot_by_id(window.from_snapshot_id()).is_none()
+            || metadata.snapshot_by_id(to).is_none()
+            || !snapshot_descends_from(metadata, to, window.from_snapshot_id())
+        {
+            return Err(invalid(
+                "MetadataOnly source has no exact original endpoint lineage",
+            ));
+        }
+        let delta =
+            change_window_handle_with_frozen_schema(name, metadata, window, to_schema.clone())?;
+        let to = pinned_table_handle_with_schema_and_domain(
+            name,
+            metadata,
+            Some(to),
+            to_schema,
+            None,
+            || Ok(Some(Arc::clone(delta.to_read_domain()))),
+        )?;
+        Ok(PreparedRelations {
+            to,
+            from: None,
             delta: Some(delta),
         })
     } else {
@@ -6313,11 +6399,10 @@ mod prepared_source_relation_tests {
     }
 
     #[test]
-    fn prepared_closed_decisions_do_not_manufacture_from_or_delta_relations() {
+    fn prepared_snapshot_and_full_rebuild_do_not_manufacture_from_or_delta_relations() {
         let metadata = metadata();
         for admission in [
             None,
-            Some(ConnectorChangeWindowAdmission::MetadataOnly),
             Some(ConnectorChangeWindowAdmission::FullRebuild(
                 ConnectorChangeWindowFullRebuildReason::LineageBroken {
                     from_snapshot_id: 999,
@@ -6342,6 +6427,111 @@ mod prepared_source_relation_tests {
             assert!(relations.from.is_none());
             assert!(relations.delta.is_none());
         }
+    }
+
+    #[test]
+    fn prepared_metadata_only_has_exact_empty_delta_without_executable_from() {
+        let metadata = metadata();
+        for from in [41, 42] {
+            let relations = frozen_prepared_source_relations(
+                &SchemaTableName::try_new("db", "t").unwrap(),
+                &metadata,
+                ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(
+                    from, 42,
+                )),
+                metadata.current_schema().clone(),
+                metadata.current_schema_id(),
+                Some(&ConnectorChangeWindowAdmission::MetadataOnly),
+            )
+            .unwrap();
+            assert!(relations.from.is_none());
+            let delta = relations.delta.unwrap();
+            assert_eq!(delta.from_snapshot_id_exclusive(), from);
+            assert_eq!(delta.to_snapshot_id_inclusive(), 42);
+            assert_eq!(relations.to.read_domain(), Some(delta.to_read_domain()));
+            assert_eq!(
+                IcebergChangeWindowHandle::from_proto(&delta.to_proto()).unwrap(),
+                delta
+            );
+            let outcome = crate::typed_read::IcebergChangeWindowPlan::try_plan(
+                delta,
+                crate::typed_read::IcebergEndpointVisibility::Proven,
+                Vec::new(),
+            )
+            .unwrap();
+            let crate::typed_read::IcebergChangeWindowPlanOutcome::Incremental(plan) = outcome
+            else {
+                panic!("closed zero contribution")
+            };
+            assert!(plan.into_splits().is_empty());
+        }
+        assert!(
+            frozen_prepared_source_relations(
+                &SchemaTableName::try_new("db", "t").unwrap(),
+                &metadata,
+                ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(999, 42)),
+                metadata.current_schema().clone(),
+                metadata.current_schema_id(),
+                Some(&ConnectorChangeWindowAdmission::MetadataOnly),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_only_delta_rejects_another_exact_window_before_empty_opening() {
+        use novarocks_spi::connector::read_stack::adapter::{
+            ProviderReadSplitManager, ProviderReadSplitOpenRequest,
+        };
+        let (_executor, _warehouse, boundary, mut source) = inventory_fixture();
+        let metadata = source.access.metadata().clone();
+        let relations = frozen_prepared_source_relations(
+            source.request.name(),
+            &metadata,
+            source.request.selection(),
+            metadata.current_schema().clone(),
+            metadata.current_schema_id(),
+            Some(&ConnectorChangeWindowAdmission::MetadataOnly),
+        )
+        .unwrap();
+        let original = Arc::get_mut(&mut source).unwrap();
+        original.relations = relations;
+        original.admission = Some(ConnectorChangeWindowAdmission::MetadataOnly);
+        install_inventory(&boundary, &source);
+        let mut foreign = source.relations.delta.as_ref().unwrap().to_proto();
+        foreign.from_snapshot_id_exclusive = foreign.to_snapshot_id_inclusive;
+        foreign.from_read_domain = foreign.to_read_domain.clone();
+        let relation = crate::typed_read::IcebergRuntimeRelation::ChangeWindow(
+            IcebergChangeWindowHandle::from_proto(&foreign).unwrap(),
+        );
+        let mut owner = None;
+        let result = Arc::clone(&boundary).begin_get_splits(
+            ProviderReadSplitOpenRequest {
+                session: ConnectorSession::try_new(
+                    "q",
+                    "u",
+                    "UTC",
+                    "en_US",
+                    std::time::SystemTime::UNIX_EPOCH,
+                )
+                .unwrap(),
+                table: Arc::new(relation),
+                columns: Vec::new(),
+                dynamic_filter_columns: BTreeSet::new(),
+                constraint: Constraint::of_summary(TupleDomain::all()),
+                preparation: None,
+            },
+            &mut owner,
+        );
+        let error = result
+            .err()
+            .expect("foreign window cannot claim the empty decision");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "prepared source relation differs from its original prepared inventory"
+        );
+        assert!(owner.is_none());
     }
 
     #[test]

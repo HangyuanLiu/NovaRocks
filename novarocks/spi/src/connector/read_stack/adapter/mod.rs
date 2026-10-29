@@ -2452,8 +2452,9 @@ mod tests {
             for projection in [P::To, P::From, P::Delta] {
                 let before = provider.created_calls.load(Ordering::SeqCst);
                 let result = adapter.project_prepared_source_read(&session(), &source, projection);
-                let permitted =
-                    projection == P::To || matches!(decision, Some(A::Incremental { .. }));
+                let permitted = projection == P::To
+                    || matches!(decision, Some(A::Incremental { .. }))
+                    || (projection == P::Delta && matches!(decision, Some(A::MetadataOnly)));
                 assert_eq!(result.is_ok(), permitted);
                 assert_eq!(
                     provider.created_calls.load(Ordering::SeqCst),

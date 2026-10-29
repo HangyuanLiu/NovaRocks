@@ -186,12 +186,20 @@ impl ConnectorPreparedSourceRead {
     pub(crate) fn permits(&self, projection: ConnectorReadSourceProjection) -> bool {
         match projection {
             ConnectorReadSourceProjection::To => true,
-            ConnectorReadSourceProjection::From | ConnectorReadSourceProjection::Delta => {
-                matches!(
-                    self.admission,
-                    Some(ConnectorChangeWindowAdmission::Incremental { .. })
+            ConnectorReadSourceProjection::From => matches!(
+                self.admission,
+                Some(ConnectorChangeWindowAdmission::Incremental { .. })
+            ),
+            ConnectorReadSourceProjection::Delta => matches!(
+                (self.request.selection(), &self.admission),
+                (
+                    ConnectorReadSourceSelection::ChangeWindow(_),
+                    Some(
+                        ConnectorChangeWindowAdmission::Incremental { .. }
+                            | ConnectorChangeWindowAdmission::MetadataOnly
+                    )
                 )
-            }
+            ),
         }
     }
 }

@@ -347,20 +347,59 @@ pub(crate) fn freeze_captured_source_overlays(
             Some(id) => QueryTableBindingKey::snapshot(&catalog, &namespace, &table, id),
             None => QueryTableBindingKey::strict_base(&catalog, &namespace, &table),
         };
-        overlays.push(QueryLocalTableOverlay::for_catalog(catalog.clone(), namespace.clone(), table.clone(), key,
+        overlays.push(QueryLocalTableOverlay::for_catalog(
+            catalog.clone(),
+            namespace.clone(),
+            table.clone(),
+            key,
             move |binding| {
-                let mut result = connector_query_binding_from_materialization(materialization.clone(), &catalog, &namespace, &table, binding)?;
+                let mut result = connector_query_binding_from_materialization(
+                    materialization.clone(),
+                    &catalog,
+                    &namespace,
+                    &table,
+                    binding,
+                )?;
                 if let Some(to) = &to {
-                    result.install_prepared_source_read(to.clone(), Projection::To, materialization.planning_lease.clone())?;
+                    result.install_prepared_source_read(
+                        to.clone(),
+                        Projection::To,
+                        materialization.planning_lease.clone(),
+                    )?;
                 }
                 for receipt in &receipts {
-                    if matches!(receipt.admission(), Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })) {
-                        result.install_prepared_source_read(receipt.clone(), Projection::From, materialization.planning_lease.clone())?;
-                        result.install_prepared_source_read(receipt.clone(), Projection::Delta, materialization.planning_lease.clone())?;
+                    match receipt.admission() {
+                        Some(
+                            novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
+                                ..
+                            },
+                        ) => {
+                            result.install_prepared_source_read(
+                                receipt.clone(),
+                                Projection::From,
+                                materialization.planning_lease.clone(),
+                            )?;
+                            result.install_prepared_source_read(
+                                receipt.clone(),
+                                Projection::Delta,
+                                materialization.planning_lease.clone(),
+                            )?;
+                        }
+                        Some(
+                            novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        ) => {
+                            result.install_prepared_source_read(
+                                receipt.clone(),
+                                Projection::Delta,
+                                materialization.planning_lease.clone(),
+                            )?;
+                        }
+                        _ => {}
                     }
                 }
                 Ok(result)
-            }));
+            },
+        ));
     }
     Ok(overlays)
 }

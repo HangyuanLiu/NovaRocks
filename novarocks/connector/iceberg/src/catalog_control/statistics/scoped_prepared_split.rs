@@ -212,6 +212,38 @@ impl Work {
     }
 }
 
+/// Pure original-owner checks shared by real discovery and a proved zero-Work
+/// opening. This packet carries the existing Root; it grants no new work.
+pub(crate) fn validate_prepared_split_request(
+    boundary: &IcebergTypedBoundary,
+    request: &ProviderReadSplitOpenRequest<IcebergTypedBoundary>,
+    receipt: &PreparedSourceAccess,
+) -> Result<ConnectorRequestContext, ConnectorError> {
+    if receipt.source.owner.instance_id != boundary.descriptor().instance_id
+        || receipt.source.owner.incarnation != boundary.incarnation()
+        || &receipt.source.catalog != boundary.catalog_handle()
+    {
+        return Err(invalid(
+            "prepared split source has a foreign exact read binding",
+        ));
+    }
+    // Check the mandatory packet before moving any original input. The
+    // caller already cloned it for drive/close; the Work stores its same
+    // original scope, without a Source -> port -> job -> Source cycle.
+    let preparation = request
+        .preparation
+        .as_ref()
+        .ok_or_else(|| invalid("prepared split source requires its original preparation packet"))?;
+    let context = boundary.prepared_source_request_context()?;
+    context.check_active()?;
+    preparation.original().check_active().map_err(|error| {
+        super::scoped_read::checked_read(crate::read_snapshot::cow_capture::ReadFailure::Original(
+            error.into(),
+        ))
+    })?;
+    Ok(context)
+}
+
 impl IcebergMetadataCpuOriginal {
     /// Construct only. The original caller installs this Source before polling
     /// the returned driver and strongly retains the exact CPU packet to close.
@@ -220,27 +252,7 @@ impl IcebergMetadataCpuOriginal {
         mut request: ProviderReadSplitOpenRequest<IcebergTypedBoundary>,
         receipt: PreparedSourceAccess,
     ) -> Result<Arc<Self>, ConnectorError> {
-        if receipt.source.owner.instance_id != boundary.descriptor().instance_id
-            || receipt.source.owner.incarnation != boundary.incarnation()
-            || &receipt.source.catalog != boundary.catalog_handle()
-        {
-            return Err(invalid(
-                "prepared split source has a foreign exact read binding",
-            ));
-        }
-        // Check the mandatory packet before moving any original input. The
-        // caller already cloned it for drive/close; the Work stores its same
-        // original scope, without a Source -> port -> job -> Source cycle.
-        let preparation = request.preparation.as_ref().ok_or_else(|| {
-            invalid("prepared split source requires its original preparation packet")
-        })?;
-        let context = boundary.prepared_source_request_context()?;
-        context.check_active()?;
-        preparation.original().check_active().map_err(|error| {
-            super::scoped_read::checked_read(
-                crate::read_snapshot::cow_capture::ReadFailure::Original(error.into()),
-            )
-        })?;
+        let context = validate_prepared_split_request(&boundary, &request, &receipt)?;
         let domains = match receipt.projection {
             ConnectorReadSourceProjection::To => [
                 None,
