@@ -1149,6 +1149,8 @@ pub struct IcebergPreparedRelation {
 }
 
 impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for IcebergTypedBoundary {
+    type PreparedSourceRead =
+        novarocks_spi::connector::read_stack::adapter::UnsupportedPreparedSourceRead;
     type PreparedRelation = IcebergPreparedRelation;
     fn prepare_relation<'a>(
         &'a self,

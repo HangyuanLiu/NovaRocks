@@ -44,6 +44,13 @@ use crate::connector::{
 
 pub use novarocks_connector_contract::{ConnectorReadBinding, ConnectorReadRelationKind};
 
+mod source_preparation;
+pub use source_preparation::{
+    ConnectorPreparedSourceRead, ConnectorPreparedSourceReadFuture,
+    ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
+    ConnectorReadSourceSelection,
+};
+
 #[derive(Clone)]
 struct OpaquePayload(Arc<dyn Any + Send + Sync>);
 
@@ -654,6 +661,34 @@ pub type ConnectorReadRelationPreparationFuture<'a> = std::pin::Pin<
 /// Coordinator-facing read services. They are transport neutral and never
 /// expose the concrete payload of a returned handle.
 pub trait ConnectorReadMetadata: Send + Sync {
+    fn prepare_source_read<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        _request: &'a ConnectorReadSourcePreparationRequest,
+        _cpu: &'a Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        _original: &'a crate::connector::ConnectorOriginalResultScope,
+        _owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> ConnectorPreparedSourceReadFuture<'a> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "read generation does not prepare frozen source reads",
+            ))
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        _session: &ConnectorSession,
+        _source: &ConnectorPreparedSourceRead,
+        _projection: ConnectorReadSourceProjection,
+    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "read generation does not project frozen source reads",
+        ))
+    }
+
     fn prepare_relation<'a>(
         &'a self,
         _session: &'a ConnectorSession,

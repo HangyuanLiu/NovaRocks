@@ -423,12 +423,25 @@ impl ConnectorTableForeignKeyConstraint {
 /// Bounded provider-neutral facts needed by Core to materialize SQL table
 /// columns and optimizer UK/FK facts. Providers that have no additional facts
 /// return [`Self::empty`].
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorTablePlanningFacts {
     column_facts: Vec<ConnectorTableColumnPlanningFact>,
     unique_constraints: Vec<ConnectorTableUniqueConstraint>,
     foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
-    partition_source_column_ordinals: Vec<u32>,
+    // None is an explicitly frozen snapshot source, which cannot state the
+    // current table's write-layout membership. It never means unknown.
+    partition_source_column_ordinals: Option<Vec<u32>>,
+}
+
+impl Default for ConnectorTablePlanningFacts {
+    fn default() -> Self {
+        Self {
+            column_facts: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_key_constraints: Vec::new(),
+            partition_source_column_ordinals: Some(Vec::new()),
+        }
+    }
 }
 
 impl ConnectorTablePlanningFacts {
@@ -439,21 +452,62 @@ impl ConnectorTablePlanningFacts {
     pub fn try_new(
         schema: &SchemaRef,
         column_facts: Vec<ConnectorTableColumnPlanningFact>,
+        unique_constraints: Vec<ConnectorTableUniqueConstraint>,
+        foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+        partition_source_column_ordinals: Vec<u32>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_projection(
+            schema,
+            column_facts,
+            unique_constraints,
+            foreign_key_constraints,
+            Some(partition_source_column_ordinals),
+            context,
+        )
+    }
+
+    /// A frozen snapshot still publishes complete column/default/constraint
+    /// facts, but cannot authorize the current table's partition write layout.
+    pub fn try_new_snapshot_source(
+        schema: &SchemaRef,
+        column_facts: Vec<ConnectorTableColumnPlanningFact>,
+        unique_constraints: Vec<ConnectorTableUniqueConstraint>,
+        foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_projection(
+            schema,
+            column_facts,
+            unique_constraints,
+            foreign_key_constraints,
+            None,
+            context,
+        )
+    }
+
+    fn try_new_projection(
+        schema: &SchemaRef,
+        column_facts: Vec<ConnectorTableColumnPlanningFact>,
         mut unique_constraints: Vec<ConnectorTableUniqueConstraint>,
         mut foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
-        mut partition_source_column_ordinals: Vec<u32>,
+        mut partition_source_column_ordinals: Option<Vec<u32>>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         let write_default_bytes = validate_column_facts(schema, &column_facts)?;
         validate_unique_constraints(schema, &mut unique_constraints)?;
         validate_foreign_key_constraints(schema, &mut foreign_key_constraints)?;
-        validate_partition_source_columns(schema, &mut partition_source_column_ordinals)?;
+        if let Some(ordinals) = &mut partition_source_column_ordinals {
+            validate_partition_source_columns(schema, ordinals)?;
+        }
 
         let bytes = planning_facts_bytes(
             &column_facts,
             &unique_constraints,
             &foreign_key_constraints,
-            &partition_source_column_ordinals,
+            partition_source_column_ordinals
+                .as_deref()
+                .unwrap_or_default(),
         )
         .saturating_add(write_default_bytes);
         if bytes > context.max_total_payload_bytes() {
@@ -489,10 +543,12 @@ impl ConnectorTablePlanningFacts {
     /// This is a membership fact only: it says which columns participate, never
     /// how they are transformed. An empty slice means the provider declares no
     /// partition source columns, which is not the same as "unknown" — a
-    /// provider that cannot state this fact must fail its metadata request
-    /// rather than return an empty list.
-    pub fn partition_source_column_ordinals(&self) -> &[u32] {
-        &self.partition_source_column_ordinals
+    /// provider that cannot state this fact must fail its current metadata
+    /// request rather than return an empty list. None explicitly identifies a
+    /// frozen snapshot source for which current write-layout membership is not
+    /// applicable; it does not describe that snapshot's file partition specs.
+    pub fn partition_source_column_ordinals(&self) -> Option<&[u32]> {
+        self.partition_source_column_ordinals.as_deref()
     }
 }
 
@@ -2736,7 +2792,64 @@ mod tests {
         )
         .expect("partition source ordinals must be accepted");
 
-        assert_eq!(facts.partition_source_column_ordinals(), &[0, 2]);
+        assert_eq!(facts.partition_source_column_ordinals(), Some(&[0, 2][..]));
+    }
+
+    #[test]
+    fn snapshot_source_preserves_column_facts_without_claiming_current_partition_membership() {
+        let current = facts_with_write_default(ConnectorColumnDefault::Int64(7), 8_192).unwrap();
+        let snapshot = ConnectorTablePlanningFacts::try_new_snapshot_source(
+            &planning_schema(),
+            current.column_facts().to_vec(),
+            current.unique_constraints().to_vec(),
+            current.foreign_key_constraints().to_vec(),
+            &context(8_192),
+        )
+        .unwrap();
+        assert_eq!(snapshot.column_facts(), current.column_facts());
+        assert_eq!(snapshot.unique_constraints(), current.unique_constraints());
+        assert_eq!(
+            snapshot.foreign_key_constraints(),
+            current.foreign_key_constraints()
+        );
+        assert_eq!(
+            snapshot.column_facts()[0].write_default(),
+            Some(&ConnectorColumnDefault::Int64(7))
+        );
+        assert_eq!(current.partition_source_column_ordinals(), Some(&[][..]));
+        assert_eq!(snapshot.partition_source_column_ordinals(), None);
+    }
+
+    #[test]
+    fn snapshot_source_still_validates_defaults_and_charges_the_original_payload_budget() {
+        let facts = |value, budget| {
+            ConnectorTablePlanningFacts::try_new_snapshot_source(
+                &planning_schema(),
+                vec![
+                    ordinary_fact(0).with_write_default(Some(value)),
+                    ordinary_fact(1),
+                    ordinary_fact(2),
+                ],
+                Vec::new(),
+                Vec::new(),
+                &context(budget),
+            )
+        };
+        assert_eq!(
+            facts(ConnectorColumnDefault::Null, 8_192)
+                .unwrap_err()
+                .kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(
+            facts(
+                ConnectorColumnDefault::String(Arc::from("x".repeat(4_096))),
+                256
+            )
+            .unwrap_err()
+            .kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
     }
 
     #[test]

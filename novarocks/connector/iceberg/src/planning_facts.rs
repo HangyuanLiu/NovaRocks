@@ -826,7 +826,12 @@ mod tests {
                 .iter()
                 .all(|fact| fact.write_target_type().is_none())
         );
-        assert!(metadata_table.partition_source_column_ordinals().is_empty());
+        assert!(
+            metadata_table
+                .partition_source_column_ordinals()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -895,7 +900,7 @@ mod tests {
         })
         .expect("planning facts");
 
-        assert_eq!(facts.partition_source_column_ordinals(), &[1]);
+        assert_eq!(facts.partition_source_column_ordinals(), Some(&[1][..]));
     }
 
     #[test]

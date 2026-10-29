@@ -115,6 +115,8 @@ impl ProviderReadRuntime for LateProvider {
     fn transaction(&self) -> Self::Transaction {}
 }
 impl ProviderReadMetadata for LateProvider {
+    type PreparedSourceRead =
+        novarocks_spi::connector::read_stack::adapter::UnsupportedPreparedSourceRead;
     type PreparedRelation = (
         Self::Table,
         Option<novarocks_spi::connector::read_stack::SystemTableUnitHint>,

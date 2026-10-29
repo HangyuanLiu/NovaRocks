@@ -201,6 +201,41 @@ impl<T> ProviderReadSystemTablePlan<T> {
 #[derive(Debug)]
 pub enum UnsupportedFrozenReadSource {}
 
+/// No preparation value exists for a provider which does not implement the
+/// frozen-source preparation contract.
+pub enum UnsupportedPreparedSourceRead {}
+
+pub struct ProviderPreparedSourceRead<T> {
+    source: T,
+    admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+    to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+}
+
+impl<T> ProviderPreparedSourceRead<T> {
+    pub const fn snapshot(
+        source: T,
+        to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+    ) -> Self {
+        Self {
+            source,
+            admission: None,
+            to_metadata,
+        }
+    }
+
+    pub const fn change_window(
+        source: T,
+        admission: crate::connector::ConnectorChangeWindowAdmission,
+        to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+    ) -> Self {
+        Self {
+            source,
+            admission: Some(admission),
+            to_metadata,
+        }
+    }
+}
+
 pub struct ProviderReadOpenedRelation<T> {
     handle: T,
     unit_hint: Option<SystemTableUnitHint>,
@@ -215,6 +250,38 @@ impl<T> ProviderReadOpenedRelation<T> {
 }
 
 pub trait ProviderReadMetadata: ProviderReadRuntime {
+    type PreparedSourceRead: Send + Sync + 'static;
+
+    fn prepare_source_read<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        _request: &'a super::runtime::ConnectorReadSourcePreparationRequest,
+        _cpu: &'a Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        _original: &'a crate::connector::ConnectorOriginalResultScope,
+        _owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> BoxFuture<'a, Result<ProviderPreparedSourceRead<Self::PreparedSourceRead>, ConnectorError>>
+    {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "provider does not prepare frozen source reads",
+            ))
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        _session: &ConnectorSession,
+        _request: &super::runtime::ConnectorReadSourcePreparationRequest,
+        _source: &Self::PreparedSourceRead,
+        _projection: super::runtime::ConnectorReadSourceProjection,
+    ) -> Result<Self::Table, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider does not project frozen source reads",
+        ))
+    }
+
     type PreparedRelation: Send + Sync + 'static;
     fn prepare_relation<'a>(
         &'a self,
@@ -715,7 +782,72 @@ struct BoundRelationPreparation<P: ProviderReadMetadata> {
     provider: Arc<P>,
 }
 
+struct BoundSourcePreparation<P: ProviderReadMetadata> {
+    facts: P::PreparedSourceRead,
+    // Retain the original preparation generation through its facts' Drop.
+    _provider: Arc<P>,
+}
+
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn prepare_source_read<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        request: &'a super::runtime::ConnectorReadSourcePreparationRequest,
+        cpu: &'a Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        original: &'a crate::connector::ConnectorOriginalResultScope,
+        owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> super::runtime::ConnectorPreparedSourceReadFuture<'a> {
+        Box::pin(async move {
+            let prepared = self
+                .provider
+                .prepare_source_read(session, request, cpu, original, owner)
+                .await?;
+            let is_window = matches!(
+                request.selection(),
+                super::runtime::ConnectorReadSourceSelection::ChangeWindow(_)
+            );
+            if is_window != prepared.admission.is_some() {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "provider source preparation decision differs from its selection",
+                ));
+            }
+            Ok(super::runtime::ConnectorPreparedSourceRead::new(
+                self.binding.clone(),
+                request.clone(),
+                prepared.admission,
+                prepared.to_metadata,
+                BoundSourcePreparation::<P> {
+                    facts: prepared.source,
+                    _provider: Arc::clone(&self.provider),
+                },
+            ))
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        session: &ConnectorSession,
+        source: &super::runtime::ConnectorPreparedSourceRead,
+        projection: super::runtime::ConnectorReadSourceProjection,
+    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
+        if source.binding() != &self.binding {
+            return Err(binding_error());
+        }
+        if !source.permits(projection) {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "prepared source does not permit the requested read projection",
+            ));
+        }
+        let prepared = source
+            .facts::<BoundSourcePreparation<P>>()
+            .ok_or_else(type_error)?;
+        self.provider
+            .project_prepared_source_read(session, source.request(), &prepared.facts, projection)
+            .map(|table| self.wrap_table(table))
+    }
+
     fn prepare_relation<'a>(
         &'a self,
         session: &'a ConnectorSession,
@@ -1732,6 +1864,20 @@ mod tests {
     }
 
     impl ProviderReadMetadata for Probe {
+        type PreparedSourceRead = usize;
+
+        fn project_prepared_source_read(
+            &self,
+            _session: &ConnectorSession,
+            _request: &super::super::ConnectorReadSourcePreparationRequest,
+            source: &Self::PreparedSourceRead,
+            _projection: super::super::ConnectorReadSourceProjection,
+        ) -> Result<Self::Table, ConnectorError> {
+            assert_eq!(*source, 41);
+            self.created_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Table)
+        }
+
         type PreparedRelation = (
             Self::Table,
             Option<crate::connector::read_stack::SystemTableUnitHint>,
@@ -2090,6 +2236,198 @@ mod tests {
     fn session() -> ConnectorSession {
         ConnectorSession::try_new("q", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
             .expect("session")
+    }
+
+    fn prepared_source_metadata(
+        adapter: &ReadRuntimeAdapter<Probe>,
+    ) -> Arc<crate::connector::ConnectorTableMetadata> {
+        use crate::connector::{
+            ConnectorTableDefinitionFacts, ConnectorTableIdentity, ConnectorTableMetadata,
+            ConnectorTableMetadataHeader, ConnectorTablePlanningFacts,
+        };
+        let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+            schema.clone(),
+            Vec::new().into_boxed_slice(),
+            storage.clone(),
+        )
+        .unwrap();
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation =
+            super::super::ConnectorReadSchemaCreation::new(storage, &mut request, &mut work);
+        Arc::new(
+            ConnectorTableMetadata::try_new_typed(
+                ConnectorTableMetadataHeader {
+                    identity: ConnectorTableIdentity {
+                        instance_id: adapter.provider.descriptor.instance_id.clone(),
+                        namespace: "db".into(),
+                        table: "source".into(),
+                    },
+                    planning_facts: ConnectorTablePlanningFacts::empty(),
+                    definition_facts: ConnectorTableDefinitionFacts::empty(),
+                    version: None,
+                    statistics_data_version: None,
+                    table: crate::connector::ConnectorTableHandle::try_new(
+                        adapter.provider.descriptor.instance_id.clone(),
+                        bytes::Bytes::from_static(b"prepared-source"),
+                    )
+                    .unwrap(),
+                },
+                schema,
+                execution,
+                &mut creation,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn prepared_source(
+        adapter: &ReadRuntimeAdapter<Probe>,
+        admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+    ) -> super::super::ConnectorPreparedSourceRead {
+        use crate::connector::read_stack::{
+            ConnectorReadChangeWindow, ConnectorReadSourcePreparationRequest,
+        };
+        let object = crate::connector::ConnectorTableObjectId::try_new(bytes::Bytes::from_static(
+            b"source-object",
+        ))
+        .unwrap();
+        let revision = |snapshot| {
+            crate::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                adapter.provider.descriptor.provider_id.clone(),
+                &object,
+                Some(snapshot),
+            )
+            .unwrap()
+        };
+        let name = SchemaTableName::try_new("db", "source").unwrap();
+        let request = if admission.is_some() {
+            ConnectorReadSourcePreparationRequest::change_window(
+                name,
+                object.clone(),
+                ConnectorReadChangeWindow::new(40, 41),
+                revision(40),
+                revision(41),
+            )
+        } else {
+            ConnectorReadSourcePreparationRequest::snapshot(name, object.clone(), 41, revision(41))
+        };
+        super::super::ConnectorPreparedSourceRead::new(
+            adapter.binding.clone(),
+            request,
+            admission,
+            prepared_source_metadata(adapter),
+            BoundSourcePreparation::<Probe> {
+                facts: 41,
+                _provider: Arc::clone(&adapter.provider),
+            },
+        )
+    }
+
+    #[test]
+    fn prepared_source_projects_only_the_capabilities_of_its_closed_decision() {
+        use crate::connector::ConnectorChangeWindowAdmission as A;
+        use crate::connector::read_stack::ConnectorReadSourceProjection as P;
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let incremental = A::Incremental {
+            has_inserts: true,
+            has_deletes: false,
+            partition_impact: crate::connector::ConnectorChangeWindowPartitionImpact::Unpartitioned,
+        };
+        for decision in [
+            None,
+            Some(A::MetadataOnly),
+            Some(A::FullRebuild(
+                crate::connector::ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                    from_snapshot_id: 40,
+                },
+            )),
+            Some(incremental),
+        ] {
+            let source = prepared_source(&adapter, decision.clone());
+            for projection in [P::To, P::From, P::Delta] {
+                let before = provider.created_calls.load(Ordering::SeqCst);
+                let result = adapter.project_prepared_source_read(&session(), &source, projection);
+                let permitted =
+                    projection == P::To || matches!(decision, Some(A::Incremental { .. }));
+                assert_eq!(result.is_ok(), permitted);
+                assert_eq!(
+                    provider.created_calls.load(Ordering::SeqCst),
+                    before + u64::from(permitted),
+                );
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+                }
+            }
+        }
+        assert_eq!(provider.prepared_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_source_rejects_foreign_bindings_and_payloads_before_projection() {
+        use crate::connector::read_stack::ConnectorReadSourceProjection as P;
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let mut foreign = Probe::new();
+        foreign.catalog_handle = CatalogHandle::new(
+            foreign.descriptor.instance_id.clone(),
+            crate::connector::CatalogVersion::from_bytes([4; 32]),
+        );
+        let foreign = ReadRuntimeAdapter::new(Arc::new(foreign));
+        let source = prepared_source(&adapter, None);
+        assert!(
+            foreign
+                .project_prepared_source_read(&session(), &source, P::To)
+                .is_err()
+        );
+        let wrong_type = super::super::ConnectorPreparedSourceRead::new(
+            adapter.binding.clone(),
+            source.request().clone(),
+            None,
+            prepared_source_metadata(&adapter),
+            41_usize,
+        );
+        assert!(
+            adapter
+                .project_prepared_source_read(&session(), &wrong_type, P::To)
+                .is_err()
+        );
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(foreign.provider.created_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_source_projects_into_another_request_of_the_same_exact_binding() {
+        use crate::connector::read_stack::ConnectorReadSourceProjection;
+        let original = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let request = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let source = prepared_source(&original, None);
+        let alias = source.clone();
+        assert!(std::ptr::eq(source.to_metadata(), alias.to_metadata()));
+        request
+            .project_prepared_source_read(&session(), &source, ConnectorReadSourceProjection::To)
+            .unwrap();
+        assert_eq!(original.provider.created_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(request.provider.created_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.provider.prepared_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_source_aliases_retain_the_original_facts_author() {
+        let provider = Arc::new(Probe::new());
+        let author = Arc::downgrade(&provider);
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let source = prepared_source(&adapter, None);
+        let alias = source.clone();
+        drop(adapter);
+        drop(provider);
+        drop(source);
+        assert!(author.upgrade().is_some());
+        drop(alias);
+        assert!(author.upgrade().is_none());
     }
 
     #[test]
