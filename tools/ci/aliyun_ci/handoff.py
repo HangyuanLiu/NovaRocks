@@ -28,9 +28,16 @@ import gzip
 import hashlib
 import io
 import json
+import os
+import pwd
+import shutil
+import stat
+import subprocess
+import sys
 from pathlib import Path, PurePosixPath
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 from .ports import MANIFEST_SCHEMA
@@ -191,9 +198,92 @@ def upload(archive: str | Path, url: str, *, timeout: float = 60) -> dict:
     return {'uploaded': True, 'kind': verify(path)['kind'], 'size': path.stat().st_size, 'sha256': digest}
 
 
+def _protected_output(path):
+    """Require the root caller to control every parent used after validation."""
+    destination = Path(path).absolute()
+    # Resolve parent links once, then operate on the validated canonical path.
+    destination = destination.parent.resolve(strict=True) / destination.name
+    for parent in (destination.parent, *destination.parent.parents):
+        facts = parent.stat()
+        writable = facts.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if facts.st_uid != 0 or (writable and not facts.st_mode & stat.S_ISVTX):
+            raise ValueError('privileged archive output requires root-controlled parents')
+    return destination
+
+
+def _pack_as_owner(attempt_root, diagnostics=None, *, kind, uid, gid, output=None, timeout=60):
+    """Receive bytes from an ordinary-account packer into a private parent file.
+
+    The parent never opens an archive path chosen by the workload. Only the
+    child traverses workload paths, with no bootstrap or upload capability.
+    """
+    if kind not in ('final', 'interrupted'):
+        raise ValueError('archive kind must be final or interrupted')
+    directory = Path(tempfile.mkdtemp(prefix='novarocks-ci-handoff-private-'))
+    os.chmod(directory, 0o700)
+    destination = directory / f'{kind}.tar.gz' if output is None else (
+        _protected_output(output) if os.geteuid() == 0 else Path(output))
+    account = pwd.getpwuid(uid)
+    package_root = Path(__file__).resolve().parent.parent
+    environment = {'HOME': account.pw_dir, 'USER': account.pw_name,
+                   'LOGNAME': account.pw_name, 'PATH': '/usr/local/bin:/usr/bin:/bin',
+                   'PYTHONPATH': str(package_root), 'PYTHONDONTWRITEBYTECODE': '1'}
+    script = """import json,shutil,sys
+from aliyun_ci.handoff import pack
+request=json.load(sys.stdin)
+archive=pack(request['attempt'],request['diagnostics'],kind=request['kind'])
+try:
+    with archive.open('rb') as source:
+        shutil.copyfileobj(source,sys.stdout.buffer)
+    sys.stdout.buffer.flush()
+finally:
+    archive.unlink(missing_ok=True)
+    archive.parent.rmdir()
+"""
+    options = {'cwd': str(package_root), 'env': environment,
+               'stdin': subprocess.PIPE}
+    if os.geteuid() == 0:
+        options.update(user=uid, group=gid, extra_groups=[])
+    elif os.geteuid() != uid or os.getegid() != gid:
+        raise ValueError('cannot pack as the attempt account')
+    request = {'attempt': str(Path(attempt_root).absolute()), 'kind': kind,
+               'diagnostics': {name: str(Path(path).absolute()) for name,path in (diagnostics or {}).items()}}
+    # Stderr is a parent-owned file, not a second unbounded pipe. Keep the real
+    # failure locally without putting arbitrary workload text into task status.
+    with (directory / 'packer.stderr').open('xb') as errors, destination.open('xb') as target:
+        os.fchmod(target.fileno(), 0o600)
+        # The ordinary child inherits only this write descriptor; it never
+        # chooses a parent-readable path and receives no upload capability.
+        process = subprocess.Popen([sys.executable, '-c', script], stdout=target, stderr=errors, **options)
+        try:
+            process.communicate(json.dumps(request).encode(), timeout=timeout)
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
+        if process.returncode != 0:
+            raise RuntimeError(f'ordinary-account archive process exited {process.returncode}; diagnostics: {directory}')
+    fact = verify(destination)
+    if not fact['manifest_ok']:
+        raise ValueError('ordinary-account archive failed member verification')
+    return destination
+
+
 def pack_upload(attempt_root, diagnostics=None, *, kind, url, output=None, timeout=60):
-    archive = pack(attempt_root, diagnostics, kind=kind, output=output)
-    return dict(upload(archive, url, timeout=timeout), archive=str(archive))
+    started = time.monotonic()
+    attempt = Path(attempt_root)
+    if attempt.is_symlink():
+        raise ValueError('archive input is a symbolic link')
+    owner = attempt.stat()
+    if os.geteuid() == 0 and owner.st_uid != 0:
+        archive = _pack_as_owner(attempt, diagnostics, kind=kind, uid=owner.st_uid, gid=owner.st_gid, output=output, timeout=timeout)
+    else:
+        archive = pack(attempt, diagnostics, kind=kind, output=output)
+    remaining = timeout - (time.monotonic() - started)
+    if remaining <= 0:
+        raise TimeoutError('archive preparation exhausted the handoff deadline')
+    return dict(upload(archive, url, timeout=remaining), archive=str(archive))
 
 
 def main(argv=None):

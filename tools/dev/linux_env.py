@@ -526,6 +526,8 @@ class LinuxEnvironment:
             finally:
                 temporary.unlink(missing_ok=True)
             self.run([str(installer), "-y", "--no-modify-path", "--profile", "minimal", "--default-toolchain", "none"], account=True)
+        # Toolchain installation must not replace the separately pinned manager.
+        self.run(["rustup", "set", "auto-self-update", "disable"], account=True)
         channel = self.toolchain["channel"]
         installed = self.run(["rustup", "toolchain", "list"], account=True).stdout.splitlines()
         if not any(line.split()[0].startswith(channel + "-") or line.split()[0] == channel for line in installed if line.split()):

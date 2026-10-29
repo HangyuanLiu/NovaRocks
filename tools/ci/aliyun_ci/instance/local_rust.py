@@ -47,7 +47,7 @@ SOURCE = Path('/var/lib/novarocks-ci/source')
 TOOLS_SOURCE = Path('/opt/novarocks-ci/tools-source')
 
 
-def _atomic(path, value, *, mode=0o600):
+def _atomic(path, value, *, mode=0o600, uid=None, gid=None):
     # The runner can create names in the attempt directory. Exclusive random
     # creation prevents root from following a preexisting temporary symlink;
     # replace also replaces the destination link itself without following it.
@@ -56,6 +56,8 @@ def _atomic(path, value, *, mode=0o600):
     try:
         with os.fdopen(descriptor, 'w') as output:
             os.fchmod(output.fileno(), mode)
+            if uid is not None:
+                os.fchown(output.fileno(), uid, gid)
             json.dump(value, output, sort_keys=True)
             output.write('\n')
         os.replace(temporary, path)
@@ -91,7 +93,7 @@ def install(payload, *, uid, gid, runtime=RUNTIME, source_root=SOURCE,
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, 'w') as output:
         os.fchmod(output.fileno(), 0o600)
-        json.dump(payload, output, sort_keys=True)
+        json.dump(dict(payload, pid_root=str(runtime)), output, sort_keys=True)
     if start_services:
         run(['systemctl', 'start', '--no-block', 'novarocks-local-rust.service',
              'novarocks-spot-watcher.service'], check=True)
@@ -166,6 +168,9 @@ def execute_batch(command, *, source_root, attempt_root, runtime, account,
     previous = {signum: signal.signal(signum, stop) for signum in (signal.SIGTERM, signal.SIGINT)}
     try:
         with (attempt / 'stdout.log').open('xb') as stdout, (attempt / 'stderr.log').open('xb') as stderr:
+            for stream in (stdout, stderr):
+                os.fchmod(stream.fileno(), 0o640)
+                os.fchown(stream.fileno(), account.pw_uid, account.pw_gid)
             options = dict(cwd=source_root, env=environment, stdout=stdout, stderr=stderr,
                            start_new_session=True)
             if os.geteuid() == 0:
@@ -175,7 +180,9 @@ def execute_batch(command, *, source_root, attempt_root, runtime, account,
             process = popen(command, **options)
             for root in (runtime, attempt):
                 with (root / 'batch.pid').open('x') as output:
-                    os.fchmod(output.fileno(), 0o600)
+                    os.fchmod(output.fileno(), 0o600 if root == runtime else 0o640)
+                    if root == attempt:
+                        os.fchown(output.fileno(), account.pw_uid, account.pw_gid)
                     output.write(str(process.pid) + '\n')
             _atomic(runtime / 'batch-identity.json', {'pid': process.pid,
                 'uid': account.pw_uid, 'started_at': now().isoformat()})
@@ -215,21 +222,21 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
               'exit_code': None, 'tools_check_exit': None, 'handoff': None}
     def publish():
         _atomic(runtime / 'local-status.json', status)
-        _atomic(attempt / 'status.json', status, mode=0o640)
+        _atomic(attempt / 'status.json', status, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
     publish()
     kind = 'final'
     try:
         source = source_preparer(payload, source_root, runtime)
-        _atomic(attempt / 'source.json', source, mode=0o640)
+        _atomic(attempt / 'source.json', source, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
         try:
             tools_fact = tools_checker(source_root, tools_source=tools_source, user=account.pw_name)
             status['tools_check_exit'] = 0
-            _atomic(attempt / 'tools-check.json', tools_fact, mode=0o640)
+            _atomic(attempt / 'tools-check.json', tools_fact, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
         except Exception:
             status['tools_check_exit'] = 1
             raise
         finally:
-            _atomic(attempt / 'tools-check-result.json', {'exit_code': status['tools_check_exit']}, mode=0o640)
+            _atomic(attempt / 'tools-check-result.json', {'exit_code': status['tools_check_exit']}, mode=0o640, uid=account.pw_uid, gid=account.pw_gid)
         _chown_tree(source_root, account.pw_uid, account.pw_gid)
         status['state'] = 'running'
         publish()

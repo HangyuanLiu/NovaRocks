@@ -62,6 +62,8 @@ class LocalRustTests(unittest.TestCase):
         self.assertTrue(self.install()['installed'])
         self.assertEqual(0o600, (self.runtime / 'bootstrap.json').stat().st_mode & 0o777)
         self.assertFalse((self.attempt / 'batch.pid').exists())
+        self.assertEqual(str(self.runtime),json.loads((self.runtime/'bootstrap.json').read_text())['pid_root'])
+        self.assertNotIn('pid_root',self.payload)
         self.assertFalse(any(self.attempt.iterdir()))
         with self.assertRaises(FileExistsError):
             self.install()
@@ -101,6 +103,9 @@ class LocalRustTests(unittest.TestCase):
         self.assertNotIn('private-capability', (self.attempt / 'status.json').read_text())
         self.assertNotIn('signed.invalid', str(result))
         self.assertEqual(0o600, (self.runtime / 'batch.pid').stat().st_mode & 0o777)
+        for name in ('status.json','source.json','tools-check.json','tools-check-result.json','stdout.log','stderr.log','batch.pid'):
+            self.assertEqual(account.pw_uid,(self.attempt/name).stat().st_uid)
+            self.assertEqual(0o640,(self.attempt/name).stat().st_mode & 0o777)
 
     def test_tools_failure_keeps_unknown_test_exit_and_upload_failure_independent(self):
         self.install()

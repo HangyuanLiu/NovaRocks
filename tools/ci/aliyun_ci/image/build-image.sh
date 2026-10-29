@@ -56,6 +56,16 @@ install -m 0644 "$source_root"/tools/ci/aliyun_ci/instance/systemd/*.service /et
 printf '%s\n' "$preparation_sha" > /opt/novarocks-ci/preparation-sha
 chown -R root:root /opt/novarocks-ci
 chmod -R go-w /opt/novarocks-ci
+# Validate the actual Linux service vocabulary and privilege boundary before capture.
+systemd-analyze verify /etc/systemd/system/novarocks-ci-bootstrap.service \
+  /etc/systemd/system/novarocks-local-rust.service \
+  /etc/systemd/system/novarocks-runner.service \
+  /etc/systemd/system/novarocks-spot-watcher.service
+(
+  cd /opt/novarocks-ci
+  /opt/novarocks-ci/venv/bin/python -m unittest \
+    aliyun_ci.tests.test_handoff.HandoffTests.test_root_packer_cannot_read_root_only_diagnostic
+)
 systemctl daemon-reload
 systemctl enable novarocks-ci-bootstrap.service
 "$source_root/tools/ci/aliyun_ci/image/harden.sh"

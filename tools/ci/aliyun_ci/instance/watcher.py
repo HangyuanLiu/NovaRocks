@@ -114,7 +114,8 @@ def watch(config: dict, *, metadata=None, uid=None, now=None,
             termination = parse_time(notice.strip())
             available = max(0, (min(termination, deadline) - now()).total_seconds())
             cancel_budget = min(config['watcher']['cancel_budget_seconds'], available)
-            cancellation = cancel_batch(config['attempt_root'], cancel_budget, uid=uid,
+            pid_root = config['pid_root'] if config.get('execution_kind') == 'local-rust' else config['attempt_root']
+            cancellation = cancel_batch(pid_root, cancel_budget, uid=uid,
                                         monotonic=monotonic, sleep=sleep)
             attempt = Path(config['attempt_root'])
             # This reports the observed process fact, never a synthetic Rust exit.

@@ -22,6 +22,8 @@ workflow changes. HTTP servers own shutdown/join; no cloud resources exist.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import os
+import pwd
 from pathlib import Path
 import tarfile
 import tempfile
@@ -119,3 +121,72 @@ class HandoffTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def pack_as_owner(self, *args, **kwargs):
+        # Expected failure diagnostics belong to this test's isolated fixture;
+        # the ordinary subprocess still creates and closes its own scratch.
+        from unittest.mock import patch
+        original=tempfile.mkdtemp
+        def private_directory(*values,**options):
+            return original(*values,**dict(options,dir=self.root))
+        with patch.object(handoff.tempfile,'mkdtemp',side_effect=private_directory):
+            return handoff._pack_as_owner(*args,**kwargs)
+
+    def test_ordinary_packer_streams_checked_bytes_without_upload_capability(self):
+        from unittest.mock import patch
+        import subprocess
+        launched=[]
+        original=subprocess.Popen
+        def spawn(*args,**kwargs):
+            launched.append((args,kwargs))
+            return original(*args,**kwargs)
+        with patch.dict(os.environ, {'GH_TOKEN':'must-not-inherit', 'ALIYUN_SECRET':'must-not-inherit'}),patch.object(handoff.subprocess,'Popen',side_effect=spawn):
+            archive=self.pack_as_owner(self.attempt,kind='interrupted',uid=os.getuid(),gid=os.getgid())
+        fact=handoff.verify(archive)
+        self.assertTrue(fact['manifest_ok'],fact)
+        self.assertEqual('interrupted',fact['kind'])
+        self.assertEqual(0o700,archive.parent.stat().st_mode & 0o777)
+        self.assertEqual(0o600,archive.stat().st_mode & 0o777)
+        self.assertNotIn('GH_TOKEN',launched[0][1]['env'])
+        self.assertNotIn('ALIYUN_SECRET',launched[0][1]['env'])
+        self.assertNotIn('https://',repr(launched[0][0]))
+        with tarfile.open(archive,'r:gz') as source:
+            self.assertEqual(b'original Rust failure\n',source.extractfile('attempt/stdout.log').read())
+        archive.unlink();(archive.parent/'packer.stderr').unlink();archive.parent.rmdir()
+
+    @unittest.skipUnless(os.geteuid()==0,'actual privilege drop requires root')
+    def test_root_packer_cannot_read_root_only_diagnostic(self):
+        account=pwd.getpwnam('nobody')
+        self.root.chmod(0o755)
+        os.chown(self.attempt,account.pw_uid,account.pw_gid)
+        self.attempt.chmod(0o755)
+        for path in self.attempt.rglob('*'):
+            os.chown(path,account.pw_uid,account.pw_gid)
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        secret=self.root/'root-only';secret.write_bytes(b'root capability must not be read')
+        secret.chmod(0o600)
+        archive=self.pack_as_owner(self.attempt,kind='final',uid=account.pw_uid,gid=account.pw_gid,output=self.root/'from-user.tar.gz')
+        self.assertTrue(handoff.verify(archive)['manifest_ok'])
+        self.assertEqual(0,archive.stat().st_uid)
+        with self.assertRaisesRegex(RuntimeError,'ordinary-account archive process exited'):
+            self.pack_as_owner(self.attempt,{'root-only':secret},kind='final',uid=account.pw_uid,gid=account.pw_gid)
+
+    def test_failed_packer_exit_never_uploads_partial_archive(self):
+        (self.attempt/'leak').symlink_to('/etc/passwd')
+        with self.assertRaisesRegex(RuntimeError,'ordinary-account archive process exited'):
+            self.pack_as_owner(self.attempt,kind='final',uid=os.getuid(),gid=os.getgid())
+
+    def test_packer_timeout_reaps_the_actual_child(self):
+        from unittest.mock import patch
+        import subprocess
+        import sys
+        children=[]
+        original=subprocess.Popen
+        def delayed(*args,**kwargs):
+            child=original([sys.executable,'-c','import time;time.sleep(30)'],**kwargs)
+            children.append(child)
+            return child
+        with patch.object(handoff.subprocess,'Popen',side_effect=delayed):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.pack_as_owner(self.attempt,kind='final',uid=os.getuid(),gid=os.getgid(),timeout=.05)
+        self.assertIsNotNone(children[0].poll())

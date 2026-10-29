@@ -125,3 +125,26 @@ class WatcherTests(unittest.TestCase):
             (Path(root) / 'batch.pid').write_text('1')
             with self.assertRaisesRegex(ValueError, 'invalid batch PID'):
                 cancel_batch(root, 1, uid=os.getuid())
+
+    def test_local_notice_uses_root_control_pid_not_workload_pid_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);attempt=root/'attempt';attempt.mkdir();control=root/'control';control.mkdir()
+            child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
+            reaper=threading.Thread(target=child.wait);reaper.start()
+            try:
+                (control/'batch.pid').write_text(str(child.pid))
+                (attempt/'batch.pid').write_text('1')
+                now=datetime.now(timezone.utc)
+                class Notice:
+                    def read(self,path):return (now+timedelta(minutes=5)).isoformat()
+                config={'execution_kind':'local-rust','pid_root':str(control),'attempt_root':str(attempt),
+                    'deadline':(now+timedelta(minutes=10)).isoformat(),
+                    'watcher':{'poll_seconds':1,'cancel_budget_seconds':3},
+                    'upload_urls':{'interrupted':'https://signed.invalid/partial'}}
+                result=watch(config,metadata=Notice(),uid=os.getuid(),upload=lambda *a,**kw:{'uploaded':False})
+                self.assertEqual(child.pid,result['cancellation']['pid'])
+                self.assertTrue(result['cancellation']['exited'])
+                self.assertEqual('1',(attempt/'batch.pid').read_text())
+            finally:
+                if child.poll() is None:child.kill()
+                child.wait();reaper.join()

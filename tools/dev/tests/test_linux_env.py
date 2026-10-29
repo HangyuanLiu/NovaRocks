@@ -164,7 +164,11 @@ class FakeCommands:
                 output = "rustup " + version if version else ""
             elif args[1:3] == ["toolchain", "list"]:
                 output = "1.98.1-x86_64-unknown-linux-gnu\n" if self.toolchain else ""
+            elif args[1:4] == ["set", "auto-self-update", "disable"]:
+                self.auto_self_update = False
             elif args[1:3] == ["toolchain", "install"]:
+                if getattr(self, "auto_self_update", True):
+                    self.tools["rustup"] = "1.29.2"
                 self.toolchain = True
                 self.components.update({"rustfmt", "clippy"})
             elif args[1:3] == ["component", "list"]:
