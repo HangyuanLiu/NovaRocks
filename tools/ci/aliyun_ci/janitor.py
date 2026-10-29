@@ -32,14 +32,19 @@ def sweep(config, ecs, oos, oss, github, *, now=None, sleep=None):
     current = now()
     query = {'deployment': config['deployment_id'], 'repository': config['repository']}
     runs, anomalies = {}, []
+    local_only = config.data.get('execution_kind') == 'local-rust'
     grace = timedelta(minutes=config['janitor']['grace_minutes'])
     for instance in describe_instances(config, ecs, tags=query):
         if any(tags_of(instance).get(key) != value for key, value in query.items()):
             continue
+        if local_only and tags_of(instance).get('execution_kind') not in ('local-rust', 'builder'):
+            continue
         tags = owned(config, instance, query)
+        if local_only and tags.get('execution_kind') not in ('local-rust', 'builder'):
+            continue
         if current <= parse_time(tags['deadline']) + grace:
             continue
-        plan = derive(config, tags['run_id'], int(tags['run_attempt']), current, role=tags['role'])
+        plan = derive(config, tags['run_id'], int(tags['run_attempt']), current, role=tags['role'], execution_kind=tags.get('execution_kind', 'github-runner'))
         plan = replace(plan, deadline=tags['deadline'], auto_release=tags['deadline'], tags=tags)
         kwargs = {'now': now}
         if sleep is not None:
@@ -56,9 +61,11 @@ def sweep(config, ecs, oos, oss, github, *, now=None, sleep=None):
             tags = json.loads(tags)
         if any(tags.get(key) != value for key, value in query.items()) or 'deadline' not in tags:
             continue
+        if local_only and tags.get('execution_kind') not in ('local-rust', 'builder'):
+            continue
         if current <= parse_time(tags['deadline']) + grace:
             continue
-        plan = derive(config, tags['run_id'], int(tags['run_attempt']), current, role=tags['role'])
+        plan = derive(config, tags['run_id'], int(tags['run_attempt']), current, role=tags['role'], execution_kind=tags.get('execution_kind', 'github-runner'))
         plan = replace(plan, deadline=tags['deadline'], auto_release=tags['deadline'], tags=tags)
         if parameter['Name'] != plan.secret_name and not re.fullmatch(re.escape(plan.secret_name) + r'-part-[0-9]{6}', parameter['Name']):
             continue
@@ -86,7 +93,7 @@ def sweep(config, ecs, oos, oss, github, *, now=None, sleep=None):
             owned(config, cloud[0], expected)
             anomalies.append({'kind': 'runner', 'name': row['name'], 'terminal': 'unknown', 'error': 'instance still present'})
             continue
-        plan = derive(config, tags['run_id'], int(tags['run_attempt']), current, role=tags['role'])
+        plan = derive(config, tags['run_id'], int(tags['run_attempt']), current, role=tags['role'], execution_kind=tags.get('execution_kind', 'github-runner'))
         plan = replace(plan, label=row['name'], deadline=tags['deadline'], auto_release=tags['deadline'], tags=expected)
         runs[(plan.run_id, plan.run_attempt)] = plan
     for plan in runs.values():

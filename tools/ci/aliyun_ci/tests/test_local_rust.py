@@ -80,7 +80,7 @@ class LocalRustTests(unittest.TestCase):
         account = SimpleNamespace(pw_name=self.account.pw_name, pw_uid=os.getuid(),
             pw_gid=os.getgid(), pw_dir=str(home))
         packed = []
-        def upload(attempt, *, kind, url):
+        def upload(attempt, *, kind, url, timeout):
             archive = handoff.pack(attempt, kind=kind, output=self.root / f'{kind}.tar.gz')
             fact = handoff.verify(archive)
             self.assertTrue(fact['manifest_ok'])
@@ -216,3 +216,36 @@ class LocalRustTests(unittest.TestCase):
         self.assertIsNone(result['pid'])
         self.assertTrue(result['cancel_requested'])
         self.assertFalse((self.runtime / 'batch.pid').exists())
+
+
+    def test_atomic_status_never_follows_runner_created_symlinks(self):
+        self.attempt.mkdir()
+        outside = self.root / 'root-owned-target'
+        outside.write_text('must remain unchanged')
+        target = self.attempt / 'status.json'
+        target.symlink_to(outside)
+        # This was the predictable root temporary name in the reported bug.
+        (self.attempt / 'status.json.new').symlink_to(outside)
+        local_rust._atomic(target, {'state': 'complete'}, mode=0o640)
+        self.assertEqual('must remain unchanged', outside.read_text())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual({'state': 'complete'}, json.loads(target.read_text()))
+        self.assertEqual(0o640, target.stat().st_mode & 0o777)
+        self.assertFalse(list(self.attempt.glob('.status.json.*')))
+
+    def test_upload_timeout_uses_remaining_original_capability_deadline(self):
+        self.install()
+        clock = datetime(2026, 10, 29, 8, 0, tzinfo=timezone.utc)
+        self.payload['deadline'] = (clock + timedelta(seconds=187)).isoformat()
+        timeouts = []
+        def no_tools(*args, **kwargs):
+            raise ValueError('tools unavailable')
+        def upload(attempt, *, kind, url, timeout):
+            timeouts.append(timeout)
+            return {'uploaded': False}
+        result = local_rust.run(self.payload, runtime=self.runtime, source_root=self.source,
+            account=self.account, source_preparer=lambda *_: {'sha': 'a' * 40},
+            tools_checker=no_tools, uploader=upload, now=lambda: clock)
+        self.assertEqual([187], timeouts)
+        self.assertFalse(result['handoff']['uploaded'])
+        self.assertIsNone(result['exit_code'])

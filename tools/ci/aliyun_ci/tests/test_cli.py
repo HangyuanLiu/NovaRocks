@@ -67,3 +67,24 @@ class CliTests(unittest.TestCase):
             (repo/'file').write_text('dirty')
             with self.assertRaisesRegex(SystemExit,'2'):
                 cli.main(command)
+
+    def test_observation_failure_cancels_before_exact_reclamation(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            record=Path(directory)/'run.json'
+            args=cli.parser().parse_args(['--config','unused','local-run','--image-id','m-one','--record',str(record)])
+            data=example();data.pop('github');data['execution_kind']='local-rust';config=validate_config(data)
+            order=[]
+            def start(*args,**kwargs):
+                order.append('start');record.write_text('{}')
+            def wait(*args,**kwargs):
+                order.append('observe');raise ConnectionError('observation disconnected')
+            def cancel(*args,**kwargs):order.append('cancel original batch')
+            def finish(*args,**kwargs):
+                order.append('collect and reclaim');return {'compute_terminal':'released','leftovers':[]}
+            with patch('aliyun_ci.source_bundle.create',return_value={}),patch('aliyun_ci.sdk.adapters',return_value={'ecs':object(),'oos':object(),'oss':object()}),patch('aliyun_ci.local_run.start_local',side_effect=start),patch('aliyun_ci.local_run.wait_local',side_effect=wait),patch('aliyun_ci.local_run.cancel_local',side_effect=cancel),patch('aliyun_ci.local_run.finish_local',side_effect=finish):
+                result,code=cli.execute(config,args)
+            self.assertEqual(['start','observe','cancel original batch','collect and reclaim'],order)
+            self.assertEqual(1,code)
+            self.assertEqual('released',result['compute_terminal'])
+            self.assertEqual('ConnectionError',json.loads(record.read_text())['summary']['control_error']['error'])

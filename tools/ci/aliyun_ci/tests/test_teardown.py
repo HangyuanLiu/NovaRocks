@@ -124,3 +124,14 @@ class TeardownTests(unittest.TestCase):
             ScriptAPI([('ListSecretParameters',{'Parameters':[]})]),Store(),DeniedGitHub(),now=lambda:NOW)
         self.assertEqual('released',result['compute_terminal'])
         self.assertEqual([],result['leftovers'])
+
+    def test_summary_storage_failure_preserves_confirmed_release(self):
+        class UnavailableStore(Store):
+            def put(self,*args,**kwargs):raise APIError('AccessDenied')
+            def get(self,*args,**kwargs):raise APIError('AccessDenied')
+        result=teardown_run(self.config,self.plan,ScriptAPI([('DescribeInstances',EMPTY)]),
+            ScriptAPI([('ListSecretParameters',{'Parameters':[]})]),UnavailableStore(),EmptyGitHub(),now=lambda:NOW)
+        self.assertEqual('released',result['compute_terminal'])
+        self.assertEqual([],result['leftovers'])
+        self.assertEqual({'published':False,'error':'AccessDenied'},result['summary_publication'])
+        self.assertEqual('AccessDenied',result['summary_history_error'])

@@ -68,6 +68,12 @@ def _update(path, *, require_absent=None, **updates):
         value = json.loads(Path(path).read_text())
         if require_absent is not None and require_absent in value:
             raise ValueError('original command dispatch already recorded; observe that identity')
+        if 'observation' in updates:
+            prior = value.get('observation', {})
+            current = dict(prior, **updates['observation'])
+            if current.get('task') is None and prior.get('task') is not None:
+                current['task'] = prior['task']
+            updates['observation'] = current
         value.update(updates)
         _save(path, value)
         return value
@@ -201,8 +207,7 @@ def status_local(config, ecs, record_path):
     observation = cloud_command.observe(config, ecs, command) if command else None
     task = _task(observation, plan) if observation else None
     value = {'instance_present': present, 'cloud_command': observation, 'task': task}
-    _update(record_path, observation=value)
-    return value
+    return _update(record_path, observation=value)['observation']
 
 
 def wait_local(config, ecs, record_path, *, now=None, sleep=time.sleep):
@@ -212,40 +217,90 @@ def wait_local(config, ecs, record_path, *, now=None, sleep=time.sleep):
         raise ValueError('record has no accepted command; use collect/teardown to recover this original run')
     observation = cloud_command.wait(config, ecs, record['command'], now=now, sleep=sleep)
     value = {'cloud_command': observation, 'task': _task(observation, plan)}
-    _update(record_path, observation=value, phase='observed-terminal' if observation.get('terminal') else 'observing')
+    return _update(record_path, observation=value,
+        phase='observed-terminal' if observation.get('terminal') else 'observing')['observation']
+
+
+def _cancel_script(plan, upload_reserve_seconds):
+    expected = repr({'run_id': plan.run_id, 'run_attempt': plan.run_attempt})
+    return """set -eu
+cd /opt/novarocks-ci
+/opt/novarocks-ci/venv/bin/python - <<'PY'
+import json,os,pwd,time
+from datetime import datetime,timedelta,timezone
+from pathlib import Path
+from aliyun_ci.instance.watcher import cancel_batch
+from aliyun_ci.plan import parse_time
+root=Path('/run/novarocks-ci')
+expected=""" + expected + """
+upload_reserve_seconds=""" + str(upload_reserve_seconds) + """
+bootstrap=json.loads((root/'bootstrap.json').read_text())
+if bootstrap.get('execution_kind') != 'local-rust' or any(bootstrap['identity'].get(k)!=v for k,v in expected.items()):
+    raise ValueError('local cancellation identity mismatch')
+status_path=root/'local-status.json'
+def completed_task():
+    if not status_path.exists():
+        return None
+    value=json.loads(status_path.read_text())
+    if any(value.get('identity',{}).get(k)!=v for k,v in expected.items()):
+        raise ValueError('local cancellation status identity mismatch')
+    return value if value.get('state') == 'complete' else None
+
+task=completed_task()
+if task is not None:
+    print(json.dumps({'cancellation':{'signal_sent':False,'exited':task.get('batch',{}).get('exited'),'reason':'original supervisor complete'},
+                      'task':task,'task_completion_observed':True},sort_keys=True))
+    raise SystemExit(0)
+# This original marker is persisted before SIGTERM, including cancellation
+# during source preparation, before the native PID has been created.
+marker=root/'local-cancel.json'
+fd=os.open(marker,os.O_CREAT|os.O_WRONLY|os.O_EXCL,0o600)
+with os.fdopen(fd,'w') as output:
+    json.dump({'identity':expected,'reason':'local-cancel'},output)
+started=datetime.now(timezone.utc)
+budget=bootstrap['watcher']['cancel_budget_seconds']
+end=min(parse_time(bootstrap['deadline']),started+timedelta(seconds=budget+upload_reserve_seconds))
+cancel_budget=min(budget,max(0,(end-datetime.now(timezone.utc)).total_seconds()))
+result=cancel_batch(root,cancel_budget,uid=pwd.getpwnam('runner').pw_uid)
+while True:
+    task=completed_task()
+    if task is not None or datetime.now(timezone.utc) >= end:
+        break
+    time.sleep(min(0.2,max(0,(end-datetime.now(timezone.utc)).total_seconds())))
+print(json.dumps({'cancellation':result,'task':task,'task_completion_observed':task is not None},sort_keys=True))
+PY
+"""
+
+
+def _retain_cancellation(config, plan, record_path, observation):
+    if (not observation.get('terminal') or observation.get('status') != 'Success' or
+            observation.get('exit_code') != 0 or observation.get('dropped')):
+        return observation
+    result = json.loads(observation.get('output') or '{}')
+    if not isinstance(result, dict) or not isinstance(result.get('cancellation'), dict):
+        raise ValueError('cancellation command returned no original cancellation fact')
+    task = result.get('task')
+    if task is not None:
+        # Reuse the same complete-task identity check as the original observer;
+        # command termination alone never proves native completion.
+        checked = dict(observation, output=json.dumps(task))
+        task = _task(checked, plan)
+    value = dict(observation, native_cancellation=result['cancellation'], task=task,
+                 task_completion_observed=task is not None)
+    _update(record_path, observation={'cancellation_cloud_command': value, 'task': task})
     return value
 
 
 def cancel_local(config, ecs, record_path, *, now=None, sleep=time.sleep):
     record, plan = load_record(config, record_path)
+    if not record.get('instance_id'):
+        return {'signal_sent': False, 'reason': 'no instance was recorded', 'instance_id': None}
     if _check_instance(config, plan, ecs, record) is False:
         return {'signal_sent': False, 'reason': 'instance already absent'}
     if record.get('cancellation'):
-        return cloud_command.observe(config, ecs, record['cancellation'])
-    expected = repr({'run_id': plan.run_id, 'run_attempt': plan.run_attempt})
-    script = """set -eu
-cd /opt/novarocks-ci
-/opt/novarocks-ci/venv/bin/python - <<'PY'
-import json,os,pwd
-from pathlib import Path
-from aliyun_ci.instance.watcher import cancel_batch
-root=Path('/run/novarocks-ci')
-expected=""" + expected + """
-bootstrap=json.loads((root/'bootstrap.json').read_text())
-if bootstrap.get('execution_kind') != 'local-rust' or any(bootstrap['identity'].get(k)!=v for k,v in expected.items()):
-    raise ValueError('local cancellation identity mismatch')
-status_path=root/'local-status.json'
-if status_path.exists() and json.loads(status_path.read_text()).get('state') == 'complete':
-    print(json.dumps({'signal_sent':False,'exited':True,'reason':'original task complete'}))
-    raise SystemExit(0)
-marker=root/'local-cancel.json'
-fd=os.open(marker,os.O_CREAT|os.O_WRONLY|os.O_EXCL,0o600)
-with os.fdopen(fd,'w') as output:
-    json.dump({'identity':expected,'reason':'local-cancel'},output)
-result=cancel_batch(root,bootstrap['watcher']['cancel_budget_seconds'],uid=pwd.getpwnam('runner').pw_uid)
-print(json.dumps(result,sort_keys=True))
-PY
-"""
+        observation = cloud_command.observe(config, ecs, record['cancellation'])
+        return _retain_cancellation(config, plan, record_path, observation)
+    script = _cancel_script(plan, config['deadline']['upload_reserve_minutes'] * 60)
     deadline = timestamp(parse_time(plan.deadline) - timedelta(
         minutes=config['deadline']['teardown_reserve_minutes']))
     def persist(command):
@@ -253,7 +308,8 @@ PY
                 cancellation=command)
     command = cloud_command.dispatch(config, ecs, record['instance_id'], script, deadline,
                                      persist=persist, now=now, sleep=sleep)
-    return cloud_command.wait(config, ecs, command, now=now, sleep=sleep)
+    observation = cloud_command.wait(config, ecs, command, now=now, sleep=sleep)
+    return _retain_cancellation(config, plan, record_path, observation)
 
 
 def collect_local(config, oss, record_path, output_dir):

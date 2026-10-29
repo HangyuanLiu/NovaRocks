@@ -162,12 +162,14 @@ def teardown_run(config, plan, ecs, oos, oss, github, *, instance_id=None,
             code = facts['tools_check_result']['value'].get('exit_code')
             if type(code) is int:
                 tools_check = code == 0
-    previous = None
+    previous, history_error = None, None
     try:
         previous = json.loads(oss.get(plan.oss_keys['summary']))
     except APIError as error:
         if error.code not in ('NoSuchKey', 'NotFound', '404'):
-            raise
+            history_error = error.code
+    except Exception as error:
+        history_error = type(error).__name__
     if previous is not None:
         if previous.get('run_id') != plan.run_id or previous.get('run_attempt') != plan.run_attempt:
             raise ValueError('existing summary belongs to another run')
@@ -178,5 +180,11 @@ def teardown_run(config, plan, ecs, oos, oss, github, *, instance_id=None,
         image_id = image_id or previous.get('image_id')
     summary = run_summary(plan, image_id=image_id, rust_result=rust_result, handoff=archives,
                           compute_terminal=terminal, leftovers=leftovers, tools_check=tools_check)
-    oss.put(plan.oss_keys['summary'], json.dumps(summary, sort_keys=True).encode())
+    if history_error:
+        summary['summary_history_error'] = history_error
+    try:
+        oss.put(plan.oss_keys['summary'], json.dumps(summary, sort_keys=True).encode())
+        summary['summary_publication'] = {'published': True}
+    except Exception as error:
+        summary['summary_publication'] = {'published': False, 'error': getattr(error, 'code', type(error).__name__)}
     return summary

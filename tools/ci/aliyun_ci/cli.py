@@ -143,15 +143,30 @@ def execute(config, args):
             return cancel_local(config,ecs,args.record),0
         if args.command == 'local-collect':
             return collect_local(config,oss,args.record,args.destination),0
+        control_error = None
         try:
             start_local(config,plan,ecs,oos,oss,image_id=args.image_id,source=source_dir,record_path=args.record)
             wait_local(config,ecs,args.record)
-        except KeyboardInterrupt:
-            cancel_local(config,ecs,args.record)
-            wait_local(config,ecs,args.record)
+        except (KeyboardInterrupt, Exception) as error:
+            control_error = {'error': type(error).__name__}
+            if args.record.exists():
+                try:
+                    cancel_local(config,ecs,args.record)
+                except Exception as cancel_error:
+                    control_error['cancel_error'] = type(cancel_error).__name__
         finally:
             if args.record.exists():
                 result=finish_local(config,ecs,oos,oss,args.record)
+                if control_error:
+                    result['control_error'] = control_error
+                    # Retain control failure alongside confirmed release even
+                    # when the original observer could not report a terminal.
+                    from .local_run import _update
+                    _update(args.record, summary=result)
+        if control_error:
+            if not args.record.exists():
+                raise RuntimeError('local request failed before cloud identity was persisted')
+            return result,1
         return result,result_exit_code(result)
     if args.command == 'deploy':
         from . import deploy
@@ -219,7 +234,7 @@ def execute(config, args):
     value = teardown_run(config, plan, ecs, oos, oss, github, instance_id=args.instance_id,
         image_id=args.image_id, rust_result=json.loads(args.rust_result) if args.rust_result else None,
         tools_check=None if args.tools_check is None else args.tools_check == 'true')
-    return value, int(value['compute_terminal'] != 'released' or bool(value['leftovers']))
+    return value, int(value['compute_terminal'] != 'released' or bool(value['leftovers']) or value.get('summary_publication', {}).get('published') is False)
 
 
 def main(argv=None):

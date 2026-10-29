@@ -34,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -47,12 +48,19 @@ TOOLS_SOURCE = Path('/opt/novarocks-ci/tools-source')
 
 
 def _atomic(path, value, *, mode=0o600):
-    temporary = path.with_name(path.name + '.new')
-    with temporary.open('w') as output:
-        os.fchmod(output.fileno(), mode)
-        json.dump(value, output, sort_keys=True)
-        output.write('\n')
-    os.replace(temporary, path)
+    # The runner can create names in the attempt directory. Exclusive random
+    # creation prevents root from following a preexisting temporary symlink;
+    # replace also replaces the destination link itself without following it.
+    descriptor, name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            os.fchmod(output.fileno(), mode)
+            json.dump(value, output, sort_keys=True)
+            output.write('\n')
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _validate(payload):
@@ -198,8 +206,9 @@ def execute_batch(command, *, source_root, attempt_root, runtime, account,
 
 def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOURCE,
         account=None, source_preparer=prepare_source, tools_checker=check_tools,
-        executor=execute_batch, uploader=pack_upload):
+        executor=execute_batch, uploader=pack_upload, now=None):
     _validate(payload)
+    now = now or (lambda: datetime.now(timezone.utc))
     account = account or pwd.getpwnam('runner')
     runtime, source_root, attempt = Path(runtime), Path(source_root), Path(payload['attempt_root'])
     status = {'schema': 1, 'identity': payload['identity'], 'state': 'preparing',
@@ -244,7 +253,8 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
     status['state'] = 'archiving'
     publish()
     try:
-        status['handoff'] = uploader(attempt, kind=kind, url=payload['upload_urls'][kind])
+        remaining = max(1, (parse_time(payload['deadline']) - now()).total_seconds())
+        status['handoff'] = uploader(attempt, kind=kind, url=payload['upload_urls'][kind], timeout=remaining)
     except Exception as error:
         status['handoff'] = {'uploaded': None, 'error': type(error).__name__}
     status['state'] = 'complete'

@@ -52,3 +52,13 @@ class JanitorTests(unittest.TestCase):
         result=sweep(config,api,oos,Store(),gh,now=lambda:NOW+timedelta(hours=5))
         self.assertEqual(['/repos/NovaRocks/NovaRocks/actions/runners/5'],gh.deleted)
         self.assertTrue(result['anomalies'][-1]['missing_teardown_summary'])
+
+    def test_local_sweep_skips_other_execution_kinds_without_github(self):
+        data=example();data.pop('github');data['execution_kind']='local-rust'
+        config=validate_config(data);old=derive(validate_config(example()),'42',1,NOW)
+        class DeniedGitHub:
+            def call(self,*args,**kwargs):raise AssertionError('local sweep cannot call GitHub')
+        api=ScriptAPI([('DescribeInstances',{'TotalCount':1,'Instances':{'Instance':[instance(config,old)]}})])
+        result=sweep(config,api,ScriptAPI([('ListSecretParameters',{'Parameters':[]})]),Store(),DeniedGitHub(),now=lambda:NOW+timedelta(hours=5))
+        self.assertEqual([],result['anomalies'])
+        self.assertEqual(['DescribeInstances'],[action for action,params in api.calls])

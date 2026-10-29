@@ -30,7 +30,7 @@ from unittest.mock import patch
 from aliyun_ci.config import validate_config
 from aliyun_ci.handoff import pack
 from aliyun_ci.local_run import (start_local,status_local,wait_local,cancel_local,collect_local,
-    finish_local,result_exit_code,_save)
+    finish_local,result_exit_code,_save,_cancel_script)
 from aliyun_ci.plan import derive
 from aliyun_ci.ports import APIError
 from .test_start import ScriptAPI,NOW,EMPTY,CREATED,instance,listed
@@ -195,3 +195,93 @@ class LocalTests(unittest.TestCase):
             start_local(self.config,self.plan,ScriptAPI([]),ScriptAPI([]),store,image_id='m-exact',
                 source=self.source,record_path=self.record,now=lambda:NOW)
         self.assertFalse(self.record.exists())
+
+    def test_cancel_without_recorded_instance_has_no_cloud_effect(self):
+        self.prepare_record(instance_id=None)
+        value=cancel_local(self.config,ScriptAPI([]),self.record,now=lambda:NOW)
+        self.assertFalse(value['signal_sent']);self.assertIsNone(value['instance_id'])
+
+    def test_cancel_recovers_complete_original_task_when_observer_dispatch_is_unknown(self):
+        self.prepare_record(command={'instance_id':'i-exact','invoke_id':None,
+            'dispatch_state':'unknown','deadline':self.plan.deadline})
+        task={'identity':{'run_id':self.plan.run_id,'run_attempt':1},'state':'complete',
+              'exit_code':143,'batch':{'exited':True},'handoff':{'uploaded':True}}
+        result={'cancellation':{'signal_sent':True,'exited':True},'task':task,
+                'task_completion_observed':True}
+        api=ScriptAPI([('DescribeInstances',listed(instance(self.config,self.plan))),
+            ('RunCommand',{'InvokeId':'cancel-original'}),
+            ('DescribeInvocationResults',row(invocation='cancel-original',output=json.dumps(result)))])
+        value=cancel_local(self.config,api,self.record,now=lambda:NOW)
+        self.assertTrue(value['task_completion_observed'])
+        self.assertEqual(143,value['task']['exit_code'])
+        self.assertEqual(1,sum(a=='RunCommand' for a,_ in api.calls))
+        record=json.loads(self.record.read_text())
+        self.assertEqual('unknown',record['command']['dispatch_state'])
+        self.assertEqual(task,record['observation']['task'])
+        # Re-observing an unknown original invocation cannot erase the terminal
+        # root status recovered through the one cancellation command.
+        value=status_local(self.config,ScriptAPI([('DescribeInstances',EMPTY)]),self.record)
+        self.assertEqual(task,value['task'])
+        self.assertEqual('DispatchUnknown',value['cloud_command']['status'])
+
+    def test_cloud_cancellation_does_not_prove_native_exit(self):
+        self.prepare_record(cancellation={'instance_id':'i-exact','invoke_id':'cancel-original',
+            'dispatch_state':'accepted','deadline':self.plan.deadline})
+        api=ScriptAPI([('DescribeInstances',listed(instance(self.config,self.plan))),
+            ('DescribeInvocationResults',row(invocation='cancel-original',status='Cancelled',code=137))])
+        value=cancel_local(self.config,api,self.record,now=lambda:NOW)
+        self.assertEqual('Cancelled',value['status'])
+        self.assertNotIn('task_completion_observed',value)
+        self.assertNotIn('task',json.loads(self.record.read_text()).get('observation',{}))
+
+    def test_cancel_budget_expiry_keeps_native_exit_unknown(self):
+        self.prepare_record(cancellation={'instance_id':'i-exact','invoke_id':'cancel-original',
+            'dispatch_state':'accepted','deadline':self.plan.deadline})
+        task={'identity':{'run_id':self.plan.run_id,'run_attempt':1},'state':'complete',
+              'exit_code':None,'batch':{'exited':False},'handoff':{'uploaded':True}}
+        output={'cancellation':{'signal_sent':True,'exited':False},'task':task}
+        api=ScriptAPI([('DescribeInstances',listed(instance(self.config,self.plan))),
+            ('DescribeInvocationResults',row(invocation='cancel-original',output=json.dumps(output)))])
+        value=cancel_local(self.config,api,self.record,now=lambda:NOW)
+        self.assertFalse(value['native_cancellation']['exited'])
+        self.assertIsNone(value['task']['exit_code'])
+        self.assertFalse(value['task']['batch']['exited'])
+
+    def test_root_cancel_waits_for_original_supervisor_upload_and_completion(self):
+        import os,subprocess,sys,threading,time
+        from datetime import datetime,timedelta,timezone
+        runtime=self.root/'runtime';runtime.mkdir()
+        identity={'run_id':self.plan.run_id,'run_attempt':1}
+        (runtime/'bootstrap.json').write_text(json.dumps({'execution_kind':'local-rust',
+            'identity':identity,'deadline':(datetime.now(timezone.utc)+timedelta(seconds=10)).isoformat(),
+            'watcher':{'cancel_budget_seconds':2}}))
+        (runtime/'local-status.json').write_text(json.dumps({'identity':identity,'state':'running'}))
+        worker=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])
+        self.addCleanup(lambda: worker.kill() if worker.poll() is None else None)
+        (runtime/'batch.pid').write_text(str(worker.pid))
+        complete={'identity':identity,'state':'complete','exit_code':-15,
+                  'batch':{'exited':True},'handoff':{'uploaded':True}}
+        def archive_after_exit():
+            worker.wait(timeout=5)
+            time.sleep(0.25)
+            temporary=runtime/'status.new';temporary.write_text(json.dumps(complete))
+            temporary.replace(runtime/'local-status.json')
+        producer=threading.Thread(target=archive_after_exit);producer.start()
+        try:
+            script=_cancel_script(self.plan,2)
+            body=script.split("<<'PY'\n",1)[1].rsplit('\nPY',1)[0]
+            body=body.replace("Path('/run/novarocks-ci')",repr(runtime).replace('PosixPath','Path'))
+            body=body.replace("pwd.getpwnam('runner').pw_uid",str(os.getuid()))
+            env=dict(os.environ,PYTHONPATH=str(Path(__file__).resolve().parents[2]))
+            started=time.monotonic()
+            result=subprocess.run([sys.executable,'-c',body],env=env,text=True,capture_output=True,timeout=6,check=True)
+            value=json.loads(result.stdout)
+            self.assertGreaterEqual(time.monotonic()-started,0.25)
+            self.assertTrue(value['task_completion_observed'])
+            self.assertTrue(value['task']['handoff']['uploaded'])
+            self.assertTrue(value['cancellation']['signal_sent'])
+            self.assertTrue(value['cancellation']['exited'])
+        finally:
+            producer.join(timeout=6)
+            if worker.poll() is None:worker.kill()
+            worker.wait()
