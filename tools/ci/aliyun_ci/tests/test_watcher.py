@@ -148,3 +148,69 @@ class WatcherTests(unittest.TestCase):
             finally:
                 if child.poll() is None:child.kill()
                 child.wait();reaper.join()
+
+    def test_spot_handoff_can_resume_after_upload_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = root / 'attempt'
+            attempt.mkdir()
+            now = datetime.now(timezone.utc)
+            class Notice:
+                def read(self, path):
+                    return (now + timedelta(minutes=5)).isoformat()
+            config = {'execution_kind': 'local-rust', 'pid_root': str(root / 'control'),
+                      'attempt_root': str(attempt), 'deadline': (now + timedelta(minutes=10)).isoformat(),
+                      'watcher': {'poll_seconds': 1, 'cancel_budget_seconds': 0},
+                      'upload_urls': {'interrupted': 'https://signed.invalid/partial'},
+                      'runner_home': str(root / 'absent-runner')}
+            calls = []
+            def upload(path, diagnostics, **options):
+                fact = Path(path) / 'spot-cancellation.json'
+                observed = fact.stat()
+                self.assertEqual(0o640, observed.st_mode & 0o777)
+                self.assertEqual(os.getuid(), observed.st_uid)
+                self.assertEqual(attempt.stat().st_gid, observed.st_gid)
+                calls.append(json.loads(fact.read_text()))
+                if len(calls) == 1:
+                    raise ConnectionError('transient upload failure')
+                return {'uploaded': True}
+            with self.assertRaises(ConnectionError):
+                watch(config, metadata=Notice(), uid=os.getuid(), now=lambda: now, upload=upload)
+            result = watch(config, metadata=Notice(), uid=os.getuid(), now=lambda: now, upload=upload)
+            self.assertTrue(result['handoff']['uploaded'])
+            self.assertEqual(2, len(calls))
+            self.assertFalse(calls[0]['signal_sent'])
+            self.assertIsNone(calls[0]['exited'])
+            self.assertEqual([], list(attempt.glob('.spot-cancellation.*')))
+
+    def test_spot_fact_replaces_link_without_overwriting_its_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = root / 'attempt'
+            attempt.mkdir()
+            target = root / 'protected-target'
+            target.write_text('original target bytes')
+            marker = attempt / 'spot-cancellation.json'
+            marker.symlink_to(target)
+            now = datetime.now(timezone.utc)
+            class Notice:
+                def read(self, path):
+                    return (now + timedelta(minutes=5)).isoformat()
+            config = {'execution_kind': 'local-rust', 'pid_root': str(root / 'control'),
+                      'attempt_root': str(attempt), 'deadline': (now + timedelta(minutes=10)).isoformat(),
+                      'watcher': {'poll_seconds': 1, 'cancel_budget_seconds': 0},
+                      'upload_urls': {'interrupted': 'https://signed.invalid/partial'},
+                      'runner_home': str(root / 'absent-runner')}
+            observed = []
+            def upload(path, diagnostics, **options):
+                observed.append(json.loads((Path(path) / 'spot-cancellation.json').read_text()))
+                return {'uploaded': True}
+            result = watch(config, metadata=Notice(), uid=os.getuid(), now=lambda: now, upload=upload)
+            self.assertTrue(result['handoff']['uploaded'])
+            self.assertEqual('original target bytes', target.read_text())
+            self.assertFalse(marker.is_symlink())
+            self.assertEqual(0o640, marker.stat().st_mode & 0o777)
+            self.assertEqual(os.getuid(), marker.stat().st_uid)
+            self.assertEqual(1, len(observed))
+            self.assertFalse(observed[0]['signal_sent'])
+            self.assertEqual([], list(attempt.glob('.spot-cancellation.*')))

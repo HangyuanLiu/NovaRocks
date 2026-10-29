@@ -26,6 +26,7 @@ from pathlib import Path
 import pwd
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -119,12 +120,17 @@ def watch(config: dict, *, metadata=None, uid=None, now=None,
                                         monotonic=monotonic, sleep=sleep)
             attempt = Path(config['attempt_root'])
             # This reports the observed process fact, never a synthetic Rust exit.
-            descriptor = os.open(attempt / 'spot-cancellation.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
-            with os.fdopen(descriptor, 'w') as output:
-                os.fchmod(output.fileno(), 0o640)
-                os.fchown(output.fileno(), uid, attempt.stat().st_gid)
-                json.dump(cancellation, output, sort_keys=True)
-                output.write('\n')
+            descriptor, name = tempfile.mkstemp(prefix='.spot-cancellation.', dir=attempt)
+            temporary = Path(name)
+            try:
+                with os.fdopen(descriptor, 'w') as output:
+                    os.fchmod(output.fileno(), 0o640)
+                    os.fchown(output.fileno(), uid, attempt.stat().st_gid)
+                    json.dump(cancellation, output, sort_keys=True)
+                    output.write('\n')
+                os.replace(temporary, attempt / 'spot-cancellation.json')
+            finally:
+                temporary.unlink(missing_ok=True)
             diagnostics = {}
             runner_diag = Path(config.get('runner_home', '/var/lib/novarocks-ci/runner/agent')) / '_diag'
             if runner_diag.is_dir():
