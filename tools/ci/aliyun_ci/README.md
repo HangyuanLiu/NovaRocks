@@ -10,7 +10,7 @@ local服务显式提供 `LimitNOFILE=65536`，满足原生FE/BE的文件描述�
 
 local另可显式选择 `"swap_gib":16`；省略或为0保持原行为，不关闭已有swap。16从原200GiB系统盘中使用16GiB，不增加机器RAM或磁盘规格，也不降低8 jobs或修改Rust参数/范围/重试。镜像guest必须实际报告 `local_rust_swap_gib` 支持16并具备dd/mkswap/swapon；旧镜像缺字段仅支持0，分配前拒绝16。
 
-仅worker原生任务启动前由镜像root代码在固定 `/var/lib/novarocks-ci/private-swap/swapfile` 独占创建root0700目录与root0600文件，检查ext4/xfs磁盘空间、用dd实际写满并核对精确size/已分配blocks，再执行mkswap/swapon并核验 `/proc/swaps` 和meminfo。未知已有目录/文件、软链、空间不足或激活失败均明确失败，不回退；不写fstab或修改全局参数。配置、命令原退出和内核读回进入 `swap.json` 及原状态/归档，私有swap文件禁止归档。builder不创建或启用swap且捕获前拒绝私有swap目录；worker释放时随原磁盘回收。Swap可为编译提供磁盘后备容量，SIGKILL本身仍不证明OOM。实际Linux激活与内核读回须由真实guest验证，macOS单测不替代。
+仅worker原生任务启动前由镜像root代码在固定 `/var/lib/novarocks-ci/private-swap/swapfile` 独占创建root0700目录与root0600文件，检查ext4/xfs磁盘空间、用dd实际写满并核对精确size/已分配blocks，再执行mkswap/swapon并核验 `/proc/swaps` 和meminfo。未知已有目录/文件、软链、空间不足或激活失败均明确失败，不回退；不写fstab或/etc/sysctl配置。仅显式16GiB托管swap通过激活及内核文件核验后，将本台一次性worker的运行时 `/proc/sys/vm/swappiness` 设为Linux标准默认值60并独立读回，保留before/requested/after；0模式不读写该策略，builder不设置。该实例运行时策略随机器释放消失，写入或读回失败保留已激活swap与失败阶段并明确停止原任务启动。配置、命令原退出和内核读回进入 `swap.json` 及原状态/归档，私有swap文件禁止归档。builder不创建或启用swap且捕获前拒绝私有swap目录；worker释放时随原磁盘回收。Swap可为编译提供磁盘后备容量，SIGKILL或swappiness为0本身仍不证明OOM；60不保证对本工作负载最优，Linux swappiness语义见[官方文档](https://docs.kernel.org/admin-guide/sysctl/vm.html#swappiness)。实际Linux激活与内核读回须由真实guest验证，macOS单测不替代。
 
 原batch启动与原进程观察结束后，root分别保存 `resources-start.json` / `resources-end.json`，记录实际限额、原cgroup及其祖先、内核内存/Swap/PSI和OOM计数，结束时限时读取OOM相关日志。运行时0600保护副本的实际摘要随原batch结果返回，可与取回归档核对。退出后的观察不重读可能复用的PID；缺失、权限或超时记unknown，空日志不证明没有OOM。这些观察不改变原退出码或测试选择，也不证明清理完成。
 

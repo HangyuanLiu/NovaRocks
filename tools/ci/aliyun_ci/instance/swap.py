@@ -30,6 +30,7 @@ import time
 from aliyun_ci.config import LOCAL_SWAP_GIB
 
 SWAP_ROOT = Path('/var/lib/novarocks-ci/private-swap')
+SWAPPINESS_PATH = Path('/proc/sys/vm/swappiness')
 ROOT_UID = 0
 GIB = 1024 ** 3
 
@@ -158,9 +159,27 @@ def configure_swap(swap_gib, *, timeout=300, run=subprocess.run,
                 or rows[0]['size_kib'] * 1024 != expected_usable
                 or after['meminfo']['SwapTotal_kib'] < rows[0]['size_kib']):
             raise ValueError('kernel worker swap readback differs from requested file')
-        fact.update(enabled=True, stage='ready', usable_bytes=expected_usable)
+        fact.update(enabled=True, usable_bytes=expected_usable)
+        # This disposable worker alone owns this runtime policy; never persist it.
+        policy = {'before': None, 'requested': 60, 'after': None}
+        fact['swappiness'] = policy
+        fact['stage'] = 'swappiness-before'
+        policy['before'] = int(SWAPPINESS_PATH.read_text().strip())
+        fact['stage'] = 'swappiness-write'
+        with SWAPPINESS_PATH.open('w') as output:
+            output.write('60\n')
+        fact['stage'] = 'swappiness-readback'
+        policy['after'] = int(SWAPPINESS_PATH.read_text().strip())
+        if policy['after'] != policy['requested']:
+            raise ValueError('worker swappiness readback differs from runtime policy')
+        fact['stage'] = 'ready'
         return fact
     except Exception as error:
+        if fact['stage'] == 'swappiness-write':
+            try:
+                fact['swappiness']['after'] = int(SWAPPINESS_PATH.read_text().strip())
+            except Exception as read_error:
+                fact['swappiness']['readback_error'] = type(read_error).__name__
         if fact['stage'] in ('activate', 'readback') and fact['kernel_after'] is None:
             fact['kernel_after'] = kernel_snapshot(read_text=read_text, strict=False)
             if fact['kernel_after'] is not None:

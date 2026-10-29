@@ -42,6 +42,8 @@ class SwapTests(unittest.TestCase):
         self.stack.enter_context(patch.object(swap.sys, 'platform', 'linux'))
         self.active = False; self.calls = []; self.filesystem = 'ext4'; self.sparse = False
         self.command_failure = None; self.command_timeout = None; self.bad_kernel_size = False
+        self.policy = self.root / 'vm-swappiness'; self.policy.write_text('0\n')
+        self.stack.enter_context(patch.object(swap, 'SWAPPINESS_PATH', self.policy))
 
     def read_text(self, path):
         size = 16 * swap.GIB - os.sysconf('SC_PAGE_SIZE')
@@ -87,10 +89,13 @@ class SwapTests(unittest.TestCase):
             disk_usage=lambda _: SimpleNamespace(free=free))
 
     def test_zero_observes_without_creating_or_activating_swap(self):
-        fact = self.configure(0)
+        with patch.object(Path, 'read_text', side_effect=AssertionError('zero must not read policy')), \
+             patch.object(Path, 'write_text', side_effect=AssertionError('zero must not write policy')):
+            fact = self.configure(0)
         self.assertFalse(fact['enabled']); self.assertEqual([], self.calls)
         self.assertFalse(self.private.exists())
         self.assertEqual(0, fact['kernel_after']['meminfo']['SwapTotal_kib'])
+        self.assertEqual('0\n', self.policy.read_text()); self.assertNotIn('swappiness', fact)
 
     def test_private_non_sparse_file_is_formatted_activated_and_verified(self):
         fact = self.configure()
@@ -104,6 +109,52 @@ class SwapTests(unittest.TestCase):
         self.assertEqual(os.geteuid(), path.stat().st_uid)
         self.assertEqual(str(path), fact['kernel_after']['swaps'][0]['path'])
         self.assertTrue(all(c['exit_code'] == 0 for c in fact['commands']))
+        self.assertEqual({'before': 0, 'requested': 60, 'after': 60}, fact['swappiness'])
+        self.assertEqual('60\n', self.policy.read_text())
+
+    def test_policy_write_failure_keeps_actual_active_swap_and_readback(self):
+        original = Path.open
+        def open_file(path, mode='r', *args, **kwargs):
+            if path == self.policy and 'w' in mode:
+                raise PermissionError('controlled policy write failure')
+            return original(path, mode, *args, **kwargs)
+        with patch.object(Path, 'open', open_file), self.assertRaises(swap.SwapSetupError) as raised:
+            self.configure()
+        fact = raised.exception.fact
+        self.assertTrue(fact['enabled']); self.assertTrue(fact['kernel_after']['swaps'])
+        self.assertEqual('swappiness-write', fact['stage'])
+        self.assertEqual('PermissionError', fact['error_type'])
+        self.assertEqual({'before': 0, 'requested': 60, 'after': 0}, fact['swappiness'])
+
+    def test_policy_readback_failure_keeps_unknown_value_and_actual_active_swap(self):
+        original = Path.read_text; reads = []
+        def read_file(path, *args, **kwargs):
+            if path == self.policy:
+                reads.append(path)
+                if len(reads) > 1:
+                    raise PermissionError('controlled policy readback failure')
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read_file), self.assertRaises(swap.SwapSetupError) as raised:
+            self.configure()
+        fact = raised.exception.fact
+        self.assertTrue(fact['enabled']); self.assertTrue(fact['kernel_after']['swaps'])
+        self.assertEqual('swappiness-readback', fact['stage'])
+        self.assertEqual('PermissionError', fact['error_type'])
+        self.assertEqual({'before': 0, 'requested': 60, 'after': None}, fact['swappiness'])
+        self.assertEqual('60\n', self.policy.read_text())
+
+    def test_policy_readback_mismatch_is_not_reported_ready(self):
+        original = Path.read_text
+        def read_file(path, *args, **kwargs):
+            if path == self.policy and original(path) == '60\n':
+                path.write_text('0\n')  # Controlled kernel-policy rejection fixture.
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read_file), self.assertRaises(swap.SwapSetupError) as raised:
+            self.configure()
+        fact = raised.exception.fact
+        self.assertTrue(fact['enabled']); self.assertEqual('swappiness-readback', fact['stage'])
+        self.assertEqual(0, fact['swappiness']['after'])
+        self.assertIn('readback differs', fact['reason'])
 
     def test_unknown_directory_or_link_is_never_overwritten(self):
         self.private.mkdir(); marker = self.private / 'existing'; marker.write_text('keep')
@@ -153,6 +204,8 @@ class SwapTests(unittest.TestCase):
         self.assertEqual('readback', raised.exception.fact['stage'])
         self.assertTrue(raised.exception.fact['enabled'])
         self.assertTrue(all(c['exit_code'] == 0 for c in raised.exception.fact['commands']))
+        self.assertEqual('0\n', self.policy.read_text())
+        self.assertNotIn('swappiness', raised.exception.fact)
 
     def test_unknown_size_fails_before_commands_or_files(self):
         for size in (True, 1, 16.0, -1, '16'):
