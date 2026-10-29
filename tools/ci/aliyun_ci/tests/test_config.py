@@ -61,7 +61,9 @@ class ConfigTests(unittest.TestCase):
 
     def test_local_requires_no_github_and_has_explicit_kind(self):
         data=example();data.pop('github');data['execution_kind']='local-rust'
+        data['build_jobs']=2
         config=validate_config(data)
+        self.assertEqual(2,config['build_jobs'])
         self.assertNotIn('github',config.data)
         from aliyun_ci.plan import derive
         from datetime import datetime,timezone

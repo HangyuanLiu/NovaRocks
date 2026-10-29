@@ -171,6 +171,7 @@ def start_local(config, plan, ecs, oos, oss, *, image_id, source, record_path,
                           'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest()},
                'deadline': capability_deadline,
                'work_deadline': work_deadline,
+               'build_jobs': config.data.get('build_jobs'),
                'attempt_root': ATTEMPT, 'upload_urls': upload_urls, 'watcher': config['watcher'],
                'identity': {'run_id': plan.run_id, 'run_attempt': plan.run_attempt,
                             'label': plan.label, 'image_id': image_id, 'instance_id': instance_id}}

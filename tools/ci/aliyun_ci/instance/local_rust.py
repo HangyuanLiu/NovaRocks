@@ -237,6 +237,10 @@ def run(payload, *, runtime=RUNTIME, source_root=SOURCE, tools_source=TOOLS_SOUR
             'LOGNAME': account.pw_name,
             'PATH': f'{account.pw_dir}/.cargo/bin:/usr/local/bin:/usr/bin:/bin',
             'PYTHONDONTWRITEBYTECODE': '1'}
+        if payload.get('build_jobs') is not None:
+            if type(payload['build_jobs']) is not int or payload['build_jobs'] <= 0:
+                raise ValueError('build_jobs must be a positive integer')
+            environment['CARGO_BUILD_JOBS'] = str(payload['build_jobs'])
         script = 'set -e; . "$HOME/.config/novarocks/linux-env.sh"; exec python3 tools/ci/test-run.py batch --output "$1"'
         command = ['/bin/bash', '-c', script, 'novarocks-local-rust', str(attempt / 'rust')]
         work_deadline = parse_time(payload.get('work_deadline', payload['deadline']))

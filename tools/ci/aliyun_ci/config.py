@@ -44,6 +44,11 @@ class DeploymentConfig:
 def validate_config(data: dict) -> DeploymentConfig:
     data = dict(data)
     execution_kind = data.pop('execution_kind', 'github-runner')
+    build_jobs = data.pop('build_jobs', None)
+    if build_jobs is not None:
+        positive(build_jobs, 'build_jobs')
+        if execution_kind != 'local-rust':
+            raise ValueError('build_jobs is a local-rust input')
     if execution_kind not in ('local-rust', 'github-runner'):
         raise ValueError('unsupported execution_kind')
     if execution_kind == 'local-rust':
@@ -98,6 +103,8 @@ def validate_config(data: dict) -> DeploymentConfig:
         data.pop('github')
     if execution_kind != 'github-runner':
         data['execution_kind'] = execution_kind
+    if build_jobs is not None:
+        data['build_jobs'] = build_jobs
     return DeploymentConfig(json.loads(json.dumps(data)))
 
 

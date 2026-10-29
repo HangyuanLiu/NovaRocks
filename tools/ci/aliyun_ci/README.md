@@ -1,6 +1,6 @@
 # 本机按需远端 Rust 验证
 
-开发者或Agent可以从开发机直接申请一次性ECS、执行完整原生Rust batch、下载校验后的材料并释放机器。local配置显式使用 `"execution_kind":"local-rust"` 并省略 `github`；不需要推送提交或配置GitHub。规格、磁盘与期限由部署配置明确提供。
+开发者或Agent可以从开发机直接申请一次性ECS、执行完整原生Rust batch、下载校验后的材料并释放机器。local配置显式使用 `"execution_kind":"local-rust"` 并省略 `github`；不需要推送提交或配置GitHub。规格、磁盘与期限由部署配置明确提供。可选 `build_jobs` 显式传递 `CARGO_BUILD_JOBS`，只调整编译并发，不改变测试选择；省略时使用当前CPU观察。
 
 ```sh
 cd tools/ci
