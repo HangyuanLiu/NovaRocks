@@ -20,7 +20,7 @@
 //! actual payload, bitmap and metadata requests precede their allocations;
 //! MutableArrayData invoices do not describe this constructor.
 
-use super::{CopyConstructionError, CopyError, extent_failure::CopyLayout, take_host};
+use super::{CopyConstructionError, CopyError, take_host};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{KernelControlObservation, KernelEvaluationControl};
 use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray};
@@ -34,20 +34,15 @@ const COPY_BYTES: usize = 64 * 1024;
 
 fn output_extent(width: usize, rows: usize) -> Result<usize, CopyError> {
     let required = width as u128 * rows as u128;
-    // Pinned Arrow 58.4 computes FixedSizeBinary value offsets in i32,
-    // including the offset after the final value. Preserve that constructor's
-    // real representation boundary before requesting the destination payload.
-    if required > i32::MAX as u128 {
-        return Err(CopyError::format_extent(
-            CopyLayout::FixedSizeBinary,
-            Some(required),
-            i32::MAX as usize,
-        ));
-    }
-    Ok(required as usize)
+    // Arrow 60.1 uses usize for value offsets; i32 constrains each value's
+    // width, not the complete payload. This writer owns a Vec<u8>, so check
+    // its actual Rust backing layout before requesting destination storage.
+    let bytes = usize::try_from(required).map_err(|_| CopyError::backing_bytes(required))?;
+    Layout::array::<u8>(bytes).map_err(|source| CopyError::layout::<u8>(bytes, source))?;
+    Ok(bytes)
 }
 
-/// Check the pinned Arrow FixedSizeBinary constructor's real offset extent.
+/// Check the fixed-byte writer's actual Rust payload backing extent.
 /// This proves representation only; it never authorizes destination storage.
 pub fn preflight_fixed_binary_constructor_extent(width: i32, rows: usize) -> Result<(), CopyError> {
     let width = usize::try_from(width)

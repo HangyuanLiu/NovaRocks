@@ -294,23 +294,34 @@ fn fixed_copy_preserves_control_failure_at_every_actual_boundary() {
 }
 
 #[test]
-fn fixed_constructor_extent_is_arrow_offset_fact_without_allocating_a_large_value() {
+fn fixed_constructor_extent_uses_real_backing_without_allocating_a_large_value() {
     assert!(preflight_fixed_binary_constructor_extent(0, usize::MAX).is_ok());
-    assert!(preflight_fixed_binary_constructor_extent(1, i32::MAX as usize).is_ok());
+    assert!(preflight_fixed_binary_constructor_extent(1, isize::MAX as usize).is_ok());
     assert!(matches!(
         preflight_fixed_binary_constructor_extent(-1, 0),
         Err(CopyError::Invalid(_))
     ));
-    let error = preflight_fixed_binary_constructor_extent(i32::MAX, 2).unwrap_err();
+    // Arrow's signed width is not a signed total-payload offset. These
+    // extents exceed i32::MAX but fit the actual 64-bit Vec backing layout.
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(preflight_fixed_binary_constructor_extent(i32::MAX, 2).is_ok());
+        assert!(preflight_fixed_binary_constructor_extent(16, i32::MAX as usize / 16 + 1).is_ok());
+    }
+    let too_many_bytes = isize::MAX as usize + 1;
+    let error = preflight_fixed_binary_constructor_extent(1, too_many_bytes).unwrap_err();
     let fact = error.failure_fact();
     assert_eq!(fact.class(), FailureClass::Representation);
     let representation = fact.representation().unwrap();
-    assert_eq!(representation.required, Some(i32::MAX as u64 * 2));
-    assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
+    assert_eq!(representation.required, Some(too_many_bytes as u64));
+    assert_eq!(representation.extent_limit, Some(isize::MAX as u64));
     assert_eq!(
-        representation.layout.code.get(),
-        CopyLayout::FixedSizeBinary as u16
+        representation.layout.code,
+        crate::allocation_failure::RUST_ARRAY_BACKING_LAYOUT
     );
+    // Even arithmetic outside usize must retain the original backing fact.
+    let error = preflight_fixed_binary_constructor_extent(2, usize::MAX).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Representation);
 }
 
 #[test]
