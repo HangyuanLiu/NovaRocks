@@ -21,7 +21,7 @@ base64.workspace = true
 bytes.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
 futures.workspace = true
-hashbrown = { workspace = true, features = ["raw"] }
+hashbrown.workspace = true
 xxhash-rust.workspace = true
 rand.workspace = true
 allocator-api2.workspace = true

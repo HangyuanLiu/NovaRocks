@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The original canonical component decoder. Legacy and governed callers share
-//! one framing/parser and typed construction body. Result custody remains with
-//! the caller that owns the published array; these borrowed ports grant none.
+//! The original canonical component decoder under caller construction ports.
+//! Tests use the same parser through a private resource-free fixture context.
+//! Result custody remains with the actual published-array owner.
 
 use super::{
     EncodedCursor, GroupKeyOutputKind, GroupKeyOutputTally, group_key_decode_arrow,
@@ -52,10 +52,10 @@ use std::{alloc::Layout, sync::Arc};
 
 const COPY_BLOCK: usize = 64 * 1024;
 
-/// Existing ungoverned callers keep their old API until their owner migrates.
-/// This private context creates neither a new successful admission nor a public
-/// alternative to the governed construction port.
-struct Legacy;
+/// Independent codec expectations share the parser without exposing another
+/// production construction path or granting caller capacity.
+#[cfg(test)]
+struct TestResources;
 struct Governed<'a> {
     owner: &'a dyn InputConstructionOwner,
     control: &'a dyn KernelEvaluationControl,
@@ -67,7 +67,8 @@ trait DecodeResources {
     fn storage(&self) -> ValueTypeStorageLifetime;
     fn structure(&self, event: ValueStructure) -> ExecutionResult<()>;
 }
-impl DecodeResources for Legacy {
+#[cfg(test)]
+impl DecodeResources for TestResources {
     fn checkpoint(&self) -> ExecutionResult<()> {
         Ok(())
     }
@@ -110,11 +111,12 @@ impl DecodeResources for Governed<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decode_group_key_rows(
     data_type: &DataType,
     rows: &[Option<&[u8]>],
 ) -> ExecutionResult<ArrayRef> {
-    decode(data_type, rows, &Legacy)
+    decode(data_type, rows, &TestResources)
 }
 
 /// Decode the original non-NULL component payloads under the actual caller's

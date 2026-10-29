@@ -23,7 +23,8 @@ use crate::{
     },
     runtime::mem_tracker::MemTracker,
 };
-use arrow::datatypes::Field;
+use arrow::array::DictionaryArray;
+use arrow::datatypes::{Field, Int32Type};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use novarocks_type_contract::FunctionValueType;
 use novarocks_value_arrays::{decode::ValueConversionContext, reachability::ReachableRows};
