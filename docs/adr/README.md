@@ -71,6 +71,7 @@ code-anchors:
 
 领域哲学：实际 debug assertions 决定开发接缝是否编入，默认开发共用主测试图与产品装配，标准 release 排除接缝；编入的能力仍须经每个实际角色启动的有限授权，准确绑定产品 owner 签发的工作身份。来源只在薄 CLI 冻结。构建事实、权限、控制结束、helper join、角色退出与资源收敛分别取证。共享测试层只提供机械能力，领域解释和生命周期仍属于原 owner。
 
+- [ADR-0204](ADR-0204-one-shot-spot-ci-and-independent-evidence.md) — 手动抢占式 CI 为何使用一次性实例与三 job，并分别记录测试、交接、算力终态与遗留资源（active）
 - [ADR-0188](ADR-0188-optional-pr-validation-and-formal-admission.md) — PR 完整反馈为何以独立非必需检查展示真实状态，并与正式准入共用执行步骤（active；仅替代 ADR-0189 的 PR 只做快速预检这一成本取舍）
 - [ADR-0189](ADR-0189-merge-queue-admission-and-current-attempt-evidence.md) — 合入队列准入为何绑定指定执行上下文、显式启用范围与当前批次证据（active；部分替代 ADR-0186；PR 只做快速预检的成本取舍由 ADR-0188 替代，正式来源、启用范围与证据规则保留）
 - [ADR-0186](ADR-0186-layered-verification-and-read-only-evidence-composition.md) — 验证为何按开发、准入、全量分层，并由原生 owner 采集事实、只读消费者按同输入与完整生命周期组合证据（active）
