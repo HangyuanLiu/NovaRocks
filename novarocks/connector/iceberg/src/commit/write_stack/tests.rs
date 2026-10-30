@@ -3442,7 +3442,10 @@ fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldR
     .map(|(ordinal, (field, value))| {
         // Independent SQL execution declarations accompany the provider's IDs.
         novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-            field.with_metadata([("PARQUET:field_id".into(), (ordinal + 1).to_string())].into()),
+            field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                "PARQUET:field_id".into(),
+                (ordinal + 1).to_string(),
+            )])),
             value,
         )
         .expect("complete scalar integer caller declaration")

@@ -4110,7 +4110,7 @@ impl TaskExecutionRegistry {
                     continue;
                 };
                 let ready = entry.tasks.values().all(TaskEntry::is_terminal_record)
-                    && entry.roots.values().all(|root| root.physical_idle())
+                    && entry.roots.values().all(|root| root.try_join_physical())
                     && state
                         .prepare_context_counts
                         .get(&context)

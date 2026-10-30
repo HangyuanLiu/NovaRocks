@@ -138,9 +138,9 @@ pub fn disabled_reason(name: &str) -> Option<&'static str> {
         | "uea4/catalog-planning-responsibility"
         | "catalog/provider-read-queued-progress"
         | "uea4/scan-producer-readiness"
-        | "uea4/scan-producer-cancel" => {
-            Some("Paimon tests are suspended pending detailed connector design")
-        }
+        | "uea4/scan-producer-cancel" => Some(
+            "Paimon provider is suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14",
+        ),
         _ => None,
     }
 }

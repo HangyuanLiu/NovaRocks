@@ -263,10 +263,7 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
         assert!(
             !matches!(
                 column.logical_type_ref(),
-                Some(LogicalType::Integer {
-                    bit_width: 8 | 16,
-                    ..
-                })
+                Some(LogicalType::Integer(value)) if matches!(value.bit_width, 8 | 16)
             ),
             "physical storage must not carry a narrow logical label"
         );
