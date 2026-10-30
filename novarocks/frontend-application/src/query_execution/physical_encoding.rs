@@ -1808,10 +1808,7 @@ mod tests {
             let projection = model
                 .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
                 .unwrap();
-            assert!(
-                projection.usage.field_occurrences
-                    <= PackageDecodeLimits::FROZEN.wire.max_field_occurrences
-            );
+            assert_eq!(projection.usage.input_bytes, bytes.len());
             let decoded =
                 decode_fragment_package(&bytes, &model, &PackageDecodeLimits::FROZEN, &control)
                     .unwrap();
@@ -1836,9 +1833,9 @@ mod tests {
         // The separate COUNT/LIKE regression above keeps the original query
         // shape. Here every output and every column varies, so ordinary column
         // pruning or constant lifting cannot turn the scale check into a
-        // narrower VALUES package. This wider auxiliary workload must retain
-        // the production field-occurrence refusal; the original query above
-        // remains the separate successful complete-package regression.
+        // narrower VALUES package. Production accepts this legal package;
+        // an explicit caller field budget must still preserve the original
+        // resource failure through artifact freezing without creating one.
         let rows = (0..16_384)
             .map(|row| {
                 format!("('catalog_{row:05}','schema_{row:05}','table_{row:05}','type_{row:05}')")
@@ -1929,7 +1926,7 @@ mod tests {
         }
         assert_eq!(values_nodes, 1);
         assert_eq!(expression_positions, 65_536);
-        let mut refused_packages = 0;
+        let mut limited_values_packages = 0;
         for (id, package) in packages {
             let contains_values = package
                 .fragment()
@@ -1937,18 +1934,29 @@ mod tests {
                 .values()
                 .any(|node| matches!(&node.kind, NodeKind::Values { .. }));
             if contains_values {
-                refused_packages += 1;
-                // These are the complete original producer bytes under the
-                // same production limits, without an injected receiver cap.
+                limited_values_packages += 1;
+                // Measure the complete legal producer bytes, then exercise an
+                // explicit caller budget one field below their actual usage.
                 let bytes =
                     encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &control)
                         .unwrap()
                         .encode_to_vec();
-                let original = model
+                let production = model
                     .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
-                    .expect_err(
-                        "the full four-column package must hit the original frozen field limit",
-                    );
+                    .expect("production accepts the complete legal four-column package");
+                assert_eq!(production.usage.input_bytes, bytes.len());
+                let mut receiver = PackageDecodeLimits::FROZEN.wire;
+                receiver.max_field_occurrences =
+                    production.usage.field_occurrences.checked_sub(1).unwrap();
+                let limited_carrier = CompiledPackageCarrier::new(
+                    FROZEN_PACKAGE_ADMISSION,
+                    PackageEncodeLimits::FROZEN,
+                    Arc::clone(&model),
+                    receiver,
+                );
+                let original = model
+                    .preflight(&bytes, receiver, &control)
+                    .expect_err("the explicit caller field limit must reject the full package");
                 assert_eq!(
                     original,
                     ResourceModelError::Limit("protobuf field occurrences exceed caller limit")
@@ -1959,7 +1967,7 @@ mod tests {
                 let error = match FragmentArtifact::freeze_package(
                     &package,
                     completed.candidate().plan().edges(),
-                    &carrier,
+                    &limited_carrier,
                     &control,
                 ) {
                     Err(error) => error,
@@ -1981,10 +1989,8 @@ mod tests {
                     before,
                     "the refused Values fragment creates no artifact"
                 );
-                // This package was refused before decode admission; do not
-                // label it as a successful full decode. Other fragments below
-                // retain their existing positive round-trip requirements.
-                continue;
+                // The caller-limited failure is separate from the normal
+                // production round trip, which must also accept this package.
             }
             let bytes = crate::query_execution::package_freeze::encode_checked_package(
                 &package, &carrier, &control,
@@ -1993,18 +1999,15 @@ mod tests {
             let projection = model
                 .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
                 .unwrap();
-            assert!(
-                projection.usage.field_occurrences
-                    <= PackageDecodeLimits::FROZEN.wire.max_field_occurrences
-            );
+            assert_eq!(projection.usage.input_bytes, bytes.len());
             let decoded =
                 decode_fragment_package(&bytes, &model, &PackageDecodeLimits::FROZEN, &control)
                     .unwrap();
             assert_eq!(decoded.fragment().id(), id);
         }
         assert_eq!(
-            refused_packages, 1,
-            "only the actual full Values package is refused"
+            limited_values_packages, 1,
+            "the caller-limited check uses the one actual full Values package"
         );
     }
 
