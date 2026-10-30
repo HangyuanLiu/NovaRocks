@@ -179,4 +179,3 @@ def delete_exact(config, ecs, instance_id, expected_tags, *, deadline=None, now=
         owned(config, values[0], expected_tags)
         sleep(5)
     raise APIError('ReleaseUnconfirmed', f'instance still present or unknown: {instance_id}')
-
